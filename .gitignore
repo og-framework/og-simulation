@@ -1,0 +1,9 @@
+build/
+.vs/
+.cache/
+*.user
+
+# UE intermediate folders (plugin packaging)
+Binaries/
+Intermediate/
+Saved/

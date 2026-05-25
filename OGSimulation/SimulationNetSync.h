@@ -1,0 +1,550 @@
+#pragma once
+// SPDX-License-Identifier: MPL-2.0
+
+#include "OGTypes.h"
+#include <concepts>
+#include <functional>
+#include <tuple>
+#include <unordered_map>
+
+#include "OGSimulation/SimulationLog.h"
+#include "OGSimulation/SimulationObjectStorage.h"
+#include "OGSimulation/SimulationQueues.h"
+#include "OGSimulation/SimulationReconciliation.h"
+#include "OGSimulation/SimulationTimeContext.h"
+
+#pragma optimize("", off)
+
+// ---------------------------------------------------------------------------
+// SimulatableOwnerTraits<SimulatableT>
+//
+// Primary template — intentionally undefined. Each simulatable type must
+// specialize this in the TestYo layer (or wherever UE types are available),
+// declaring PredictionOwnerType and AuthorityOwnerType. Undefined primary
+// gives a clean compile error if a specialization is missing.
+// ---------------------------------------------------------------------------
+template <typename SimulatableT>
+struct SimulatableOwnerTraits;
+
+template <typename T>
+using PredictionOwnerFor = typename SimulatableOwnerTraits<T>::PredictionOwnerType;
+
+template <typename T>
+using AuthorityOwnerFor = typename SimulatableOwnerTraits<T>::AuthorityOwnerType;
+
+// ---------------------------------------------------------------------------
+// Owner-bound pointer structs — no std::function, no per-id heap allocation.
+// Single pointer; all surrounding per-tick state (storage slot, last-used
+// input, pending queue) is looked up in the call body by id, not captured here.
+// sizeof must equal sizeof(void*) — enforced via static_assert in test files.
+// ---------------------------------------------------------------------------
+
+template <typename T>
+struct AuthorityWriter
+{
+    AuthorityOwnerFor<T>* owner;
+};
+
+template <typename T>
+struct LocalInputSender
+{
+    PredictionOwnerFor<T>* owner;
+};
+
+// ---------------------------------------------------------------------------
+// Per-type map aliases for SimulationNetSync members
+// ---------------------------------------------------------------------------
+
+template <typename T>
+using InputProviderMapFor = std::unordered_map<
+    unsigned int,
+    std::function<typename T::InputType(const SimulationTimeStep&)>>;
+
+template <typename T>
+using RemoteMoveQueueMapFor = std::unordered_map<
+    unsigned int,
+    RemoteMoveQueue<typename T::InputType>>;
+
+template <typename T>
+using PendingInputQueueMapFor = std::unordered_map<
+    unsigned int,
+    PendingInputQueue<typename T::InputType>>;
+
+template <typename T>
+using LastUsedInputMapFor = std::unordered_map<unsigned int, typename T::InputType>;
+
+template <typename T>
+using AuthorityWriterMapFor = std::unordered_map<unsigned int, AuthorityWriter<T>>;
+
+template <typename T>
+using LocalInputSenderMapFor = std::unordered_map<unsigned int, LocalInputSender<T>>;
+
+// ---------------------------------------------------------------------------
+// Concept helpers — declared here so concepts below can reference them.
+//
+// CompositeSyncedBufferConcept encodes the wire-format contract of every
+// tick-stamped replicated buffer in the system: it must support writing a
+// composite with a tick, and reading one back, returning the tick. The two
+// are the exact mirror pair used by SimulationNetSync::sendCorrectionAll /
+// sendLocalInputToAuthorityAll (write side) and
+// SimulationReconciliation::injectCorrectionState / injectCorrectionInput +
+// SimulationNetSync::registerAuthorityOwner RPC callback (read side).
+// Constraining buffer accessors through this concept is what guarantees
+// the two sides stay in lockstep — breaking either the write or the readInto
+// signature becomes a compile error at the registerSimulatable call site,
+// not a runtime "tick=1056398093" wire-format corruption.
+// ---------------------------------------------------------------------------
+
+template <typename BufferT, typename CompositeT>
+concept CompositeSyncedBufferConcept =
+    requires(std::remove_reference_t<BufferT>& b,
+             const std::remove_reference_t<BufferT>& cb,
+             const CompositeT& in,
+             CompositeT& out,
+             uint32 tick)
+    {
+        { b.write(in, tick) };
+        { cb.readInto(out) } -> std::same_as<uint32_t>;
+    };
+
+template <typename OwnerT, typename StateT, typename InputT>
+concept PredictionSyncedBufferOwnerConcept =
+    requires(OwnerT& owner,
+             std::function<void(const typename OwnerT::SyncedCorrectionBufferType&)> corrFn,
+             std::function<void(const typename OwnerT::SyncedRemoteInputBufferType&)> inputFn,
+             const typename OwnerT::SyncedRemoteInputBufferType& buffer)
+    {
+        typename OwnerT::SyncedCorrectionBufferType;
+        typename OwnerT::SyncedRemoteInputBufferType;
+        requires CompositeSyncedBufferConcept<typename OwnerT::SyncedCorrectionBufferType, StateT>;
+        requires CompositeSyncedBufferConcept<typename OwnerT::SyncedRemoteInputBufferType, InputT>;
+        { owner.setOnCorrectionStateReceivedCallback(corrFn) };
+        { owner.setOnCorrectionInputReceivedCallback(inputFn) };
+        { owner.clearOnCorrectionStateReceivedCallback() };
+        { owner.clearOnCorrectionInputReceivedCallback() };
+        { owner.getClientToServerInputSyncedBuffer() } -> std::same_as<typename OwnerT::SyncedRemoteInputBufferType*>;
+        { owner.sendLocalInputToAuthority(buffer) };
+    };
+
+template <typename OwnerT, typename StateT, typename InputT>
+concept AuthoritySyncedBufferOwnerConcept =
+    requires(OwnerT& owner,
+             std::function<void(const typename OwnerT::SyncedRemoteInputBufferType&)> fn)
+    {
+        typename OwnerT::SyncedRemoteInputBufferType;
+        requires CompositeSyncedBufferConcept<typename OwnerT::SyncedRemoteInputBufferType, InputT>;
+        { owner.getSyncedCorrectionStateBuffer() } -> CompositeSyncedBufferConcept<StateT>;
+        { owner.getSyncedCorrectionInputBuffer() } -> CompositeSyncedBufferConcept<InputT>;
+        { owner.setOnRemoteMoveReceivedCallback(fn) };
+        { owner.clearOnRemoteMoveReceivedCallback() };
+    };
+
+// ---------------------------------------------------------------------------
+// SimulationNetSync<SimulatableTs...>
+//
+// Owns all per-type transport state: input providers, remote-move queues,
+// pending-input queues, last-used inputs. Owns per-type owner-binding maps
+// (AuthorityWriter, LocalInputSender) as concrete pointer structs (no std::function
+// on the hot path). Holds refs to SimulationObjectStorage and SimulationReconciliation.
+//
+// Layer: OGSimulation. Adapter-agnostic, UE/Chaos-free.
+// ---------------------------------------------------------------------------
+
+template <typename... SimulatableTs>
+class SimulationNetSync
+{
+public:
+    SimulationNetSync(
+        SimulationObjectStorage<SimulatableTs...>& storage,
+        SimulationReconciliation<SimulatableTs...>& reconciliation)
+        : m_storage(storage)
+        , m_reconciliation(reconciliation)
+    {}
+
+    void setLogger(std::function<void(const char*)> logger)
+    {
+        m_logger = std::move(logger);
+    }
+
+    // -----------------------------------------------------------------------
+    // Registration — free functions delegate here; not called directly by users
+    // -----------------------------------------------------------------------
+
+    // Client overload registration helpers — called from registerSimulatable free function.
+    template <typename SimulatableT>
+        requires PredictionSyncedBufferOwnerConcept<
+            PredictionOwnerFor<SimulatableT>,
+            typename SimulatableT::StateType,
+            typename SimulatableT::InputType>
+    void registerPredictionOwner(
+        unsigned int id,
+        PredictionOwnerFor<SimulatableT>& predictionOwner,
+        std::function<typename SimulatableT::InputType(const SimulationTimeStep&)> inputProvider)
+    {
+        // Input provider is present iff this owner drives a locally-controlled
+        // simulatable. Keep m_inputProviders / m_pendingInputQueues / m_localInputSenders
+        // populated as a set: sendLocalInputToAuthorityAll iterates m_localInputSenders
+        // and looks up m_pendingInputQueues by id, so the three maps must agree.
+        if (inputProvider)
+        {
+            std::get<InputProviderMapFor<SimulatableT>>(m_inputProviders)
+                .emplace(id, std::move(inputProvider));
+
+            // try_emplace default-constructs in place — PendingInputQueue
+            // holds std::atomic members and is neither copyable nor movable.
+            std::get<PendingInputQueueMapFor<SimulatableT>>(m_pendingInputQueues)
+                .try_emplace(id);
+
+            std::get<LocalInputSenderMapFor<SimulatableT>>(m_localInputSenders)
+                .emplace(id, LocalInputSender<SimulatableT>{ &predictionOwner });
+        }
+
+        // Register correction-state callback — passes raw buffer to reconciliation.
+        predictionOwner.setOnCorrectionStateReceivedCallback(
+            [this, id](const typename PredictionOwnerFor<SimulatableT>::SyncedCorrectionBufferType& buffer) {
+                m_reconciliation.template injectCorrectionState<SimulatableT>(id, buffer);
+            });
+
+        // Register correction-input callback.
+        predictionOwner.setOnCorrectionInputReceivedCallback(
+            [this, id](const typename PredictionOwnerFor<SimulatableT>::SyncedRemoteInputBufferType& buffer) {
+                m_reconciliation.template injectCorrectionInput<SimulatableT>(id, buffer);
+            });
+    }
+
+    // Server overload registration helper.
+    template <typename SimulatableT>
+        requires AuthoritySyncedBufferOwnerConcept<
+            AuthorityOwnerFor<SimulatableT>,
+            typename SimulatableT::StateType,
+            typename SimulatableT::InputType>
+    void registerAuthorityOwner(unsigned int id, AuthorityOwnerFor<SimulatableT>& authorityOwner)
+    {
+        std::get<RemoteMoveQueueMapFor<SimulatableT>>(m_remoteMoveQueues)
+            .emplace(id, RemoteMoveQueue<typename SimulatableT::InputType>{});
+
+        std::get<LastUsedInputMapFor<SimulatableT>>(m_lastUsedInputs)
+            .emplace(id, typename SimulatableT::InputType{});
+
+        // RPC inbound — lambda captures ref into m_remoteMoveQueues.
+        // Cleared in unregisterSimulatable before data-map erasure (see ordering comment there).
+        auto& remoteQueue = std::get<RemoteMoveQueueMapFor<SimulatableT>>(m_remoteMoveQueues).at(id);
+        using InputBufferT = typename AuthorityOwnerFor<SimulatableT>::SyncedRemoteInputBufferType;
+        authorityOwner.setOnRemoteMoveReceivedCallback([this, id, &remoteQueue](const InputBufferT& buffer) {
+            typename SimulatableT::InputType input;
+            const uint32 tick = buffer.readInto(input);
+            SIMLOG(m_logger, "[ReceiveLocalInput] id=%u tick=%u", id, tick);
+            remoteQueue.queueMove(std::move(input), tick);
+        });
+
+        // Concrete pointer struct.
+        std::get<AuthorityWriterMapFor<SimulatableT>>(m_authorityWriters)
+            .emplace(id, AuthorityWriter<SimulatableT>{ &authorityOwner });
+    }
+
+    // Centralized unregister — fixed order; ordering is load-bearing.
+    // Step 1 MUST precede step 3: onRemoteMoveReceived captures &remoteQueue from
+    // m_remoteMoveQueues. Clear RPC-inbound callbacks before erasing data maps,
+    // or the cleared lambda may fire against a dangling queue reference.
+    template <typename T>
+    void unregisterSimulatable(
+        unsigned int id,
+        PredictionOwnerFor<T>* predictionOwner,
+        AuthorityOwnerFor<T>* authorityOwner = nullptr)
+    {
+        // Step 1: clear RPC-inbound callbacks on the owner(s) — before any data-map erase.
+        if (predictionOwner)
+        {
+            predictionOwner->clearOnCorrectionStateReceivedCallback();
+            predictionOwner->clearOnCorrectionInputReceivedCallback();
+        }
+        if (authorityOwner)
+        {
+            authorityOwner->clearOnRemoteMoveReceivedCallback();
+        }
+
+        // Step 2: erase writer structs.
+        std::get<AuthorityWriterMapFor<T>>(m_authorityWriters).erase(id);
+        std::get<LocalInputSenderMapFor<T>>(m_localInputSenders).erase(id);
+
+        // Step 3: erase data maps.
+        std::get<InputProviderMapFor<T>>(m_inputProviders).erase(id);
+        std::get<RemoteMoveQueueMapFor<T>>(m_remoteMoveQueues).erase(id);
+        std::get<PendingInputQueueMapFor<T>>(m_pendingInputQueues).erase(id);
+        std::get<LastUsedInputMapFor<T>>(m_lastUsedInputs).erase(id);
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-tick input resolution (physics thread)
+    // -----------------------------------------------------------------------
+
+    ResolvedInputs<SimulatableTs...> collectInputAll(const SimulationTimeStep& step)
+    {
+        ResolvedInputs<SimulatableTs...> inputs;
+        m_storage.forEachSimulatable([&](unsigned int id, auto& simulatable) {
+            using T = std::remove_reference_t<decltype(simulatable)>;
+            auto& providerMap   = std::get<InputProviderMapFor<T>>(m_inputProviders);
+            auto& queueMap      = std::get<RemoteMoveQueueMapFor<T>>(m_remoteMoveQueues);
+            auto& map           = std::get<std::unordered_map<unsigned int, typename T::InputType>>(inputs);
+
+            if (auto it = providerMap.find(id); it != providerMap.end())
+            {
+                auto input = it->second(step);
+
+                SIMLOG(m_logger, "[CollectInput] id=%u tick=%u source=Provider kind=%s",
+                    id, step.getTick(), stepKindName(step.getStepKind()));
+
+                if (step.getStepKind() == StepKind::Skip)
+                    m_reconciliation.template backfillSkippedTick<T>(
+                        id, step.getTick() - 1, simulatable.getAllState().getState());
+
+                if (step.getStepKind() != StepKind::Stall)
+                {
+                    m_reconciliation.template pushPredictionTick<T>(id, step.getTick());
+                    m_reconciliation.template pushPredictionInput<T>(id, input);
+                    std::get<PendingInputQueueMapFor<T>>(m_pendingInputQueues)
+                        .at(id).enqueue(step.getTick(), input);
+                }
+
+                map.emplace(id, std::move(input));
+            }
+            else if (auto qit = queueMap.find(id); qit != queueMap.end())
+            {
+                auto move = qit->second.dequeueMove();
+                SIMLOG(m_logger, "[CollectInput] id=%u tick=%u source=RemoteQueue queuedTick=%u",
+                    id, step.getTick(), move.tick);
+                std::get<LastUsedInputMapFor<T>>(m_lastUsedInputs).at(id) = move.input;
+                map.emplace(id, std::move(move.input));
+            }
+            else
+            {
+                // Simulated-proxy branch (client predicting a remote character).
+                // Resolve input from the cache's last server-reported input, then
+                // advance the cache's prediction tick in lockstep with the provider
+                // branch — otherwise postPredictionAll keeps overwriting a stale
+                // tick slot, every correction lands outside the cache window, and
+                // getLastCorrectionInput never refreshes.
+                auto cached = m_reconciliation.template getLastCorrectionInput<T>(id);
+                typename T::InputType input = cached.value_or(typename T::InputType{});
+
+                SIMLOG(m_logger, "[CollectInput] id=%u tick=%u source=Cache found=%d",
+                    id, step.getTick(), cached.has_value() ? 1 : 0);
+
+                if (step.getStepKind() == StepKind::Skip)
+                    m_reconciliation.template backfillSkippedTick<T>(
+                        id, step.getTick() - 1, simulatable.getAllState().getState());
+
+                if (step.getStepKind() != StepKind::Stall)
+                {
+                    m_reconciliation.template pushPredictionTick<T>(id, step.getTick());
+                    m_reconciliation.template pushPredictionInput<T>(id, input);
+                }
+
+                map.emplace(id, std::move(input));
+            }
+        });
+        return inputs;
+    }
+
+    // -----------------------------------------------------------------------
+    // Outbound — authority state/input replication (game thread)
+    // -----------------------------------------------------------------------
+
+    void sendCorrectionAll(const SimulationTimeStep& step)
+    {
+        // Wire format is fully encapsulated by the buffer's write(composite, tick).
+        // Must stay in lockstep with the client-side readInto() in
+        // SimulationReconciliation::injectCorrectionState / injectCorrectionInput.
+        const uint32 tick = step.getTick();
+        forEachTypeMap(m_authorityWriters, [&]<typename T>(auto& perTypeMap) {
+            for (auto& [id, w] : perTypeMap)
+            {
+                auto& stored    = m_storage.template get<T>(id);
+                auto& lastInput = std::get<LastUsedInputMapFor<T>>(m_lastUsedInputs).at(id);
+                SIMLOG(m_logger, "[SendCorrectionStateToClients] id=%u tick=%u", id, tick);
+                w.owner->getSyncedCorrectionStateBuffer().write(stored.getAllState().getState(), tick);
+                SIMLOG(m_logger, "[SendRemoteInputToClients] id=%u tick=%u", id, tick);
+                w.owner->getSyncedCorrectionInputBuffer().write(lastInput, tick);
+            }
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // Outbound — local input RPC to authority (game thread)
+    // -----------------------------------------------------------------------
+
+    void sendLocalInputToAuthorityAll()
+    {
+        // Wire format is encapsulated by the buffer's write(composite, tick).
+        // Must match the authority-side readInto() in registerAuthorityOwner.
+        forEachTypeMap(m_localInputSenders, [&]<typename T>(auto& perTypeMap) {
+            auto& pendingQueueMap = std::get<PendingInputQueueMapFor<T>>(m_pendingInputQueues);
+            for (auto& [id, s] : perTypeMap)
+            {
+                auto& pendingQueue  = pendingQueueMap.at(id);
+                auto* scratchBuffer = s.owner->getClientToServerInputSyncedBuffer();
+                uint32 lastDrainTick = 0;
+                bool hasPrev = false;
+                while (auto entry = pendingQueue.dequeue())
+                {
+                    if (hasPrev && entry->tick < lastDrainTick)
+                    {
+                        SIMLOG(m_logger,
+                            "[DrainOutOfOrder] id=%u prevTick=%u curTick=%u gap=%u",
+                            id, lastDrainTick, entry->tick, lastDrainTick - entry->tick);
+                    }
+                    lastDrainTick = entry->tick;
+                    hasPrev = true;
+                    SIMLOG(m_logger, "[SendLocalInputToServer] id=%u tick=%u",
+                        id, entry->tick);
+                    scratchBuffer->write(entry->input, entry->tick);
+                    s.owner->sendLocalInputToAuthority(*scratchBuffer);
+                }
+            }
+        });
+    }
+
+    // Drops any queued local inputs that were produced against the pre-resync
+    // prediction clock. Invoked from the ClientPredictionClock resync callback
+    // alongside the reconciliation cache wipe.
+    void wipeAllForResync(uint32 newPredictionTick)
+    {
+        forEachTypeMap(m_pendingInputQueues, [&]<typename T>(auto& perTypeMap) {
+            for (auto& [id, queue] : perTypeMap)
+            {
+                SIMLOG(m_logger,
+                    "[TimeResync.WipeInputQueue] id=%u newPredictionTick=%u",
+                    id, newPredictionTick);
+                queue.clear();
+            }
+        });
+    }
+
+private:
+    // Variadic helper: expands over each per-type tuple slot using index_sequence.
+    // Calls fn<SimulatableT>(perTypeMap) for each SimulatableT in the pack.
+    template <typename TupleT, typename Fn, std::size_t... Is>
+    static void forEachTypeMapImpl(TupleT& tup, Fn&& fn, std::index_sequence<Is...>)
+    {
+        using TypeList = std::tuple<SimulatableTs...>;
+        (fn.template operator()<std::tuple_element_t<Is, TypeList>>(std::get<Is>(tup)), ...);
+    }
+
+    template <typename TupleT, typename Fn>
+    void forEachTypeMap(TupleT& tup, Fn&& fn)
+    {
+        forEachTypeMapImpl(tup, std::forward<Fn>(fn), std::index_sequence_for<SimulatableTs...>{});
+    }
+
+    // m_inputProviders uses std::function intentionally — converting to a pointer struct
+    // would require extending PredictionSyncedBufferOwnerConcept with a typed
+    // getLocalInputFor<T>(step) method; tracked as a post-cutover follow-up.
+    std::tuple<InputProviderMapFor<SimulatableTs>...>    m_inputProviders;
+    std::tuple<RemoteMoveQueueMapFor<SimulatableTs>...>  m_remoteMoveQueues;
+    std::tuple<PendingInputQueueMapFor<SimulatableTs>...> m_pendingInputQueues;
+    std::tuple<LastUsedInputMapFor<SimulatableTs>...>    m_lastUsedInputs;
+    std::tuple<AuthorityWriterMapFor<SimulatableTs>...>  m_authorityWriters;
+    std::tuple<LocalInputSenderMapFor<SimulatableTs>...> m_localInputSenders;
+
+    SimulationObjectStorage<SimulatableTs...>&   m_storage;
+    SimulationReconciliation<SimulatableTs...>&  m_reconciliation;
+    std::function<void(const char*)>             m_logger;
+};
+
+// ---------------------------------------------------------------------------
+// SimulationNetSyncConcept
+// ---------------------------------------------------------------------------
+
+template <typename T, typename... SimulatableTs>
+concept SimulationNetSyncConcept = requires(
+    T& t, const SimulationTimeStep& step, uint32 tick)
+{
+    { t.sendCorrectionAll(step) };
+    { t.sendLocalInputToAuthorityAll() };
+    { t.collectInputAll(step) } -> std::convertible_to<ResolvedInputs<SimulatableTs...>>;
+    { t.wipeAllForResync(tick) };
+};
+
+// ---------------------------------------------------------------------------
+// Free-function registration facade
+//
+// Client overload: prediction owner + optional input provider.
+// Server overload: prediction owner + authority owner (no input provider needed
+//   — authority reads from the inbound remote-move queue).
+//
+// Owner types are resolved via SimulatableOwnerTraits<SimulatableT>;
+// callers never name the owner template parameters directly.
+// ---------------------------------------------------------------------------
+
+// Client overload
+template <typename SimulatableT, typename... Ts>
+    requires PredictionSyncedBufferOwnerConcept<
+        PredictionOwnerFor<SimulatableT>,
+        typename SimulatableT::StateType,
+        typename SimulatableT::InputType>
+void registerSimulatable(
+    SimulationObjectStorage<Ts...>&        storage,
+    SimulationReconciliation<Ts...>&       reconciliation,
+    SimulationNetSync<Ts...>&              netSync,
+    unsigned int                           id,
+    SimulatableT&&                         simulatable,
+    PredictionOwnerFor<SimulatableT>&      owner,
+    std::function<typename SimulatableT::InputType(const SimulationTimeStep&)> inputProvider = nullptr)
+{
+    // Order matters: cache must exist before storage, because the physics thread
+    // iterates m_storage.forEachSimulatable and looks up each id in the cache map
+    // (postPredictionAll etc.). If storage gets the id first, a concurrent physics
+    // tick sees storage-has-id and calls getCacheFor(id), which throws.
+    // Inverted-order invariant: if storage has id, cache has id.
+    reconciliation.template createCacheFor<SimulatableT>(id);
+    storage.template add<SimulatableT>(id, std::forward<SimulatableT>(simulatable));
+    netSync.template registerPredictionOwner<SimulatableT>(id, owner, std::move(inputProvider));
+}
+
+// Server overload — no correction cache is allocated: the authority does not
+// predict, resim, or reconcile, so it has no need for per-simulatable state
+// history. NetSync alone handles the outbound correction send and inbound
+// remote-move queue.
+template <typename SimulatableT, typename... Ts>
+    requires PredictionSyncedBufferOwnerConcept<
+                 PredictionOwnerFor<SimulatableT>,
+                 typename SimulatableT::StateType,
+                 typename SimulatableT::InputType>
+          && AuthoritySyncedBufferOwnerConcept<
+                 AuthorityOwnerFor<SimulatableT>,
+                 typename SimulatableT::StateType,
+                 typename SimulatableT::InputType>
+void registerSimulatable(
+    SimulationObjectStorage<Ts...>&        storage,
+    SimulationReconciliation<Ts...>&       /*reconciliation*/,
+    SimulationNetSync<Ts...>&              netSync,
+    unsigned int                           id,
+    SimulatableT&&                         simulatable,
+    PredictionOwnerFor<SimulatableT>&      predictionOwner,
+    AuthorityOwnerFor<SimulatableT>&       authorityOwner)
+{
+    storage.template add<SimulatableT>(id, std::forward<SimulatableT>(simulatable));
+    netSync.template registerPredictionOwner<SimulatableT>(id, predictionOwner, nullptr);
+    netSync.template registerAuthorityOwner<SimulatableT>(id, authorityOwner);
+}
+
+// Unregister facade — mirrors registration; clears callbacks before data-map erasure.
+template <typename SimulatableT, typename... Ts>
+void unregisterSimulatable(
+    SimulationObjectStorage<Ts...>&   storage,
+    SimulationReconciliation<Ts...>&  reconciliation,
+    SimulationNetSync<Ts...>&         netSync,
+    unsigned int                      id,
+    PredictionOwnerFor<SimulatableT>* predictionOwner,
+    AuthorityOwnerFor<SimulatableT>*  authorityOwner = nullptr)
+{
+    // Symmetric to register ordering: remove from storage before cache, so a
+    // physics tick racing this teardown never sees storage-has-id without a
+    // corresponding cache entry. Preserves the invariant "if storage has id,
+    // cache has id" across both lifecycle directions.
+    netSync.template unregisterSimulatable<SimulatableT>(id, predictionOwner, authorityOwner);
+    storage.template remove<SimulatableT>(id);
+    reconciliation.template removeCacheFor<SimulatableT>(id);
+}
+
+#pragma optimize("", on)
