@@ -30,6 +30,11 @@ enum class KeyId : uint16_t
 
 	Key_Space,
 	Key_LeftShift,
+	Key_LeftControl,
+	Key_LeftAlt,
+
+	// Number row
+	Key_1, Key_2, Key_3, Key_4, Key_5, Key_6, Key_7, Key_8, Key_9, Key_0,
 
 	// Mouse
 	Mouse_X, Mouse_Y, Mouse_XY,
@@ -46,6 +51,8 @@ enum class KeyId : uint16_t
 	Gamepad_RightTrigger,     // RT (digital)
 	Gamepad_LeftTriggerAxis,  // LT (analog)
 	Gamepad_RightTriggerAxis, // RT (analog)
+	Gamepad_LeftShoulder,     // LB
+	Gamepad_RightShoulder,    // RB
 };
 
 enum class KeyModifier : uint8_t
