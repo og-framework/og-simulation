@@ -249,6 +249,18 @@ public:
         return getCacheFor<T>(id).getLastCorrectionInput();
     }
 
+    // Returns a pointer to the correction cache for the given simulatable type and id,
+    // or nullptr if no cache exists (e.g. on the authority, where caches are not allocated).
+    template <typename T>
+    const StateCorrectionCache<typename T::StateType, typename T::InputType>* findInputCache(unsigned int id) const
+    {
+        const auto& map = std::get<CacheMapFor<T>>(m_caches);
+        auto it = map.find(id);
+        if (it == map.end())
+            return nullptr;
+        return &it->second;
+    }
+
 private:
     template <typename T>
     using CacheMapFor = std::unordered_map<
