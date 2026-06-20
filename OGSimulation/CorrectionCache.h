@@ -6,6 +6,10 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <cstdint>
+#include <cstddef>
+#include <cstring>
+#include <type_traits>
 #include <functional>
 #include <vector>
 #include <optional>
@@ -14,6 +18,83 @@
 #include "glm/vec3.hpp"
 #include <glm/gtc/quaternion.hpp>
 #include "OGSimulation/SimulationTimeContext.h"
+#include "OGSimulation/SimulationComposite.h"
+
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// [Task 2] Checksum support for the StateCorrectionCache 4-method external API.
+//
+// crc32 is the standard reflected CRC-32 (polynomial 0xEDB88320, init 0xFFFFFFFF,
+// final XOR 0xFFFFFFFF) implemented via a 256-entry lookup table built once on
+// first use. It is declared `inline` (not `static`) so a translation unit that
+// includes this header without ever instantiating compute_checksum does not emit
+// an -Wunused-function warning on the standalone GCC/Clang/NDK build paths.
+//
+// ChecksumByteBuffer is a minimal byte sink exposing the same writeToBuffer<T> /
+// readFromBuffer<T> template surface as the UE-side FSimulationStateSyncBuffer, so
+// the existing writeToSyncedBuffer / writeCompositeToSyncedBuffer serializers can
+// target it without any UE dependency. compute_checksum CRCs the serialized bytes
+// (padding-free, deterministic) rather than the raw object, which keeps the hash
+// stable across compilers/architectures for the cross-arch determinism harness.
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline std::uint32_t crc32(const std::uint8_t* data, std::size_t length)
+{
+	static const std::array<std::uint32_t, 256> table = [] {
+		std::array<std::uint32_t, 256> t{};
+		for (std::uint32_t i = 0; i < 256; ++i)
+		{
+			std::uint32_t c = i;
+			for (int k = 0; k < 8; ++k)
+				c = (c & 1u) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+			t[i] = c;
+		}
+		return t;
+	}();
+
+	std::uint32_t crc = 0xFFFFFFFFu;
+	for (std::size_t i = 0; i < length; ++i)
+		crc = table[(crc ^ data[i]) & 0xFFu] ^ (crc >> 8);
+	return crc ^ 0xFFFFFFFFu;
+}
+
+struct ChecksumByteBuffer
+{
+	std::vector<std::uint8_t> bytes;
+
+	// Scalar/trivially-copyable field sink used by writeToSyncedBuffer descriptors.
+	template <typename T>
+	void writeToBuffer(std::uint32_t offset, const T& value)
+	{
+		static_assert(std::is_trivially_copyable_v<T>,
+			"ChecksumByteBuffer::writeToBuffer requires a trivially-copyable field type");
+		growTo(static_cast<std::size_t>(offset) + sizeof(T));
+		std::memcpy(bytes.data() + offset, &value, sizeof(T));
+	}
+
+	template <typename T>
+	T readFromBuffer(std::uint32_t offset) const
+	{
+		T value{};
+		std::memcpy(&value, bytes.data() + offset, sizeof(T));
+		return value;
+	}
+
+	void writeRaw(std::uint32_t offset, const std::uint8_t* src, std::size_t length)
+	{
+		growTo(static_cast<std::size_t>(offset) + length);
+		std::memcpy(bytes.data() + offset, src, length);
+	}
+
+	const std::uint8_t* data() const { return bytes.data(); }
+	std::size_t size() const { return bytes.size(); }
+
+private:
+	void growTo(std::size_t requiredSize)
+	{
+		if (bytes.size() < requiredSize)
+			bytes.resize(requiredSize, std::uint8_t(0));
+	}
+};
 
 #pragma optimize( "", off )
 
@@ -26,11 +107,30 @@ public:
 	static constexpr size_t StateBufferSize = 60;
 	static constexpr size_t InvalidCacheIndex = 1337;
 
+	// Integrate functor for the externally-driven advance_frame() path:
+	// (tick, prevState, input) -> newState. The cache itself owns no integration
+	// logic; the harness injects it via the 2-arg constructor below.
+	using IntegrateFn = std::function<StateType(uint32, const StateType&, const InputType&)>;
+
 	StateCorrectionCache(std::function<void(const char*)> logger)
 		: m_stateBuffer()
 		, m_inputBuffer()
 		, m_tickBuffer()
 		, m_logger(std::move(logger))
+		, m_integrateFn()
+	{
+		m_tickBuffer.fill(0);
+	}
+
+	// [Task 2] Overload that injects an integrate functor so advance_frame() can
+	// drive one externally-triggered sim step. The single-arg constructor stays;
+	// caches built with it must not call advance_frame() (it OG_CHECK-fails).
+	StateCorrectionCache(std::function<void(const char*)> logger, IntegrateFn integrateFn)
+		: m_stateBuffer()
+		, m_inputBuffer()
+		, m_tickBuffer()
+		, m_logger(std::move(logger))
+		, m_integrateFn(std::move(integrateFn))
 	{
 		m_tickBuffer.fill(0);
 	}
@@ -293,7 +393,125 @@ public:
 		m_tickBuffer[predictionIndex] = newPredictionTick;
 	}
 
+	//////////////////////////////////////////////////////////////////////////////
+	// [Task 2] StateCorrectionCache 4-method external API (proposal §2.2).
+	// Additive public wrappers around the existing internal mechanisms; the legacy
+	// API surface above is unchanged. These exist so the Catch2 determinism harness
+	// (and, from Stage 3, the rollback driver) can save/load/advance/checksum the
+	// cache without a live SimulationManager.
+	//////////////////////////////////////////////////////////////////////////////
+
+	// Writes `state` into the cache slot for `tick`.
+	//
+	// Slot-collision semantics: if `tick` is already present in the cache (at any
+	// index, e.g. inserted earlier via the ring-advancing prediction path), its
+	// existing slot is updated in place — we never create a duplicate entry for the
+	// same tick. Otherwise the slot is `tick % StateBufferSize`; writing there
+	// naturally evicts whatever older tick previously mapped to that ring slot
+	// (the cache holds a rolling window of StateBufferSize ticks). A freshly
+	// allocated slot has its per-slot bookkeeping bits reset (mirrors
+	// pushPredictionTick), so stale correction/resim metadata cannot leak.
+	void save_snapshot(uint32 tick, const StateType& state)
+	{
+		const uint32 existingIndex = getCacheIndex(tick);
+		const uint32 slot = (existingIndex != InvalidCacheIndex)
+			? existingIndex
+			: static_cast<uint32>(tick % StateBufferSize);
+
+		if (existingIndex == InvalidCacheIndex)
+		{
+			m_tickBuffer[slot] = tick;
+			m_containsCorrectTick[slot] = false;
+			m_predictionWasCorrect[slot] = false;
+			m_isResimulated[slot] = false;
+			m_containsCorrectionInput[slot] = false;
+		}
+
+		m_stateBuffer[slot] = state;
+	}
+
+	// Returns true and fills `out_state` if `tick` is in the cache window; false otherwise.
+	[[nodiscard]] bool load_snapshot(uint32 tick, StateType& out_state) const
+	{
+		const uint32 cacheIndex = getCacheIndex(tick);
+		if (cacheIndex == InvalidCacheIndex)
+			return false;
+
+		out_state = m_stateBuffer[cacheIndex];
+		return true;
+	}
+
+	// Drives one externally-triggered sim step. Reads the previous prediction
+	// state, integrates it via the injected functor, then commits the new
+	// (tick, input, state) into the cache exactly as the manual
+	// pushPredictionTick + pushPredictionInput + pushPredictionState sequence would.
+	// OG_CHECK-fails if the cache was built without an integrate functor.
+	void advance_frame(uint32 tick, const InputType& input)
+	{
+		OG_CHECK(static_cast<bool>(m_integrateFn),
+			"advance_frame called on a cache with no integrate functor (use the 2-arg constructor)");
+
+		const uint32 prevIndex = getCacheIndex(getPredictionTick());
+		OG_CHECK(prevIndex != InvalidCacheIndex, "advance_frame: previous prediction tick not in cache");
+
+		// Integrate into a fresh value BEFORE mutating the ring (prevState is a
+		// reference into m_stateBuffer and must stay valid through the call).
+		StateType newState = m_integrateFn(tick, m_stateBuffer[prevIndex], input);
+
+		pushPredictionTick(tick);
+		pushPredictionInput(input);
+		pushPredictionState(newState);
+	}
+
+	// CRC-32 over the serialized bytes of the state cached at `tick`. Returns 0
+	// (with a logger warning) if `tick` is not in the cache window. The state is
+	// serialized via the project serializer when possible (padding-free,
+	// deterministic across compilers/architectures); trivially-copyable test
+	// types fall back to a raw-byte hash.
+	[[nodiscard]] uint32 compute_checksum(uint32 tick) const
+	{
+		const uint32 cacheIndex = getCacheIndex(tick);
+		if (cacheIndex == InvalidCacheIndex)
+		{
+			if (m_logger)
+			{
+				char buf[128];
+				std::snprintf(buf, sizeof(buf),
+					"[Warning] compute_checksum: tick=%u not in cache window, returning 0", tick);
+				m_logger(buf);
+			}
+			return 0;
+		}
+
+		ChecksumByteBuffer buffer;
+		const std::uint32_t written = serializeStateForChecksum(m_stateBuffer[cacheIndex], buffer);
+		return crc32(buffer.data(), written);
+	}
+
 private:
+	// Serializes a state into the checksum byte sink. Prefers the project's
+	// field-wise serializer (Serializable scalars/aggregates and SimulationComposite)
+	// for determinism; trivially-copyable POD test types use a raw-byte fallback.
+	template <typename S>
+	static std::uint32_t serializeStateForChecksum(const S& state, ChecksumByteBuffer& buffer)
+	{
+		if constexpr (Serializable<S>)
+		{
+			return writeToSyncedBuffer(state, buffer, 0u);
+		}
+		else if constexpr (requires { writeCompositeToSyncedBuffer(state, buffer, 0u); })
+		{
+			return writeCompositeToSyncedBuffer(state, buffer, 0u);
+		}
+		else
+		{
+			static_assert(std::is_trivially_copyable_v<S>,
+				"compute_checksum: StateType must be Serializable, a SimulationComposite, or trivially copyable");
+			buffer.writeRaw(0u, reinterpret_cast<const std::uint8_t*>(&state), sizeof(S));
+			return static_cast<std::uint32_t>(sizeof(S));
+		}
+	}
+
 	std::array<StateType, StateBufferSize> m_stateBuffer;
 	std::array<std::optional<InputType>, StateBufferSize> m_inputBuffer;
 	std::array<uint32, StateBufferSize> m_tickBuffer;
@@ -302,6 +520,7 @@ private:
 	std::bitset<StateBufferSize> m_isResimulated;
 	std::bitset<StateBufferSize> m_containsCorrectionInput;
 	std::function<void(const char*)> m_logger;
+	IntegrateFn m_integrateFn;
 };
 
 template <typename SyncedBuffer, typename StateType, typename InputType>

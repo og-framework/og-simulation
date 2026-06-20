@@ -11,6 +11,40 @@
 //   RTT   — Round Trip Time (network latency: client → server → client)
 // ---------------------------------------------------------------------------
 
+// ===========================================================================
+// ADR — Bounded-depth prediction: Stall / Skip / RollbackWindow / HardResync
+// ===========================================================================
+// These four mechanisms together bound how far client prediction may diverge
+// from the authoritative server. They are easy to conflate, so the 4-way
+// interaction is spelled out explicitly (proposal §4.3):
+//
+//   * Stall   — client too far AHEAD of the server tick. The client pauses one
+//               sim sub-step to let the server catch up. (Existing OGSim
+//               behaviour; bounded stalls are preferred over unbounded
+//               rollback under cellular packet-loss bursts.)
+//   * Skip    — client BEHIND the server tick. The client advances multiple
+//               ticks in one display frame to catch up. (Existing OGSim
+//               behaviour, kept as a binary catch-up.)
+//   * RollbackWindow — SOFT cap on client prediction/resim depth (the primary
+//               circuit-breaker). When a server correction would require
+//               resimulating more than `rollbackWindowTicks` ticks, the client
+//               clamps to the window and accepts a partial resim (older ticks
+//               beyond the ring-buffer window are not corrected). Degraded
+//               mobile may raise this up to `rollbackWindowHardCap`.
+//   * HardResync — ABSOLUTE FAILSAFE BACKSTOP. The legacy drift threshold,
+//               repurposed: it fires only when the soft cap has failed and the
+//               client ends up further adrift than `rollbackWindowHardCap`
+//               (off-the-rails packet loss, multi-second freeze, dev pause).
+//               It snaps the clock and wipes the cache; expected very rarely.
+//
+// Ordering invariant: `hardResyncThresholdTicks > rollbackWindowHardCap` so the
+// failsafe always fires strictly LATER than the soft cap (clamp before snap).
+// T6's R-D3 ordering test asserts this strict inequality.
+//
+// See OGBrawlerNetworkModelResearch/arch/proposal_ogbrawler_netcode.md §4 for
+// the bounded-depth design rationale.
+// ===========================================================================
+
 // TimeConfig — all tunable parameters for the PCTM time management system.
 // Plain POD struct; copy freely. Set once at startup (e.g., in SimulationManager
 // constructor) and pass by const-ref into NetworkTimeEstimator / ClientPredictionClock.
@@ -44,8 +78,12 @@ struct TimeConfig
 
 	// Ticks of drift above which a hard resync is triggered:
 	//   CLIENT CLOCK  — prediction tick jumps to the target tick immediately.
-	// Default: 15
-	uint32_t hardResyncThresholdTicks = 15;
+	// FAILSAFE BACKSTOP ONLY — primary clamping is `rollbackWindowTicks` /
+	// `rollbackWindowHardCap`; this fires only when the soft cap fails. MUST
+	// satisfy `hardResyncThresholdTicks > rollbackWindowHardCap` (T6 asserts this).
+	// See `rollbackWindowTicks` / `rollbackWindowHardCap` for the primary caps.
+	// Default: 21
+	uint32_t hardResyncThresholdTicks = 21;
 
 	// In the graduated correction zone (soft < drift <= hard):
 	// apply a CLIENT CLOCK-only correction (one tick skip or stall) every N frames.
@@ -65,4 +103,48 @@ struct TimeConfig
 	//   config.tickFrequency = 1.0 / asyncDeltaTime
 	// Default: 60.0
 	double tickFrequency = 60.0;
+
+	// -------------------------------------------------------------------------
+	// Bounded-depth prediction (RollbackWindow) — see ADR block at top of file
+	// -------------------------------------------------------------------------
+
+	// Soft cap on client resim depth — the primary prediction circuit-breaker.
+	// When a server correction would require resimulating more than this many
+	// ticks, the client clamps to the window and accepts a partial resim.
+	// Derived from the Quantum formula on OGBrawler's cellular profile
+	// (proposal §4.2, §11; Synthesis §B Axis b Gate). For the failsafe backstop,
+	// see `hardResyncThresholdTicks`.
+	// Default: 12
+	int32_t rollbackWindowTicks = 12;
+
+	// Degraded-mobile maximum that C.2 tier escalation can raise the soft cap to.
+	// `rollbackWindowTicks` may grow up to this ceiling on poor connections
+	// (proposal §4.2, §11). For the failsafe backstop, see `hardResyncThresholdTicks`.
+	// Default: 20
+	int32_t rollbackWindowHardCap = 20;
+
+	// -------------------------------------------------------------------------
+	// Input redundancy (FInputRedundancyBundle)
+	// -------------------------------------------------------------------------
+
+	// Slot count for FInputRedundancyBundle. Default tracks the runtime tick rate:
+	// 5 at 100 Hz (current interim), 3 at the 60 Hz ratified target. Per proposal §11.
+	// (Stage 2 flips this default to 3 when the runtime moves to 60 Hz.)
+	// For the failsafe backstop, see `hardResyncThresholdTicks`.
+	// Default: 5
+	int32_t redundancyDepthTicks = 5;
+
+	// -------------------------------------------------------------------------
+	// Test harness mode selector (Catch2 determinism harness)
+	// -------------------------------------------------------------------------
+
+	// Catch2 determinism-harness mode (proposal §9.1, §11).
+	//   Production   — default; the production-shipped test surface.
+	//   DevTest      — opt-in, heavier CI-only determinism runs.
+	//   KU1CrossArch — opt-in cross-architecture hash-log verification.
+	enum class HarnessMode { Production, DevTest, KU1CrossArch };
+
+	// Active harness mode. For the failsafe backstop, see `hardResyncThresholdTicks`.
+	// Default: HarnessMode::Production
+	HarnessMode harnessMode = HarnessMode::Production;
 };
