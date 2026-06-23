@@ -216,7 +216,10 @@ public:
     {
         const SimulationTimeStep step = currentStep();
         m_netSync.sendCorrectionAll(step);
-        m_netSync.sendLocalInputToAuthorityAll();
+        // redundancy depth tracks the runtime tick rate via
+        // TimeConfig::redundancyDepthTicks (5 @ 100 Hz interim / 3 @ 60 Hz target).
+        m_netSync.sendLocalInputToAuthorityAll(
+            step.getTick(), static_cast<uint32>(m_timeConfig.redundancyDepthTicks));
     }
 
 private:
@@ -258,6 +261,10 @@ private:
         m_serverClock->advanceTick();
         const SimulationTimeStep step = m_serverClock->getSimulationStep();
         SIMLOG(m_logger, "[AuthoritySimulation] tick=%u", step.getTick());
+        // publish the current authority tick + rollback window so the
+        // RPC-arrival queueMove path can reject too-far-future capture ticks. The window
+        // is TimeConfig::rollbackWindowTicks (no hardcoded literal — R-P1 clean).
+        m_netSync.setAuthorityGuardContext(step.getTick(), m_timeConfig.rollbackWindowTicks);
         auto inputs = m_netSync.collectInputAll(step);
         m_integrationLayer.integrateAll(step, inputs);
         m_lastStep = step;

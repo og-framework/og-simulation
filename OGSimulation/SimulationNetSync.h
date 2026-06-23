@@ -112,7 +112,9 @@ concept PredictionSyncedBufferOwnerConcept =
     requires(OwnerT& owner,
              std::function<void(const typename OwnerT::SyncedCorrectionBufferType&)> corrFn,
              std::function<void(const typename OwnerT::SyncedRemoteInputBufferType&)> inputFn,
-             const typename OwnerT::SyncedRemoteInputBufferType& buffer)
+             const PendingInputQueue<InputT>& pendingQueue,
+             uint32 currentTick,
+             uint32 redundancyDepth)
     {
         typename OwnerT::SyncedCorrectionBufferType;
         typename OwnerT::SyncedRemoteInputBufferType;
@@ -123,18 +125,26 @@ concept PredictionSyncedBufferOwnerConcept =
         { owner.clearOnCorrectionStateReceivedCallback() };
         { owner.clearOnCorrectionInputReceivedCallback() };
         { owner.getClientToServerInputSyncedBuffer() } -> std::same_as<typename OwnerT::SyncedRemoteInputBufferType*>;
-        { owner.sendLocalInputToAuthority(buffer) };
+        // Stage 1 (Task 9): the local-input RPC is now the unreliable + redundancy
+        // FInputRedundancyBundle path. The owner builds the bundle (a UE wire type
+        // opaque to this UE-free layer) from the most-recent `redundancyDepth` ticks
+        // still held in `pendingQueue` and fires the unreliable RPC. The bundle type
+        // never appears here — only the core PendingInputQueue + scalar params do.
+        { owner.sendLocalInputToAuthority(pendingQueue, currentTick, redundancyDepth) };
     };
 
 template <typename OwnerT, typename StateT, typename InputT>
 concept AuthoritySyncedBufferOwnerConcept =
     requires(OwnerT& owner,
-             std::function<void(const typename OwnerT::SyncedRemoteInputBufferType&)> fn)
+             std::function<void(uint32, const InputT&)> fn)
     {
         typename OwnerT::SyncedRemoteInputBufferType;
         requires CompositeSyncedBufferConcept<typename OwnerT::SyncedRemoteInputBufferType, InputT>;
         { owner.getSyncedCorrectionStateBuffer() } -> CompositeSyncedBufferConcept<StateT>;
         { owner.getSyncedCorrectionInputBuffer() } -> CompositeSyncedBufferConcept<InputT>;
+        // Stage 1 (Task 9): the remote-move callback is now per-slot. The owner
+        // unpacks the inbound FInputRedundancyBundle and invokes this callback once
+        // per (capture_tick, input) slot — the bundle type stays UE-side.
         { owner.setOnRemoteMoveReceivedCallback(fn) };
         { owner.clearOnRemoteMoveReceivedCallback() };
     };
@@ -164,6 +174,18 @@ public:
     void setLogger(std::function<void(const char*)> logger)
     {
         m_logger = std::move(logger);
+    }
+
+    // Stage 1 (Task 10): published by SimulationManager each authority tick so the
+    // RPC-arrival queueMove path can reject too-far-future capture ticks. currentAuthorityTick
+    // is the server's current tick; rollbackWindowTicks comes from TimeConfig::rollbackWindowTicks
+    // (no hardcoded literal here — R-P1). Until this is called, the guard is disabled
+    // (m_rollbackWindowTicks defaults to -1), so unconfigured instances (isolated unit
+    // tests) keep the pre-Task-10 accept-all behavior plus the capture-tick dedup.
+    void setAuthorityGuardContext(uint32 currentAuthorityTick, int32 rollbackWindowTicks)
+    {
+        m_currentAuthorityTick = currentAuthorityTick;
+        m_rollbackWindowTicks  = rollbackWindowTicks;
     }
 
     // -----------------------------------------------------------------------
@@ -229,13 +251,26 @@ public:
         // RPC inbound — lambda captures ref into m_remoteMoveQueues.
         // Cleared in unregisterSimulatable before data-map erasure (see ordering comment there).
         auto& remoteQueue = std::get<RemoteMoveQueueMapFor<SimulatableT>>(m_remoteMoveQueues).at(id);
-        using InputBufferT = typename AuthorityOwnerFor<SimulatableT>::SyncedRemoteInputBufferType;
-        authorityOwner.setOnRemoteMoveReceivedCallback([this, id, &remoteQueue](const InputBufferT& buffer) {
-            typename SimulatableT::InputType input;
-            const uint32 tick = buffer.readInto(input);
-            SIMLOG(m_logger, "[ReceiveLocalInput] id=%u tick=%u", id, tick);
-            remoteQueue.queueMove(std::move(input), tick);
-        });
+        // Per-slot inbound callback (Stage 1, Task 9): the owner walks the inbound
+        // FInputRedundancyBundle and invokes this once per (capture_tick, input).
+        // Stage 1 (Task 10): the queue now dedups by capture_tick (R-T5 first-writer-wins)
+        // and rejects too-far-future capture ticks against the guard context published by
+        // SimulationManager via setAuthorityGuardContext (current authority tick +
+        // TimeConfig::rollbackWindowTicks). A too-far-future drop is warned here so the
+        // queue stays logger-free.
+        authorityOwner.setOnRemoteMoveReceivedCallback(
+            [this, id, &remoteQueue](uint32 tick, const typename SimulatableT::InputType& input) {
+                SIMLOG(m_logger, "[ReceiveLocalInput] id=%u tick=%u", id, tick);
+                typename SimulatableT::InputType copy = input;
+                const QueueMoveResult result = remoteQueue.queueMove(
+                    std::move(copy), tick, m_currentAuthorityTick, m_rollbackWindowTicks);
+                if (result == QueueMoveResult::TooFarFutureDiscarded)
+                {
+                    SIMLOG(m_logger,
+                        "[ReceiveLocalInput] DISCARD too-far-future id=%u tick=%u authorityTick=%u",
+                        id, tick, m_currentAuthorityTick);
+                }
+            });
 
         // Concrete pointer struct.
         std::get<AuthorityWriterMapFor<SimulatableT>>(m_authorityWriters)
@@ -373,33 +408,25 @@ public:
     // Outbound — local input RPC to authority (game thread)
     // -----------------------------------------------------------------------
 
-    void sendLocalInputToAuthorityAll()
+    void sendLocalInputToAuthorityAll(uint32 currentTick, uint32 redundancyDepth)
     {
-        // Wire format is encapsulated by the buffer's write(composite, tick).
-        // Must match the authority-side readInto() in registerAuthorityOwner.
+        // Stage 1 (Task 9): unreliable + redundancy local-input RPC. Instead of
+        // draining the pending queue one entry per reliable RPC, the owner builds a
+        // single FInputRedundancyBundle out of the most-recent `redundancyDepth` ticks
+        // still retained in the pending queue and fires ONE unreliable RPC. A dropped
+        // datagram self-heals on the next frame's overlapping bundle. The bundle wire
+        // type stays UE-side (opaque to this layer); we only hand the owner the queue
+        // + scalar params. After the send we retain only the redundancy window for the
+        // next frame's overlap and release older entries so the queue stays bounded.
         forEachTypeMap(m_localInputSenders, [&]<typename T>(auto& perTypeMap) {
             auto& pendingQueueMap = std::get<PendingInputQueueMapFor<T>>(m_pendingInputQueues);
             for (auto& [id, s] : perTypeMap)
             {
-                auto& pendingQueue  = pendingQueueMap.at(id);
-                auto* scratchBuffer = s.owner->getClientToServerInputSyncedBuffer();
-                uint32 lastDrainTick = 0;
-                bool hasPrev = false;
-                while (auto entry = pendingQueue.dequeue())
-                {
-                    if (hasPrev && entry->tick < lastDrainTick)
-                    {
-                        SIMLOG(m_logger,
-                            "[DrainOutOfOrder] id=%u prevTick=%u curTick=%u gap=%u",
-                            id, lastDrainTick, entry->tick, lastDrainTick - entry->tick);
-                    }
-                    lastDrainTick = entry->tick;
-                    hasPrev = true;
-                    SIMLOG(m_logger, "[SendLocalInputToServer] id=%u tick=%u",
-                        id, entry->tick);
-                    scratchBuffer->write(entry->input, entry->tick);
-                    s.owner->sendLocalInputToAuthority(*scratchBuffer);
-                }
+                auto& pendingQueue = pendingQueueMap.at(id);
+                SIMLOG(m_logger, "[SendLocalInputToServer] id=%u tick=%u depth=%u",
+                    id, currentTick, redundancyDepth);
+                s.owner->sendLocalInputToAuthority(pendingQueue, currentTick, redundancyDepth);
+                pendingQueue.releaseAllButRecent(static_cast<size_t>(redundancyDepth));
             }
         });
     }
@@ -449,6 +476,15 @@ private:
     SimulationObjectStorage<SimulatableTs...>&   m_storage;
     SimulationReconciliation<SimulatableTs...>&  m_reconciliation;
     std::function<void(const char*)>             m_logger;
+
+    // Stage 1 (Task 10): receive-side dedup guard context, pushed by SimulationManager
+    // (setAuthorityGuardContext) every authority tick. Plain (non-atomic) members match
+    // RemoteMoveQueue's existing single-consumer threading assumption — the authority tick
+    // is refreshed once per tick and read at RPC arrival, where an at-most-one-tick-stale
+    // value is fine for a multi-tick rollback window. m_rollbackWindowTicks = -1 disables
+    // the future guard until SimulationManager injects TimeConfig::rollbackWindowTicks.
+    uint32 m_currentAuthorityTick = 0;
+    int32  m_rollbackWindowTicks  = -1;
 };
 
 // ---------------------------------------------------------------------------
@@ -457,12 +493,13 @@ private:
 
 template <typename T, typename... SimulatableTs>
 concept SimulationNetSyncConcept = requires(
-    T& t, const SimulationTimeStep& step, uint32 tick)
+    T& t, const SimulationTimeStep& step, uint32 tick, int32 rollbackWindow)
 {
     { t.sendCorrectionAll(step) };
-    { t.sendLocalInputToAuthorityAll() };
+    { t.sendLocalInputToAuthorityAll(tick, tick) };
     { t.collectInputAll(step) } -> std::convertible_to<ResolvedInputs<SimulatableTs...>>;
     { t.wipeAllForResync(tick) };
+    { t.setAuthorityGuardContext(tick, rollbackWindow) };
 };
 
 // ---------------------------------------------------------------------------

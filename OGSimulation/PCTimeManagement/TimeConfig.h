@@ -128,11 +128,13 @@ struct TimeConfig
 	// -------------------------------------------------------------------------
 
 	// Slot count for FInputRedundancyBundle. Default tracks the runtime tick rate:
-	// 5 at 100 Hz (current interim), 3 at the 60 Hz ratified target. Per proposal §11.
-	// (Stage 2 flips this default to 3 when the runtime moves to 60 Hz.)
+	// 3 at the 60 Hz ratified target (active default), 5 at the 100 Hz interim
+	// (historical, pre-Stage-2). Per proposal §11.
+	// (Stage 2 flipped this default 5 -> 3 when the runtime moved to 60 Hz; the
+	// runtime tick rate is set in Config/DefaultEngine.ini AsyncFixedTimeStepSize.)
 	// For the failsafe backstop, see `hardResyncThresholdTicks`.
-	// Default: 5
-	int32_t redundancyDepthTicks = 5;
+	// Default: 3
+	int32_t redundancyDepthTicks = 3;
 
 	// -------------------------------------------------------------------------
 	// Test harness mode selector (Catch2 determinism harness)
