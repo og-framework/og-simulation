@@ -47,6 +47,10 @@ enum class KeyId : uint16_t
 	Gamepad_FaceRight,        // B / Circle
 	Gamepad_FaceLeft,         // X / Square
 	Gamepad_FaceTop,          // Y / Triangle
+	Gamepad_DPad_Up,          // D-pad up
+	Gamepad_DPad_Down,        // D-pad down
+	Gamepad_DPad_Left,        // D-pad left
+	Gamepad_DPad_Right,       // D-pad right
 	Gamepad_LeftTrigger,      // LT (digital)
 	Gamepad_RightTrigger,     // RT (digital)
 	Gamepad_LeftTriggerAxis,  // LT (analog)
