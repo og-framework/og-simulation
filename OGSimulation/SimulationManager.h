@@ -212,6 +212,15 @@ public:
         m_integrationLayer.firstResimStepAll(chaosStep);
     }
 
+    // Tick of the most recently integrated step — authority tick / prediction tick /
+    // resim tick, i.e. whichever step integrateAll just ran. Consumed by the manager's
+    // post-integrate inbound-hit routing pass to one-shot projectile slots that ended
+    // THIS tick. Returns 0 before the first integrate (0 is the reserved pre-sim tick).
+    uint32_t currentIntegratedTick() const
+    {
+        return m_lastStep.has_value() ? m_lastStep->getTick() : 0u;
+    }
+
     void onPostSimulationGameThread()
     {
         const SimulationTimeStep step = currentStep();

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 #include "NetworkTimeEstimator.h"
 
+#include <algorithm>
 #include <cstdio>
 
 #pragma optimize( "", off )
@@ -63,7 +64,17 @@ unsigned int NetworkTimeEstimator::getPredictionOffsetTicks() const
 
     // ceil rounds up so predictions arrive slightly early rather than late.
     const double ceiled = std::ceil(rawOffset);
-    return ceiled > 0.0 ? static_cast<unsigned int>(ceiled) : 0u;
+    const unsigned int computed = ceiled > 0.0 ? static_cast<unsigned int>(ceiled) : 0u;
+
+    // Floor: keep the client predictively AHEAD of authority even on LAN /
+    // near-zero RTT. Without this, on cooked-dedicated + late-connect client,
+    // the HardResync sequence deposits the client at exactly authorityTick + 0..1
+    // with zero margin ahead, and the softDriftThresholdTicks dead band lets it
+    // sit stably 0..softDrift ticks BEHIND server's live tick, discarding every
+    // correction. See ../og-brawler-hit-resolution/netcode_finding_pred_offset_floor.md
+    // for the full derivation. The floor is a no-op on WAN because rawOffset already
+    // exceeds predOffsetFloorTicks at any real RTT + jitter.
+    return std::max(computed, static_cast<unsigned int>(m_config.predOffsetFloorTicks));
 }
 
 unsigned int NetworkTimeEstimator::getTargetPredictionTick() const

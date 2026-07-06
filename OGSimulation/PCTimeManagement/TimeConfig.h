@@ -68,6 +68,21 @@ struct TimeConfig
 	// Default: 2.0
 	double jitterMultiplier = 2.0;
 
+	// Minimum floor for NetworkTimeEstimator::getPredictionOffsetTicks(). Guarantees
+	// the client's prediction target sits at least this far ahead of the last known
+	// authority tick, keeping the dead-band lower bound at or above authorityTick + 1
+	// and preserving the "client predicts forward" invariant on LAN. Without this
+	// floor, sub-millisecond RTT rounds predOffset to 0-1 ticks and the softDrift
+	// dead band locks the client at or behind authority in perpetuity. Prevents the
+	// LAN late-connect corner case documented in
+	// ../og-brawler-hit-resolution/netcode_finding_pred_offset_floor.md. On WAN /
+	// cellular with real RTT the natural rawOffset already exceeds this floor and the
+	// floor is a no-op (verified: at 50 ms RTT + 5 ms jitter → rawOffset = 3.6 → ceil = 4
+	// = floor; at 150 ms cellular → rawOffset = 12.6 → ceil = 13, floor irrelevant).
+	// Default: 4 (= softDriftThresholdTicks + 1 at current defaults; guarantees
+	// dead-band lower bound sits at authorityTick + 1).
+	uint32_t predOffsetFloorTicks = 4;
+
 	// -------------------------------------------------------------------------
 	// Drift correction (ClientPredictionClock)
 	// -------------------------------------------------------------------------
