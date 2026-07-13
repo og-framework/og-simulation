@@ -7,6 +7,8 @@
 #include <unordered_map>
 
 #include "OGAssert.h"
+#include "OGSimulation/SimulatableList.h"  // SimulatableList, apply_t, IsSimulatableList, list_contains_v
+#include "OGSimulation/StorageView.h"      // StorageView, StorageViewThunk (projectTo<> return + thunks)
 
 #pragma optimize("", off)
 
@@ -91,6 +93,45 @@ public:
         (forEachOfTypeConst<SimulatableTs>(func), ...);
     }
 
+    // Per-type iteration — the PUBLIC per-type entry point promoted from the
+    // formerly-private forEachOfType<T> (design §5.3: "public per-type overload
+    // wins"). Calls func(id, T&) for every simulatable of type T. This is what the
+    // StorageView projection thunks bind to. Coexists unambiguously with the
+    // all-types overloads above: an unqualified forEachSimulatable(fn) deduces Func
+    // only, so this overload (whose T is non-deducible without an explicit argument)
+    // drops out; an explicit forEachSimulatable<T>(fn) selects this one.
+    template <typename T, typename Func>
+    void forEachSimulatable(Func&& func)
+    {
+        forEachOfType<T>(func);
+    }
+
+    template <typename T, typename Func>
+    void forEachSimulatable(Func&& func) const
+    {
+        forEachOfTypeConst<T>(func);
+    }
+
+    // Projects this storage down to the subset a system declared, returning a
+    // StorageView over just WantedList's types (design §3.11 / §4.1). The returned
+    // view holds an opaque handle to *this plus, per WantedT, typed function-pointer
+    // thunks bound to this storage's concrete get<T> / forEachSimulatable<T>.
+    //
+    // Constraint ordering is load-bearing (NEW-2 / SB-4): IsSimulatableList is the
+    // FIRST conjunct, so a caller that forgets the wrap — projectTo<SomeType>() —
+    // fails on that concept with a legible diagnostic BEFORE list_contains_v would
+    // otherwise instantiate list_contains<>'s primary template and hit its hard
+    // static_assert. A well-formed-but-not-a-subset request —
+    // projectTo<SimulatableList<Unrelated>>() where Unrelated is not in
+    // SimulatableTs... — fails on the list_contains_v conjunct instead.
+    template <typename WantedList>
+        requires IsSimulatableList<WantedList>
+              && list_contains_v<SimulatableList<SimulatableTs...>, WantedList>
+    auto projectTo() -> apply_t<StorageView, WantedList>
+    {
+        return makeView(WantedList{});
+    }
+
 private:
     template <typename T>
     using MapFor = std::unordered_map<unsigned int, std::unique_ptr<T>>;
@@ -109,6 +150,34 @@ private:
     {
         for (const auto& [id, ptr] : std::get<MapFor<T>>(m_maps))
             func(id, *ptr);
+    }
+
+    // Unpacks WantedList's pack and mints the StorageView with per-WantedT thunks.
+    // Constructs the view through its PRIVATE ctor (this storage is a friend of
+    // StorageView per design §4.1).
+    template <typename... WantedTs>
+    StorageView<WantedTs...> makeView(SimulatableList<WantedTs...>)
+    {
+        return StorageView<WantedTs...>(
+            static_cast<void*>(this),
+            StorageViewThunk<WantedTs>{ &getThunk<WantedTs>, &forEachThunk<WantedTs> }...);
+    }
+
+    // Typed thunks bound into the view at projection time. Each recovers the
+    // concrete storage from the opaque handle and forwards to a public accessor;
+    // both are stack-only (no heap), so view access is allocation-free.
+    template <typename T>
+    static T& getThunk(void* storage, unsigned int id)
+    {
+        return static_cast<SimulationObjectStorage*>(storage)->template get<T>(id);
+    }
+
+    template <typename T>
+    static void forEachThunk(void* storage, void* ctx,
+        void (*invoke)(void* ctx, unsigned int id, T& item))
+    {
+        static_cast<SimulationObjectStorage*>(storage)->template forEachSimulatable<T>(
+            [ctx, invoke](unsigned int id, T& item) { invoke(ctx, id, item); });
     }
 };
 

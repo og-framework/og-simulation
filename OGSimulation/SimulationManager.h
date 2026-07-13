@@ -34,15 +34,24 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// SimulationManager<IntegrationExecT, NetSyncT, ReconciliationT>
+// SimulationManager<IntegrationExecT, NetSyncT, ReconciliationT, SystemsExecT>
 //
-// Orchestrates the simulation loop. Holds references to the three peers
-// (integration executor, net sync, reconciliation) and owns the clocks.
+// Orchestrates the simulation loop. Holds references to the four peers
+// (integration executor, net sync, reconciliation, systems executor) and owns
+// the clocks.
+//
+// The SystemsExecT peer (the SimulationSystemsExecutor — the ogsim-system-api
+// "fourth peer") fires cross-simulatable system hooks around integrateAll:
+// firePreIntegrate BEFORE integration, firePostIntegrate AFTER (see the
+// sequencing note in onGameSimulation* below). Character-lifecycle
+// notifications are forwarded through notifyCharacterRegistered/Unregistered.
+// The manager depends only on the peer's duck-typed method surface — it never
+// names a concrete system type.
 //
 // Layer: OGSimulation. Adapter-agnostic, UE/Chaos-free.
 // ---------------------------------------------------------------------------
 
-template <typename IntegrationExecT, typename NetSyncT, typename ReconciliationT>
+template <typename IntegrationExecT, typename NetSyncT, typename ReconciliationT, typename SystemsExecT>
 class SimulationManager
 {
 public:
@@ -54,11 +63,13 @@ public:
         IntegrationExecT& integrationLayer,
         NetSyncT&         netSync,
         ReconciliationT&  reconciliation,
+        SystemsExecT&     systemsExec,
         LoggerFn          logger = nullptr)
         : m_runsPrediction(shouldRunPrediction)
         , m_integrationLayer(integrationLayer)
         , m_netSync(netSync)
         , m_reconciliation(reconciliation)
+        , m_systemsExec(systemsExec)
         , m_logger(logger)
     {
         m_timeConfig.tickFrequency = 1.0 / tickFrequency;
@@ -231,6 +242,27 @@ public:
             step.getTick(), static_cast<uint32>(m_timeConfig.redundancyDepthTicks));
     }
 
+    // -----------------------------------------------------------------------
+    // Character-lifecycle notifications — forwarded to the systems executor so
+    // each system can maintain its own per-character bookkeeping (e.g. the hit-
+    // routing system's rootBodyId map). Called by the engine adapter on
+    // register/unregister, out of band from the integrate loop. The storage +
+    // static data are supplied from the integration layer so a system's hook
+    // can read the just-(un)registered character out of storage (§3.11 timing).
+    // -----------------------------------------------------------------------
+
+    void notifyCharacterRegistered(unsigned int id)
+    {
+        m_systemsExec.notifyCharacterRegistered(
+            id, m_integrationLayer.editStorage(), m_integrationLayer.getStaticData());
+    }
+
+    void notifyCharacterUnregistered(unsigned int id)
+    {
+        m_systemsExec.notifyCharacterUnregistered(
+            id, m_integrationLayer.editStorage(), m_integrationLayer.getStaticData());
+    }
+
 private:
     void onGameSimulationPrediction()
     {
@@ -261,8 +293,15 @@ private:
             step.getTick(), stepKindName(step.getStepKind()), advanceName);
 
         auto inputs = m_netSync.collectInputAll(step);
+        // SB-6 sequencing: fire preIntegrate BEFORE integrateAll; save m_lastStep
+        // (so currentIntegratedTick() == step.getTick() for postIntegrate hooks)
+        // BEFORE firing postIntegrate. See §7 "Sequencing consideration".
+        auto&       storage    = m_integrationLayer.editStorage();
+        const auto& staticData = m_integrationLayer.getStaticData();
+        m_systemsExec.firePreIntegrate(step, storage, staticData);
         m_integrationLayer.integrateAll(step, inputs);
         m_lastStep = step;
+        m_systemsExec.firePostIntegrate(step, storage, staticData);
     }
 
     void onGameSimulationAuthority()
@@ -275,8 +314,13 @@ private:
         // is TimeConfig::rollbackWindowTicks (no hardcoded literal — R-P1 clean).
         m_netSync.setAuthorityGuardContext(step.getTick(), m_timeConfig.rollbackWindowTicks);
         auto inputs = m_netSync.collectInputAll(step);
+        // SB-6 sequencing (see onGameSimulationPrediction).
+        auto&       storage    = m_integrationLayer.editStorage();
+        const auto& staticData = m_integrationLayer.getStaticData();
+        m_systemsExec.firePreIntegrate(step, storage, staticData);
         m_integrationLayer.integrateAll(step, inputs);
         m_lastStep = step;
+        m_systemsExec.firePostIntegrate(step, storage, staticData);
     }
 
     void onGameSimulationResimulation()
@@ -285,8 +329,14 @@ private:
         const SimulationTimeStep step = m_clientClock->getResimulationStep();
         SIMLOG(m_logger, "[Resim.Pre] tick=%u", step.getTick());
         auto inputs = m_reconciliation.collectResimInputAll(step.getTick());
+        // SB-6 sequencing (see onGameSimulationPrediction). Systems fire on every
+        // resim replay tick too — routing stays deterministic across rollback (D4).
+        auto&       storage    = m_integrationLayer.editStorage();
+        const auto& staticData = m_integrationLayer.getStaticData();
+        m_systemsExec.firePreIntegrate(step, storage, staticData);
         m_integrationLayer.integrateAll(step, inputs);
         m_lastStep = step;
+        m_systemsExec.firePostIntegrate(step, storage, staticData);
     }
 
     SimulationTimeStep currentStep() const
@@ -305,6 +355,7 @@ private:
     IntegrationExecT& m_integrationLayer;
     NetSyncT&         m_netSync;
     ReconciliationT&  m_reconciliation;
+    SystemsExecT&     m_systemsExec;
 
     TimeConfig                           m_timeConfig;
     std::optional<ServerTickClock>       m_serverClock;

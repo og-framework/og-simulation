@@ -8,6 +8,8 @@
 #include "OGSimulation/SimulationObjectStorage.h"
 #include "OGSimulation/SimulationTimeContext.h"
 
+#pragma optimize("", off)
+
 // Adapter-dependent side of a simulatable: integrate() and firstResimStep().
 // Required by SimulationIntegrationExecutor.
 template <typename T, typename PhysAdapterT, typename QueryAdapterT, typename StaticDataT>
@@ -82,6 +84,28 @@ public:
         });
     }
 
+    // Mutable access to the executor's internal object storage. Systems
+    // (e.g. the SimulationSystemsExecutor peer) project storage views off
+    // this reference to run their pre/post-integrate hooks.
+    SimulationObjectStorage<SimulatableTs...>& editStorage()
+    {
+        return m_storage;
+    }
+
+    // Const access to the executor's StaticData.
+    //
+    // The `const&` return type is load-bearing, NOT stylistic: per the ctor
+    // doc-comment above, m_staticData is default-constructed in place so its
+    // nested fields hold references bound to m_staticData's own members.
+    // Returning by value would copy/move StaticData and silently leave those
+    // internal references dangling (pointing at the moved-from original).
+    // Every consumer in this initiative therefore takes StaticData by
+    // const-reference; do NOT change this to a by-value return.
+    const StaticDataT& getStaticData() const
+    {
+        return m_staticData;
+    }
+
 private:
     PhysAdapterT&                              m_physicsAdapter;
     QueryAdapterT&                             m_queryAdapter;
@@ -98,3 +122,5 @@ concept SimulationIntegrationExecutorConcept = requires(
     { t.firstResimStepAll(physStep) };
     { t.captureBodyStatesAll() };
 };
+
+#pragma optimize("", on)
