@@ -30,6 +30,13 @@ concept SimulatableIntegration =
         { t.firstResimStep(phys, physStep) };
     };
 
+// Storage and StaticData are EXTERNALLY OWNED (by the engine adapter's
+// composition root); the executor holds only references to them. This makes the
+// object storage a genuinely shared resource across all simulation peers
+// (integration executor, net-sync, reconciliation, systems executor) rather than
+// being owned by one peer and bridged to the others via accessors. See the
+// adapter's m_staticData declaration for the StaticData internal-reference
+// invariant that mandates the const& (never by-value) handling.
 template <
     typename StaticDataT,
     PhysicsBodyAdapter PhysAdapterT,
@@ -39,17 +46,20 @@ template <
 class SimulationIntegrationExecutor
 {
 public:
-    // StaticDataT is default-constructed in place — its inner references bind to
-    // m_staticData's own members, avoiding a dangling-reference hazard that arises
-    // when copying/moving StaticData (whose nested fields hold refs, not values).
+    // storage and staticData are externally owned; the executor stores references.
+    // staticData MUST be constructed in place at its owner and never copied — its
+    // nested fields hold references bound to its own members (see the adapter's
+    // m_staticData doc-comment), so the const& binding is load-bearing, not
+    // stylistic.
     SimulationIntegrationExecutor(
+        SimulationObjectStorage<SimulatableTs...>& storage,
+        const StaticDataT& staticData,
         PhysAdapterT& physAdapter,
-        QueryAdapterT& queryAdapter,
-        SimulationObjectStorage<SimulatableTs...>& storage)
-        : m_physicsAdapter(physAdapter)
+        QueryAdapterT& queryAdapter)
+        : m_storage(storage)
+        , m_staticData(staticData)
+        , m_physicsAdapter(physAdapter)
         , m_queryAdapter(queryAdapter)
-        , m_staticData{}
-        , m_storage(storage)
     {}
 
     using ResolvedInputsType = ResolvedInputs<SimulatableTs...>;
@@ -84,33 +94,13 @@ public:
         });
     }
 
-    // Mutable access to the executor's internal object storage. Systems
-    // (e.g. the SimulationSystemsExecutor peer) project storage views off
-    // this reference to run their pre/post-integrate hooks.
-    SimulationObjectStorage<SimulatableTs...>& editStorage()
-    {
-        return m_storage;
-    }
-
-    // Const access to the executor's StaticData.
-    //
-    // The `const&` return type is load-bearing, NOT stylistic: per the ctor
-    // doc-comment above, m_staticData is default-constructed in place so its
-    // nested fields hold references bound to m_staticData's own members.
-    // Returning by value would copy/move StaticData and silently leave those
-    // internal references dangling (pointing at the moved-from original).
-    // Every consumer in this initiative therefore takes StaticData by
-    // const-reference; do NOT change this to a by-value return.
-    const StaticDataT& getStaticData() const
-    {
-        return m_staticData;
-    }
-
 private:
+    // Externally-owned references (see class + ctor doc-comments). Declaration
+    // order matches the ctor init-list to keep -Wreorder clean.
+    SimulationObjectStorage<SimulatableTs...>& m_storage;
+    const StaticDataT&                         m_staticData;
     PhysAdapterT&                              m_physicsAdapter;
     QueryAdapterT&                             m_queryAdapter;
-    StaticDataT                                m_staticData;
-    SimulationObjectStorage<SimulatableTs...>& m_storage;
 };
 
 // Concept for types that implement the SimulationIntegrationExecutor interface.

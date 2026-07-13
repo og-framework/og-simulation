@@ -34,11 +34,15 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// SimulationManager<IntegrationExecT, NetSyncT, ReconciliationT, SystemsExecT>
+// SimulationManager<IntegrationExecT, NetSyncT, ReconciliationT, SystemsExecT,
+//                   StorageT, StaticDataT>
 //
 // Orchestrates the simulation loop. Holds references to the four peers
-// (integration executor, net sync, reconciliation, systems executor) and owns
-// the clocks.
+// (integration executor, net sync, reconciliation, systems executor), plus
+// references to the externally-owned object storage and static data, and owns
+// the clocks. Storage + static data live at the engine adapter's composition
+// root (shared by all peers); the manager reaches them directly rather than
+// bridging through the integration executor.
 //
 // The SystemsExecT peer (the SimulationSystemsExecutor — the ogsim-system-api
 // "fourth peer") fires cross-simulatable system hooks around integrateAll:
@@ -51,33 +55,51 @@ private:
 // Layer: OGSimulation. Adapter-agnostic, UE/Chaos-free.
 // ---------------------------------------------------------------------------
 
-template <typename IntegrationExecT, typename NetSyncT, typename ReconciliationT, typename SystemsExecT>
+template <typename IntegrationExecT, typename NetSyncT, typename ReconciliationT, typename SystemsExecT,
+          typename StorageT, typename StaticDataT>
 class SimulationManager
 {
 public:
     using LoggerFn = std::function<void(const char*)>;
 
+    // Grouped dependency refs for the ctor (arch review Rec #2). Bundles the four
+    // peer refs + storage + staticData + logger into one named aggregate so the
+    // two composition-root emplace() sites cannot silently transpose the adjacent
+    // duck-typed peer refs (a transposition of two same-category refs COMPILES —
+    // they are duck-typed — and misbehaves only at runtime). Nested so it inherits
+    // the enclosing template params: call sites write ManagerType::Params{ ... }
+    // without re-naming the six type arguments. Only the scalar loop config
+    // (shouldRunPrediction / tickFrequency) stays positional.
+    struct Params
+    {
+        IntegrationExecT&  integrationLayer;
+        NetSyncT&          netSync;
+        ReconciliationT&   reconciliation;
+        SystemsExecT&      systemsExec;
+        StorageT&          storage;
+        const StaticDataT& staticData;
+        LoggerFn           logger = nullptr;
+    };
+
     SimulationManager(
-        bool            shouldRunPrediction,
-        double          tickFrequency,
-        IntegrationExecT& integrationLayer,
-        NetSyncT&         netSync,
-        ReconciliationT&  reconciliation,
-        SystemsExecT&     systemsExec,
-        LoggerFn          logger = nullptr)
+        bool          shouldRunPrediction,
+        double        tickFrequency,
+        const Params& params)
         : m_runsPrediction(shouldRunPrediction)
-        , m_integrationLayer(integrationLayer)
-        , m_netSync(netSync)
-        , m_reconciliation(reconciliation)
-        , m_systemsExec(systemsExec)
-        , m_logger(logger)
+        , m_integrationLayer(params.integrationLayer)
+        , m_netSync(params.netSync)
+        , m_reconciliation(params.reconciliation)
+        , m_systemsExec(params.systemsExec)
+        , m_storage(params.storage)
+        , m_staticData(params.staticData)
+        , m_logger(params.logger)
     {
         m_timeConfig.tickFrequency = 1.0 / tickFrequency;
 
         if (shouldRunPrediction)
         {
-            m_networkEstimator.emplace(m_timeConfig, logger);
-            m_clientClock.emplace(m_timeConfig, *m_networkEstimator, logger);
+            m_networkEstimator.emplace(m_timeConfig, params.logger);
+            m_clientClock.emplace(m_timeConfig, *m_networkEstimator, params.logger);
             m_clientClock->registerResyncCallback(
                 [this](unsigned int newPredictionTick)
                 {
@@ -92,7 +114,7 @@ public:
             // physics dt in seconds (it's passed in from solver->GetAsyncDeltaTime()).
             // Feed that directly to ServerTickClock so the steps it produces carry
             // the right dt through to integrate().
-            m_serverClock.emplace(static_cast<float>(tickFrequency), logger);
+            m_serverClock.emplace(static_cast<float>(tickFrequency), params.logger);
         }
     }
 
@@ -253,14 +275,12 @@ public:
 
     void notifyCharacterRegistered(unsigned int id)
     {
-        m_systemsExec.notifyCharacterRegistered(
-            id, m_integrationLayer.editStorage(), m_integrationLayer.getStaticData());
+        m_systemsExec.notifyCharacterRegistered(id, m_storage, m_staticData);
     }
 
     void notifyCharacterUnregistered(unsigned int id)
     {
-        m_systemsExec.notifyCharacterUnregistered(
-            id, m_integrationLayer.editStorage(), m_integrationLayer.getStaticData());
+        m_systemsExec.notifyCharacterUnregistered(id, m_storage, m_staticData);
     }
 
 private:
@@ -296,8 +316,8 @@ private:
         // SB-6 sequencing: fire preIntegrate BEFORE integrateAll; save m_lastStep
         // (so currentIntegratedTick() == step.getTick() for postIntegrate hooks)
         // BEFORE firing postIntegrate. See §7 "Sequencing consideration".
-        auto&       storage    = m_integrationLayer.editStorage();
-        const auto& staticData = m_integrationLayer.getStaticData();
+        auto&       storage    = m_storage;
+        const auto& staticData = m_staticData;
         m_systemsExec.firePreIntegrate(step, storage, staticData);
         m_integrationLayer.integrateAll(step, inputs);
         m_lastStep = step;
@@ -315,8 +335,8 @@ private:
         m_netSync.setAuthorityGuardContext(step.getTick(), m_timeConfig.rollbackWindowTicks);
         auto inputs = m_netSync.collectInputAll(step);
         // SB-6 sequencing (see onGameSimulationPrediction).
-        auto&       storage    = m_integrationLayer.editStorage();
-        const auto& staticData = m_integrationLayer.getStaticData();
+        auto&       storage    = m_storage;
+        const auto& staticData = m_staticData;
         m_systemsExec.firePreIntegrate(step, storage, staticData);
         m_integrationLayer.integrateAll(step, inputs);
         m_lastStep = step;
@@ -331,8 +351,8 @@ private:
         auto inputs = m_reconciliation.collectResimInputAll(step.getTick());
         // SB-6 sequencing (see onGameSimulationPrediction). Systems fire on every
         // resim replay tick too — routing stays deterministic across rollback (D4).
-        auto&       storage    = m_integrationLayer.editStorage();
-        const auto& staticData = m_integrationLayer.getStaticData();
+        auto&       storage    = m_storage;
+        const auto& staticData = m_staticData;
         m_systemsExec.firePreIntegrate(step, storage, staticData);
         m_integrationLayer.integrateAll(step, inputs);
         m_lastStep = step;
@@ -356,6 +376,13 @@ private:
     NetSyncT&         m_netSync;
     ReconciliationT&  m_reconciliation;
     SystemsExecT&     m_systemsExec;
+
+    // Externally-owned object storage + static data (owned at the engine adapter's
+    // composition root, shared by all peers). Held by reference here so the
+    // manager's system-hook fan-out and lifecycle forwarders read/mutate the same
+    // storage the integration executor iterates — no bridge accessor.
+    StorageT&          m_storage;
+    const StaticDataT& m_staticData;
 
     TimeConfig                           m_timeConfig;
     std::optional<ServerTickClock>       m_serverClock;
