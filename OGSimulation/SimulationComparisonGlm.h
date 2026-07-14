@@ -1,7 +1,7 @@
 #pragma once
 // SPDX-License-Identifier: MPL-2.0
 
-// [Task 35] GLM overloads for isSimilarToField.
+// GLM overloads for isSimilarToField.
 // Kept in a separate header so that SimulationComposite.h stays GLM-free.
 
 #include "OGSimulation/SimulationTypes.h"

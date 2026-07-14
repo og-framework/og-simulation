@@ -1,7 +1,7 @@
 #pragma once
 // SPDX-License-Identifier: MPL-2.0
 
-// [Task 61] SimulationDependencies — tuple utilities, ValidDependencies,
+// SimulationDependencies — tuple utilities, ValidDependencies,
 // makeDependencies, execution order validation, ownership validation,
 // structured violation diagnostics, and ValidExecutionOrder concept.
 
@@ -10,7 +10,7 @@
 #include <type_traits>
 
 // ---------------------------------------------------------------------------
-// [Task 57 / Task 62] Dependency infrastructure — tuple utilities,
+// Dependency infrastructure — tuple utilities,
 // OwnedDeps/ExternalDeps templates, ValidDependencies, makeDependencies,
 // and ValidExecutionOrder for nested Owned/External layout.
 // ---------------------------------------------------------------------------
@@ -41,7 +41,7 @@ struct AddMutableRef<std::tuple<Ts...>> {
 template <typename Tuple>
 using AddMutableRef_t = typename AddMutableRef<Tuple>::type;
 
-// [Task 62] indexOfBareType — find the index of the Ref whose remove_cvref_t matches T.
+// indexOfBareType — find the index of the Ref whose remove_cvref_t matches T.
 template <typename T, typename... Refs>
 consteval std::size_t indexOfBareType()
 {
@@ -83,7 +83,7 @@ Sub makeExternalImpl(Composite& composite, std::index_sequence<Is...>)
 } // namespace compositeDetail
 
 // ---------------------------------------------------------------------------
-// [Task 62] OwnedDeps<Ts...> — stores mutable references to owned types.
+// OwnedDeps<Ts...> — stores mutable references to owned types.
 // Types = tuple<Ts...> (bare value types).
 // ---------------------------------------------------------------------------
 
@@ -100,7 +100,7 @@ struct OwnedDeps {
 };
 
 // ---------------------------------------------------------------------------
-// [Task 62] ExternalDeps<Refs...> — stores references with original qualification.
+// ExternalDeps<Refs...> — stores references with original qualification.
 // Refs are e.g. const T&, T& — preserved as-is in the tuple.
 // ---------------------------------------------------------------------------
 
@@ -163,7 +163,7 @@ Deps makeDependencies(Composite& composite)
 }
 
 // ---------------------------------------------------------------------------
-// [Task 57] Compile-time execution order validation (updated for Owned/External).
+// Compile-time execution order validation (updated for Owned/External).
 // Edge detection iterates External::Types only — all entries are cross-namespace.
 // ---------------------------------------------------------------------------
 
@@ -214,7 +214,7 @@ consteval bool hasHardEdge()
 }
 
 // ---------------------------------------------------------------------------
-// [Task 59/60] Unique ownership validation + structured violation diagnostics
+// Unique ownership validation + structured violation diagnostics
 // ---------------------------------------------------------------------------
 
 template <typename...>
@@ -419,7 +419,7 @@ consteval bool validateExecutionOrder()
 }
 
 // ---------------------------------------------------------------------------
-// [Task 60] Phase 2 — DecodeViolation maps Violation indices back to types
+// Phase 2 — DecodeViolation maps Violation indices back to types
 // ---------------------------------------------------------------------------
 
 template <ViolationKind Kind, typename Type, typename SimADeps, typename SimBDeps = void>

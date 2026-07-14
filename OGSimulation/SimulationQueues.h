@@ -7,11 +7,10 @@
 #include <optional>
 #include <cstddef>
 
-// pragma optimize off — debugger-friendliness across all build configs (breakpoints hit,
-// locals visible, call-stack intact). OGSim-core convention.
+// pragma optimize off — debugger-friendliness; rationale in SimulationManager.h.
 #pragma optimize("", off)
 
-// Outcome of RemoteMoveQueue::queueMove — Stage 1 (Task 10) receive-side capture-tick
+// Outcome of RemoteMoveQueue::queueMove — receive-side capture-tick
 // guard (proposal §3.3 step 10). Returned (rather than logged here) so the queue stays
 // a pure container with no logger dependency; the caller (SimulationNetSync) emits the
 // too-far-future warning.
@@ -33,7 +32,7 @@ public:
 
     RemoteMoveQueue() : m_head(0), m_tail(0), m_count(0) {}
 
-    // Enqueue one inbound (captureTick, input) slot with Stage 1 (Task 10) dedup.
+    // Enqueue one inbound (captureTick, input) slot with dedup.
     //
     // 1. R-T5 dedup (first-writer-wins): if a still-pending entry already carries this
     //    captureTick, silently discard the new one. This is correct ONLY under the
@@ -202,4 +201,4 @@ private:
 };
 
 #pragma optimize("", on)
-// pragma optimize on — restore command-line optimization settings.
+// pragma optimize on.

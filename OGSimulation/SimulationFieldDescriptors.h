@@ -9,7 +9,7 @@
 #include "OGSimulation/SimulationSerialization.h"
 
 // ---------------------------------------------------------------------------
-// [Task 50] SimulationFieldDescriptors — field-descriptor types for
+// SimulationFieldDescriptors — field-descriptor types for
 // SerializableFields<T> specializations.
 //
 // Usage summary:
@@ -57,7 +57,7 @@ struct FieldDesc
 	using Owner = typename serializationDetail::GetterTraits<decltype(Getter)>::ClassType;
 	using Value = typename serializationDetail::GetterTraits<decltype(Getter)>::ValueType;
 
-	// [Task 51] Use syncSize when Value is a nested Serializable aggregate.
+	// Use syncSize when Value is a nested Serializable aggregate.
 	static constexpr std::uint32_t Size = []() -> std::uint32_t {
 		if constexpr (Serializable<Value>)
 			return syncSize<Value>();
@@ -79,7 +79,7 @@ struct FieldDescReadOnly
 	using Owner = typename serializationDetail::GetterTraits<decltype(Getter)>::ClassType;
 	using Value = typename serializationDetail::GetterTraits<decltype(Getter)>::ValueType;
 
-	// [Task 51] Use syncSize when Value is a nested Serializable aggregate.
+	// Use syncSize when Value is a nested Serializable aggregate.
 	static constexpr std::uint32_t Size = []() -> std::uint32_t {
 		if constexpr (Serializable<Value>)
 			return syncSize<Value>();
@@ -109,11 +109,11 @@ struct FieldDescReadOnly
 //   - std::array<T, N> (trivially copyable T)        — Size = sizeof(array),
 //     raw byte-copy round-trips correctly.
 //   - glm::vec2 / glm::vec3                          — trivially copyable.
-//   - Nested Serializable aggregate (Task 51)        — Size = syncSize<Value>(),
+//   - Nested Serializable aggregate                  — Size = syncSize<Value>(),
 //     serialized field-by-field via recursion. Ordering constraint: specialize
 //     SerializableFields<Inner> before SerializableFields<Outer>.
 //
-// For std::vector members, use VectorMemberFieldDesc (Task 52) instead.
+// For std::vector members, use VectorMemberFieldDesc instead.
 // ---------------------------------------------------------------------------
 
 template <auto MemberPtr>
@@ -122,7 +122,7 @@ struct MemberFieldDesc
 	using Owner = typename serializationDetail::MemberPtrTraits<decltype(MemberPtr)>::ClassType;
 	using Value = typename serializationDetail::MemberPtrTraits<decltype(MemberPtr)>::ValueType;
 
-	// [Task 51] Use syncSize when Value is a nested Serializable aggregate.
+	// Use syncSize when Value is a nested Serializable aggregate.
 	static constexpr std::uint32_t Size = []() -> std::uint32_t {
 		if constexpr (Serializable<Value>)
 			return syncSize<Value>();
@@ -139,7 +139,7 @@ struct MemberFieldDesc
 
 // ---------------------------------------------------------------------------
 // VectorMemberFieldDesc<MemberPtr, MaxCount> — fixed-max-capacity std::vector
-// serialization descriptor (Task 52).
+// serialization descriptor.
 //
 // Wire layout: [uint32_t count][Element × MaxCount]
 //   Size is a compile-time constant = sizeof(uint32_t) + MaxCount * ElementSize.

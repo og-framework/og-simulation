@@ -13,7 +13,8 @@
 #include "OGSimulation/SimulationTimeContext.h"
 
 // pragma optimize off — debugger-friendliness across all build configs (breakpoints hit,
-// locals visible, call-stack intact). OGSim-core convention.
+// locals visible, call-stack intact). OGSim-core convention; canonical statement — the
+// other OGSim-core pragma sites point here.
 #pragma optimize( "", off )
 
 // SimulationUpdateInfo — passed from the Chaos async callback into onGameSimulation.

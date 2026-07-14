@@ -1,7 +1,7 @@
 #pragma once
 // SPDX-License-Identifier: MPL-2.0
 
-// [Task 28 + Task 29 / Task 61] SimulationComposite — variadic state/input composite
+// SimulationComposite — variadic state/input composite
 // aggregate with isSimilarTo fold and role concepts for composite serialization.
 //
 // Split history (Task 61):
@@ -14,7 +14,7 @@
 #include "OGSimulation/SimulationSerialization.h"
 
 // ---------------------------------------------------------------------------
-// [Task 28] SimulationComposite<Ts...>
+// SimulationComposite<Ts...>
 // ---------------------------------------------------------------------------
 
 template <typename... Ts>
@@ -52,13 +52,13 @@ private:
 	std::tuple<Ts...> m_data;
 };
 
-// [Task 28] Domain aliases (same underlying template, separate names for clarity).
+// Domain aliases (same underlying template, separate names for clarity).
 template <typename... Ts> using SimulationStateComposite  = SimulationComposite<Ts...>;
 template <typename... Ts> using SimulationInputComposite  = SimulationComposite<Ts...>;
 template <typename... Ts> using SimulationPhysicsComposite = SimulationComposite<Ts...>;
 
 // ---------------------------------------------------------------------------
-// [Task 37 / Task 48 / Task 50] High-level simulation-role concepts.
+// High-level simulation-role concepts.
 // All three roles require Serializable<T>.
 // ---------------------------------------------------------------------------
 
@@ -72,7 +72,7 @@ template <typename T>
 concept SimulationInitialConditions = Serializable<T>;
 
 // ---------------------------------------------------------------------------
-// [Task 29 / Task 48 / Task 50] Composite serialization helpers
+// Composite serialization helpers
 // ---------------------------------------------------------------------------
 
 // Serialize all Serializable elements in tuple order; returns total bytes written.
@@ -121,7 +121,7 @@ SimulationComposite<Ts...> readCompositeInputFromSyncedBuffer(
 }
 
 // ---------------------------------------------------------------------------
-// [Task 29 / Task 47 / Task 50] compositeSyncSize<Ts...>() — sum of syncSize for all Ts
+// compositeSyncSize<Ts...>() — sum of syncSize for all Ts
 // ---------------------------------------------------------------------------
 
 template <typename... Ts>
@@ -131,7 +131,7 @@ constexpr std::uint32_t compositeSyncSize()
 }
 
 // ---------------------------------------------------------------------------
-// [Task 36] SimulationAllInput<PlayerInputT, IntegrationUtilsT>
+// SimulationAllInput<PlayerInputT, IntegrationUtilsT>
 // A generic value-type pairing a player-input reference with an integration-
 // utils reference.  Per-simulation AllInput types become using-aliases of this.
 // ---------------------------------------------------------------------------
@@ -161,7 +161,7 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// [Task 40] Generic fallback no-ops for correctSimulation /
+// Generic fallback no-ops for correctSimulation /
 // contextSwitchSimulation.  Per-simulation namespaces used to provide empty
 // stubs for these; the stubs have been removed and these global templates
 // serve as fallbacks via ordinary name-lookup at unqualified call sites.

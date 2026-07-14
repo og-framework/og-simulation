@@ -1,7 +1,7 @@
 #pragma once
 // SPDX-License-Identifier: MPL-2.0
 
-// [Task 61] SimulationSerialization — SerializableFields, Serializable concept,
+// SimulationSerialization — SerializableFields, Serializable concept,
 // syncSize, write/read/fieldwiseIsSimilarTo, and compositeDetail dispatch helpers.
 
 #include "OGSimulation/SimulationTypes.h"
@@ -13,7 +13,7 @@
 #include <vector>
 
 // ---------------------------------------------------------------------------
-// [Task 47 / Task 50] SerializableFields<T> primary template — intentionally undefined.
+// SerializableFields<T> primary template — intentionally undefined.
 // Specialize to expose a static constexpr auto get() returning a std::tuple
 // of field descriptors describing all serialized fields.
 //
@@ -24,12 +24,12 @@
 //   - glm::vec2, glm::vec3                             — works: trivially copyable,
 //     isSimilarToField overloads in SimulationComparisonGlm.h.
 //
-// Nested Serializable aggregates (Task 51):
+// Nested Serializable aggregates:
 //   - When MemberFieldDesc<&Outer::inner>::Value is itself Serializable,
 //     Size becomes syncSize<Inner>() and serialization recurses field-by-field.
 //     Ordering constraint: SerializableFields<Inner> must be specialized
 //     before SerializableFields<Outer>.
-// Variable-length fields (Task 52):
+// Variable-length fields:
 //   - Use VectorMemberFieldDesc<&Class::vec, MaxCount> for std::vector members.
 //     Fixed-max-capacity wire layout: [uint32 count][Element × MaxCount].
 // ---------------------------------------------------------------------------
@@ -38,14 +38,14 @@ template <typename T>
 struct SerializableFields; // No body — must be specialized.
 
 // ---------------------------------------------------------------------------
-// [Task 47 / Task 50] Serializable concept — T has a SerializableFields<T> specialization.
+// Serializable concept — T has a SerializableFields<T> specialization.
 // ---------------------------------------------------------------------------
 
 template <typename T>
 concept Serializable = requires { { SerializableFields<T>::get() }; };
 
 // ---------------------------------------------------------------------------
-// [Task 47 / Task 50] Internal: compile-time sum of field sizes from a tuple type.
+// Internal: compile-time sum of field sizes from a tuple type.
 // ---------------------------------------------------------------------------
 
 namespace serializationDetail {
@@ -86,7 +86,7 @@ void forEachField(F&& f)
 } // namespace serializationDetail
 
 // ---------------------------------------------------------------------------
-// [Task 47 / Task 50] syncSize<T>() — compile-time sum of all field sizes.
+// syncSize<T>() — compile-time sum of all field sizes.
 // ---------------------------------------------------------------------------
 
 template <typename T>
@@ -97,7 +97,7 @@ constexpr std::uint32_t syncSize()
 }
 
 // ---------------------------------------------------------------------------
-// [Task 48 / Task 50] writeToSyncedBuffer — serialize all fields.
+// writeToSyncedBuffer — serialize all fields.
 // (Moved here from AutoSerialization.h / SimulationFieldDescriptors.h.)
 // ---------------------------------------------------------------------------
 
@@ -106,7 +106,7 @@ std::uint32_t writeToSyncedBuffer(const T& obj, SyncedBuffer& buffer, std::uint3
 {
 	std::uint32_t off = offset;
 	serializationDetail::forEachField<T>([&]<typename FD>(FD) {
-		// [Task 51/52] 3-tier dispatch per field:
+		// 3-tier dispatch per field:
 		//   Tier 1: descriptor has serializeToBuffer (e.g. VectorMemberFieldDesc)
 		//   Tier 2: Value is Serializable — recurse field-by-field
 		//   Tier 3: scalar/trivially-copyable — raw writeToBuffer
@@ -123,7 +123,7 @@ std::uint32_t writeToSyncedBuffer(const T& obj, SyncedBuffer& buffer, std::uint3
 }
 
 // ---------------------------------------------------------------------------
-// [Task 48 / Task 50] readFromSyncedBuffer — deserialize all fields.
+// readFromSyncedBuffer — deserialize all fields.
 // (Moved here from AutoSerialization.h / SimulationFieldDescriptors.h.)
 // ---------------------------------------------------------------------------
 
@@ -132,7 +132,7 @@ void readFromSyncedBuffer(T& obj, const SyncedBuffer& buffer, std::uint32_t offs
 {
 	std::uint32_t off = offset;
 	serializationDetail::forEachField<T>([&]<typename FD>(FD) {
-		// [Task 51/52] 3-tier dispatch per field (mirrors writeToSyncedBuffer).
+		// 3-tier dispatch per field (mirrors writeToSyncedBuffer).
 		using V = typename FD::Value;
 		if constexpr (requires { FD::deserializeFromBuffer(obj, buffer, off); })
 			FD::deserializeFromBuffer(obj, buffer, off);
@@ -148,7 +148,7 @@ void readFromSyncedBuffer(T& obj, const SyncedBuffer& buffer, std::uint32_t offs
 }
 
 // ---------------------------------------------------------------------------
-// [Task 48 / Task 50] fieldwiseIsSimilarTo<T> — compare field by field.
+// fieldwiseIsSimilarTo<T> — compare field by field.
 // (Moved here from AutoSerialization.h / SimulationFieldDescriptors.h.)
 // Note: unconstrained so it works in class bodies before SerializableFields is declared.
 // ---------------------------------------------------------------------------
@@ -159,7 +159,7 @@ bool fieldwiseIsSimilarTo(const T& a, const T& b)
 	bool result = true;
 	serializationDetail::forEachField<T>([&]<typename FD>(FD) {
 		if (!result) return;
-		// [Task 51] Recurse for Serializable<V> fields; use isSimilarToField otherwise.
+		// Recurse for Serializable<V> fields; use isSimilarToField otherwise.
 		using V = typename FD::Value;
 		if constexpr (Serializable<V>)
 			result = fieldwiseIsSimilarTo(FD::read(a), FD::read(b));
@@ -170,7 +170,7 @@ bool fieldwiseIsSimilarTo(const T& a, const T& b)
 }
 
 // ---------------------------------------------------------------------------
-// [Task 51] isSimilarToField overload for Serializable types.
+// isSimilarToField overload for Serializable types.
 // Preferred over the unconstrained template by C++20 partial ordering.
 // Placed after fieldwiseIsSimilarTo since it calls it.
 // ---------------------------------------------------------------------------
@@ -183,7 +183,7 @@ bool isSimilarToField(const T& a, const T& b)
 }
 
 // ---------------------------------------------------------------------------
-// [Task 52] isSimilarToField overload for std::vector<T>.
+// isSimilarToField overload for std::vector<T>.
 // Compares element-wise via isSimilarToField — floats get epsilon compare,
 // Serializable elements get fieldwiseIsSimilarTo via the overload above.
 // ---------------------------------------------------------------------------
@@ -198,7 +198,7 @@ bool isSimilarToField(const std::vector<T>& a, const std::vector<T>& b)
 }
 
 // ---------------------------------------------------------------------------
-// [Task 48] compositeDetail — dispatch helpers with if constexpr customization points.
+// compositeDetail — dispatch helpers with if constexpr customization points.
 // write/read: fall back to writeToSyncedBuffer/readFromSyncedBuffer unless a
 //             customWriteToSyncedBuffer/customReadFromSyncedBuffer ADL override exists.
 // compare:    prefer member isSimilarTo if defined, else fieldwiseIsSimilarTo.

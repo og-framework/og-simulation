@@ -9,8 +9,7 @@
 
 #include "TimeConfig.h"
 
-// pragma optimize off — debugger-friendliness across all build configs (breakpoints hit,
-// locals visible, call-stack intact). OGSim-core convention.
+// pragma optimize off — debugger-friendliness; rationale in SimulationManager.h.
 #pragma optimize( "", off )
 
 // NetworkTimeEstimator — client-only network estimation component.
@@ -88,4 +87,4 @@ private:
 };
 
 #pragma optimize( "", on )
-// pragma optimize on — restore command-line optimization settings.
+// pragma optimize on.

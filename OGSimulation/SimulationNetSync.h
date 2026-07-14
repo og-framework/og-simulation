@@ -13,8 +13,7 @@
 #include "OGSimulation/SimulationReconciliation.h"
 #include "OGSimulation/SimulationTimeContext.h"
 
-// pragma optimize off — debugger-friendliness across all build configs (breakpoints hit,
-// locals visible, call-stack intact). OGSim-core convention.
+// pragma optimize off — debugger-friendliness; rationale in SimulationManager.h.
 #pragma optimize("", off)
 
 // ---------------------------------------------------------------------------
@@ -127,11 +126,11 @@ concept PredictionSyncedBufferOwnerConcept =
         { owner.clearOnCorrectionStateReceivedCallback() };
         { owner.clearOnCorrectionInputReceivedCallback() };
         { owner.getClientToServerInputSyncedBuffer() } -> std::same_as<typename OwnerT::SyncedRemoteInputBufferType*>;
-        // Stage 1 (Task 9): the local-input RPC is now the unreliable + redundancy
-        // FInputRedundancyBundle path. The owner builds the bundle (a UE wire type
-        // opaque to this UE-free layer) from the most-recent `redundancyDepth` ticks
-        // still held in `pendingQueue` and fires the unreliable RPC. The bundle type
-        // never appears here — only the core PendingInputQueue + scalar params do.
+        // The local-input RPC is the unreliable + redundancy FInputRedundancyBundle
+        // path. The owner builds the bundle (a UE wire type opaque to this UE-free
+        // layer) from the most-recent `redundancyDepth` ticks still held in
+        // `pendingQueue` and fires the unreliable RPC. The bundle type never appears
+        // here — only the core PendingInputQueue + scalar params do.
         { owner.sendLocalInputToAuthority(pendingQueue, currentTick, redundancyDepth) };
     };
 
@@ -144,9 +143,9 @@ concept AuthoritySyncedBufferOwnerConcept =
         requires CompositeSyncedBufferConcept<typename OwnerT::SyncedRemoteInputBufferType, InputT>;
         { owner.getSyncedCorrectionStateBuffer() } -> CompositeSyncedBufferConcept<StateT>;
         { owner.getSyncedCorrectionInputBuffer() } -> CompositeSyncedBufferConcept<InputT>;
-        // Stage 1 (Task 9): the remote-move callback is now per-slot. The owner
-        // unpacks the inbound FInputRedundancyBundle and invokes this callback once
-        // per (capture_tick, input) slot — the bundle type stays UE-side.
+        // The remote-move callback is per-slot. The owner unpacks the inbound
+        // FInputRedundancyBundle and invokes this callback once per
+        // (capture_tick, input) slot — the bundle type stays UE-side.
         { owner.setOnRemoteMoveReceivedCallback(fn) };
         { owner.clearOnRemoteMoveReceivedCallback() };
     };
@@ -178,12 +177,12 @@ public:
         m_logger = std::move(logger);
     }
 
-    // Stage 1 (Task 10): published by SimulationManager each authority tick so the
-    // RPC-arrival queueMove path can reject too-far-future capture ticks. currentAuthorityTick
+    // Published by SimulationManager each authority tick so the RPC-arrival
+    // queueMove path can reject too-far-future capture ticks. currentAuthorityTick
     // is the server's current tick; rollbackWindowTicks comes from TimeConfig::rollbackWindowTicks
     // (no hardcoded literal here — R-P1). Until this is called, the guard is disabled
     // (m_rollbackWindowTicks defaults to -1), so unconfigured instances (isolated unit
-    // tests) keep the pre-Task-10 accept-all behavior plus the capture-tick dedup.
+    // tests) keep an accept-all behavior plus the capture-tick dedup.
     void setAuthorityGuardContext(uint32 currentAuthorityTick, int32 rollbackWindowTicks)
     {
         m_currentAuthorityTick = currentAuthorityTick;
@@ -253,9 +252,9 @@ public:
         // RPC inbound — lambda captures ref into m_remoteMoveQueues.
         // Cleared in unregisterSimulatable before data-map erasure (see ordering comment there).
         auto& remoteQueue = std::get<RemoteMoveQueueMapFor<SimulatableT>>(m_remoteMoveQueues).at(id);
-        // Per-slot inbound callback (Stage 1, Task 9): the owner walks the inbound
+        // Per-slot inbound callback: the owner walks the inbound
         // FInputRedundancyBundle and invokes this once per (capture_tick, input).
-        // Stage 1 (Task 10): the queue now dedups by capture_tick (R-T5 first-writer-wins)
+        // The queue dedups by capture_tick (R-T5 first-writer-wins)
         // and rejects too-far-future capture ticks against the guard context published by
         // SimulationManager via setAuthorityGuardContext (current authority tick +
         // TimeConfig::rollbackWindowTicks). A too-far-future drop is warned here so the
@@ -412,9 +411,9 @@ public:
 
     void sendLocalInputToAuthorityAll(uint32 currentTick, uint32 redundancyDepth)
     {
-        // Stage 1 (Task 9): unreliable + redundancy local-input RPC. Instead of
-        // draining the pending queue one entry per reliable RPC, the owner builds a
-        // single FInputRedundancyBundle out of the most-recent `redundancyDepth` ticks
+        // Unreliable + redundancy local-input RPC. Instead of draining the pending
+        // queue one entry per reliable RPC, the owner builds a single
+        // FInputRedundancyBundle out of the most-recent `redundancyDepth` ticks
         // still retained in the pending queue and fires ONE unreliable RPC. A dropped
         // datagram self-heals on the next frame's overlapping bundle. The bundle wire
         // type stays UE-side (opaque to this layer); we only hand the owner the queue
@@ -479,7 +478,7 @@ private:
     SimulationReconciliation<SimulatableTs...>&  m_reconciliation;
     std::function<void(const char*)>             m_logger;
 
-    // Stage 1 (Task 10): receive-side dedup guard context, pushed by SimulationManager
+    // Receive-side dedup guard context, pushed by SimulationManager
     // (setAuthorityGuardContext) every authority tick. Plain (non-atomic) members match
     // RemoteMoveQueue's existing single-consumer threading assumption — the authority tick
     // is refreshed once per tick and read at RPC arrival, where an at-most-one-tick-stale
@@ -587,4 +586,4 @@ void unregisterSimulatable(
 }
 
 #pragma optimize("", on)
-// pragma optimize on — restore command-line optimization settings.
+// pragma optimize on.

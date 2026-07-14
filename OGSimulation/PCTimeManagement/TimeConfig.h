@@ -127,8 +127,7 @@ struct TimeConfig
 	// When a server correction would require resimulating more than this many
 	// ticks, the client clamps to the window and accepts a partial resim.
 	// Derived from the Quantum formula on OGBrawler's cellular profile
-	// (proposal §4.2, §11; Synthesis §B Axis b Gate). For the failsafe backstop,
-	// see `hardResyncThresholdTicks`.
+	// (proposal §4.2, §11; Synthesis §B Axis b Gate).
 	// Default: 12
 	int32_t rollbackWindowTicks = 12;
 
@@ -147,7 +146,6 @@ struct TimeConfig
 	// (historical, pre-Stage-2). Per proposal §11.
 	// (Stage 2 flipped this default 5 -> 3 when the runtime moved to 60 Hz; the
 	// runtime tick rate is set in Config/DefaultEngine.ini AsyncFixedTimeStepSize.)
-	// For the failsafe backstop, see `hardResyncThresholdTicks`.
 	// Default: 3
 	int32_t redundancyDepthTicks = 3;
 
@@ -161,7 +159,7 @@ struct TimeConfig
 	//   KU1CrossArch — opt-in cross-architecture hash-log verification.
 	enum class HarnessMode { Production, DevTest, KU1CrossArch };
 
-	// Active harness mode. For the failsafe backstop, see `hardResyncThresholdTicks`.
+	// Active harness mode.
 	// Default: HarnessMode::Production
 	HarnessMode harnessMode = HarnessMode::Production;
 };

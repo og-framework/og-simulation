@@ -20,8 +20,7 @@
 #include "OGSimulation/SimulationTimeContext.h"
 #include "OGSimulation/SimulationComposite.h"
 
-//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// [Task 2] Checksum support for the StateCorrectionCache 4-method external API.
+// Checksum support for the StateCorrectionCache 4-method external API.
 //
 // crc32 is the standard reflected CRC-32 (polynomial 0xEDB88320, init 0xFFFFFFFF,
 // final XOR 0xFFFFFFFF) implemented via a 256-entry lookup table built once on
@@ -35,7 +34,6 @@
 // target it without any UE dependency. compute_checksum CRCs the serialized bytes
 // (padding-free, deterministic) rather than the raw object, which keeps the hash
 // stable across compilers/architectures for the cross-arch determinism harness.
-//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 inline std::uint32_t crc32(const std::uint8_t* data, std::size_t length)
 {
@@ -96,11 +94,8 @@ private:
 	}
 };
 
-// pragma optimize off — debugger-friendliness across all build configs (breakpoints hit,
-// locals visible, call-stack intact). OGSim-core convention.
+// pragma optimize off — debugger-friendliness; rationale in SimulationManager.h.
 #pragma optimize( "", off )
-
-//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename StateType, typename InputType>
 class StateCorrectionCache
@@ -124,7 +119,7 @@ public:
 		m_tickBuffer.fill(0);
 	}
 
-	// [Task 2] Overload that injects an integrate functor so advance_frame() can
+	// Overload that injects an integrate functor so advance_frame() can
 	// drive one externally-triggered sim step. The single-arg constructor stays;
 	// caches built with it must not call advance_frame() (it OG_CHECK-fails).
 	StateCorrectionCache(std::function<void(const char*)> logger, IntegrateFn integrateFn)
@@ -395,13 +390,11 @@ public:
 		m_tickBuffer[predictionIndex] = newPredictionTick;
 	}
 
-	//////////////////////////////////////////////////////////////////////////////
-	// [Task 2] StateCorrectionCache 4-method external API (proposal §2.2).
+	// StateCorrectionCache 4-method external API (proposal §2.2).
 	// Additive public wrappers around the existing internal mechanisms; the legacy
 	// API surface above is unchanged. These exist so the Catch2 determinism harness
 	// (and, from Stage 3, the rollback driver) can save/load/advance/checksum the
 	// cache without a live SimulationManager.
-	//////////////////////////////////////////////////////////////////////////////
 
 	// Writes `state` into the cache slot for `tick`.
 	//
@@ -562,7 +555,7 @@ void sendCorrectionState(const SimulationTimeStep& timingInfo, const StateType& 
 }
 
 #pragma optimize( "", on )
-// pragma optimize on — restore command-line optimization settings.
+// pragma optimize on.
 
 
 
