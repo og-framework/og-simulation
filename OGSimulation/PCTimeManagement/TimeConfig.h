@@ -39,7 +39,7 @@
 //
 // Ordering invariant: `hardResyncThresholdTicks > rollbackWindowHardCap` so the
 // failsafe always fires strictly LATER than the soft cap (clamp before snap).
-// T6's R-D3 ordering test asserts this strict inequality.
+// An ordering test asserts this strict inequality.
 //
 // See OGBrawlerNetworkModelResearch/arch/proposal_ogbrawler_netcode.md §4 for
 // the bounded-depth design rationale.
@@ -95,7 +95,7 @@ struct TimeConfig
 	//   CLIENT CLOCK  — prediction tick jumps to the target tick immediately.
 	// FAILSAFE BACKSTOP ONLY — primary clamping is `rollbackWindowTicks` /
 	// `rollbackWindowHardCap`; this fires only when the soft cap fails. MUST
-	// satisfy `hardResyncThresholdTicks > rollbackWindowHardCap` (T6 asserts this).
+	// satisfy `hardResyncThresholdTicks > rollbackWindowHardCap`.
 	// See `rollbackWindowTicks` / `rollbackWindowHardCap` for the primary caps.
 	// Default: 21
 	uint32_t hardResyncThresholdTicks = 21;
@@ -126,14 +126,13 @@ struct TimeConfig
 	// Soft cap on client resim depth — the primary prediction circuit-breaker.
 	// When a server correction would require resimulating more than this many
 	// ticks, the client clamps to the window and accepts a partial resim.
-	// Derived from the Quantum formula on OGBrawler's cellular profile
-	// (proposal §4.2, §11; Synthesis §B Axis b Gate).
+	// Derived from the Quantum formula on OGBrawler's cellular profile.
 	// Default: 12
 	int32_t rollbackWindowTicks = 12;
 
 	// Degraded-mobile maximum that C.2 tier escalation can raise the soft cap to.
-	// `rollbackWindowTicks` may grow up to this ceiling on poor connections
-	// (proposal §4.2, §11). For the failsafe backstop, see `hardResyncThresholdTicks`.
+	// `rollbackWindowTicks` may grow up to this ceiling on poor connections.
+	// For the failsafe backstop, see `hardResyncThresholdTicks`.
 	// Default: 20
 	int32_t rollbackWindowHardCap = 20;
 
@@ -141,11 +140,9 @@ struct TimeConfig
 	// Input redundancy (FInputRedundancyBundle)
 	// -------------------------------------------------------------------------
 
-	// Slot count for FInputRedundancyBundle. Default tracks the runtime tick rate:
-	// 3 at the 60 Hz ratified target (active default), 5 at the 100 Hz interim
-	// (historical, pre-Stage-2). Per proposal §11.
-	// (Stage 2 flipped this default 5 -> 3 when the runtime moved to 60 Hz; the
-	// runtime tick rate is set in Config/DefaultEngine.ini AsyncFixedTimeStepSize.)
+	// Slot count for FInputRedundancyBundle; tracks the runtime tick rate
+	// (3 at 60 Hz, 5 at 100 Hz). The runtime tick rate is set in
+	// Config/DefaultEngine.ini AsyncFixedTimeStepSize.
 	// Default: 3
 	int32_t redundancyDepthTicks = 3;
 
@@ -153,7 +150,7 @@ struct TimeConfig
 	// Test harness mode selector (Catch2 determinism harness)
 	// -------------------------------------------------------------------------
 
-	// Catch2 determinism-harness mode (proposal §9.1, §11).
+	// Catch2 determinism-harness mode.
 	//   Production   — default; the production-shipped test surface.
 	//   DevTest      — opt-in, heavier CI-only determinism runs.
 	//   KU1CrossArch — opt-in cross-architecture hash-log verification.

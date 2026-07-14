@@ -65,7 +65,7 @@ class SimulationManager
 public:
     using LoggerFn = std::function<void(const char*)>;
 
-    // Grouped dependency refs for the ctor (arch review Rec #2). Bundles the four
+    // Grouped dependency refs for the ctor. Bundles the four
     // peer refs + storage + staticData + logger into one named aggregate so the
     // two composition-root emplace() sites cannot silently transpose the adjacent
     // duck-typed peer refs (a transposition of two same-category refs COMPILES —
@@ -316,7 +316,7 @@ private:
             step.getTick(), stepKindName(step.getStepKind()), advanceName);
 
         auto inputs = m_netSync.collectInputAll(step);
-        // SB-6 sequencing: fire preIntegrate BEFORE integrateAll; save m_lastStep
+        // Sequencing: fire preIntegrate BEFORE integrateAll; save m_lastStep
         // (so currentIntegratedTick() == step.getTick() for postIntegrate hooks)
         // BEFORE firing postIntegrate. See §7 "Sequencing consideration".
         auto&       storage    = m_storage;
@@ -334,10 +334,10 @@ private:
         SIMLOG(m_logger, "[AuthoritySimulation] tick=%u", step.getTick());
         // publish the current authority tick + rollback window so the
         // RPC-arrival queueMove path can reject too-far-future capture ticks. The window
-        // is TimeConfig::rollbackWindowTicks (no hardcoded literal — R-P1 clean).
+        // is TimeConfig::rollbackWindowTicks (no hardcoded literal).
         m_netSync.setAuthorityGuardContext(step.getTick(), m_timeConfig.rollbackWindowTicks);
         auto inputs = m_netSync.collectInputAll(step);
-        // SB-6 sequencing (see onGameSimulationPrediction).
+        // Sequencing (see onGameSimulationPrediction).
         auto&       storage    = m_storage;
         const auto& staticData = m_staticData;
         m_systemsExec.firePreIntegrate(step, storage, staticData);
@@ -352,7 +352,7 @@ private:
         const SimulationTimeStep step = m_clientClock->getResimulationStep();
         SIMLOG(m_logger, "[Resim.Pre] tick=%u", step.getTick());
         auto inputs = m_reconciliation.collectResimInputAll(step.getTick());
-        // SB-6 sequencing (see onGameSimulationPrediction). Systems fire on every
+        // Sequencing (see onGameSimulationPrediction). Systems fire on every
         // resim replay tick too — routing stays deterministic across rollback (D4).
         auto&       storage    = m_storage;
         const auto& staticData = m_staticData;

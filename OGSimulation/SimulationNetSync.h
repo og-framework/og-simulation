@@ -180,7 +180,7 @@ public:
     // Published by SimulationManager each authority tick so the RPC-arrival
     // queueMove path can reject too-far-future capture ticks. currentAuthorityTick
     // is the server's current tick; rollbackWindowTicks comes from TimeConfig::rollbackWindowTicks
-    // (no hardcoded literal here — R-P1). Until this is called, the guard is disabled
+    // (no hardcoded literal here). Until this is called, the guard is disabled
     // (m_rollbackWindowTicks defaults to -1), so unconfigured instances (isolated unit
     // tests) keep an accept-all behavior plus the capture-tick dedup.
     void setAuthorityGuardContext(uint32 currentAuthorityTick, int32 rollbackWindowTicks)
@@ -222,13 +222,11 @@ public:
                 .emplace(id, LocalInputSender<SimulatableT>{ &predictionOwner });
         }
 
-        // Register correction-state callback — passes raw buffer to reconciliation.
         predictionOwner.setOnCorrectionStateReceivedCallback(
             [this, id](const typename PredictionOwnerFor<SimulatableT>::SyncedCorrectionBufferType& buffer) {
                 m_reconciliation.template injectCorrectionState<SimulatableT>(id, buffer);
             });
 
-        // Register correction-input callback.
         predictionOwner.setOnCorrectionInputReceivedCallback(
             [this, id](const typename PredictionOwnerFor<SimulatableT>::SyncedRemoteInputBufferType& buffer) {
                 m_reconciliation.template injectCorrectionInput<SimulatableT>(id, buffer);
@@ -254,7 +252,7 @@ public:
         auto& remoteQueue = std::get<RemoteMoveQueueMapFor<SimulatableT>>(m_remoteMoveQueues).at(id);
         // Per-slot inbound callback: the owner walks the inbound
         // FInputRedundancyBundle and invokes this once per (capture_tick, input).
-        // The queue dedups by capture_tick (R-T5 first-writer-wins)
+        // The queue dedups by capture_tick (first-writer-wins)
         // and rejects too-far-future capture ticks against the guard context published by
         // SimulationManager via setAuthorityGuardContext (current authority tick +
         // TimeConfig::rollbackWindowTicks). A too-far-future drop is warned here so the
@@ -273,7 +271,6 @@ public:
                 }
             });
 
-        // Concrete pointer struct.
         std::get<AuthorityWriterMapFor<SimulatableT>>(m_authorityWriters)
             .emplace(id, AuthorityWriter<SimulatableT>{ &authorityOwner });
     }

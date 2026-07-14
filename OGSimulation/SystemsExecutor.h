@@ -22,11 +22,7 @@
 // …) live in game core; this header is engine-agnostic AND game-agnostic OGSim
 // core. See system_api_design.md §3.11 / §4.1 / §8.3 for the full rationale.
 //
-// NAMESPACE NOTE: the design corpus wraps these in `namespace ogsim`, but the
-// entire existing OGSim core (SimulationObjectStorage, SimulationTimeStep,
-// BodyId, every executor) plus tasks 1-4's primitives live in the GLOBAL
-// namespace. This header matches that convention (lead D12, ratified
-// 2026-07-07); the `ogsim::` qualification in the design/backlog is schematic.
+// Global namespace per lead decision D12 (see SimulatableList.h).
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
@@ -40,7 +36,7 @@
 // into the concept.
 //
 // Requirement ordering is load-bearing: the "RequiredSimulatables is a
-// SimulatableList<>" gate (S9) fires FIRST — as its own requires-block — so a
+// SimulatableList<>" gate fires FIRST — as its own requires-block — so a
 // system that forgets the wrap gets a legible IsSimulatableList diagnostic
 // before the hook checks (which reference apply_t<StorageView, ...> and would
 // otherwise produce a noisier failure).
@@ -57,7 +53,7 @@ template <typename T, typename StaticDataT>
 concept SimulationSystem = requires
 {
     typename T::RequiredSimulatables;
-    requires IsSimulatableList<typename T::RequiredSimulatables>;   // S9 — clearer diagnostic than an undefined list_contains hit
+    requires IsSimulatableList<typename T::RequiredSimulatables>;   // clearer diagnostic than an undefined list_contains hit
 } && requires(
     T& t,
     const SimulationTimeStep& step,
@@ -65,7 +61,7 @@ concept SimulationSystem = requires
     apply_t<StorageView, typename T::RequiredSimulatables> view,    // lvalue — hooks may take by value / const-ref / mutable-ref (see §3.11 / C2)
     const StaticDataT& staticData)
 {
-    { t.preIntegrate(step, view, staticData)           } -> std::same_as<void>;   // S8 — tighten diagnostic
+    { t.preIntegrate(step, view, staticData)           } -> std::same_as<void>;   // tighten diagnostic
     { t.postIntegrate(step, view, staticData)          } -> std::same_as<void>;
     { t.onCharacterRegistered(id, view, staticData)    } -> std::same_as<void>;
     { t.onCharacterUnregistered(id, view, staticData)  } -> std::same_as<void>;
@@ -76,8 +72,7 @@ concept SimulationSystem = requires
     // integrateAll. Additive strategy (§8.3): v1 systems do NOT declare
     // intraIntegrate; when the feature ships, the executor's fireIntraIntegrate
     // uses `if constexpr (requires { ... })` to skip systems missing the method.
-    // No concept change, no v1-system source changes. See fireIntraIntegrate
-    // block-comment below and §3.3.
+    // No concept change, no v1-system source changes. See design §3.3 / §8.3.
 };
 
 // ---------------------------------------------------------------------------
@@ -202,27 +197,8 @@ public:
         }, m_systems);
     }
 
-    // --- FUTURE (deferred per §3.3): fireIntraIntegrate ---------------------
-    //
-    // When the interleaved firing point ships, this method uses a per-system
-    // detection idiom so v1 systems WITHOUT intraIntegrate remain valid — no
-    // concept split, no v1-system source changes:
-    //
-    //   void fireIntraIntegrate(const SimulationTimeStep& step, StorageT& storage,
-    //                           const StaticDataT& staticData)
-    //   {
-    //       std::apply([&](auto&... systems) {
-    //           ([&]{
-    //               using S = std::decay_t<decltype(systems)>;
-    //               auto view = storage.template projectTo<typename S::RequiredSimulatables>();
-    //               if constexpr (requires (S& s) { s.intraIntegrate(step, view, staticData); }) {
-    //                   systems.intraIntegrate(step, view, staticData);
-    //               }
-    //           }(), ...);
-    //       }, m_systems);
-    //   }
-    //
-    // See §3.3 + §8.3.
+    // FUTURE: fireIntraIntegrate (deferred v1) — sketched implementation +
+    // rationale in system_api_design.md §4.1 / §3.3 / §8.3.
 
     // --- Direct system access (for testing, debug, cross-system hooks) ------
 

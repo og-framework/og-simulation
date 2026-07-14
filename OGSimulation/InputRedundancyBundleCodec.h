@@ -2,12 +2,12 @@
 // SPDX-License-Identifier: MPL-2.0
 
 // ---------------------------------------------------------------------------
-// [Task 12 / Phase 1 — Stage 1] InputRedundancyBundleCodec
+// InputRedundancyBundleCodec
 //
 // Engine-agnostic byte-codec for the FInputRedundancyBundle wire payload
 // (proposal §3.1 step 8; R-T5 immutability invariant; risks_and_plan.md §5.2).
 //
-// The Stage 1 unreliable + redundancy input channel re-sends the last
+// The unreliable + redundancy input channel re-sends the last
 // `redundancyDepthTicks` ticks of input every frame so a dropped UDP datagram
 // self-heals on the next send (the R-T1 streeting-saturation mitigation). The
 // bundle on the wire is a length-prefixed byte blob:
@@ -17,7 +17,7 @@
 //   [slots...]           offset 2  each slot is:
 //       [capture_tick (u32)] [input_serialized_bytes (fixed per InputType)]
 //
-// WHY THIS LIVES IN CORE (Task 12): the bundle's append/dedup/iteration logic is
+// WHY THIS LIVES IN CORE: the bundle's append/dedup/iteration logic is
 // pure byte manipulation over the og-simulation serialization free functions —
 // it has no Unreal dependency. The UE-side wrapper FInputRedundancyBundle
 // (Source/OGSimulationUnreal/SyncedSimulationStateBuffer.h) is a USTRUCT that
@@ -60,8 +60,8 @@
 
 namespace inputRedundancyBundle
 {
-	// Stage 1 wire-format version. Bumped when the on-wire layout changes so a
-	// mismatched peer is detected and rejected (Task 11 compat fence).
+	// Wire-format version. Bumped when the on-wire layout changes so a
+	// mismatched peer is detected and rejected (compat fence).
 	inline constexpr std::uint8_t  kWireFormatVersion = 1;
 	// Hard upper bound on slots for wire safety; the runtime depth is
 	// min(TimeConfig::redundancyDepthTicks, kMaxSlots).
@@ -202,7 +202,7 @@ namespace inputRedundancyBundle
 
 	// Consumer-side iteration: invokes callback(std::uint32_t capture_tick,
 	// const InputType& input) for each slot in arrival order. No-op on an empty
-	// bundle. The server feeds these into RemoteMoveQueue::queueMove (Task 10).
+	// bundle. The server feeds these into RemoteMoveQueue::queueMove.
 	template <typename InputType, typename Buffer, typename Callback>
 	void forEachSlot(const Buffer& buf, Callback&& callback)
 	{

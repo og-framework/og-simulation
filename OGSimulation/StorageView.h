@@ -27,11 +27,7 @@ class SimulationObjectStorage;
 // compile error gated by a legible requires-clause. See system_api_design.md
 // §3.11 / §4.1 for the full rationale.
 //
-// NAMESPACE NOTE: the design corpus wraps these in `namespace ogsim`, but the
-// entire existing OGSim core (SimulationObjectStorage, SimulationTimeStep, BodyId,
-// every executor) and task 1's SimulatableList.h live in the GLOBAL namespace.
-// This header matches that convention (lead D12, ratified 2026-07-07); the
-// `ogsim::` qualification in the design/backlog is schematic.
+// Global namespace per lead decision D12 (see SimulatableList.h).
 //
 // ---- IMPLEMENTATION STRATEGY (design §4.1) --------------------------------
 //
@@ -52,10 +48,7 @@ class SimulationObjectStorage;
 // PRODUCTION CONSTRUCTION: SimulationObjectStorage::projectTo<>() builds the
 // thunks and constructs the view. The constructor is PRIVATE; the sole grant is
 // `friend class SimulationObjectStorage` (all specializations) per design §4.1 —
-// a StorageView is "not directly constructible by user code". The task-2 phase
-// used a temporary public ctor to test the view before projectTo<> existed; task
-// 3 restored the design's friend-only encapsulation now that projectTo<> is the
-// real construction entry point (and the StorageView test builds through it).
+// a StorageView is "not directly constructible by user code".
 //
 // ---- ITERATION ORDER (§3.11) ----------------------------------------------
 //
