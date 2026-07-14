@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <cstdio>
 
+// pragma optimize off — debugger-friendliness across all build configs (breakpoints hit,
+// locals visible, call-stack intact). OGSim-core convention.
 #pragma optimize( "", off )
 
 NetworkTimeEstimator::NetworkTimeEstimator(const TimeConfig& config, LoggerFn logger)
@@ -98,3 +100,4 @@ double NetworkTimeEstimator::getSmoothedJitter() const
 }
 
 #pragma optimize( "", on )
+// pragma optimize on — restore command-line optimization settings.

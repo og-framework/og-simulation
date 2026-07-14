@@ -7,6 +7,8 @@
 #include <optional>
 #include <cstddef>
 
+// pragma optimize off — debugger-friendliness across all build configs (breakpoints hit,
+// locals visible, call-stack intact). OGSim-core convention.
 #pragma optimize("", off)
 
 // Outcome of RemoteMoveQueue::queueMove — Stage 1 (Task 10) receive-side capture-tick
@@ -200,3 +202,4 @@ private:
 };
 
 #pragma optimize("", on)
+// pragma optimize on — restore command-line optimization settings.

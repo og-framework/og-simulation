@@ -8,6 +8,8 @@
 #include "OGSimulation/SimulationObjectStorage.h"
 #include "OGSimulation/SimulationTimeContext.h"
 
+// pragma optimize off — debugger-friendliness across all build configs (breakpoints hit,
+// locals visible, call-stack intact). OGSim-core convention.
 #pragma optimize("", off)
 
 // Adapter-dependent side of a simulatable: integrate() and firstResimStep().
@@ -114,3 +116,4 @@ concept SimulationIntegrationExecutorConcept = requires(
 };
 
 #pragma optimize("", on)
+// pragma optimize on — restore command-line optimization settings.

@@ -10,6 +10,8 @@
 #include "OGSimulation/SimulatableList.h"  // SimulatableList, apply_t, IsSimulatableList, list_contains_v
 #include "OGSimulation/StorageView.h"      // StorageView, StorageViewThunk (projectTo<> return + thunks)
 
+// pragma optimize off — debugger-friendliness across all build configs (breakpoints hit,
+// locals visible, call-stack intact). OGSim-core convention.
 #pragma optimize("", off)
 
 // ---------------------------------------------------------------------------
@@ -193,3 +195,4 @@ void updateVisualizationAll(SimulationObjectStorage<Ts...>& storage)
 }
 
 #pragma optimize("", on)
+// pragma optimize on — restore command-line optimization settings.
