@@ -48,9 +48,14 @@ ClientPredictionClock::AdvanceResult ClientPredictionClock::advancePrediction()
     const unsigned int targetTick = m_estimator.getTargetPredictionTick();
     const int          drift      = static_cast<int>(targetTick) - static_cast<int>(m_predictionTick);
 
-    // Startup guard: skip drift correction until both clocks are past the warm-up period.
-    const bool pastGuard = (m_predictionTick >= m_config.minTicksBeforeDriftCheck)
-                        && (targetTick        >= m_config.minTicksBeforeDriftCheck);
+    // Startup guard: skip drift correction until the *authority* clock is past
+    // the warm-up period. The client's own tick counter is NOT gated — a
+    // late-connect client that has never seen tick 60 on its own local counter
+    // should still be allowed to HardResync forward as soon as authority is
+    // available. This closes the "10-20 s late-start walks predictionTick 0..59
+    // while server is 600+" corner case documented in
+    // ../og-brawler-hit-resolution/netcode_finding_pred_offset_floor.md §3.2.
+    const bool pastGuard = (targetTick >= m_config.minTicksBeforeDriftCheck);
 
     if (!pastGuard)
     {
@@ -220,8 +225,13 @@ ClientPredictionClock::DriftAction ClientPredictionClock::evaluateDrift() const
     const unsigned int targetTick = m_estimator.getTargetPredictionTick();
     const int          drift      = static_cast<int>(targetTick) - static_cast<int>(m_predictionTick);
 
-    const bool pastGuard = (m_predictionTick >= m_config.minTicksBeforeDriftCheck)
-                        && (targetTick        >= m_config.minTicksBeforeDriftCheck);
+    // Startup guard: authority-only form — MUST match advancePrediction()'s guard
+    // exactly (see the fuller comment there +
+    // ../og-brawler-hit-resolution/netcode_finding_pred_offset_floor.md §3.2). If the
+    // two guards diverge, this query reports a different drift zone than
+    // advancePrediction() would act on for the same tick. The
+    // WarmupGuard.EvaluateDriftConsistency test pins the two occurrences together.
+    const bool pastGuard = (targetTick >= m_config.minTicksBeforeDriftCheck);
 
     if (!pastGuard)
         return DriftAction::None;
