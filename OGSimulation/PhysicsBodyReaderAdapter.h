@@ -15,4 +15,5 @@ concept PhysicsBodyReaderAdapter = requires(const T cadapter, BodyId bodyId)
 	{ cadapter.getBodyTransform(bodyId) }     -> std::convertible_to<glm::mat4>;
 	{ cadapter.getBodyInertiaTensor(bodyId) }  -> std::convertible_to<glm::vec3>;
 	{ cadapter.captureBodyState(bodyId) }      -> std::convertible_to<PhysicsBodyState>;
+	{ cadapter.isBodyResolvable(bodyId) }      -> std::convertible_to<bool>;
 };

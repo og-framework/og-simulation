@@ -242,6 +242,20 @@ public:
 		return std::nullopt;
 	}
 
+	// Returns the input at the current prediction-tick slot — the just-applied
+	// input for LOCAL characters (via pushPredictionInput in collectInputAll's
+	// provider branch) and the last-server-corrected value for REMOTE simulated
+	// proxies (via collectInputAll's simulated-proxy branch, also calling
+	// pushPredictionInput). Complements getLastCorrectionInput, which walks
+	// backward for server-correction-flagged slots (older by ~1 RTT for the
+	// local character). Returns nullopt if the slot is empty (transient state
+	// at registration).
+	std::optional<InputType> getLatestInput() const
+	{
+		const uint32 predictionIndex = getCacheIndex(getPredictionTick());
+		return m_inputBuffer[predictionIndex];
+	}
+
 	bool needsResimulation()
 	{
 		uint32 lastResimulationTick = getLastResimulationTick();

@@ -250,6 +250,19 @@ public:
         return getCacheFor<T>(id).getLastCorrectionInput();
     }
 
+    // Returns the input at the current prediction slot for the given simulatable
+    // (live for LOCAL characters, held-constant server correction for REMOTE
+    // simulated proxies). Sibling to getLastCorrectionInput but reads the fresh
+    // prediction-slot input instead of walking back for server-flagged slots.
+    // Routed through findInputCache (nullable) so it returns nullopt safely on
+    // the authority, where no correction caches are allocated.
+    template <typename T>
+    std::optional<typename T::InputType> getLatestInput(unsigned int id) const
+    {
+        const auto* cache = findInputCache<T>(id);
+        return cache != nullptr ? cache->getLatestInput() : std::nullopt;
+    }
+
     // Returns a pointer to the correction cache for the given simulatable type and id,
     // or nullptr if no cache exists (e.g. on the authority, where caches are not allocated).
     template <typename T>
