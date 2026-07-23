@@ -44,11 +44,43 @@
 //   - plain Serializable InputType -> syncSize<InputType>()
 //   - SimulationComposite<Ts...>   -> compositeSyncSize<Ts...>()
 //
-// INVARIANT (R-T5): inputs in a bundle are append-only / immutable per
-// capture-tick. appendSlot() OG_CHECK-fails on a duplicate capture_tick to catch
-// a producer that would violate the invariant the server's dedup relies on
-// (RemoteMoveQueue::queueMove, Task 10). The version byte exists so pre/post-
-// Stage-1 builds refuse to interop loudly (compat fence, Task 11).
+// INVARIANT (R-T5 / D3.11): inputs written into FInputRedundancyBundle are
+// append-only and immutable per capture-tick. The client MUST NOT revise the
+// input value for a previously-emitted capture-tick; any producer that does so
+// silently loses the corrected value at the dedup-by-capture-tick step on the
+// server. If a future feature requires input revision post-capture, the wire
+// format needs an explicit revision-number field and the dedup contract must be
+// re-designed.
+//
+// ENFORCEMENT — two layers, deliberately different per build config (D3.11):
+//   - Development / checked builds: appendSlot() OG_CHECK-fails loudly on a
+//     duplicate capture_tick, so a producer bug surfaces at its origin rather
+//     than as a silent value loss three hops downstream on the server.
+//   - Shipping builds (OG_CHECK compiles out): the duplicate is SILENTLY
+//     DROPPED and the first-arrival input is preserved. Never overwrite. A
+//     shipping client must not be able to revise an already-emitted input, and
+//     an unguarded append would additionally emit two slots for one capture
+//     tick — a malformed bundle the server's dedup would resolve arbitrarily by
+//     arrival order.
+// Both layers share one always-compiled kernel, tryAppendSlot(), which owns the
+// drop decision; appendSlot() is that kernel plus the debug-time OG_CHECK. The
+// shipping semantics are therefore testable in a checked build (call the kernel
+// directly) without needing a shipping-configured test target.
+//
+// The kMaxSlots wire-safety bound is enforced the SAME way (T16): the kernel
+// drops an append that would exceed kMaxSlots in every build config, and
+// appendSlot() keeps its OG_CHECK in front so a checked build still aborts
+// loudly at the offending producer. Note this is DEFENCE IN DEPTH, not a live
+// bug fix: the sole production caller (buildRedundancyBundle) already clamps
+// depth to min(redundancyDepthTicks, kMaxSlots), so an overflow is unreachable
+// through the current call graph. The kernel bound exists so a future caller
+// that skips the clamp — or a rewritten client driving the codec directly —
+// cannot emit an over-budget bundle in a shipping build, where an unguarded
+// append previously produced a bounded-but-MALFORMED payload (the TArray grows,
+// so this was never an out-of-bounds write; it was a wire-budget violation).
+//
+// The version byte exists so pre/post-Stage-1 builds refuse to interop loudly
+// (compat fence, Task 11).
 // ---------------------------------------------------------------------------
 
 #include "OGSimulation/SimulationSerialization.h"
@@ -150,7 +182,10 @@ namespace inputRedundancyBundle
 		return buf.template readFromBuffer<std::uint8_t>(kSlotCountOffset);
 	}
 
-	// True once the bundle holds kMaxSlots slots — appendSlot() would OG_CHECK.
+	// True once the bundle holds kMaxSlots slots — a further append is dropped by
+	// tryAppendSlot() in every build config, and additionally OG_CHECK-fails in a
+	// checked build via appendSlot(). Exposed so tests and callers can query the
+	// bound without tripping the abort.
 	template <typename Buffer>
 	bool isFull(const Buffer& buf)
 	{
@@ -176,18 +211,36 @@ namespace inputRedundancyBundle
 		return false;
 	}
 
-	// Producer-side append of one (capture_tick, input) slot. ENFORCES R-T5:
-	// OG_CHECK-fails on a duplicate capture_tick; also OG_CHECK-guards kMaxSlots.
-	// Lazily initializes the wire header on first use.
+	// Always-compiled append kernel — owns the R-T5 append-only decision in EVERY
+	// build config, including shipping where OG_CHECK compiles out.
+	//
+	// Returns true when the slot was appended. Returns false — leaving the buffer
+	// byte-for-byte untouched — in either of two cases:
+	//   1. `captureTick` already occupies a slot. The first-arrival input is
+	//      preserved: an already-emitted capture tick is immutable, so a revision
+	//      is dropped rather than overwritten (D3.11 / R-T5).
+	//   2. The bundle already holds kMaxSlots slots. Appending would exceed the
+	//      wire-safety budget, so the slot is dropped rather than emitted (T16).
+	//
+	// Callers on the normal producer path should use appendSlot(), which adds the
+	// debug-time OG_CHECK on top of this kernel. Call tryAppendSlot() directly
+	// only when a duplicate is an expected, recoverable outcome rather than a
+	// producer bug (e.g. tests asserting the shipping-build semantics).
 	template <typename InputType, typename Buffer>
-	void appendSlot(Buffer& buf, std::uint32_t captureTick, const InputType& input)
+	[[nodiscard]] bool tryAppendSlot(Buffer& buf, std::uint32_t captureTick, const InputType& input)
 	{
 		detail::initHeaderIfEmpty(buf);
 
-		OG_CHECK(!containsCaptureTick<InputType>(buf, captureTick),
-			"R-T5 invariant violation: cannot revise already-sent capture_tick");
-		OG_CHECK(!isFull(buf),
-			"FInputRedundancyBundle overflow: slot_count would exceed kMaxSlots");
+		// R-T5: first arrival wins. Drop the revision, preserve the emitted value.
+		if (containsCaptureTick<InputType>(buf, captureTick))
+			return false;
+
+		// Wire-safety bound (D3.11 / T16). The bundle budget is kMaxSlots slots;
+		// a 9th append would produce a payload that violates that budget, so it is
+		// dropped here in EVERY build config rather than only where OG_CHECK is
+		// compiled in. The buffer is left byte-for-byte untouched.
+		if (isFull(buf))
+			return false;
 
 		const std::uint32_t stride =
 			static_cast<std::uint32_t>(sizeof(std::uint32_t)) + detail::slotInputSize<InputType>();
@@ -198,6 +251,28 @@ namespace inputRedundancyBundle
 			buf, writeOffset + static_cast<std::uint32_t>(sizeof(std::uint32_t)), input);
 
 		buf.writeToBuffer(kSlotCountOffset, static_cast<std::uint8_t>(slotCount(buf) + 1));
+		return true;
+	}
+
+	// Producer-side append of one (capture_tick, input) slot. ENFORCES R-T5 and the
+	// kMaxSlots wire budget: OG_CHECK-fails loudly on a duplicate capture_tick or
+	// an overflow in checked builds, and silently drops either in shipping builds
+	// where the OG_CHECK compiles out — see the ENFORCEMENT block at the top of
+	// this file. Lazily initializes the wire header on first use.
+	template <typename InputType, typename Buffer>
+	void appendSlot(Buffer& buf, std::uint32_t captureTick, const InputType& input)
+	{
+		OG_CHECK(!containsCaptureTick<InputType>(buf, captureTick),
+			"R-T5 invariant violation: cannot revise already-sent capture_tick");
+		OG_CHECK(!isFull(buf),
+			"FInputRedundancyBundle overflow: slot_count would exceed kMaxSlots");
+
+		// Shipping path: the OG_CHECKs above are no-ops, so the kernel's silent
+		// drops are what keep an already-emitted capture tick immutable and the
+		// slot count within the kMaxSlots wire budget. A false return here means
+		// exactly one of those drops — the bundle as already emitted stands, and
+		// there is nothing further for the producer to do.
+		(void)tryAppendSlot<InputType>(buf, captureTick, input);
 	}
 
 	// Consumer-side iteration: invokes callback(std::uint32_t capture_tick,

@@ -19,6 +19,7 @@
 #include <glm/gtc/quaternion.hpp>
 #include "OGSimulation/SimulationTimeContext.h"
 #include "OGSimulation/SimulationComposite.h"
+#include "OGSimulation/PCTimeManagement/TimeConfig.h"
 
 // Checksum support for the StateCorrectionCache 4-method external API.
 //
@@ -177,7 +178,75 @@ public:
 		return *maxIt;
 	}
 
-	uint32 getLastCorrectTick() const 
+	// -----------------------------------------------------------------------
+	// Correction-miss log gating (Stage 5 / Task 18)
+	// -----------------------------------------------------------------------
+	// A correction whose tick has no slot in this cache is DISCARDED. That is a
+	// routine, expected, self-healing outcome on three known-benign paths, all
+	// characterised from the 2026-07-20 dedicated-server PIE session
+	// (`impl/research_correction_discards.md`):
+	//
+	//   1. Freshly registered remote proxy — the per-simulatable cache exists but
+	//      pushPredictionTick has never been called, so the tick buffer is still
+	//      all-zero and EVERY correction misses for a few ticks until the proxy
+	//      joins the resim loop.
+	//   2. Connect transient — the client's prediction frontier has not yet
+	//      converged on authority; corrections land ahead of or behind it until
+	//      the clock settles (or HardResync fires).
+	//   3. Post-Skip holes — a graduated Skip advances the frontier by two,
+	//      leaving a gap that backfillSkippedTick does not always cover.
+	//
+	// Corrections are an unthrottled per-tick stream and reconciliation anchors on
+	// the newest LANDED correction rather than a specific tick, so a miss costs at
+	// most one tick of delayed reconciliation. Logging these at Warning cried wolf
+	// badly enough to cost real diagnostic time during that session, because the
+	// shape resembled the v1 T23/T24 hard-lock bug signature.
+	//
+	// GATE: warn only when the missed tick is FURTHER than rollbackWindowHardCap
+	// from the prediction frontier. That bound is the maximum depth the reconciler
+	// will ever resimulate, so a miss beyond it could not have become a useful
+	// resim anchor even had a slot existed — and, because TimeConfig pins the
+	// ordering invariant `hardResyncThresholdTicks > rollbackWindowHardCap`, a
+	// sustained miss out there means the clock should have hard-resynced and has
+	// not. That is genuinely anomalous. Everything closer is routine and logs at
+	// Verbose.
+	//
+	// Verified against the 2026-07-20 session (both clients, both miss sites,
+	// 111 events): 108 events had a live frontier with a max distance of exactly
+	// 20 == rollbackWindowHardCap, and 3 were empty-cache registration transients.
+	// This gate suppresses all 111 while still firing at distance 21+.
+	//
+	// NOTE: the frontier check is `getPredictionTick() != 0` because both
+	// constructors fill the tick buffer with 0. The deferred UINT32_MAX empty-slot
+	// sentinel (researcher item 3, deliberately out of scope here) would make this
+	// exact rather than conventional.
+	bool isAnomalousMiss(uint32 missedTick) const
+	{
+		const uint32 predictionTick = getPredictionTick();
+
+		// No prediction frontier yet — registration transient. Comparing a real
+		// server tick against a never-initialised frontier is meaningless, not
+		// anomalous.
+		if (predictionTick == 0)
+			return false;
+
+		const uint32 distance = (missedTick > predictionTick)
+			? (missedTick - predictionTick)
+			: (predictionTick - missedTick);
+
+		return distance > m_anomalousMissDistanceTicks;
+	}
+
+	// Seam for wiring the LIVE TimeConfig once a consumer has one to hand. The
+	// default is sourced from the TimeConfig default (not a literal), so R-P1
+	// holds and the gate tracks any retune of the field's default; it does NOT
+	// track a runtime override. Acceptable for a log gate, one line to fix.
+	void setAnomalousMissDistanceTicks(uint32 distanceTicks)
+	{
+		m_anomalousMissDistanceTicks = distanceTicks;
+	}
+
+	uint32 getLastCorrectTick() const
 	{
 		const uint32 predictionTick = getPredictionTick();
 		const uint32 predictionIndex = getCacheIndex(predictionTick);
@@ -353,10 +422,15 @@ public:
 		else
 		{
 			// Tick not in cache window — correction arrived too late or too early; discard.
+			// Severity is gated by isAnomalousMiss: routine self-healing misses log at
+			// Verbose, only a miss beyond the reconciler's reach warns. predictionTick is
+			// now included so a Warning from this site is actionable on its own.
 			if (m_logger)
 			{
-				char buf[128];
-				std::snprintf(buf, sizeof(buf), "[Warning] tryInsertingCorrectState: tick=%u not in cache window, discarding", tick);
+				char buf[192];
+				std::snprintf(buf, sizeof(buf),
+					"%s tryInsertingCorrectState: tick=%u not in cache window (predictionTick=%u), discarding",
+					isAnomalousMiss(tick) ? "[Warning]" : "[Verbose]", tick, getPredictionTick());
 				m_logger(buf);
 			}
 			return;
@@ -381,12 +455,13 @@ public:
 		}
 		else
 		{
+			// Severity gated by isAnomalousMiss — see the comment on that method.
 			if (m_logger)
 			{
 				char buf[192];
 				std::snprintf(buf, sizeof(buf),
-					"[Warning] insertCorrectionInput: tick=%u not in cache (predictionTick=%u), discarding",
-					tick, getPredictionTick());
+					"%s insertCorrectionInput: tick=%u not in cache (predictionTick=%u), discarding",
+					isAnomalousMiss(tick) ? "[Warning]" : "[Verbose]", tick, getPredictionTick());
 				m_logger(buf);
 			}
 		}
@@ -530,6 +605,10 @@ private:
 	std::bitset<StateBufferSize> m_containsCorrectionInput;
 	std::function<void(const char*)> m_logger;
 	IntegrateFn m_integrateFn;
+
+	// Log gate only — never read by insertion logic. See isAnomalousMiss.
+	uint32 m_anomalousMissDistanceTicks =
+		static_cast<uint32>(TimeConfig{}.rollbackWindowHardCap);
 };
 
 template <typename SyncedBuffer, typename StateType, typename InputType>

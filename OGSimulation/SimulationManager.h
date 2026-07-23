@@ -125,6 +125,18 @@ public:
 
     bool runsPrediction() const { return m_runsPrediction; }
 
+    // Read-only view of the manager's owned TimeConfig.
+    //
+    // [C.2 / T10] Exists so an engine-side composition root can bind
+    // per-connection structures (ConnectionTierTable, ServerInputDelayQueue)
+    // to the SAME config instance the clocks and the authority guard already
+    // read. Those structures hold `const TimeConfig&`, so handing out a
+    // reference to a manager-owned member — rather than letting the adapter
+    // keep a second TimeConfig — is what makes "one config, one tier policy"
+    // true by construction instead of by convention. The reference is stable
+    // for the manager's lifetime (m_timeConfig is a by-value member).
+    const TimeConfig& getTimeConfig() const { return m_timeConfig; }
+
     ServerTickClock& editServerClock()
     {
         if (!m_serverClock.has_value()) { std::terminate(); }

@@ -2,11 +2,13 @@
 // SPDX-License-Identifier: MPL-2.0
 
 #include "OGTypes.h"
+#include <atomic>
 #include <concepts>
 #include <functional>
 #include <tuple>
 #include <unordered_map>
 
+#include "OGSimulation/Network/ClientInputDelayLine.h"
 #include "OGSimulation/SimulationLog.h"
 #include "OGSimulation/SimulationObjectStorage.h"
 #include "OGSimulation/SimulationQueues.h"
@@ -73,6 +75,28 @@ using PendingInputQueueMapFor = std::unordered_map<
 
 template <typename T>
 using LastUsedInputMapFor = std::unordered_map<unsigned int, typename T::InputType>;
+
+// [T9 parts 3+4] Per-locally-controlled-simulatable ring of the client's own raw
+// input captures. Populated ONLY for ids that have an input provider, i.e. the
+// exact set for which m_pendingInputQueues is populated. See
+// Network/ClientInputDelayLine.h for why this is a separate structure from the
+// correction cache — the short version is that the cache's slot T already means
+// "input APPLIED at tick T" and resim reads it with no offset.
+template <typename T>
+using ClientInputDelayLineMapFor = std::unordered_map<
+    unsigned int,
+    ClientInputDelayLine<typename T::InputType>>;
+
+// Per-SIMULATABLE-TYPE (not per-id) neutral input. Wrapped in a struct keyed on
+// the simulatable rather than stored as a bare `InputType` so that a pack whose
+// members happen to share one InputType still gets distinct tuple slots —
+// `std::get<InputType>` would be ill-formed there, and silently so at the
+// template level until such a pack first appeared.
+template <typename T>
+struct NeutralInputFor
+{
+    typename T::InputType value{};
+};
 
 template <typename T>
 using AuthorityWriterMapFor = std::unordered_map<unsigned int, AuthorityWriter<T>>;
@@ -190,6 +214,63 @@ public:
     }
 
     // -----------------------------------------------------------------------
+    // [T9 part 3] Client-side Layer-1 input delay
+    // -----------------------------------------------------------------------
+    //
+    // The number of ticks the LOCAL client's own captured input is held before
+    // the integrator sees it. One scalar, not a per-id map, because a delay is a
+    // property of the local CONNECTION and a client has exactly one — the same
+    // reason the server keys its queue by Address rather than by simulatable.
+    //
+    // THE GAME->PHYSICS THREAD CROSSING, and why an atomic is sufficient here.
+    // The writer is USimmableUpdateComponent::OnRep_ConnectionTier on the GAME
+    // thread; the reader is collectInputAll on the PHYSICS thread, which loads it
+    // ONCE per tick and uses that one value for the whole tick. This is safe
+    // precisely because it is a lone independent scalar with no internal
+    // structure: the worst a relaxed, one-tick-stale read can do is apply a tier
+    // change one tick later than it landed. It is emphatically NOT the same
+    // situation as T10's ServerInputDelayQueue, where the shared thing was an
+    // unordered_map whose concurrent rehash is undefined behaviour rather than a
+    // stale value — which is why that one needed the R2 restructuring and this
+    // one does not.
+    //
+    // Relaxed ordering is deliberate: there is no other datum whose visibility
+    // this value has to order, so acquire/release would buy nothing.
+    //
+    // Defaults to 0 = "no delay", i.e. exact pre-T9 behaviour, so an instance
+    // nobody configures (isolated unit tests, the authority-role manager) is
+    // unaffected.
+    void setClientEffectiveInputDelayTicks(int32 delayTicks)
+    {
+        m_clientEffectiveInputDelayTicks.store(delayTicks < 0 ? 0 : delayTicks,
+                                               std::memory_order_relaxed);
+    }
+
+    int32 getClientEffectiveInputDelayTicks() const
+    {
+        return m_clientEffectiveInputDelayTicks.load(std::memory_order_relaxed);
+    }
+
+    // [T9 part 4] Inject the game's zero input, used to fill the
+    // [0, effectiveDelay) window at session start and after a resync wipe.
+    //
+    // MUST be called by the composition root: the default `InputType{}` is NOT
+    // the brawler's zero input (`getZeroPlayerInput` builds (0,0,1) forward
+    // vectors, a value-initialised one would carry (0,0,0) into normalisation).
+    // Applies to delay lines created later AND to any already created, so it is
+    // order-independent with respect to registration.
+    template <typename SimulatableT>
+    void setNeutralInput(const typename SimulatableT::InputType& neutralInput)
+    {
+        std::get<NeutralInputFor<SimulatableT>>(m_clientNeutralInputs).value = neutralInput;
+        for (auto& [id, line] :
+             std::get<ClientInputDelayLineMapFor<SimulatableT>>(m_clientInputDelayLines))
+        {
+            line.setNeutralInput(neutralInput);
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Registration — free functions delegate here; not called directly by users
     // -----------------------------------------------------------------------
 
@@ -217,6 +298,14 @@ public:
             // holds std::atomic members and is neither copyable nor movable.
             std::get<PendingInputQueueMapFor<SimulatableT>>(m_pendingInputQueues)
                 .try_emplace(id);
+
+            // [T9 part 3] The delay line is populated for exactly the ids that
+            // have a provider — the locally-controlled ones. A remote proxy has
+            // no capture of its own to delay, so it must not get a line, and
+            // collectInputAll's proxy branch is left untouched.
+            std::get<ClientInputDelayLineMapFor<SimulatableT>>(m_clientInputDelayLines)
+                .try_emplace(id,
+                    std::get<NeutralInputFor<SimulatableT>>(m_clientNeutralInputs).value);
 
             std::get<LocalInputSenderMapFor<SimulatableT>>(m_localInputSenders)
                 .emplace(id, LocalInputSender<SimulatableT>{ &predictionOwner });
@@ -304,6 +393,7 @@ public:
         std::get<InputProviderMapFor<T>>(m_inputProviders).erase(id);
         std::get<RemoteMoveQueueMapFor<T>>(m_remoteMoveQueues).erase(id);
         std::get<PendingInputQueueMapFor<T>>(m_pendingInputQueues).erase(id);
+        std::get<ClientInputDelayLineMapFor<T>>(m_clientInputDelayLines).erase(id);
         std::get<LastUsedInputMapFor<T>>(m_lastUsedInputs).erase(id);
     }
 
@@ -314,6 +404,13 @@ public:
     ResolvedInputs<SimulatableTs...> collectInputAll(const SimulationTimeStep& step)
     {
         ResolvedInputs<SimulatableTs...> inputs;
+
+        // [T9 part 3] ONE load per tick, used for every locally-controlled
+        // simulatable below. Reading it once (rather than per id) is what makes
+        // a concurrent OnRep_ConnectionTier write unable to split a single tick
+        // across two different delays.
+        const int32 effectiveDelay = getClientEffectiveInputDelayTicks();
+
         m_storage.forEachSimulatable([&](unsigned int id, auto& simulatable) {
             using T = std::remove_reference_t<decltype(simulatable)>;
             auto& providerMap   = std::get<InputProviderMapFor<T>>(m_inputProviders);
@@ -322,10 +419,45 @@ public:
 
             if (auto it = providerMap.find(id); it != providerMap.end())
             {
-                auto input = it->second(step);
+                // The RAW capture, as the local player produced it THIS tick.
+                const auto capture = it->second(step);
 
-                SIMLOG(m_logger, "[CollectInput] id=%u tick=%u source=Provider kind=%s",
-                    id, step.getTick(), stepKindName(step.getStepKind()));
+                // [T9 parts 3+4] Layer-1 client input delay.
+                //
+                // Two different values leave this branch and the distinction is
+                // the whole point of the task:
+                //
+                //   `capture` — the ORIGINAL, undelayed input, stamped at the
+                //     CURRENT tick. This is what goes on the wire. The server
+                //     parks it in its own ServerInputDelayQueue and applies the
+                //     same delay itself; sending an already-delayed input would
+                //     have the server delay it a SECOND time and the two ends
+                //     would diverge by exactly `effectiveDelay` ticks.
+                //
+                //   `applied`  — the capture from `tick - effectiveDelay`. This
+                //     is what the integrator predicts with and what goes into
+                //     the correction cache, because the cache's slot T means
+                //     "the input APPLIED at tick T" — the same meaning the
+                //     server's replicated correction writes into that slot, and
+                //     the meaning collectResimInputAll relies on when it reads
+                //     those slots with no offset.
+                //
+                // With `effectiveDelay == 0` this is exactly the pre-T9 path:
+                // resolveDelayedInput returns the live capture untouched.
+                auto& delayLine =
+                    std::get<ClientInputDelayLineMapFor<T>>(m_clientInputDelayLines).at(id);
+
+                if (step.getStepKind() != StepKind::Stall)
+                {
+                    delayLine.push(static_cast<int32>(step.getTick()), capture);
+                }
+
+                typename T::InputType applied = resolveDelayedInput(
+                    delayLine, static_cast<int32>(step.getTick()), effectiveDelay, capture);
+
+                SIMLOG(m_logger,
+                    "[CollectInput] id=%u tick=%u source=Provider kind=%s delay=%d",
+                    id, step.getTick(), stepKindName(step.getStepKind()), effectiveDelay);
 
                 if (step.getStepKind() == StepKind::Skip)
                     m_reconciliation.template backfillSkippedTick<T>(
@@ -334,12 +466,14 @@ public:
                 if (step.getStepKind() != StepKind::Stall)
                 {
                     m_reconciliation.template pushPredictionTick<T>(id, step.getTick());
-                    m_reconciliation.template pushPredictionInput<T>(id, input);
+                    m_reconciliation.template pushPredictionInput<T>(id, applied);
+                    // ORIGINAL capture, current tick — see above. Do not pass
+                    // `applied` here.
                     std::get<PendingInputQueueMapFor<T>>(m_pendingInputQueues)
-                        .at(id).enqueue(step.getTick(), input);
+                        .at(id).enqueue(step.getTick(), capture);
                 }
 
-                map.emplace(id, std::move(input));
+                map.emplace(id, std::move(applied));
             }
             else if (auto qit = queueMap.find(id); qit != queueMap.end())
             {
@@ -443,6 +577,23 @@ public:
                 queue.clear();
             }
         });
+
+        // [T9 part 3] The delay line is keyed by CAPTURE TICK against the
+        // pre-resync prediction clock. After a hard resync that clock has jumped,
+        // so those keys describe ticks that no longer mean what they meant, and a
+        // surviving capture would be read at the wrong tick for `effectiveDelay`
+        // ticks. Dropping them re-enters the neutral-filled window — the same
+        // well-defined state as session start (part 4), which is exactly why part
+        // 4 is not special-cased to tick 0.
+        forEachTypeMap(m_clientInputDelayLines, [&]<typename T>(auto& perTypeMap) {
+            for (auto& [id, line] : perTypeMap)
+            {
+                SIMLOG(m_logger,
+                    "[TimeResync.WipeInputDelayLine] id=%u newPredictionTick=%u",
+                    id, newPredictionTick);
+                line.clear();
+            }
+        });
     }
 
 private:
@@ -471,6 +622,12 @@ private:
     std::tuple<AuthorityWriterMapFor<SimulatableTs>...>  m_authorityWriters;
     std::tuple<LocalInputSenderMapFor<SimulatableTs>...> m_localInputSenders;
 
+    // [T9 parts 3+4] Client Layer-1 input delay. Populated for provider-owning
+    // ids only; touched exclusively from collectInputAll (physics thread) and
+    // wipeAllForResync.
+    std::tuple<ClientInputDelayLineMapFor<SimulatableTs>...> m_clientInputDelayLines;
+    std::tuple<NeutralInputFor<SimulatableTs>...>            m_clientNeutralInputs;
+
     SimulationObjectStorage<SimulatableTs...>&   m_storage;
     SimulationReconciliation<SimulatableTs...>&  m_reconciliation;
     std::function<void(const char*)>             m_logger;
@@ -483,6 +640,11 @@ private:
     // the future guard until SimulationManager injects TimeConfig::rollbackWindowTicks.
     uint32 m_currentAuthorityTick = 0;
     int32  m_rollbackWindowTicks  = -1;
+
+    // [T9 part 3] Written on the GAME thread (OnRep_ConnectionTier), read once
+    // per tick on the PHYSICS thread. Atomic — and ONLY atomic — for the reasons
+    // spelled out on setClientEffectiveInputDelayTicks. 0 = pre-T9 behaviour.
+    std::atomic<int32> m_clientEffectiveInputDelayTicks{ 0 };
 };
 
 // ---------------------------------------------------------------------------

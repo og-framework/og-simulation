@@ -57,13 +57,73 @@ ClientPredictionClock::AdvanceResult ClientPredictionClock::advancePrediction()
     // ../og-brawler-hit-resolution/netcode_finding_pred_offset_floor.md §3.2.
     const bool pastGuard = (targetTick >= m_config.minTicksBeforeDriftCheck);
 
+    const unsigned int absDrift = drift >= 0 ? static_cast<unsigned int>(drift) : static_cast<unsigned int>(-drift);
+
+    // [T11] PRIORITY ORDER: hard resync > tier-transition rollback debt >
+    // ordinary graduated drift correction. Hoisted above the guard/dead-band
+    // chain so the three cannot fight each other:
+    //
+    //  * A hard resync TELEPORTS the frontier onto authority and wipes the
+    //    caches through the resync callbacks. Any rollback debt describes the
+    //    PRE-teleport frontier, which no longer exists, so it is discarded
+    //    rather than applied on top of the jump (applying both would overshoot
+    //    backwards past authority).
+    //  * Otherwise debt is paid BEFORE drift correction. Both are expressed as
+    //    Stalls, and interleaving them would let a Skip cancel a rollback the
+    //    tier change requires — the tier delay and the prediction offset are
+    //    independent quantities and must not net each other out.
+    if (pastGuard && absDrift > m_config.hardResyncThresholdTicks)
+    {
+        const unsigned int oldTick  = m_predictionTick;
+        m_predictionTick           = targetTick;
+        m_resimulationTick         = targetTick;
+        m_gradualCorrectionCounter = 0;
+        m_pendingRollbackTicks     = 0;
+
+        if (m_logger)
+        {
+            char buf[192];
+            std::snprintf(buf, sizeof(buf),
+                "[Warning] PCTM CPC: hard resync oldTick=%u -> newTick=%u drift=%d",
+                oldTick, targetTick, drift);
+            m_logger(buf);
+        }
+
+        fireResyncCallbacks(targetTick);
+        return AdvanceResult::HardResync;
+    }
+
+    // [T11] Pay down one tick of tier-transition rollback. The mechanism is the
+    // SAME Stall the soft-drift path uses: do not advance this call, so the
+    // frontier falls one tick further behind where it would otherwise have been.
+    //
+    // WHY A STALL AND NOT `m_predictionTick -= delta`. The prediction frontier
+    // is monotonically non-decreasing everywhere except hard resync, and hard
+    // resync fires resync callbacks precisely BECAUSE moving it backwards
+    // invalidates every cache slot above the new value. A silent decrement here
+    // would leave already-populated slots ahead of the frontier that the resim
+    // path would then consume as if they were fresh. Stalling reaches the same
+    // relative position without ever breaking that invariant.
+    if (m_pendingRollbackTicks > 0)
+    {
+        --m_pendingRollbackTicks;
+
+        if (m_logger)
+        {
+            char buf[192];
+            std::snprintf(buf, sizeof(buf),
+                "[Log] PCTM CPC: tier rollback Stall predTick=%u remainingRollback=%u",
+                m_predictionTick, m_pendingRollbackTicks);
+            m_logger(buf);
+        }
+        return AdvanceResult::Stall;
+    }
+
     if (!pastGuard)
     {
         doNormalAdvance(m_predictionTick, m_resimulationTick, &m_logger);
         return AdvanceResult::Normal;
     }
-
-    const unsigned int absDrift = drift >= 0 ? static_cast<unsigned int>(drift) : static_cast<unsigned int>(-drift);
 
     if (absDrift <= m_config.softDriftThresholdTicks)
     {
@@ -71,9 +131,11 @@ ClientPredictionClock::AdvanceResult ClientPredictionClock::advancePrediction()
         doNormalAdvance(m_predictionTick, m_resimulationTick, &m_logger);
         return AdvanceResult::Normal;
     }
-    else if (absDrift <= m_config.hardResyncThresholdTicks)
+    else
     {
-        // Graduated correction zone.
+        // Graduated correction zone. The hard-resync zone was already handled
+        // and returned above (T11 priority hoist), so reaching here means
+        // softDriftThresholdTicks < absDrift <= hardResyncThresholdTicks.
         ++m_gradualCorrectionCounter;
         if (m_gradualCorrectionCounter >= m_config.gradualCorrectionRate)
         {
@@ -117,28 +179,33 @@ ClientPredictionClock::AdvanceResult ClientPredictionClock::advancePrediction()
         doNormalAdvance(m_predictionTick, m_resimulationTick, &m_logger);
         return AdvanceResult::Normal;
     }
-    else
+}
+
+// ---------------------------------------------------------------------------
+// Tier-transition rollback (T11)
+// ---------------------------------------------------------------------------
+
+void ClientPredictionClock::requestTierTransitionRollback(int32_t deltaDelayTicks)
+{
+    // Downward / no-change transitions need no correction — see the header.
+    if (deltaDelayTicks <= 0)
+        return;
+
+    m_pendingRollbackTicks += static_cast<unsigned int>(deltaDelayTicks);
+
+    if (m_logger)
     {
-        // Hard resync: jump straight to target, reset counters, fire callbacks.
-        // Both clocks jump together so isResimulating() returns false after the jump
-        // (the cache wipe from callbacks makes previous resim state irrelevant).
-        const unsigned int oldTick = m_predictionTick;
-        m_predictionTick          = targetTick;
-        m_resimulationTick        = targetTick;
-        m_gradualCorrectionCounter = 0;
-
-        if (m_logger)
-        {
-            char buf[192];
-            std::snprintf(buf, sizeof(buf),
-                "[Warning] PCTM CPC: hard resync oldTick=%u -> newTick=%u drift=%d",
-                oldTick, targetTick, drift);
-            m_logger(buf);
-        }
-
-        fireResyncCallbacks(targetTick);
-        return AdvanceResult::HardResync;
+        char buf[192];
+        std::snprintf(buf, sizeof(buf),
+            "[Log] PCTM CPC: tier rollback requested delta=%d totalPending=%u predTick=%u",
+            static_cast<int>(deltaDelayTicks), m_pendingRollbackTicks, m_predictionTick);
+        m_logger(buf);
     }
+}
+
+unsigned int ClientPredictionClock::getPendingTierRollbackTicks() const
+{
+    return m_pendingRollbackTicks;
 }
 
 unsigned int ClientPredictionClock::getPredictionTick() const
@@ -233,18 +300,26 @@ ClientPredictionClock::DriftAction ClientPredictionClock::evaluateDrift() const
     // WarmupGuard.EvaluateDriftConsistency test pins the two occurrences together.
     const bool pastGuard = (targetTick >= m_config.minTicksBeforeDriftCheck);
 
+    const unsigned int absDrift = drift >= 0 ? static_cast<unsigned int>(drift) : static_cast<unsigned int>(-drift);
+
+    // [T11] Mirror advancePrediction()'s priority order EXACTLY — hard resync,
+    // then rollback debt, then the guard/dead-band chain. This query's whole
+    // contract is "what advancePrediction() would do right now", so a pending
+    // rollback has to be visible here too or the two answers diverge for every
+    // tick between a tier transition and its last paid-down Stall.
+    if (pastGuard && absDrift > m_config.hardResyncThresholdTicks)
+        return DriftAction::HardResync;
+
+    if (m_pendingRollbackTicks > 0)
+        return DriftAction::Stall;
+
     if (!pastGuard)
         return DriftAction::None;
-
-    const unsigned int absDrift = drift >= 0 ? static_cast<unsigned int>(drift) : static_cast<unsigned int>(-drift);
 
     if (absDrift <= m_config.softDriftThresholdTicks)
         return DriftAction::None;
 
-    if (absDrift <= m_config.hardResyncThresholdTicks)
-        return drift > 0 ? DriftAction::Skip : DriftAction::Stall;
-
-    return DriftAction::HardResync;
+    return drift > 0 ? DriftAction::Skip : DriftAction::Stall;
 }
 
 // ---------------------------------------------------------------------------
