@@ -31,6 +31,8 @@
 //               clamps to the window and accepts a partial resim (older ticks
 //               beyond the ring-buffer window are not corrected). Degraded
 //               mobile may raise this up to `rollbackWindowHardCap`.
+//               *** THIS BULLET IS INTENDED DESIGN, NOT SHIPPED BEHAVIOUR —
+//               see the status note below before relying on it. ***
 //   * HardResync — ABSOLUTE FAILSAFE BACKSTOP. The legacy drift threshold,
 //               repurposed: it fires only when the soft cap has failed and the
 //               client ends up further adrift than `rollbackWindowHardCap`
@@ -40,6 +42,35 @@
 // Ordering invariant: `hardResyncThresholdTicks > rollbackWindowHardCap` so the
 // failsafe always fires strictly LATER than the soft cap (clamp before snap).
 // An ordering test asserts this strict inequality.
+//
+// ---------------------------------------------------------------------------
+// STATUS NOTE — the RollbackWindow CLAMP is INTENDED, NOT IMPLEMENTED
+// (recorded 2026-08-04; og-netcode-v2-input-relay T13)
+//
+// "The client clamps to the window and accepts a partial resim" describes an
+// INTENDED mechanism that does not exist in the shipped code. Established by an
+// exhaustive code trace (input-relay review finding A1; ruling recorded in
+// RelayDelaySpectrumDesign.md §7):
+//
+//   - `SimulationReconciliation` contains NO window or clamp logic. The resim
+//     span is "newest landed correction -> prediction frontier"; depth is
+//     bounded only implicitly, by correction-ring capacity.
+//   - The only PRODUCTION consumer of `rollbackWindowTicks` is the SERVER-side
+//     late-input future-guard context (`SimulationManager.h`) — a different
+//     mechanism from the client clamp described above.
+//   - Client-side, `rollbackWindowHardCap` appears solely as a LOG GATE
+//     (`CorrectionCache.h`). It gates a diagnostic; it clamps nothing.
+//
+// The three Stall / Skip / HardResync bullets DO describe shipped behaviour;
+// only the RollbackWindow clamp is aspirational.
+//
+// Building the clamp is genuine DESIGN work, not wiring — the site (naturally
+// the resim-anchor selection) and the partial-resim semantics both have to be
+// specified. It is deliberately DEFERRED to the sparse-state increment, where
+// corrections stop landing every tick and deep resims become real. While state
+// replicates every frame the need is theoretical: resim depth stays ~= client
+// lead + downlink, comfortably under every configured ceiling.
+// ---------------------------------------------------------------------------
 //
 // See OGBrawlerNetworkModelResearch/arch/proposal_ogbrawler_netcode.md §4 for
 // the bounded-depth design rationale.
@@ -81,7 +112,80 @@ struct TimeConfig
 	// = floor; at 150 ms cellular → rawOffset = 12.6 → ceil = 13, floor irrelevant).
 	// Default: 4 (= softDriftThresholdTicks + 1 at current defaults; guarantees
 	// dead-band lower bound sits at authorityTick + 1).
+	//
+	// NOTE (T26a): this floor is ALSO what the no-RTT-sample path of
+	// getPredictionOffsetTicks() returns. It is a structural invariant guard
+	// ("the client predicts forward"), not an estimate, so it holds whether or
+	// not an RTT estimate exists yet. See NetworkTimeEstimator.cpp.
 	uint32_t predOffsetFloorTicks = 4;
+
+	// -------------------------------------------------------------------------
+	// Outlier RTT rejection (NetworkTimeEstimator) — og-netcode-v2-input-relay T26b
+	// -------------------------------------------------------------------------
+	// WHAT THESE FIVE FIELDS EXIST FOR. UE measures RTT as
+	// `CurrentTime - OutLagTime[Index]` with `CurrentTime = FApp::GetCurrentTime()`
+	// — FRAME-START time. A frame hitch delays ack processing and that delay lands
+	// straight in the sample, so a loopback session with 5-10 ms emulated lag can
+	// report a ~1-SECOND RTT purely because the game thread stalled. Pre-T26b
+	// updateRTT believed it unconditionally: jitterMultiplier doubled the
+	// excursion into the offset and jitterSmoothingAlpha made recovery take
+	// seconds. The engine hands us an obviously-bad number; the estimator's job is
+	// to not believe it. Full rationale, including why the gate is one-sided and
+	// what it costs, lives at the gate itself in NetworkTimeEstimator.cpp.
+	//
+	// The mechanism is NOT a clamp: an implausible sample is REJECTED (it does not
+	// move either EMA), matching the T21 validity gate's doctrine in the same
+	// function. `rttOutlierConsecutiveLimit` is what stops that being a bug — see
+	// its comment.
+
+	// Multiplicative half of the plausibility bound: a sample is implausible when
+	// it exceeds `rttOutlierMultiplier * smoothedRTT + rttOutlierMarginSeconds`.
+	// 4x is deliberately loose — this gate is aimed at 100x frame-hitch artifacts,
+	// not at trimming ordinary jitter, and anything under 4x the current estimate
+	// is inside what jitterMultiplier * smoothedJitter is already there to cover.
+	// Default: 4.0
+	double rttOutlierMultiplier = 4.0;
+
+	// Additive half of the same bound. Without it the multiplicative term collapses
+	// on LAN: at a 0.5 ms smoothed RTT, 4x is 2 ms, which would reject an entirely
+	// ordinary 10 ms reading. 30 ms is above any plausible loopback/LAN excursion
+	// and far below the ~1 s artifacts being filtered.
+	// Default: 0.030 (seconds)
+	double rttOutlierMarginSeconds = 0.030;
+
+	// COLD START. The first sample seeds m_smoothedRTT VERBATIM, so the relative
+	// bound above has nothing to compare against; the seed is instead gated by
+	// this absolute ceiling. Chosen over accept-then-correct because T21 showed the
+	// seed is the single most damaging value in the estimator — it is latched, and
+	// every subsequent jitter delta is measured against it. A genuinely >500 ms
+	// link is NOT locked out: rttOutlierConsecutiveLimit re-seeds it after a short
+	// run of consistent readings, so this ceiling costs a fraction of a second on
+	// such links and rejects a hitch-inflated first reading outright.
+	// Default: 0.5 (seconds)
+	double rttOutlierColdStartCeilingSeconds = 0.5;
+
+	// THE ESCAPE HATCH — the field that makes this a filter rather than a bug.
+	// A filter that never lets the estimate move cannot follow a GENUINE step
+	// change in network conditions. After this many CONSECUTIVE implausible
+	// samples the estimator concludes the level really has moved and RE-SEEDS
+	// (smoothedRTT = the sample, jitter = 0), exactly as it would on a first
+	// sample. A single hitch is isolated and never reaches the limit; a real step
+	// is sustained and always does. ~30 samples is ~0.3 s at the 100 Hz timing
+	// relay — longer than a hitch's inflated-ack backlog, short enough that a real
+	// step is absorbed in well under a second.
+	// 0 or 1 DISABLES the filter (the first implausible sample is accepted
+	// immediately), which is the degenerate setting for A/B measurement.
+	// Default: 30
+	uint32_t rttOutlierConsecutiveLimit = 30;
+
+	// OBSERVABILITY. A silent reject hides a genuine RTT step change exactly as
+	// well as it hides a hitch artifact, so rejections are counted per window and
+	// summarised in ONE log line per window that contains any. Sized to bound log
+	// volume at roughly one line per 6 s at the 100 Hz timing relay even if the
+	// ping source misbehaves continuously. 0 disables the window summary; the
+	// running totals stay available through the estimator's accessors either way.
+	// Default: 600 (samples)
+	uint32_t rttOutlierLogWindowSamples = 600;
 
 	// -------------------------------------------------------------------------
 	// Drift correction (ClientPredictionClock)
@@ -96,6 +200,9 @@ struct TimeConfig
 	// FAILSAFE BACKSTOP ONLY — primary clamping is `rollbackWindowTicks` /
 	// `rollbackWindowHardCap`; this fires only when the soft cap fails. MUST
 	// satisfy `hardResyncThresholdTicks > rollbackWindowHardCap`.
+	// (That "primary clamping" is INTENDED, NOT IMPLEMENTED — see the ADR status
+	// note at the top of this file. This backstop IS live and, today, the only
+	// shipped bound of the three.)
 	// See `rollbackWindowTicks` / `rollbackWindowHardCap` for the primary caps.
 	// Default: 21
 	uint32_t hardResyncThresholdTicks = 21;
@@ -127,12 +234,24 @@ struct TimeConfig
 	// When a server correction would require resimulating more than this many
 	// ticks, the client clamps to the window and accepts a partial resim.
 	// Derived from the Quantum formula on OGBrawler's cellular profile.
+	//
+	// THE CLIENT-SIDE CLAMP IS INTENDED, NOT IMPLEMENTED (ADR status note at the
+	// top of this file; ruling in RelayDelaySpectrumDesign.md §7). The field IS
+	// live — but its only production consumer is the SERVER-side late-input
+	// future-guard context, not a client resim clamp. Deferred to the
+	// sparse-state increment.
 	// Default: 12
 	int32_t rollbackWindowTicks = 12;
 
 	// Degraded-mobile maximum that C.2 tier escalation can raise the soft cap to.
 	// `rollbackWindowTicks` may grow up to this ceiling on poor connections.
 	// For the failsafe backstop, see `hardResyncThresholdTicks`.
+	//
+	// THE ESCALATION THIS BOUNDS IS INTENDED, NOT IMPLEMENTED (ADR status note at
+	// the top of this file; RelayDelaySpectrumDesign.md §7): nothing raises
+	// `rollbackWindowTicks` toward this ceiling today. Client-side this value is
+	// read only as a LOG GATE (`CorrectionCache.h`) and as T26's deliberate flat
+	// release gate — both real, neither a clamp.
 	// Default: 20
 	int32_t rollbackWindowHardCap = 20;
 
@@ -145,6 +264,107 @@ struct TimeConfig
 	// Config/DefaultEngine.ini AsyncFixedTimeStepSize.
 	// Default: 3
 	int32_t redundancyDepthTicks = 3;
+
+	// -------------------------------------------------------------------------
+	// Outbound input relay (FRelayedInputRing) — og-netcode-v2-input-relay
+	// -------------------------------------------------------------------------
+
+	// Entry count of the OUTBOUND relay ring — how many of a character's most
+	// recent (captureTick, dA, input) entries the server keeps replicated to the
+	// other clients. NOT the same knob as `redundancyDepthTicks` above: that one
+	// sizes the INBOUND client->server redundancy bundle. The two directions have
+	// different payloads and different failure modes and are tuned separately.
+	//
+	// SIZING RULE (RelayDelaySpectrumDesign.md §8.2): once the delay floor is
+	// above zero, a peer READS this ring on a schedule (`captureTick + dA`), so
+	// every capture tick that never made it onto the wire between two successful
+	// replications is a scheduled MISS. Therefore
+	//
+	//     depth >= (measured ticks between successful relay replications) + margin
+	//
+	// That measurement does not exist yet — the T9 relay-cadence probe produces it
+	// (its acceptance criterion is to emit a measured `depth >= gap_p99 + margin`
+	// recommendation). UNTIL THEN THE DEFAULT IS 1: at floor 0 the scheduled read
+	// nearly always misses anyway and falls back to the peer's last-known input,
+	// which is the degenerate, no-bandwidth-increase behaviour this increment
+	// ships. Do not raise this on intuition — raise it against the probe's number.
+	//
+	// DELIBERATELY INDEPENDENT OF `relayDelayFloorTicks` (§11 Q3): the floor sets
+	// how far ahead inputs are scheduled, this sets how much history survives a
+	// replication gap. A `depth = f(floor)` derivation was considered and REJECTED
+	// for now — it cannot be written honestly before the T9 cadence measurement
+	// exists. Raising the floor without raising this simply means more scheduled
+	// misses (self-healed by the next correction), not a correctness break.
+	//
+	// Clamped to [1, relayedInputRing::kMaxDepth = 8] at the write site: 0 would
+	// silently disable the relay, and the upper bound is the per-character wire
+	// budget (RelayedInputRingCodec.h).
+	// Default: 1
+	int32_t relayRedundancyDepthTicks = 1;
+
+	// THE FLOOR LEVER — the session-scoped minimum effective Layer-1 input delay,
+	// in ticks. (RelayDelaySpectrumDesign.md §3, §6, §10, §11 Q1/Q2/Q5.)
+	//
+	// WHAT IT BUYS. A peer can only simulate a relayed input AT its scheduled tick
+	// if the input reached that peer before the peer's frontier got there. The
+	// trip left to cover is a property of the RECEIVER (§3.2):
+	//
+	//     D >= lead_B + downlink_B  ~=  RTT_B (+ jitter/wobble margin)
+	//
+	// The per-connection tier derives its delay from the SENDER's wire, which is
+	// the wrong variable for receiver coverage — hence this separate, session-wide
+	// quantity. Raising it moves the whole session along the spectrum from
+	// "extrapolate + correct" toward "everyone applies the same input on the same
+	// tick"; the price is that EVERY player's own felt input lag rises to at least
+	// this many ticks (§6). That is why the knob defaults to 0 and is tuned by
+	// playtest, not by intuition.
+	//
+	// SIZING GUIDE at 60 Hz (§3.3; m = jitter + frontier-wobble margin, ~2-3):
+	//
+	//     cover-to-RTT:  30 ms -> >= 2+m    80 ms -> >= 5+m    150 ms -> >= 9+m
+	//
+	// so "the floor covers decent connections" lands around 7-8. NO PRESET SHIPS:
+	// exact values wait on the T9 relay-cadence probe and playtest (§11 Q2).
+	//
+	// HOW IT COMPOSES. It is a MAX, never a sum, and it is applied at every site
+	// that derives an effective input delay, through the ONE shared helper
+	// `applyRelayDelayFloor` (ConnectionTierTable.h):
+	//
+	//     effective = max(relayDelayFloorTicks, <tier-or-fallback value>)
+	//
+	// A nonzero floor therefore DOMINATES `lanZeroDelayOverride` as well — see the
+	// note at that field.
+	//
+	// UNIFORM-D FAIRNESS MODE (§11 Q5) is a config VALUE, not a feature: once
+	// `relayDelayFloorTicks >= max(rttTierInputDelays)` every derivation path —
+	// tier, LAN override, and the no-tier `forcedInputLatencyTicks` fallback —
+	// collapses to exactly this value, so every sender is scheduled with the same
+	// D and no player is advantaged by their connection.
+	//
+	// CLAMPED, and the ceiling is DERIVED, not a literal (review finding A5):
+	// effective values are capped at
+	// `kClientInputDelayLineCapacityTicks - rollbackWindowHardCap` (= 64 - 20 = 44
+	// at current defaults). Beyond that cap the client's own capture for the
+	// scheduled tick has already been evicted from `ClientInputDelayLine` before
+	// it can be consumed, and the whole scheduled regime silently degenerates
+	// instead of failing loudly. The clamp is enforced at BOTH intake points (the
+	// ini override at the composition root and the client's floor OnRep) and once
+	// more on every read inside `applyRelayDelayFloor` — the same belt-and-braces
+	// shape `clampConnectionTierIndex` uses for the replicated tier.
+	//
+	// SOURCE OF TRUTH + DISTRIBUTION. The SERVER owns the value (optionally
+	// overridden from `[OGNetcode] RelayDelayFloorTicks` in the ini at the
+	// composition root) and replicates it to every client as its own uint8
+	// UPROPERTY on `ASimulationTimingRelay` — session-scoped state on the
+	// session-scoped vehicle. Clients never derive it locally; a client's copy of
+	// this field is written from that OnRep. §11 Q6's deferred dynamic-floor policy
+	// needs no new mechanism: it writes this field and the property again.
+	//
+	// RELATED KNOB: `relayRedundancyDepthTicks` above. Deliberately independent
+	// (§11 Q3) — the floor sets how far ahead inputs are scheduled, the depth sets
+	// how much history survives a replication gap.
+	// Default: 0 (degenerate — today's behaviour, byte-for-byte)
+	int32_t relayDelayFloorTicks = 0;
 
 	// -------------------------------------------------------------------------
 	// Test harness mode selector (Catch2 determinism harness)
@@ -175,6 +395,13 @@ struct TimeConfig
 	// every array describes the same connection quality bucket. Keeping them as
 	// parallel arrays (rather than an array-of-struct) matches the proposal §11
 	// appendix layout and keeps each row independently tunable from config.
+	//
+	// C2 AMENDMENT (2026-08-03, RelayDelaySpectrumDesign.md §6/§9): every effective
+	// input delay derived below is FLOORED by `relayDelayFloorTicks` —
+	// `max(floor, tier-or-fallback)` — through the single shared helper
+	// `applyRelayDelayFloor`. The tier remains the per-wire quantity; the floor is
+	// the session-wide receiver-coverage minimum. At the shipped floor of 0 the
+	// max is the identity, so everything documented in this section is unchanged.
 	// -------------------------------------------------------------------------
 
 	// Baseline Layer-1 input-delay in ticks, applied when NO per-connection tier
@@ -183,6 +410,17 @@ struct TimeConfig
 	// per-tier value in `rttTierInputDelays` REPLACES this baseline — the two are
 	// NOT additive (locked 2026-07-19, backlog C2; the earlier additive draft
 	// algebraically cancelled to a constant).
+	//
+	// C2 AMENDED (RelayDelaySpectrumDesign.md §6 / §9, 2026-08-03). The replacement
+	// rule is now floored by the session lever:
+	//
+	//     effectiveDelay = max(relayDelayFloorTicks, <tier-or-fallback value>)
+	//
+	// so THIS baseline is itself floored on the no-tier path. Both no-tier
+	// fallback sites (`ServerInputDelayQueue::effectiveDelay` and
+	// `ReplicatedTierConsumer::effectiveInputDelayTicks`) route this field through
+	// `applyRelayDelayFloor`; with the default floor of 0 the max is the identity
+	// and the pre-amendment value is preserved exactly.
 	// Deliberately trading a small constant input lag for the ability to absorb
 	// short network hiccups without a visible re-simulation pop.
 	// Default: 2
@@ -201,7 +439,10 @@ struct TimeConfig
 
 	// Per-tier Layer-1 input delay, in ticks. Indexed by tier index 0..3. This IS
 	// the effective input delay once a tier is known (see `forcedInputLatencyTicks`
-	// for the no-tier fallback). Worse tiers buy more delay, which hides more of
+	// for the no-tier fallback), subject to the session floor: the C2 replacement
+	// rule reads `max(relayDelayFloorTicks, rttTierInputDelays[tier])` since the
+	// 2026-08-03 amendment, applied inside `tierInputDelayTicks`. Worse tiers buy
+	// more delay, which hides more of
 	// the network round-trip behind the local input latency.
 	// MUST be monotonically non-decreasing — a worse connection must never get a
 	// SHORTER delay, which would defeat the escalation entirely.
@@ -215,6 +456,18 @@ struct TimeConfig
 	// `rollbackWindowHardCap` — tier 3 cannot escalate past the absolute failsafe,
 	// otherwise the soft cap would overtake the hard cap and the bounded-depth
 	// ordering invariant (clamp before snap) would silently invert.
+	//
+	// INTENDED API, NO CONSUMER — the escalation described above is INTENDED, NOT
+	// IMPLEMENTED (ADR status note at the top of this file; ruling in
+	// RelayDelaySpectrumDesign.md §7). This array is defined, ordering-tested and
+	// replicated to the client, but the client-side soft clamp that would read it
+	// does not exist, so it has ZERO production call sites. Its three lookup
+	// helpers — `tierRollbackCeiling` / `lookupRollbackCeiling`
+	// (ConnectionTierTable.h) and `effectiveRollbackCeiling`
+	// (ReplicatedTierConsumer.h) — are unconsumed for the same reason. Wiring is
+	// deferred to the sparse-state increment; this is kept (not deleted) because
+	// the R-P1 configurability rule requires every proposal-named constant to
+	// have a TimeConfig home before its consumer ships.
 	// Default: { 6, 9, 12, 20 }
 	int32_t rttTierRollbackCeilings[4] = { 6, 9, 12, 20 };
 
@@ -251,6 +504,16 @@ struct TimeConfig
 	// link there is no round-trip to hide, so any forced delay is pure added input
 	// lag with no benefit. Only tier 0 is affected — a bad connection on a LAN
 	// session still gets its tier's delay.
+	//
+	// DOMINATED BY A NONZERO `relayDelayFloorTicks` (RelayDelaySpectrumDesign.md
+	// §6). The floor is applied AFTER this branch, so `max(floor, 0) == floor`
+	// wins. That is the correct precedence, not a conflict: on a pure-LAN session
+	// the floor is configured 0 and this override behaves exactly as before, while
+	// on a MIXED session a LAN sender must still be schedulable by WAN receivers —
+	// and a sender applying its own input at capture+0 while its peers schedule it
+	// at capture+floor is precisely the two-ends-disagree bug the floor exists to
+	// prevent. See `tierInputDelayTicks` in ConnectionTierTable.h, where the
+	// ordering is implemented.
 	// Default: false
 	bool lanZeroDelayOverride = false;
 

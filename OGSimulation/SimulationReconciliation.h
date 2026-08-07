@@ -16,6 +16,54 @@
 #pragma optimize("", off)
 
 // ---------------------------------------------------------------------------
+// [og-netcode-v2-input-relay T6 / design D3] AppliedCaptureRef — the answer to
+// "which capture tick did the authority apply at tick T for this character".
+//
+// This is the ONE piece of reconciliation-owned data the relocated
+// SimulationNetSync::collectResimInputAll consumes (T6 placement ruling, Option
+// C). It deliberately exposes NO cache and NO store: reconciliation answers the
+// D3 question and knows nothing about how netsync then resolves an input from it.
+//
+// FOUR KINDS, THREE OUTCOMES. The ruling names three — ref / sentinel / absent —
+// and `Absent` is split in two here because the two halves must produce different
+// BEHAVIOUR at the call site while meaning the same thing to this class:
+//
+//   NoSlot   this tick is outside the character's cache window, so the character
+//            is not part of this resim at all. Resim's state restore
+//            (prepareResimAll) skips such a character for the same reason, so
+//            handing the integrator an input for it would integrate an
+//            un-restored state. The caller must emit NO input — which is exactly
+//            what the pre-T6 body did by only emplacing on a cache hit.
+//   NoRef    the slot exists but no correction has landed in it. Covers the
+//            prediction FRONTIER (ticks newer than the last correction) and
+//            correction HOLES (an intermediate tick whose correction was never
+//            replicated — routine, since the net update rate is below the sim
+//            rate). Both re-derive; neither is a sentinel.
+//   Sentinel a correction landed and named NO capture: the authority substituted
+//            an input (RemoteMoveQueue underrun, D1). Resolves to the injected
+//            game zero — the value T17 made the authority actually integrate.
+//   Ref      a correction landed carrying a real capture tick. `captureTick` is
+//            that tick, and it WINS over any relay-entry schedule stamp
+//            (RelayDelaySpectrumDesign.md §5.3 — see the precedence note at the
+//            resolution site).
+// ---------------------------------------------------------------------------
+
+enum class AppliedCaptureRefKind : uint8
+{
+    NoSlot,
+    NoRef,
+    Sentinel,
+    Ref,
+};
+
+struct AppliedCaptureRef
+{
+    AppliedCaptureRefKind kind        = AppliedCaptureRefKind::NoSlot;
+    // Meaningful only when `kind == Ref`; the sentinel otherwise.
+    uint32                captureTick = kNoInputCaptureTick;
+};
+
+// ---------------------------------------------------------------------------
 // SimulationReconciliation<SimulatableTs...>
 //
 // Owns per-simulatable StateCorrectionCache instances and every operation that
@@ -70,23 +118,29 @@ public:
         getCacheFor<T>(id).pushPredictionTick(tick);
     }
 
-    template <typename T>
-    void pushPredictionInput(unsigned int id, const typename T::InputType& input)
-    {
-        getCacheFor<T>(id).pushPredictionInput(input);
-    }
+    // [og-netcode-v2-input-relay T16] `pushPredictionInput` — the wrapper around
+    // StateCorrectionCache's input-column writer — IS GONE with the column. Its
+    // two production callers were both arms of SimulationNetSync::collectInputAll;
+    // both now push only the prediction TICK, which is what allocates the slot.
+    // A cache slot is state + the applied-capture-tick ref; it holds no input
+    // value, and nothing in this class can put one there.
 
-    // Called on StepKind::Skip — back-fills the skipped tick with a zero input and prior state.
+    // Called on StepKind::Skip — back-fills the skipped tick with the prior state.
     // skippedTick is step.getTick() - 1 (the tick that was jumped over).
-    // Must push tick then input before state: pushPredictionState writes into the slot
+    // Must push the tick before the state: pushPredictionState writes into the slot
     // for the current prediction tick, so the tick advance must happen first.
+    //
+    // [T16] The `pushPredictionInput(InputType{})` that used to sit between them is
+    // gone with the column. Note it was a VALUE-INITIALISED input, not the injected
+    // game zero — the (0,0,0)-forward poison T17 hunted elsewhere. Removing the
+    // column removes that write entirely rather than having to fix it, since the
+    // backfilled slot exists to be re-derivable, not to carry a remembered input.
     template <typename T>
     void backfillSkippedTick(unsigned int id, uint32 skippedTick, const typename T::StateType& priorState)
     {
         SIMLOG(m_logger, "[TimeResync.BackfillSkipped] id=%u skippedTick=%u", id, skippedTick);
         auto& cache = getCacheFor<T>(id);
         cache.pushPredictionTick(skippedTick);
-        cache.pushPredictionInput(typename T::InputType{});
         cache.pushPredictionState(priorState);
     }
 
@@ -129,23 +183,54 @@ public:
     // Correction injection — called from OnRep_-dispatched lambdas (game thread)
     // -----------------------------------------------------------------------
 
+    // [og-netcode-v2-input-relay T4 / design D3] The correction now carries a
+    // SECOND scalar beside the tick: the capture tick of the input the authority
+    // applied when it produced this state (kNoInputCaptureTick when it substituted
+    // one). It is stashed in the SAME cache slot as the state it corrects, so a
+    // later resim can ask "which input produced tick T" for every tick it replays
+    // rather than only for the newest correction — the reason a single scalar
+    // stash would not do (T6 consumes it).
+    //
+    // Read through the buffer's getAppliedCaptureTick rather than a second
+    // readInto: the ref is a fixed-offset header field, and the state read has
+    // already paid for the composite.
+    //
+    // [og-netcode-v2-input-relay T24] `outVerdict` forwards the cache's existing
+    // prediction-vs-authority verdict to the caller. It is DEFAULTED and purely
+    // observational — see CorrectionInsertVerdict in CorrectionCache.h for why the
+    // verdict has to leave the cache at all (the cache is id-agnostic; the
+    // attribution this initiative needs is by id AND by character class, and
+    // neither fact exists down there).
+    //
+    // THIS CLASS IS NOT THE PLACE THE VERDICT IS INTERPRETED, and deliberately so.
+    // It knows the `id` but not whether that id is locally controlled or a remote
+    // proxy: provider-presence lives in SimulationNetSync's `m_inputProviders`, and
+    // reconciliation owning a second answer to "is this character remote" is
+    // exactly the duplicate-truth shape the T6/T16 retirements exist to avoid. So
+    // this method only relays.
     template <typename T, typename BufferT>
-    void injectCorrectionState(unsigned int id, const BufferT& buffer)
+    void injectCorrectionState(unsigned int id, const BufferT& buffer,
+                               CorrectionInsertVerdict* outVerdict = nullptr)
     {
         typename T::StateType state;
         const uint32 tick = buffer.readInto(state);
-        SIMLOG(m_logger, "[InjectCorrectionState] id=%u tick=%u", id, tick);
-        getCacheFor<T>(id).tryInsertingCorrectState(std::move(state), tick);
+        const uint32 appliedCaptureTick = buffer.getAppliedCaptureTick();
+        SIMLOG(m_logger, "[InjectCorrectionState] id=%u tick=%u appliedCaptureTick=%u",
+            id, tick, appliedCaptureTick);
+        getCacheFor<T>(id).tryInsertingCorrectState(
+            std::move(state), tick, appliedCaptureTick, outVerdict);
     }
 
-    template <typename T, typename BufferT>
-    void injectCorrectionInput(unsigned int id, const BufferT& buffer)
-    {
-        typename T::InputType input;
-        const uint32 tick = buffer.readInto(input);
-        SIMLOG(m_logger, "[InjectCorrectionInput] id=%u tick=%u", id, tick);
-        getCacheFor<T>(id).insertCorrectionInput(std::move(input), tick);
-    }
+    // [og-netcode-v2-input-relay T8] `injectCorrectionInput` IS GONE. It was the
+    // client-side half of the SERVER->CLIENT correction-INPUT channel: decode the
+    // replicated (tick, input) payload, stash it in the cache slot. The whole
+    // channel is retired — the server no longer writes it (sendCorrectionAll), the
+    // component no longer replicates it, and StateCorrectionCache no longer has an
+    // insertion point for it. A remote character's input now travels on the relay
+    // ring and is resolved by CAPTURE TICK, not by application tick.
+    //
+    // `injectCorrectionState` above is untouched and carries the T4
+    // applied-capture-tick ref, which is what replaced this channel's usefulness.
 
     // -----------------------------------------------------------------------
     // Divergence check — called by SimulationManager (replaces checkIsSimilarAll)
@@ -221,50 +306,119 @@ public:
     }
 
     // -----------------------------------------------------------------------
-    // Resim replay input — called by SimulationManager before integrate in resim.
-    // Lives here (not on NetSync) because resim inputs come purely from the cache.
+    // Resim replay input — RELOCATED to SimulationNetSync by T6.
     // -----------------------------------------------------------------------
-
-    ResolvedInputs<SimulatableTs...> collectResimInputAll(uint32 simTick)
-    {
-        ResolvedInputs<SimulatableTs...> inputs;
-        m_storage.forEachSimulatable([&](unsigned int id, auto& simulatable) {
-            using T = std::remove_reference_t<decltype(simulatable)>;
-            auto& cache = getCacheFor<T>(id);
-            auto& map   = std::get<std::unordered_map<unsigned int, typename T::InputType>>(inputs);
-            const uint32 idx = cache.getCacheIndex(simTick);
-            if (idx != StateCorrectionCache<typename T::StateType, typename T::InputType>::InvalidCacheIndex)
-                map.emplace(id, cache.getInput(idx));
-        });
-        return inputs;
-    }
+    //
+    // `collectResimInputAll` used to live here, and its own comment said why:
+    // "resim inputs come purely from the cache". T6 falsified that premise. The
+    // resim input is now resolved from the client's own delay lines, the relayed-
+    // input stores and the injected neutrals — all NetSync-owned — and only the
+    // JOIN KEY comes from the cache. So the method moved to the class that owns
+    // the sources, and this class kept exactly one narrow query
+    // (getAppliedCaptureTickRef, below) that hands over that key and nothing else.
+    //
+    // Do not re-add a resim collector here. If a future task needs one, it needs
+    // the stores, and the stores are not this class's business.
 
     // -----------------------------------------------------------------------
-    // Remote-client input lookup — called by SimulationNetSync::collectInputAll
-    // for simulatables with no local input provider (remote client branch).
+    // The cache input column — RETIRED. There are no input readers here.
     // -----------------------------------------------------------------------
+    //
+    // [og-netcode-v2-input-relay T8] `getLastCorrectionInput` IS GONE, at this
+    // level and on StateCorrectionCache. This section's old heading — "remote-
+    // client input lookup, called by collectInputAll for simulatables with no
+    // local input provider" — described the pre-T7 proxy branch, which now
+    // resolves through the relay store. With the correction-input channel retired
+    // there is nothing left to flag an input slot as server-sourced, so the
+    // accessor could only have answered nullopt for the rest of time: a call that
+    // compiles, looks authoritative and quietly always fails.
+    //
+    // [og-netcode-v2-input-relay T16] `getLatestInput` IS ALSO GONE, and with it
+    // the COLUMN both of them read. T8 left it standing under "remove what T8
+    // makes FALSE, leave what T8 makes merely UNUSED" — it still returned real,
+    // freshly-written data, it just had no caller. T16 removes the writer, so
+    // there is nothing left to return.
+    //
+    // WHAT SURVIVES THIS SECTION, and it is the point of the whole retirement:
+    // `findInputCache` below (still the route for every accessor here — it is NOT
+    // an input reader despite the name, which is pre-initiative), plus the two
+    // applied-capture-tick queries. A slot answers "WHICH capture the authority
+    // applied at tick T", never "what that capture WAS". The value comes from
+    // ClientInputDelayLine (local) or RelayedInputStore (remote), both owned by
+    // SimulationNetSync.
 
+    // [T4 / D3] The join key stored for `tick` — "which capture tick did the
+    // authority apply when it produced the state it corrected us to at `tick`".
+    //
+    // Returns nullopt when the tick is outside this character's cache window (no
+    // slot to have stored anything), and kNoInputCaptureTick when a slot exists
+    // but names no capture — the two are deliberately distinguishable: the first
+    // means "cannot answer", the second means "the authority itself had no client
+    // capture behind that tick" (D1), which T6 resolves to game-zero.
+    //
+    // Routed through findInputCache (nullable) so it is safe to call on the
+    // authority, where no correction caches are allocated at all.
     template <typename T>
-    std::optional<typename T::InputType> getLastCorrectionInput(unsigned int id)
-    {
-        return getCacheFor<T>(id).getLastCorrectionInput();
-    }
-
-    // Returns the input at the current prediction slot for the given simulatable
-    // (live for LOCAL characters, held-constant server correction for REMOTE
-    // simulated proxies). Sibling to getLastCorrectionInput but reads the fresh
-    // prediction-slot input instead of walking back for server-flagged slots.
-    // Routed through findInputCache (nullable) so it returns nullopt safely on
-    // the authority, where no correction caches are allocated.
-    template <typename T>
-    std::optional<typename T::InputType> getLatestInput(unsigned int id) const
+    std::optional<uint32> getAppliedCaptureTick(unsigned int id, uint32 tick) const
     {
         const auto* cache = findInputCache<T>(id);
-        return cache != nullptr ? cache->getLatestInput() : std::nullopt;
+        if (cache == nullptr)
+            return std::nullopt;
+
+        const uint32 idx = cache->getCacheIndex(tick);
+        if (idx == StateCorrectionCache<typename T::StateType, typename T::InputType>::InvalidCacheIndex)
+            return std::nullopt;
+
+        return cache->getAppliedCaptureTick(idx);
+    }
+
+    // [T6] THE ONE QUERY SimulationNetSync::collectResimInputAll consumes — the
+    // classified form of the raw accessor above. See the AppliedCaptureRef block
+    // at the top of this header for what each kind means and why `Absent` is two
+    // kinds rather than one.
+    //
+    // WHY BOTH EXIST. getAppliedCaptureTick (T4) reports the SLOT VALUE and is the
+    // accessor T4's own wire/stash tests assert against; it cannot tell a
+    // correction that named no capture from a slot no correction ever reached,
+    // because both hold the sentinel. This one adds that single discriminator (the
+    // slot's correction flag) and is the only form safe to dispatch a resolution
+    // table on. Neither exposes the cache.
+    //
+    // Routed through the nullable findInputCache, so it is safe on the authority
+    // (no caches allocated there) — where it answers NoSlot for every id, which is
+    // correct: the authority never resimulates.
+    template <typename T>
+    AppliedCaptureRef getAppliedCaptureTickRef(unsigned int id, uint32 simTick) const
+    {
+        const auto* cache = findInputCache<T>(id);
+        if (cache == nullptr)
+            return AppliedCaptureRef{};
+
+        const uint32 idx = cache->getCacheIndex(simTick);
+        if (idx == StateCorrectionCache<typename T::StateType, typename T::InputType>::InvalidCacheIndex)
+            return AppliedCaptureRef{};
+
+        // An uncorrected slot is NOT a sentinel — it is "no answer yet". Checking
+        // the flag before the value is what keeps the prediction frontier (and any
+        // never-replicated intermediate tick) out of the sentinel row.
+        if (!cache->containsCorrectTick(idx))
+            return AppliedCaptureRef{ AppliedCaptureRefKind::NoRef, kNoInputCaptureTick };
+
+        const uint32 ref = cache->getAppliedCaptureTick(idx);
+        return ref == kNoInputCaptureTick
+            ? AppliedCaptureRef{ AppliedCaptureRefKind::Sentinel, kNoInputCaptureTick }
+            : AppliedCaptureRef{ AppliedCaptureRefKind::Ref, ref };
     }
 
     // Returns a pointer to the correction cache for the given simulatable type and id,
     // or nullptr if no cache exists (e.g. on the authority, where caches are not allocated).
+    //
+    // [T16] THE NAME IS HISTORICAL — it predates this initiative and no longer
+    // describes anything about inputs. This is the nullable route every accessor
+    // above takes, and in particular the route for getAppliedCaptureTickRef, which
+    // is T6's join-key query and the single most load-bearing read in the resim
+    // path. It was NOT retired with the input column. Renaming it is a separate,
+    // purely cosmetic change and was deliberately not bundled into a deletion task.
     template <typename T>
     const StateCorrectionCache<typename T::StateType, typename T::InputType>* findInputCache(unsigned int id) const
     {
@@ -306,7 +460,9 @@ concept SimulationReconciliationConcept = requires(
     { t.wipeAllForResync(tick) };
     { t.prepareResimAll(tick) };
     { t.applyResimAll() };
-    { t.collectResimInputAll(tick) } -> std::convertible_to<ResolvedInputs<SimulatableTs...>>;
+    // [T6] collectResimInputAll MOVED to SimulationNetSyncConcept — resim input
+    // resolution is no longer a cache-only operation. See the relocation note in
+    // the class body.
 };
 
 #pragma optimize("", on)

@@ -52,7 +52,12 @@ using PCClockLoggerFn = std::function<void(const char*)>;
     OGSIMULATION_API SimulationTimeStep getPredictionStep() const;
 
     // -----------------------------------------------------------------------
-    // Tier-transition rollback (T11, D5.3)
+    // Input-delay-increase stall (T11, D5.3)
+    //
+    // NOTE ON THE NAME: this mechanism never resimulates anything — it only
+    // declines to advance the prediction frontier for N calls (an AdvanceResult
+    // Stall). It is unrelated to the resimulation-depth machinery in TimeConfig,
+    // which owns the codebase's other vocabulary for "give ticks back".
     // -----------------------------------------------------------------------
 
     // Register the effective-input-delay change produced by an authoritative
@@ -61,7 +66,7 @@ using PCClockLoggerFn = std::function<void(const char*)>;
     // OnRep handler — under Option A that OnRep delta is the only transition
     // signal the client has.
     //
-    // WHY A ROLLBACK AT ALL. An upward transition RAISES the effective input
+    // WHY A STALL AT ALL. An upward transition RAISES the effective input
     // delay: an input captured at tick T now lands at T + newDelay instead of
     // T + oldDelay. Every already-predicted tick ahead of the frontier was
     // computed against the OLD, smaller delay, so the frontier now sits
@@ -76,12 +81,12 @@ using PCClockLoggerFn = std::function<void(const char*)>;
     //
     // ACCUMULATES. Consecutive upward transitions add their deltas: two
     // unpaid transitions owe the sum, never just the most recent one.
-    OGSIMULATION_API void requestTierTransitionRollback(int32_t deltaDelayTicks);
+    OGSIMULATION_API void requestInputDelayIncreaseStall(int32_t deltaDelayTicks);
 
-    // Ticks of rollback still owed. Nonzero means advancePrediction() will
+    // Ticks of stall still owed. Nonzero means advancePrediction() will
     // return Stall on the next call(s) instead of applying ordinary drift
     // correction. Exposed for tests and telemetry.
-    OGSIMULATION_API unsigned int getPendingTierRollbackTicks() const;
+    OGSIMULATION_API unsigned int getRequiredInputDelayIncreaseStallTicks() const;
 
     // -----------------------------------------------------------------------
     // Resimulation
@@ -134,9 +139,9 @@ private:
     unsigned int m_resimulationTick         = 0;
     unsigned int m_gradualCorrectionCounter = 0;  // cycles 0 .. gradualCorrectionRate-1
 
-    // [T11] Unpaid tier-transition rollback, in ticks. Paid down one tick per
+    // [T11] Unpaid input-delay-increase stall, in ticks. Paid down one tick per
     // advancePrediction() call (as a Stall), cleared by a hard resync.
-    unsigned int m_pendingRollbackTicks = 0;
+    unsigned int m_requiredInputDelayIncreaseStallTicks = 0;
 
     std::vector<ResyncCallback> m_resyncCallbacks;
     PCClockLoggerFn m_logger;

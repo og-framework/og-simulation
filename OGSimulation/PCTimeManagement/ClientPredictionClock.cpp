@@ -59,17 +59,17 @@ ClientPredictionClock::AdvanceResult ClientPredictionClock::advancePrediction()
 
     const unsigned int absDrift = drift >= 0 ? static_cast<unsigned int>(drift) : static_cast<unsigned int>(-drift);
 
-    // [T11] PRIORITY ORDER: hard resync > tier-transition rollback debt >
+    // [T11] PRIORITY ORDER: hard resync > input-delay-increase stall debt >
     // ordinary graduated drift correction. Hoisted above the guard/dead-band
     // chain so the three cannot fight each other:
     //
     //  * A hard resync TELEPORTS the frontier onto authority and wipes the
-    //    caches through the resync callbacks. Any rollback debt describes the
+    //    caches through the resync callbacks. Any stall debt describes the
     //    PRE-teleport frontier, which no longer exists, so it is discarded
     //    rather than applied on top of the jump (applying both would overshoot
     //    backwards past authority).
     //  * Otherwise debt is paid BEFORE drift correction. Both are expressed as
-    //    Stalls, and interleaving them would let a Skip cancel a rollback the
+    //    Stalls, and interleaving them would let a Skip cancel a stall the
     //    tier change requires — the tier delay and the prediction offset are
     //    independent quantities and must not net each other out.
     if (pastGuard && absDrift > m_config.hardResyncThresholdTicks)
@@ -78,7 +78,7 @@ ClientPredictionClock::AdvanceResult ClientPredictionClock::advancePrediction()
         m_predictionTick           = targetTick;
         m_resimulationTick         = targetTick;
         m_gradualCorrectionCounter = 0;
-        m_pendingRollbackTicks     = 0;
+        m_requiredInputDelayIncreaseStallTicks = 0;
 
         if (m_logger)
         {
@@ -93,7 +93,7 @@ ClientPredictionClock::AdvanceResult ClientPredictionClock::advancePrediction()
         return AdvanceResult::HardResync;
     }
 
-    // [T11] Pay down one tick of tier-transition rollback. The mechanism is the
+    // [T11] Pay down one tick of input-delay-increase stall. The mechanism is the
     // SAME Stall the soft-drift path uses: do not advance this call, so the
     // frontier falls one tick further behind where it would otherwise have been.
     //
@@ -104,16 +104,16 @@ ClientPredictionClock::AdvanceResult ClientPredictionClock::advancePrediction()
     // would leave already-populated slots ahead of the frontier that the resim
     // path would then consume as if they were fresh. Stalling reaches the same
     // relative position without ever breaking that invariant.
-    if (m_pendingRollbackTicks > 0)
+    if (m_requiredInputDelayIncreaseStallTicks > 0)
     {
-        --m_pendingRollbackTicks;
+        --m_requiredInputDelayIncreaseStallTicks;
 
         if (m_logger)
         {
             char buf[192];
             std::snprintf(buf, sizeof(buf),
-                "[Log] PCTM CPC: tier rollback Stall predTick=%u remainingRollback=%u",
-                m_predictionTick, m_pendingRollbackTicks);
+                "[Log] PCTM CPC: input delay increase Stall predTick=%u remainingStalls=%u",
+                m_predictionTick, m_requiredInputDelayIncreaseStallTicks);
             m_logger(buf);
         }
         return AdvanceResult::Stall;
@@ -182,30 +182,30 @@ ClientPredictionClock::AdvanceResult ClientPredictionClock::advancePrediction()
 }
 
 // ---------------------------------------------------------------------------
-// Tier-transition rollback (T11)
+// Input-delay-increase stall (T11)
 // ---------------------------------------------------------------------------
 
-void ClientPredictionClock::requestTierTransitionRollback(int32_t deltaDelayTicks)
+void ClientPredictionClock::requestInputDelayIncreaseStall(int32_t deltaDelayTicks)
 {
     // Downward / no-change transitions need no correction — see the header.
     if (deltaDelayTicks <= 0)
         return;
 
-    m_pendingRollbackTicks += static_cast<unsigned int>(deltaDelayTicks);
+    m_requiredInputDelayIncreaseStallTicks += static_cast<unsigned int>(deltaDelayTicks);
 
     if (m_logger)
     {
         char buf[192];
         std::snprintf(buf, sizeof(buf),
-            "[Log] PCTM CPC: tier rollback requested delta=%d totalPending=%u predTick=%u",
-            static_cast<int>(deltaDelayTicks), m_pendingRollbackTicks, m_predictionTick);
+            "[Log] PCTM CPC: input delay increase stall requested delta=%d totalPending=%u predTick=%u",
+            static_cast<int>(deltaDelayTicks), m_requiredInputDelayIncreaseStallTicks, m_predictionTick);
         m_logger(buf);
     }
 }
 
-unsigned int ClientPredictionClock::getPendingTierRollbackTicks() const
+unsigned int ClientPredictionClock::getRequiredInputDelayIncreaseStallTicks() const
 {
-    return m_pendingRollbackTicks;
+    return m_requiredInputDelayIncreaseStallTicks;
 }
 
 unsigned int ClientPredictionClock::getPredictionTick() const
@@ -303,14 +303,14 @@ ClientPredictionClock::DriftAction ClientPredictionClock::evaluateDrift() const
     const unsigned int absDrift = drift >= 0 ? static_cast<unsigned int>(drift) : static_cast<unsigned int>(-drift);
 
     // [T11] Mirror advancePrediction()'s priority order EXACTLY — hard resync,
-    // then rollback debt, then the guard/dead-band chain. This query's whole
+    // then stall debt, then the guard/dead-band chain. This query's whole
     // contract is "what advancePrediction() would do right now", so a pending
-    // rollback has to be visible here too or the two answers diverge for every
+    // stall has to be visible here too or the two answers diverge for every
     // tick between a tier transition and its last paid-down Stall.
     if (pastGuard && absDrift > m_config.hardResyncThresholdTicks)
         return DriftAction::HardResync;
 
-    if (m_pendingRollbackTicks > 0)
+    if (m_requiredInputDelayIncreaseStallTicks > 0)
         return DriftAction::Stall;
 
     if (!pastGuard)

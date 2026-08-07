@@ -9,6 +9,8 @@
 #include <type_traits>
 #include <unordered_map>
 
+#include "OGSimulation/Network/ClientInputDelayLine.h"
+#include "OGSimulation/Network/RelayedInputStore.h"
 #include "OGSimulation/PCTimeManagement/TimeConfig.h"
 
 // ---------------------------------------------------------------------------
@@ -123,6 +125,126 @@ inline constexpr int32_t clampConnectionTierIndex(int32_t tierIndex)
     return tierIndex;
 }
 
+// ---------------------------------------------------------------------------
+// THE RELAY DELAY FLOOR (og-netcode-v2-input-relay T11;
+// RelayDelaySpectrumDesign.md §6, §10, §11 Q1/Q5)
+//
+// `TimeConfig::relayDelayFloorTicks` is a SESSION-scoped minimum on the
+// effective Layer-1 input delay, independent of the per-wire tier. It exists
+// because the tier answers the wrong question for input relay: the tier covers
+// the SENDER's uplink (arrival margin at the server), while a peer scheduling a
+// relayed input needs the RECEIVER's round trip covered (§3.2). The floor is
+// that receiver-coverage budget, and it is session-wide because every receiver
+// must be able to schedule every sender.
+//
+// THE RULE IS A MAX, NEVER A SUM, AND IT LIVES IN ONE PLACE. Every production
+// site that derives an effective input delay routes through
+// `applyRelayDelayFloor`. There are FOUR such sites (the count was corrected by
+// the 2026-08-03 review — the design doc and the backlog each named a different,
+// incomplete THREE, which is exactly the mistake this single helper prevents):
+//
+//   1. `tierInputDelayTicks` below — the sole production reader of
+//      `rttTierInputDelays[]`, serving BOTH the server's ConnectionTierTable and
+//      the client's ReplicatedTierConsumer.
+//   2. `ServerInputDelayQueue::effectiveDelay`'s no-tier fallback.
+//   3. `ReplicatedTierConsumer::effectiveInputDelayTicks`'s no-tier fallback.
+//   4. The composition-root pre-tier baseline publish, which since the T10 tier
+//      channel migration no longer derives anything of its own — it publishes
+//      site 3's answer, so it is floored by construction.
+//
+// A MISSED SITE IS A DIVERGENCE BUG, not a cosmetic gap: the server parks the
+// input at its own effective delay while the client predicts at a different one,
+// so every tick mispredicts by the difference. Note that the completeness guard
+// is a grep on `forcedInputLatencyTicks` READS, not on `rttTierInputDelays[`:
+// the two fallback sites never touch the array.
+// ---------------------------------------------------------------------------
+
+// The absolute ceiling for an effective floor, in ticks (review finding A5,
+// widened to BOTH capacities by T5's AM-3, 2026-08-04).
+//
+// DERIVED, not a literal, and derived from the SMALLER of the two ring capacities
+// the floor has to survive — because a configured floor delays the read on BOTH
+// ends of the relay and each end holds the value in a ring of its own:
+//
+//   SENDER SIDE (`ClientInputDelayLine`, capacity
+//   `kClientInputDelayLineCapacityTicks`): the local capture is pushed AT capture,
+//   read at `capture + floor`, and revisited by a resim up to
+//   `rollbackWindowHardCap` ticks further back. It must therefore survive
+//   `floor + rollbackWindowHardCap` ticks of pushes.
+//
+//   RECEIVER SIDE (`RelayedInputStore`, capacity
+//   `kRelayedInputStoreCapacityTicks`): the relayed entry for capture tick `c`
+//   enters the store at arrival (~`c + wire`), is consumed by the scheduled read
+//   at `c + dA`, and must stay resident for T6's resim reads until the frontier
+//   passes `c + dA + rollbackWindowHardCap`. The store is fed at up to one entry
+//   per tick, so `c` is evicted at ~`c + capacity + wire`. Residency therefore
+//   needs `dA + rollbackWindowHardCap <= capacity + wire` — THE SAME INEQUALITY as
+//   the delay line's, with `wire = 0`. It is not a different quantity; it is a
+//   bound that merely happens not to bind while both capacities are 64 and the
+//   wire slack is non-negative.
+//
+// SO THE MIN IS THE POINT, NOT A FLOURISH. Lower `kRelayedInputStoreCapacityTicks`
+// to 32 and a delay-line-only derivation would still admit a floor of 44 into a
+// store that evicts scheduled entries before their resim window closes — the
+// scheduled regime degenerating SILENTLY into permanent fallback reads, which is
+// precisely the failure this cap exists to make impossible. A comment coupling the
+// two would have been the silent-drift hole; this derivation closes it.
+//
+// 64 - 20 = 44 at current defaults; lowering `rollbackWindowHardCap` raises it,
+// lowering EITHER capacity lowers it.
+constexpr int32_t relayDelayFloorHardCapForCapacities(std::size_t delayLineCapacityTicks,
+                                                      std::size_t storeCapacityTicks,
+                                                      int32_t     rollbackWindowHardCap)
+{
+    // Split out from `relayDelayFloorHardCapTicks` so the derivation is TESTABLE
+    // against capacities other than the shipped ones: both capacities are
+    // `constexpr` constants, so a test can only prove "the cap follows the store
+    // capacity down" by feeding a different one in here.
+    const std::size_t smallerCapacity =
+        delayLineCapacityTicks < storeCapacityTicks ? delayLineCapacityTicks : storeCapacityTicks;
+
+    const int32_t cap = static_cast<int32_t>(smallerCapacity) - rollbackWindowHardCap;
+    return cap < 0 ? 0 : cap;   // a pathological hardCap must not produce a negative cap
+}
+
+inline int32_t relayDelayFloorHardCapTicks(const TimeConfig& cfg)
+{
+    return relayDelayFloorHardCapForCapacities(kClientInputDelayLineCapacityTicks,
+                                               kRelayedInputStoreCapacityTicks,
+                                               cfg.rollbackWindowHardCap);
+}
+
+// Clamp a REQUESTED floor into [0, relayDelayFloorHardCapTicks(cfg)].
+//
+// Called at BOTH intake points — the ini override at the composition root and
+// the client's floor OnRep — and again on every read inside
+// `applyRelayDelayFloor`. That belt-and-braces shape is deliberate and is the
+// same one `clampConnectionTierIndex` uses for the replicated tier: the value
+// arrives off the wire as a uint8, so "clamped at intake" alone would leave a
+// corrupt or version-mismatched byte able to break the regime if any future
+// intake point forgot to clamp.
+inline int32_t clampRelayDelayFloorTicks(int32_t requestedFloorTicks, const TimeConfig& cfg)
+{
+    if (requestedFloorTicks < 0)
+    {
+        return 0;
+    }
+    const int32_t cap = relayDelayFloorHardCapTicks(cfg);
+    return requestedFloorTicks > cap ? cap : requestedFloorTicks;
+}
+
+// THE shared floor application: `max(relayDelayFloorTicks, base)`.
+//
+// `base` is whatever the caller's own rule produced (a tier delay, or the
+// no-tier `forcedInputLatencyTicks` baseline). At the shipped default floor of 0
+// this is the identity for every non-negative base, which is what makes the
+// whole feature ship degenerate — floor 0 behaves exactly as the pre-T11 build.
+inline int32_t applyRelayDelayFloor(int32_t baseDelayTicks, const TimeConfig& cfg)
+{
+    const int32_t floorTicks = clampRelayDelayFloorTicks(cfg.relayDelayFloorTicks, cfg);
+    return baseDelayTicks > floorTicks ? baseDelayTicks : floorTicks;
+}
+
 // Effective Layer-1 input delay in ticks for `tierIndex`.
 //
 // `lanZeroDelayOverride` collapses tier 0 to zero delay: on a sub-millisecond
@@ -130,23 +252,35 @@ inline constexpr int32_t clampConnectionTierIndex(int32_t tierIndex)
 // pure added lag. Only tier 0 is affected — a bad connection inside a LAN
 // session still gets its own tier's delay.
 //
+// THE FLOOR IS APPLIED AFTER THE OVERRIDE BRANCH, so a nonzero floor DOMINATES
+// the override (`max(floor, 0) == floor`). That ordering is the point, not an
+// accident: on a mixed session a LAN sender must still be schedulable by WAN
+// receivers. Documented at `lanZeroDelayOverride`'s definition too.
+//
 // NOTE this is the C2-locked REPLACES value: it IS the effective delay, and is
 // never added to `TimeConfig::forcedInputLatencyTicks`. The baseline applies
 // only when NO tier is available at all (see ReplicatedTierConsumer and
 // ServerInputDelayQueue::effectiveDelay, which each own that fallback for their
-// own "no tier" condition).
+// own "no tier" condition). AMENDED 2026-08-03: the replacement value is
+// `max(relayDelayFloorTicks, tier-or-fallback)` at every one of those sites.
 inline int32_t tierInputDelayTicks(int32_t tierIndex, const TimeConfig& cfg)
 {
     const int32_t tier = clampConnectionTierIndex(tierIndex);
-    if (tier == 0 && cfg.lanZeroDelayOverride)
-    {
-        return 0;
-    }
-    return cfg.rttTierInputDelays[tier];
+    const int32_t tierDelay =
+        (tier == 0 && cfg.lanZeroDelayOverride) ? 0 : cfg.rttTierInputDelays[tier];
+    return applyRelayDelayFloor(tierDelay, cfg);
 }
 
 // Per-tier SOFT ceiling for `rollbackWindowTicks`. The hard cap
 // (`rollbackWindowHardCap`) is enforced elsewhere and is unaffected by tier.
+//
+// INTENDED API, NO PRODUCTION CALLER — the client-side soft resim clamp this
+// would feed is INTENDED, NOT IMPLEMENTED (TimeConfig.h ADR status note; ruling
+// in RelayDelaySpectrumDesign.md §7). Defined and tested, called only from the
+// Catch2 suite and from `lookupRollbackCeiling` / `effectiveRollbackCeiling`,
+// which are unconsumed for the same reason. Wiring is deferred to the
+// sparse-state increment. Not dead code to delete: keeping the lookup here is
+// what stops a future consumer re-deriving the tier math at its call site.
 inline int32_t tierRollbackCeiling(int32_t tierIndex, const TimeConfig& cfg)
 {
     return cfg.rttTierRollbackCeilings[clampConnectionTierIndex(tierIndex)];
@@ -169,6 +303,14 @@ inline bool tierShouldMuteEcho(int32_t tierIndex, const TimeConfig& cfg)
 // `rttTierInputDelays[0]`, so the raw-array form reports the wrong delta for
 // every transition that touches tier 0 — which is the most common transition
 // there is. The suite pins this with a dedicated case + verified negative.
+//
+// BENIGN SIDE EFFECT OF THE FLOOR (T11): because this routes through
+// `tierInputDelayTicks`, a floor that dominates both endpoints collapses the
+// delta to 0 — and that is CORRECT, not a swallowed transition: with the floor
+// dominating, the player's felt delay does not change across the transition, so
+// there is no prediction-stall debt to pay. The server's publish predicate
+// compares tier INDICES, not deltas (ServerReceptionCoordinator), so publishes
+// are unaffected and the client still learns the new tier.
 inline int32_t tierDelayDeltaTicks(int32_t fromTier, int32_t toTier, const TimeConfig& cfg)
 {
     return tierInputDelayTicks(toTier, cfg) - tierInputDelayTicks(fromTier, cfg);
@@ -323,6 +465,9 @@ public:
     }
 
     // Per-tier SOFT ceiling for `rollbackWindowTicks`.
+    // INTENDED API, NO PRODUCTION CALLER — see `tierRollbackCeiling` above: the
+    // client-side soft resim clamp that would consume this is INTENDED, NOT
+    // IMPLEMENTED (TimeConfig.h ADR status note; RelayDelaySpectrumDesign.md §7).
     int32_t lookupRollbackCeiling(const Address& addr) const
     {
         return tierRollbackCeiling(lookupTierIndex(addr), m_config);

@@ -34,17 +34,41 @@
 //      delay, is the client's capture from tick T-delay. Storing the capture at
 //      slot T instead would put two different values in one slot and make every
 //      correction comparison in the delay window wrong.
+//      [og-netcode-v2-input-relay T8] THAT SERVER WRITE IS GONE — sendCorrectionAll
+//      no longer replicates an applied input, and receiveCorrectionInput /
+//      insertCorrectionInput no longer exist. Recorded here rather than deleted
+//      because it is why this class exists; reason 2 below, as T6 restated it, is
+//      what keeps the ruling live. What T8 changes is the failure mode if someone
+//      ignored it: the two-writers-one-slot collision described above can no
+//      longer happen, so a future "just reuse the cache column" proposal would
+//      break on the offset argument alone, not on this one.
 //
 //   2. RESIMULATION READS THOSE SLOTS WITH NO OFFSET.
-//      SimulationReconciliation::collectResimInputAll(simTick) reads
-//      `cache.getInput(cache.getCacheIndex(simTick))` and integrates it
+//      The pre-relay `SimulationReconciliation::collectResimInputAll(simTick)`
+//      read `cache.getInput(cache.getCacheIndex(simTick))` and integrated it
 //      directly. Captures in slot T would make every resim replay tick T with
 //      the wrong input, and a tier change inside a rollback window would replay
 //      with a MIXTURE of offsets.
+//      [og-netcode-v2-input-relay T6] That reader is GONE — resim now resolves
+//      through `SimulationNetSync::collectResimInputAll`, which reads the slot's
+//      applied-capture-tick REF and then looks THIS line up at that capture tick.
+//      The ruling is unchanged and, if anything, stronger: the ref is a capture
+//      identity, so it can only be redeemed against a capture-keyed structure.
+//      Slot T of the cache still means "applied at tick T"; slot T here still
+//      means "captured at tick T"; conflating them would break the join outright
+//      rather than merely shifting it.
 //
 // Both invariants hold iff slot T keeps meaning "input applied at tick T". So
-// the cache continues to store the ALREADY-DELAYED input (that is what
-// pushPredictionInput receives), and the raw captures live here instead.
+// the cache continued to store the ALREADY-DELAYED input (that is what
+// pushPredictionInput received), and the raw captures live here instead.
+//
+// [og-netcode-v2-input-relay T16] THE RULING OUTLIVED ITS OWN PREMISE, WHICH IS
+// THE OUTCOME IT WAS AIMING AT. The cache's input column is now retired outright
+// — m_inputBuffer, getInput, getLatestInput and pushPredictionInput are all gone
+// — so THIS RING IS THE ONLY PLACE A CLIENT'S OWN INPUT IS STORED AT ALL. The
+// original question, "which of the two structures should hold the raw capture",
+// no longer has two candidates. A cache slot carries state plus the T4
+// applied-capture-tick REF, and redeeming that ref means coming here.
 //
 // PendingInputQueue cannot serve as the delay line either: it retains only
 // `redundancyDepthTicks` (3) entries while the worst tier delay is 4, and
@@ -92,6 +116,18 @@
 // design corpus writes `ogsim::` but no such namespace exists in this tree.
 // ---------------------------------------------------------------------------
 
+// Slot count of a default-constructed ClientInputDelayLine.
+//
+// Declared as a FREE constant (the class member below aliases it) so that
+// config-layer code can derive bounds from it without naming an arbitrary
+// `InputT` just to reach a static member of a class template. The one consumer
+// today is `clampRelayDelayFloorTicks` (ConnectionTierTable.h), which caps the
+// relay delay floor at `capacity - rollbackWindowHardCap`: a floor larger than
+// that would schedule reads at a tick whose capture has already been evicted,
+// silently degenerating the scheduled regime instead of failing loudly
+// (RelayDelaySpectrumDesign.md review finding A5).
+inline constexpr std::size_t kClientInputDelayLineCapacityTicks = 64u;
+
 template <typename InputT>
 class ClientInputDelayLine
 {
@@ -103,7 +139,7 @@ public:
     // a tick modulus the caller has to reason about — `at()` validates the
     // stored tick, so an evicted tick reads as absent rather than as a stale
     // neighbour.
-    static constexpr std::size_t kDefaultCapacityTicks = 64u;
+    static constexpr std::size_t kDefaultCapacityTicks = kClientInputDelayLineCapacityTicks;
 
     explicit ClientInputDelayLine(InputT neutralInput = InputT{},
                                   std::size_t capacity = kDefaultCapacityTicks)

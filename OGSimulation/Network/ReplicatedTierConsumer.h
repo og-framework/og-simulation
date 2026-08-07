@@ -34,9 +34,20 @@
 // coexist; neither replaces the other, and nothing in this header touches the
 // estimator.
 //
+// POST-T10 PLACEMENT, and it is load-bearing for T11. Since the tier-channel
+// migration this class is instantiated ONCE PER WORLD, owned by
+// ASimulationManagerUImpl and fed by the per-connection ASimulationConnectionRelay
+// (it used to be one instance per CHARACTER on the update component). It is
+// therefore THE client's tier cache, and `effectiveInputDelayTicks` below is the
+// tier half of T11's shared two-input recompute — the floor half is the
+// session-scoped `TimeConfig::relayDelayFloorTicks`, written into the SAME
+// borrowed config by the floor's own OnRep. Both OnReps then call one recompute,
+// rather than two parallel paths racing to write one atomic.
+//
 // PRE-ARRIVAL FALLBACK. Until the first OnRep actually lands, there is no
 // authoritative tier and `TimeConfig::forcedInputLatencyTicks` — the documented
-// "no per-connection tier is available" baseline — is used instead. This is
+// "no per-connection tier is available" baseline, floored by
+// `relayDelayFloorTicks` since the 2026-08-03 C2 amendment — is used instead. This is
 // deliberately keyed on ARRIVAL, not on the tier VALUE: the replicated property
 // defaults to 0, which is also a perfectly legal tier, so a value test could not
 // tell "server says tier 0" from "server has not spoken yet", and a client that
@@ -102,21 +113,48 @@ public:
     // it (locked 2026-07-19, backlog C2; the earlier additive draft algebraically
     // cancelled to a constant). Before arrival it is `forcedInputLatencyTicks`.
     //
+    // AMENDED 2026-08-03 (RelayDelaySpectrumDesign.md §6, review C2/A2a+A2b). Both
+    // arms are floored by the session relay delay floor. In full:
+    //
+    //     effective = max(relayDelayFloorTicks,
+    //                     tierKnown ? tierInputDelayTicks(tier) : forcedInputLatencyTicks)
+    //
+    // THE NO-TIER ARM IS NOT OPTIONAL. This method IS the client's half of the
+    // shared recompute, and both channels feeding it (the per-connection tier
+    // relay and the session floor relay) are independent OnReps that can land in
+    // either order. If the floor arm silently assumed a tier, a floor OnRep
+    // arriving first would compute tier 0's delay (1) while the server's
+    // no-entry fallback still answers max(floor, 2) — the exact two-ends-diverge
+    // bug the C2 ruling exists to prevent. Keying on ARRIVAL (below) is what
+    // makes the two ends agree during that window.
+    //
     // This is the same value the server's ServerInputDelayQueue::effectiveDelay
-    // computes for this connection, reached through the same shared lookup, so
-    // the two ends delay by the identical number of ticks.
+    // computes for this connection, reached through the same shared lookups —
+    // including `applyRelayDelayFloor` — so the two ends delay by the identical
+    // number of ticks. This is derivation site 3 of 4 (see ConnectionTierTable.h);
+    // site 4, the composition-root pre-tier baseline publish, publishes THIS
+    // value rather than deriving its own.
     int32_t effectiveInputDelayTicks() const
     {
         if (!m_hasReceivedTier)
         {
-            return m_config.forcedInputLatencyTicks;
+            return applyRelayDelayFloor(m_config.forcedInputLatencyTicks, m_config);
         }
-        return tierInputDelayTicks(m_tierIndex, m_config);
+        return tierInputDelayTicks(m_tierIndex, m_config);   // floored inside
     }
 
     // Per-tier SOFT rollback ceiling. Before any tier arrives the client keeps
     // the unescalated configured window — the tier can only ever RAISE the
     // ceiling, so the pre-arrival state must be the un-escalated one.
+    //
+    // INTENDED API, NO PRODUCTION CALLER — this is the client-side half of the
+    // dormant ceiling, and the client-side soft resim clamp that would consume it
+    // is INTENDED, NOT IMPLEMENTED (TimeConfig.h ADR status note; ruling in
+    // RelayDelaySpectrumDesign.md §7). `SimulationReconciliation` has no window
+    // or clamp logic to hand this to; the tier scales the input DELAY only.
+    // Called from the Catch2 suite only. Wiring deferred to the sparse-state
+    // increment — do NOT read a call to this into the resim path without
+    // specifying the partial-resim semantics first.
     int32_t effectiveRollbackCeiling() const
     {
         if (!m_hasReceivedTier)

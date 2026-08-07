@@ -144,24 +144,82 @@ concept RemoteInputDeliverySink =
         { t.deliverRemoteInput(id, captureTick, in) } -> std::same_as<void>;
     };
 
+// ---------------------------------------------------------------------------
+// RemoteInputRelaySink — the RELAY boundary for a received remote input.
+// (og-netcode-v2-input-relay / T3, symmetric with T23's ConnectionTierSink and
+// T24's RemoteInputDeliverySink.)
+//
+// WHAT THIS IS FOR. Delivery (above) routes an input INTO the simulation for the
+// character that sent it. The RELAY is a separate, outbound concern: the server
+// forwards the same input to the OTHER clients so each peer can simulate that
+// character with its real input instead of extrapolating
+// (InputRelayDesign.md §3a). Two different destinations, two different lifetimes,
+// therefore two concepts — a second engine could bind one and not the other.
+//
+// THE STAMP (`dA`). Each relayed entry carries the SCHEDULE the authority intends
+// for it: the effective input delay held for that wire AT RECEIPT
+// (RelayDelaySpectrumDesign.md §5.2). The application tick is `captureTick + dA`
+// and is DERIVED by the receiver, never sent. A peer cannot compute `dA` itself —
+// the sender's tier is replicated owner-only — so stamping is what makes the
+// receiver's scheduled read possible at all (§5.1, decision D5). `uint8_t` is
+// deliberate: the delay is a small tick count (tier delays 1..4 today, floored at
+// most to the ClientInputDelayLine's residency ceiling), and one byte per entry is
+// the entire wire cost of the schedule.
+//
+// TWO-PARAMETER (T, InputT) for the same reason RemoteInputDeliverySink is: the
+// core is variadic over the simulatable pack, so the input type is supplied at the
+// call site as `InputFor<SimT>` rather than baked into the concept. `id` names the
+// entity whose relay payload is being written, so a central-manager sink can route
+// on it — which is exactly how the UE binding works (the manager writes the
+// id->component's replicated relay ring).
+template <typename T, typename InputT>
+concept RemoteInputRelaySink =
+    requires(T& t, unsigned int id, uint32_t captureTick, uint8_t dA, const InputT& in) {
+        { t.relayRemoteInput(id, captureTick, dA, in) } -> std::same_as<void>;
+    };
+
+// A do-nothing RemoteInputRelaySink — the DEFAULT for the receipt entry points
+// below, so every call site that predates the relay (and every unit case that has
+// no interest in it) compiles and behaves exactly as before. Production always
+// passes a real sink; the concept constraint means a sink that is passed but lacks
+// `relayRemoteInput` is a compile error at the call site, not a silent no-op.
+struct NullRemoteInputRelaySink
+{
+    template <typename InputT>
+    void relayRemoteInput(unsigned int, uint32_t, uint8_t, const InputT&) const {}
+};
+
 // Outcome of a single `receiveRemoteInput` call.
 //
 //   parked      — TRUE when the input was accepted into the delay queue. FALSE
 //                 means the ADAPTER must fall back to legacy direct delivery so
 //                 no player input is ever silently dropped (the malformed-slot
 //                 fence is the only in-core false path; the adapter early-outs on
-//                 no-wire before ever calling in).
+//                 no-wire before ever calling in). SEE `rejectedOutOfDomain`: it
+//                 is the ONE false-parked case that must NOT be delivered.
 //   acceptedNew — TRUE when this (id, captureTick) is the first time the
 //                 coordinator has seen that capture tick for that id; FALSE for a
-//                 redundancy-bundle re-send of an already-seen tick. This is a
-//                 pure SIGNAL surfaced for the future input-relay write (so its
-//                 relay becomes one line and does not re-import the duplicate
-//                 hazard) — it gates NOTHING in this task; parking/delivery are
-//                 unchanged by it. (fable review B1 residual.)
+//                 redundancy-bundle re-send of an already-seen tick, AND for a
+//                 genuinely-new but out-of-order-OLDER tick. Introduced by T20 as
+//                 a pure signal for the then-future relay write (fable review B1
+//                 residual); since T3 it GATES THE RELAY TAP — see the tap itself
+//                 in receiveRemoteInput. It still gates nothing about
+//                 parking/delivery, which are unchanged by it.
+//   rejectedOutOfDomain
+//               — TRUE when the out-of-domain receipt gate (T12) refused the
+//                 capture tick: it fell outside
+//                 `[serverTick - rollbackWindowHardCap, serverTick + hardResyncThresholdTicks]`.
+//                 The input is DISCARDED — not parked, not claimed, not relayed,
+//                 and (unlike the malformed-slot fence) NOT delivered undelayed.
+//                 `parked` is false and `acceptedNew` is false in this case; the
+//                 caller must check this flag BEFORE treating !parked as "fall
+//                 back to legacy delivery", which is exactly what
+//                 `receiveInputBundle` below does.
 struct ReceiveRemoteInputResult
 {
-    bool parked      = false;
-    bool acceptedNew = false;
+    bool parked              = false;
+    bool acceptedNew         = false;
+    bool rejectedOutOfDomain = false;
 };
 
 template <ConnectionAddress Address, SimulatableWithInput... SimulatableTs>
@@ -193,6 +251,54 @@ public:
     // Optional structured-log sink; routes the one-shot malformed-slot warning.
     // Prefix "[Warning]" is honoured by the UE logger route (see SimulationLog.h).
     void setLogger(std::function<void(const char*)> logger) { m_logger = std::move(logger); }
+
+    // -----------------------------------------------------------------------
+    // noteServerTick — the adapter's GAME-THREAD server sim-tick reference.
+    // (og-netcode-v2-input-relay / T12.)
+    //
+    // WHY THIS EXISTS. The out-of-domain receipt gate (see receiveRemoteInput)
+    // judges an inbound capture tick against the CURRENT server tick, but
+    // `receiveRemoteInput` / `receiveInputBundle` are per-slot payload calls that
+    // do not carry one. The server tick is an ENGINE PRIMITIVE (Address, RTT and
+    // sim-tick are the three the adapter already resolves), and the adapter ALREADY
+    // hands one to this type every physics frame via `reapConnections(serverTick)`,
+    // which therefore records it here. No adapter signature changed for this gate.
+    //
+    // EXACTLY ONE FEED, AND IT IS THE DRAIN HOOK — deliberate. `noteRttSample` also
+    // receives a serverTick and could plausibly feed this too (it runs on the RPC
+    // path, immediately before `receiveInputBundle`), but it is NOT wired in, for
+    // two reasons:
+    //   * SOURCE QUALITY. `reapConnections` is called from the same game-thread
+    //     hook as the drain and is passed the ChaosTickMapper-derived
+    //     `firstUpcomingSimTick` — the tick source that resolution is documented as
+    //     game-thread-safe. `noteRttSample`'s tick is `getServerReceptionTick()`, an
+    //     acknowledged wart: an unsynchronized read of the physics-thread-written
+    //     server clock. A gate that DISCARDS player input should judge against the
+    //     safe source, not the racy one.
+    //   * MONOTONIC-ENOUGH REFERENCE. Two feeds a tick apart could hand the gate a
+    //     reference that jitters backwards between consecutive receipts, making an
+    //     input sitting exactly on a boundary accepted or rejected depending on
+    //     which feed wrote last. One feed, one cadence, no jitter.
+    // The cost is that the gate is unarmed until the first physics frame — a window
+    // in which the server tick is ~0 and warm-up capture ticks are legitimately
+    // in-domain anyway. It is PUBLIC so an adapter (or the Catch2 suite) can arm it
+    // explicitly.
+    //
+    // LAST-WRITE-WINS, NOT a monotonic max: a max would stick forever if the clock
+    // ever restarted (PIE restart, seamless travel), permanently rejecting every
+    // subsequent input.
+    //
+    // FAIL-OPEN UNTIL ARMED, deliberately. Before the first call the coordinator
+    // has NO tick reference, so the gate cannot judge and accepts everything: a
+    // gate that failed CLOSED with an unset reference would silently discard every
+    // player input on any path that forgot to feed it. `m_serverTickKnown` makes
+    // "never armed" distinguishable from "armed at tick 0". This is also what keeps
+    // the pre-T12 Catch2 cases — which never drive a tick — byte-identical.
+    void noteServerTick(int32_t serverTick)
+    {
+        m_serverTickKnown = true;
+        m_serverTick      = serverTick;
+    }
 
     // -----------------------------------------------------------------------
     // (1) noteRttSample — ONCE PER BUNDLE. (fable review B1'.)
@@ -275,18 +381,129 @@ public:
     // to be released on `captureTick + effectiveDelay`. Returns the fallback
     // decision + the dedup signal (see ReceiveRemoteInputResult).
     //
-    // The malformed-slot fence is the only in-core false path: a slot outside the
-    // uint8 substitution-mask range means a malformed topology, not a supported
-    // configuration. It is warned ONCE per (id, slot) — never per tick — because
-    // the un-throttled UE predecessor produced 28,192 lines / 6.4 MB in 94 s of a
-    // single PIE session. The input still takes the legacy undelayed path.
-    template <typename SimT>
+    // The malformed-slot fence is the only in-core false path that still DELIVERS:
+    // a slot outside the uint8 substitution-mask range means a malformed topology,
+    // not a supported configuration. It is warned ONCE per (id, slot) — never per
+    // tick — because the un-throttled UE predecessor produced 28,192 lines / 6.4 MB
+    // in 94 s of a single PIE session. The input still takes the legacy undelayed
+    // path. The out-of-domain gate below is the one false path that DISCARDS.
+    //
+    // -----------------------------------------------------------------------
+    // THE OUT-OF-DOMAIN RECEIPT GATE (og-netcode-v2-input-relay / T12;
+    // RelayDelaySpectrumDesign.md §8.1). RUNS FIRST — before the dedup watermark,
+    // before the slot fence, before park/claim, and before the (T3) relay tap.
+    //
+    // WHAT IT REJECTS. A capture tick outside
+    //     [serverTick - rollbackWindowHardCap, serverTick + hardResyncThresholdTicks]
+    // (both bounds INCLUSIVE, both sourced from TimeConfig — no literals here).
+    //
+    // WHY. A client that is warming up or free-running has not yet been anchored
+    // to the server's tick numbering: it emits capture ticks from its OWN counter
+    // (0, 1, 2 …) while the server is at 600+. Today that garbage is merely parked
+    // and later purged, so it is invisible past the drain — but once T3 makes
+    // receipt-time input PEER-VISIBLE through the relay, an unfiltered garbage tick
+    // is broadcast to every other client and resolved against THEIR timelines. The
+    // gate exists so nothing outside the server's own tick domain ever reaches the
+    // relay tap.
+    //
+    // WHY THESE BOUNDS.
+    //   * Lower `serverTick - rollbackWindowHardCap` is exactly the drain's
+    //     `staleBefore` (see releaseDelayedInputs) — one window semantics for the
+    //     whole reception path. An out-of-window receipt is now rejected up front
+    //     instead of parked-then-purged; both mean "too old to matter".
+    //   * Upper `serverTick + hardResyncThresholdTicks` is the failsafe drift
+    //     threshold: a client legitimately captures AHEAD of the server (that is
+    //     the whole prediction offset), and steady-state lead is roughly
+    //     2·jitter·freq plus the ±3 dead band — comfortably inside 21 at any
+    //     playable RTT. Beyond it the client is further adrift than the hard-resync
+    //     backstop tolerates, i.e. it is about to be snapped anyway.
+    //   * `hardResyncThresholdTicks > rollbackWindowHardCap` is a TimeConfig
+    //     ordering invariant, so the window is never empty or inverted.
+    //
+    // WHY BEFORE THE DEDUP WATERMARK (load-bearing). `noteCaptureTick` keeps a
+    // MONOTONIC MAX per owner id. One garbage tick far in the future would raise
+    // that watermark permanently, and every subsequent LEGITIMATE input would then
+    // report `acceptedNew == false` — silently suppressing the [Park] trace and,
+    // post-T3, the relay write itself. The gate must run before the watermark is
+    // touched, not merely before the park.
+    //
+    // A REJECTED INPUT IS DISCARDED, NOT DELIVERED. It returns
+    // `parked == false` like the malformed-slot fence, but with
+    // `rejectedOutOfDomain == true` so `receiveInputBundle` (and any other adapter)
+    // does NOT take the undelayed fallback — falling back would hand the very
+    // garbage tick we just refused straight to the delivery sink.
+    //
+    // AUDIT — THE SECOND, PRE-EXISTING GUARD (kept deliberately; review ruling
+    // "document both"). `RemoteMoveQueue::queueMove` (SimulationQueues.h) already
+    // rejects `captureTick > serverAuthorityTick + rollbackWindowTicks` (+12,
+    // TIGHTER than this gate's +21) at the PHYSICS-THREAD DELIVERY layer, with its
+    // context published per authority tick via `setAuthorityGuardContext`. The two
+    // do not conflict and neither subsumes the other: this one guards RECEIPT (and
+    // therefore the relay tap) on the game thread; that one guards DELIVERY into
+    // the simulation. On the parked path the queue guard is effectively dead —
+    // drained entries are due-or-overdue, never ahead of authority. It fires only
+    // on the fallback paths (no-wire adapter early-out, malformed slot), where the
+    // ACCEPTED COMPOSITE BEHAVIOUR is: an input in the band
+    // `(authorityTick + rollbackWindowTicks, serverTick + hardResyncThresholdTicks]`
+    // passes THIS gate and is then discarded by `queueMove` as too-far-future. That
+    // is accepted and documented, not silent.
+    //
+    // -----------------------------------------------------------------------
+    // THE RELAY TAP (og-netcode-v2-input-relay / T3; InputRelayDesign.md §3a,
+    // RelayDelaySpectrumDesign.md §5). `relay` is an OUTBOUND TAP on this path:
+    // when a genuinely-new capture tick is parked, the same input is handed to the
+    // RemoteInputRelaySink, stamped with the schedule the authority intends for it.
+    // It is a TAP in the strict sense — it reads what the path already computed and
+    // changes nothing about park/claim/delivery. Defaulted to a no-op sink so every
+    // pre-relay call site stays byte-identical.
+    //
+    // AT RECEIPT, NOT AT RELEASE (decision, InputRelayDesign.md §3a). The relay's
+    // job is to feed remote-proxy prediction PROMPTLY; holding the input for the
+    // tier delay before forwarding would shorten every peer's prediction runway by
+    // exactly that delay. Capture-tick identity means peers key it correctly
+    // regardless of when the authority applies it. The documented trade-off (D1) is
+    // that we relay the RECEIVED input, which on server underrun/substitution can
+    // differ from what the server APPLIED — a divergence the every-frame state
+    // channel heals.
+    //
+    // THE GATE IS `parked && acceptedNew` (review A6) — and it is STRUCTURAL here,
+    // not a re-tested boolean: the tap sits after both non-parked returns (the
+    // out-of-domain rejection and the malformed-slot fence), so reaching it already
+    // means `parked == true`, and it lives inside the `acceptedNew` arm. Bare
+    // `acceptedNew` would be WRONG: it is computed BEFORE the parked/fallback split,
+    // so a malformed-slot input — which the adapter then delivers UNDELAYED — would
+    // be relayed carrying a stamp promising application at `captureTick + dA` while
+    // the authority applies it at arrival. A peer would then schedule it wrongly.
+    // There is NO relay on any fallback path.
+    //
+    // THE OTHER HALF OF THE GATE — `parked && !acceptedNew` (spectrum doc §5.3a).
+    // Two populations land there. A redundancy-bundle RE-SEND of an already-parked
+    // tick is uninteresting. But a genuinely-new OUT-OF-ORDER-OLDER tick (one that
+    // arrived after a newer tick had moved the watermark) IS applied by the server —
+    // the delay queue accepts it and T26's capture-order release delivers it — and
+    // is deliberately NOT relayed: the relay stream is monotonic in capture tick by
+    // construction, and at the shipped depth of 1 the payload is replace-latest, so
+    // writing an older input would move every peer's "latest" BACKWARDS. Peers
+    // experience a HOLE (scheduled read misses -> last-known fallback -> one-tick
+    // proxy mispredict -> healed by the every-frame state anchor). The two
+    // populations are told apart by `enqueue`'s return value, and the second is
+    // counted as `relayOooSkipCount()` and logged, because the depth>1 future must
+    // REOPEN this gate decision on measured evidence (T9's probe), not on argument.
+    template <typename SimT, typename RelaySink = NullRemoteInputRelaySink>
+        requires RemoteInputRelaySink<RelaySink, InputFor<SimT>>
     ReceiveRemoteInputResult receiveRemoteInput(unsigned int id,
                                                 const Address& addr,
                                                 uint8_t playerSlot,
                                                 int32_t captureTick,
-                                                const InputFor<SimT>& input)
+                                                const InputFor<SimT>& input,
+                                                RelaySink&& relay = RelaySink{})
     {
+        if (rejectOutOfDomainCaptureTick(id, captureTick))
+        {
+            return ReceiveRemoteInputResult{ /*parked=*/false, /*acceptedNew=*/false,
+                                             /*rejectedOutOfDomain=*/true };
+        }
+
         // Dedup watermark: a pure signal for the future relay write, computed and
         // updated BEFORE the parked/fallback split so it covers both paths.
         // Reaped in forgetOwner, so it is bounded by live component ids.
@@ -297,7 +514,8 @@ public:
         if (!key.hasValidSlot())
         {
             warnOutOfRangeSlotOnce(id, playerSlot);
-            return ReceiveRemoteInputResult{ /*parked=*/false, acceptedNew };
+            return ReceiveRemoteInputResult{ /*parked=*/false, acceptedNew,
+                                             /*rejectedOutOfDomain=*/false };
         }
 
         // Delivery routing: which owner id this slot's released input goes to. A
@@ -307,7 +525,11 @@ public:
         // distinct keys, so there is nothing to conflate.
         m_delayedInputTargets[key] = id;
 
-        m_inputDelayQueue.template enqueue<SimT>(key, captureTick, input);
+        // TRUE when this capture tick was not already resident in the slot's deque,
+        // i.e. the server really did take a new input here (T3 — the discriminator
+        // between a redundancy re-send and an out-of-order-older arrival).
+        const bool queuedNewEntry =
+            m_inputDelayQueue.template enqueue<SimT>(key, captureTick, input);
 
         // [Park] (Log severity — on-demand under LogOGNet Verbose). The full
         // per-tick input timeline for deep dives; its companion is [Release] at
@@ -320,9 +542,29 @@ public:
             const int32_t delay = m_inputDelayQueue.effectiveDelay(key);
             SIMLOG(m_logger, "[Park] id=%u captureTick=%d delay=%d releaseTick=%d",
                 id, captureTick, delay, captureTick + delay);
+
+            // --- THE RELAY TAP (T3) -----------------------------------------
+            // Reached only on the parked path (see the long note above), and only
+            // for a capture tick this id has never sent before => each newer tick
+            // is relayed EXACTLY ONCE, at receipt, stamped with the wire's CURRENT
+            // effective delay. `delay` is the very value the [Park] line reports,
+            // read from the same queue the release schedule uses, so the stamp and
+            // the authority's own plan cannot drift apart at the moment of stamping.
+            // (After T11 lands, the relay floor is already folded INSIDE
+            // effectiveDelay — no code dependency between the two tasks, only value
+            // composition.)
+            relay.relayRemoteInput(id, static_cast<uint32_t>(captureTick),
+                                   stampFromDelay(delay), input);
+        }
+        else if (queuedNewEntry)
+        {
+            // Genuinely new, but older than this id's watermark: applied, not
+            // relayed. Counted + traced — see the gate note above.
+            noteRelayOooSkip(id, captureTick);
         }
 
-        return ReceiveRemoteInputResult{ /*parked=*/true, acceptedNew };
+        return ReceiveRemoteInputResult{ /*parked=*/true, acceptedNew,
+                                         /*rejectedOutOfDomain=*/false };
     }
 
     // -----------------------------------------------------------------------
@@ -348,10 +590,20 @@ public:
     // loop. The genericized `[ServerReceive] id tick` trace replaces the former
     // brawler-specific attackLeft log (the core is templated over SimT and cannot
     // read a game-specific input field); it routes through the coordinator logger.
-    template <typename SimT, typename Buffer, typename Sink>
+    //
+    // [T3] `relay` is threaded straight through to receiveRemoteInput's relay tap —
+    // this method adds no relay policy of its own. Production passes the SAME object
+    // for both sinks (the manager binds delivery AND relay), but they stay separate
+    // parameters because they are separate boundaries: delivery routes an input INTO
+    // the simulation, the relay forwards it OUT to the other clients. Defaulted to
+    // the no-op sink so a caller that has no relay wiring is unaffected.
+    template <typename SimT, typename Buffer, typename Sink,
+              typename RelaySink = NullRemoteInputRelaySink>
         requires RemoteInputDeliverySink<Sink, InputFor<SimT>>
+              && RemoteInputRelaySink<RelaySink, InputFor<SimT>>
     void receiveInputBundle(unsigned int id, const Address& addr, uint8_t playerSlot,
-                            const Buffer& wire, Sink&& deliver)
+                            const Buffer& wire, Sink&& deliver,
+                            RelaySink&& relay = RelaySink{})
     {
         inputRedundancyBundle::forEachSlot<InputFor<SimT>>(
             wire,
@@ -360,13 +612,21 @@ public:
                 SIMLOG(m_logger, "[ServerReceive] id=%u tick=%u",
                     id, static_cast<unsigned int>(captureTick));
 
-                if (!receiveRemoteInput<SimT>(id, addr, playerSlot,
-                        static_cast<int32_t>(captureTick), input).parked)
+                const ReceiveRemoteInputResult result = receiveRemoteInput<SimT>(
+                    id, addr, playerSlot, static_cast<int32_t>(captureTick), input, relay);
+
+                // TWO different false-parked meanings, and only one of them
+                // delivers (T12):
+                //   * rejectedOutOfDomain — the receipt gate refused the capture
+                //     tick. It is NOT this server's tick domain, so it is DROPPED
+                //     here: delivering it undelayed would defeat the gate (and
+                //     `queueMove`'s own future-guard would likely refuse it anyway).
+                //     Already counted + rate-limit-logged by receiveRemoteInput.
+                //   * otherwise (malformed slot) — the delay queue refused it and
+                //     already warned once. Deliver undelayed so no player input is
+                //     ever silently dropped, through the same sink the drain uses.
+                if (!result.parked && !result.rejectedOutOfDomain)
                 {
-                    // Malformed slot — the delay queue refused it (already warned
-                    // once by receiveRemoteInput). Deliver undelayed so no player
-                    // input is ever silently dropped, through the same sink the
-                    // drain uses.
                     deliver.deliverRemoteInput(id, captureTick, input);
                 }
             });
@@ -507,6 +767,11 @@ public:
     // finding), so that path is proven in the PIE smoke test, not by unit tests.
     void reapConnections(int32_t serverTick)
     {
+        // T12: the once-per-physics-frame tick reference for the out-of-domain
+        // receipt gate. Recorded BEFORE the dwell gate below so it refreshes every
+        // frame, not once per dwell period.
+        noteServerTick(serverTick);
+
         // [InputStats] (Warning) — the periodic drop-rate summary. Driven from
         // this once-per-tick hook and evaluated BEFORE the dwell gate below, so
         // the ~2s window is measured purely in SERVER-TICK time (no wall-clock —
@@ -576,12 +841,63 @@ public:
 
     std::size_t claimCount() const { return m_delayedInputTargets.size(); }
 
+    // T12: cumulative count of capture ticks the out-of-domain receipt gate has
+    // refused since construction. Never reset (the per-window counter that drives
+    // the [InputDomain] log line is separate) — this is the lifetime total for
+    // introspection and the Catch2 suite.
+    std::size_t outOfDomainRejectCount() const { return m_outOfDomainRejectTotal; }
+
+    // T3: cumulative count of capture ticks the server APPLIED but the monotonic
+    // relay stream skipped as out-of-order-older (`parked && !acceptedNew` with the
+    // delay queue actually accepting the entry). Never reset. This is the evidence
+    // T9's probe reads: the depth>1 future must decide whether to widen the relay
+    // gate on a measured rate, not on argument (RelayDelaySpectrumDesign.md §5.3a).
+    // Zero in the ordered steady state, and NOT bumped by redundancy re-sends.
+    std::size_t relayOooSkipCount() const { return m_relayOooSkipTotal; }
+
     bool hasClaim(const SlotKey& key) const
     {
         return m_delayedInputTargets.find(key) != m_delayedInputTargets.end();
     }
 
 private:
+    // -----------------------------------------------------------------------
+    // The schedule stamp, narrowed to its wire type. (T3;
+    // RelayDelaySpectrumDesign.md §5.2 — `dA` is one byte per relay entry.)
+    // Effective delays are small tick counts (tier delays 1..4 today; the T11 floor
+    // is itself capped at 44 by the client ring's residency limit), so this clamp
+    // never fires in any shipped configuration — it exists so that a misconfigured
+    // delay can only SATURATE the stamp, never wrap it into a tiny value and make
+    // peers schedule an input wildly early.
+    static uint8_t stampFromDelay(int32_t delay)
+    {
+        if (delay <= 0)
+        {
+            return 0;
+        }
+        return (delay >= 255) ? uint8_t{ 255 } : static_cast<uint8_t>(delay);
+    }
+
+    // [Verbose][RelaySkip] — one line per genuinely-new-but-out-of-order-older
+    // capture tick the relay stream deliberately drops, plus the counters the
+    // per-window summary and `relayOooSkipCount()` read. (T3, spectrum doc §5.3a.)
+    // Verbose severity: in the ordered steady state this never fires, and when the
+    // network does reorder we want the per-event detail available on demand without
+    // it riding the default log. The per-WINDOW total is emitted at Warning by
+    // maybeEmitInputStats, on the same window [InputStats]/[InputDomain] already use.
+    void noteRelayOooSkip(unsigned int id, int32_t captureTick)
+    {
+        ++m_relayOooSkipTotal;
+        ++m_windowRelayOooSkips;
+
+        const auto it = m_captureTickWatermark.find(id);
+        const int32_t watermark = (it == m_captureTickWatermark.end()) ? captureTick : it->second;
+        SIMLOG(m_logger,
+            "[Verbose][RelaySkip] id=%u captureTick=%d watermark=%d out-of-order-older; "
+            "applied by the authority, not relayed",
+            id, captureTick, watermark);
+    }
+
     // First-seen watermark per owner id. `captureTick > seen` => newly accepted.
     // Missing id => first sample, accepted. Monotonic max; NOT a gate on delivery.
     bool noteCaptureTick(unsigned int id, int32_t captureTick)
@@ -598,6 +914,45 @@ private:
             it->second = captureTick;
         }
         return acceptedNew;
+    }
+
+    // -----------------------------------------------------------------------
+    // The out-of-domain receipt gate's decision + accounting. (T12.) Returns TRUE
+    // when `captureTick` must be REFUSED; see the long rationale block on
+    // receiveRemoteInput for the bounds and why this runs before everything else.
+    //
+    // Both bounds come from TimeConfig — there is deliberately no literal here.
+    // `hardResyncThresholdTicks` is uint32_t and `rollbackWindowHardCap` int32_t,
+    // so the upper bound is cast explicitly: an unsigned promotion of the sum would
+    // wrap the comparison for an early-session (or negative) serverTick.
+    //
+    // Counting is split in two on purpose: `m_outOfDomainRejectTotal` is the
+    // lifetime total (introspection), `m_windowOutOfDomainRejects` is the burst
+    // counter that maybeEmitInputStats drains into ONE [InputDomain] line per
+    // window — the SAME window mechanism [InputStats] already uses, deliberately
+    // reused rather than duplicated, so a free-running client cannot produce one
+    // log line per tick.
+    bool rejectOutOfDomainCaptureTick(unsigned int id, int32_t captureTick)
+    {
+        if (!m_serverTickKnown)
+        {
+            return false;       // no tick reference yet — fail open, see noteServerTick
+        }
+
+        const int32_t lower = m_serverTick - m_config.rollbackWindowHardCap;
+        const int32_t upper = m_serverTick + static_cast<int32_t>(m_config.hardResyncThresholdTicks);
+
+        if (captureTick >= lower && captureTick <= upper)
+        {
+            return false;       // in domain — the accepted path is untouched
+        }
+
+        ++m_outOfDomainRejectTotal;
+        ++m_windowOutOfDomainRejects;
+        m_lastRejectedId          = id;
+        m_lastRejectedCaptureTick = captureTick;
+        m_lastRejectedServerTick  = m_serverTick;
+        return true;
     }
 
     // [InputGap] (Warning) — the primary, cause-agnostic drop signal. (T25.)
@@ -662,6 +1017,13 @@ private:
     // wall-clock). Emits only when the window actually carried remote input, so an
     // idle server does not heartbeat a Warning line every 2s. Counters reset each
     // window.
+    //
+    // T12 ALSO RIDES THIS WINDOW. The out-of-domain gate's rejections are summed
+    // per window and emitted here as one [InputDomain] line — the rate limit the
+    // task asks for IS this mechanism, not a second one: same window length, same
+    // start tick, same reset point, same "emit only if the window carried
+    // something" rule. The two lines are independent (a window can carry rejects
+    // and no deliveries, or the reverse) but they share the one timer.
     void maybeEmitInputStats(int32_t serverTick)
     {
         const int32_t window = static_cast<int32_t>(2.0 * m_config.tickFrequency);
@@ -689,9 +1051,42 @@ private:
                 m_windowDropped, total, pct);
         }
 
-        m_windowDelivered      = 0;
-        m_windowDropped        = 0;
-        m_statsWindowStartTick = serverTick;
+        // [InputDomain] (Warning) — ONE line per rejection burst (T12). Names the
+        // most recent offender and the window it was judged against, so a garbage
+        // capture tick is diagnosable from the log alone: a warm-up/free-running
+        // client shows up as `captureTick` near 0 against a window in the hundreds.
+        if (m_windowOutOfDomainRejects > 0)
+        {
+            const int32_t lower = m_lastRejectedServerTick - m_config.rollbackWindowHardCap;
+            const int32_t upper = m_lastRejectedServerTick
+                                + static_cast<int32_t>(m_config.hardResyncThresholdTicks);
+            SIMLOG(m_logger,
+                "[Warning][InputDomain] rejected %d out-of-domain capture ticks; "
+                "last id=%u captureTick=%d serverTick=%d window=[%d,%d]",
+                m_windowOutOfDomainRejects, m_lastRejectedId, m_lastRejectedCaptureTick,
+                m_lastRejectedServerTick, lower, upper);
+        }
+
+        // [RelaySkip] (Warning) — ONE line per window naming how many genuinely-new
+        // capture ticks the server applied but the monotonic relay stream skipped as
+        // out-of-order-older (T3). Its own tag rather than a field appended to
+        // [InputStats], following the [InputDomain] precedent: same window, same
+        // reset point, no second timer, and the existing [InputStats] string that
+        // the PIE scripts grep stays byte-identical. Silent when the window carried
+        // no skips, which is the ordered steady state.
+        if (m_windowRelayOooSkips > 0)
+        {
+            SIMLOG(m_logger,
+                "[Warning][RelaySkip] %d out-of-order-older capture ticks applied but not "
+                "relayed this window; lifetime %zu",
+                m_windowRelayOooSkips, m_relayOooSkipTotal);
+        }
+
+        m_windowDelivered          = 0;
+        m_windowDropped            = 0;
+        m_windowOutOfDomainRejects = 0;
+        m_windowRelayOooSkips      = 0;
+        m_statsWindowStartTick     = serverTick;
     }
 
     // One-shot (id, slot) warning. Keyed on a packed 64-bit (id<<8 | slot) so a
@@ -750,6 +1145,31 @@ private:
     int32_t m_statsWindowStartTick = 0;
     int32_t m_windowDelivered      = 0;
     int32_t m_windowDropped        = 0;
+
+    // --- Out-of-domain receipt gate (T12) ----------------------------------
+    // The adapter's game-thread server-tick reference, fed by noteRttSample (per
+    // bundle) and reapConnections (per physics frame). `m_serverTickKnown` keeps
+    // "never armed" (fail open) distinct from "armed at tick 0" — see
+    // noteServerTick.
+    bool    m_serverTickKnown = false;
+    int32_t m_serverTick      = 0;
+
+    // Lifetime total (introspection) + the per-window burst counter that
+    // maybeEmitInputStats drains into ONE [InputDomain] line, with the most recent
+    // offender kept for that line.
+    std::size_t m_outOfDomainRejectTotal   = 0;
+    int32_t     m_windowOutOfDomainRejects = 0;
+    unsigned int m_lastRejectedId          = 0;
+    int32_t     m_lastRejectedCaptureTick  = 0;
+    int32_t     m_lastRejectedServerTick   = 0;
+
+    // --- Relay tap (T3) ----------------------------------------------------
+    // Lifetime total + per-window burst counter for out-of-order-older capture
+    // ticks the server applied but did not relay. Rides the [InputStats] window,
+    // exactly like the out-of-domain counters above. NOT reset in forgetOwner: this
+    // is a session-scoped diagnostic, not per-owner state.
+    std::size_t m_relayOooSkipTotal  = 0;
+    int32_t     m_windowRelayOooSkips = 0;
 
     std::function<void(const char*)> m_logger;
 };

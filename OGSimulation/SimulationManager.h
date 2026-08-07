@@ -6,6 +6,7 @@
 #include <optional>
 
 #include "OGAssert.h"
+#include "OGSimulation/Network/ConnectionTierTable.h"   // clampRelayDelayFloorTicks (T11)
 #include "OGSimulation/PCTimeManagement/ServerTickClock.h"
 #include "OGSimulation/PCTimeManagement/NetworkTimeEstimator.h"
 #include "OGSimulation/PCTimeManagement/ClientPredictionClock.h"
@@ -136,6 +137,33 @@ public:
     // true by construction instead of by convention. The reference is stable
     // for the manager's lifetime (m_timeConfig is a by-value member).
     const TimeConfig& getTimeConfig() const { return m_timeConfig; }
+
+    // [T11 / og-netcode-v2-input-relay] THE one writable location for the session
+    // relay delay floor. (RelayDelaySpectrumDesign.md §6, §11 Q1/Q6.)
+    //
+    // Deliberately a single narrow setter rather than a mutable `editTimeConfig()`:
+    // the rest of TimeConfig is a start-up constant that the clocks, the tier
+    // table and the delay queue all hold by reference, and handing out a mutable
+    // handle would make every one of those fields silently re-settable mid-session.
+    // The floor is the one field that legitimately changes after construction —
+    // it is server-owned and REPLICATED, so a client learns it from an OnRep, and
+    // the deferred dynamic-floor policy (§11 Q6) publishes through this same door.
+    //
+    // CLAMPED HERE TOO. `clampRelayDelayFloorTicks` also runs at both intake
+    // points; repeating it at the single write site means no future caller can
+    // store an out-of-range floor by forgetting, and the clamp is idempotent.
+    //
+    // THREADING. Game thread only, and the value it feeds crosses to the physics
+    // thread exactly where it always did — through the one
+    // `setClientEffectiveInputDelayTicks` atomic. On the server the floor is
+    // written once at composition, before any connection exists; on a client it
+    // is written from the floor OnRep, a game-thread UObject callback, and read
+    // back on the same thread by the recompute.
+    void setRelayDelayFloorTicks(int32_t requestedFloorTicks)
+    {
+        m_timeConfig.relayDelayFloorTicks =
+            clampRelayDelayFloorTicks(requestedFloorTicks, m_timeConfig);
+    }
 
     ServerTickClock& editServerClock()
     {
@@ -363,7 +391,11 @@ private:
         m_clientClock->advanceResimulation();
         const SimulationTimeStep step = m_clientClock->getResimulationStep();
         SIMLOG(m_logger, "[Resim.Pre] tick=%u", step.getTick());
-        auto inputs = m_reconciliation.collectResimInputAll(step.getTick());
+        // [og-netcode-v2-input-relay T6] NetSync, not reconciliation. The resim
+        // input is resolved from the delay lines / relay stores / neutrals NetSync
+        // owns; reconciliation now contributes only the per-tick applied-capture
+        // reference, which NetSync asks it for internally.
+        auto inputs = m_netSync.collectResimInputAll(step.getTick());
         // Sequencing (see onGameSimulationPrediction). Systems fire on every
         // resim replay tick too — routing stays deterministic across rollback (D4).
         auto&       storage    = m_storage;

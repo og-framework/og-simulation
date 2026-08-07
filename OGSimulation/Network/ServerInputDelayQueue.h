@@ -211,6 +211,19 @@ public:
     // `rttTierInputDelays[tier]` IS the effective delay and REPLACES the
     // baseline. It is NOT added to `forcedInputLatencyTicks`.
     //
+    // AMENDED 2026-08-03 (RelayDelaySpectrumDesign.md §6, review C2/A2a). The
+    // replacement value is floored by the session relay delay floor:
+    //
+    //     effectiveDelay = max(relayDelayFloorTicks, <tier-or-fallback value>)
+    //
+    // The tier arm gets that for free — `lookupInputDelayTicks` delegates to
+    // `tierInputDelayTicks`, which applies the floor. The FALLBACK arm below has
+    // to apply it explicitly, and it is one of the two sites that reads
+    // `forcedInputLatencyTicks` directly: this is derivation site 2 of 4 (see the
+    // enumeration in ConnectionTierTable.h). Missing it would make the server
+    // park an untiered connection's input at `forcedInputLatencyTicks` while its
+    // own client predicts at the floor.
+    //
     // `forcedInputLatencyTicks` is the fallback in exactly two situations, both
     // meaning "no per-connection tier is available":
     //   1. No tier table wired (single-argument constructor), and
@@ -228,9 +241,9 @@ public:
     {
         if (m_tierTable != nullptr && m_tierTable->hasEntry(addr))
         {
-            return m_tierTable->lookupInputDelayTicks(addr);
+            return m_tierTable->lookupInputDelayTicks(addr);   // floored inside tierInputDelayTicks
         }
-        return m_config.forcedInputLatencyTicks;
+        return applyRelayDelayFloor(m_config.forcedInputLatencyTicks, m_config);
     }
 
     // Slot-key overload — convenience for the call sites that hold a full key
@@ -262,8 +275,18 @@ public:
     // untouched, and RemoteMoveQueue::queueMove is first-writer-wins. A last-wins
     // rule here would let a late retransmission mutate an input the simulation
     // may already have consumed.
+    //
+    // RETURNS TRUE when a NEW entry was parked, FALSE when the capture tick was
+    // already resident and the write was dropped as a duplicate.
+    // (og-netcode-v2-input-relay / T3 — additive; every pre-existing call site
+    // discards the value and behaviour is unchanged.) The coordinator needs this
+    // to tell the two `acceptedNew == false` populations apart: a redundancy-bundle
+    // RE-SEND of an already-parked tick (the common case, uninteresting) versus a
+    // genuinely-new but OUT-OF-ORDER-OLDER capture tick, which the server applies
+    // but the monotonic relay stream deliberately skips (RelayDelaySpectrumDesign.md
+    // §5.3a). Only the latter is counted as a relay hole.
     template <typename SimT>
-    void enqueue(const SlotKey& key, int32_t captureTick, const InputFor<SimT>& input)
+    bool enqueue(const SlotKey& key, int32_t captureTick, const InputFor<SimT>& input)
     {
         static_assert(is_type_in_pack<SimT>(),
             "ServerInputDelayQueue::enqueue<SimT>: SimT is not in this queue's simulatable pack");
@@ -274,7 +297,7 @@ public:
         {
             if (existing.first == captureTick)
             {
-                return;     // duplicate capture tick — first value wins
+                return false;   // duplicate capture tick — first value wins
             }
         }
 
@@ -289,6 +312,7 @@ public:
         // partner keeps the shared connection busy.
         int32_t& lastSeen = m_lastActivityTick[key.address];
         lastSeen = (lastSeen > captureTick) ? lastSeen : captureTick;
+        return true;
     }
 
     // Pop the input DUE at or before `currentServerTick`, if any.
