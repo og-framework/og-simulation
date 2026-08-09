@@ -4,8 +4,10 @@
 // ---------------------------------------------------------------------------
 // CorrectionStateBufferCodec — the CORRECTION STATE payload (server -> clients).
 //
-// Engine-agnostic byte-codec for the every-frame authoritative state correction
+// Engine-agnostic byte-codec for the authoritative state correction
 // (og-netcode-v2-input-relay T4; InputRelayDesign.md §3 "STATE", D1/D3).
+// [T39] Formerly "the EVERY-FRAME authoritative state correction" — it is not
+// every-frame any more; see the cadence note at WHY THE SECOND FIELD EXISTS.
 //
 // Payload layout:
 //
@@ -17,10 +19,25 @@
 // WHY THE SECOND FIELD EXISTS — the join key.
 //
 // Input and state are now two independently-cadenced channels: input is relayed
-// at RECEIPT keyed by capture tick (T1/T3), state is corrected every frame keyed
-// by the AUTHORITY tick. Nothing in either message says which input produced
-// which state — so a client resimulating through a corrected tick cannot know
-// which relayed input the authority actually fed into it.
+// at RECEIPT keyed by capture tick (T1/T3), state is corrected keyed by the
+// AUTHORITY tick. Nothing in either message says which input produced which
+// state — so a client resimulating through a corrected tick cannot know which
+// relayed input the authority actually fed into it.
+//
+// ⚠ [T39] "CORRECTED EVERY FRAME" WAS TRUE HERE UNTIL T39 AND IS NOT ANY MORE.
+// `SimulationNetSync::sendCorrectionAll` now writes `TimeConfig::
+// correctionRotationK` characters' buffers per tick, round-robin, so a given
+// character's state rides this payload at `tickFrequency * K / N` Hz — 60 Hz at
+// two characters and 20 Hz at six, with the shipped K = 2. The wire LAYOUT is
+// untouched by that change; only how often it is written is.
+//
+// The join-key argument above is not weakened by the sparser cadence — it is
+// STRENGTHENED by it. The reason the ref must ride the message rather than be
+// inferred from a delay is that the two channels are independent, and reducing
+// the state cadence makes them MORE independent: with corrections arriving every
+// ceil(N/K) ticks, a client that guessed the applied capture from a schedule
+// would be guessing across a wider gap. The `appliedCaptureTick` field answers
+// it exactly, at whatever cadence the state arrives.
 //
 // `appliedCaptureTick` is that statement: "the state at `tick` was produced by
 // the input captured at `appliedCaptureTick`". It is the ONLY thing that

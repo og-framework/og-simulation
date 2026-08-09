@@ -681,6 +681,50 @@ inline constexpr std::size_t   kGapOverflowBucket         = kRelayArrivalMaxTrac
 // the same feel as the physics-side window without pretending to share its clock.
 inline constexpr std::uint32_t kRelayArrivalProbeWindowSamples = 120u;
 
+// ---------------------------------------------------------------------------
+// ⭐ [T34 rework] THE DISCONTINUITY GUARD — the same guard, for the same reason,
+// that `ServerFrameProbe` (`kServerFrameDiscontinuityTicks`) and `RelayWriteProbe`
+// (`kRelayWriteDiscontinuityTicks`) already carry. A capture-tick jump larger than
+// this is a SINGLE CORRELATED EVENT — a connection hiccup, a host stall, a
+// relevancy pause, a re-join, the client's game thread blocking so OnReps queue —
+// not `gap - 1` independently lost inputs. Charging it to the per-input loss rate
+// mixes two distributions and reports catastrophic failure on a working relay.
+//
+// WHY THIS MATTERS MORE HERE THAN ON EITHER SIBLING: `lostCaptureTicksX1000` is the
+// discriminating term of item 34's acceptance gate, whose pass condition is ~11 per
+// mille. A single 47-tick gap in a 120-sample window computes to ~355 per mille —
+// 30x the pass condition, on a window whose other 118 samples are healthy.
+//
+// ⚠ THE VALUE IS 16 BECAUSE THE ARCHIVES FORCE IT, not because it is round. Every
+// `[RelayProbe.Arrival]` window in `runs/t39_runA_3char`, `runs/t39_runB_2char` and
+// `runs/t33_depth1_control` was re-read; the observed gap distribution is BIMODAL
+// with a completely empty band:
+//
+//   healthy   every window's `max=` is in 1..6, and p99 never exceeds 4
+//   EMPTY     no sample anywhere in 7..17, across ~28,000 samples in three runs
+//   outliers  18, 20, 20, 22, 46, 47 and four samples >= 64 (max 229)
+//
+// 16 sits at the top of that empty band: 2.6x the worst healthy `max` and 4x the
+// worst healthy p99 below it, 2 ticks of margin below the smallest outlier above
+// it. It is also exactly 2 * `relayedInputRing::kMaxDepth` (8) — one flush round
+// can publish at most kMaxDepth capture ticks, so a gap of more than two full
+// rounds cannot be produced by the flush path at all; something upstream stopped.
+//
+// The reviewer's suggested 15-30 range is only satisfiable at its very bottom: a
+// threshold of 20 or 24 would let the 18/20/22 class through, and the window
+// carrying 18 and 22 still computes to ~250 per mille. 16 is therefore not a taste
+// call — anything above 17 fails to fix the defect.
+//
+// And it cannot be produced by ordinary wire loss: at the measured 1.122 % per
+// capture tick, 16 consecutive losses has probability ~1e-31.
+//
+// A gap above this RE-SEEDS the watermark, is counted in `discontinuities`, and is
+// a sample of nothing — it enters neither loss accumulator, neither the histogram
+// nor `maxGap`. Its magnitude is preserved exactly in `maxDiscontinuityGap` so
+// nothing is hidden, only re-classified.
+// ---------------------------------------------------------------------------
+inline constexpr std::uint32_t kRelayArrivalDiscontinuityTicks = 16u;
+
 struct RelayArrivalWindowSummary
 {
     std::uint32_t samples = 0u;
@@ -702,7 +746,110 @@ struct RelayArrivalWindowSummary
     std::uint32_t noAdvance = 0u;
 
     // Samples that landed in the saturating bucket.
+    //
+    // ⚠ [T34 rework] STRUCTURALLY UNREACHABLE SINCE THE DISCONTINUITY GUARD, and
+    // this is deliberate rather than an oversight. The bucket sits at
+    // kRelayArrivalMaxTrackedGap = 64; the guard fires at 16. Every gap big enough
+    // to saturate is re-classified as a discontinuity before it is ever sampled, so
+    // `saturatedSamples` and `p99Saturated` now read 0/false forever.
+    //
+    // THEY ARE KEPT because every archived T22/T33/T39 window carries `saturated=`,
+    // and runB's two poisoned windows were found by it — deleting the field would
+    // break comparability with exactly the logs that motivated the guard. But an
+    // operator reading a NEW log must read `discontinuities` instead: `saturated=`
+    // never saw the 46/47 class at all, which is precisely why it was not enough.
     std::uint32_t saturatedSamples = 0u;
+
+    // -----------------------------------------------------------------------
+    // ⭐ [og-netcode-v2-input-relay T34] THE R = 0 LOSS COUNTER — MANDATORY, not
+    // diagnostic garnish, and the reason is structural: with bare C1 flush-on-poll
+    // at R = 0 an input is sent exactly ONCE, and there is NO send-success signal
+    // anywhere in Iris that game code can read (T38 §4.3 — `FReplicationWriter::
+    // HandleDroppedRecord` recovers the changemask, not the values). So permanent
+    // input loss is INVISIBLE on the server by construction.
+    //
+    // THE COUNTABLE END IS THE CLIENT. Capture ticks are per-character monotonic at
+    // ~60/s, so every permanently lost input is a visible ARITHMETIC GAP in the
+    // received stream, and nothing else can produce one: a gap of g means g-1
+    // capture ticks were produced by the sender and never arrived here.
+    //
+    // ⛔ [T34 loss-counter fix] THE NUMERATOR IS `gap - delivered`, NOT `gap - 1`,
+    // AND THE DIFFERENCE IS THE WHOLE INSTRUMENT. `gap - 1` measures ADVANCE OF THE
+    // NEWEST WATERMARK MINUS ONE, which equals the lost count only while an arrival
+    // carries exactly ONE new capture tick — the retired replace-latest regime.
+    // Under flush-on-poll one arrival publishes the whole staged burst, so a 2-entry
+    // burst advances the watermark by 2 and `gap - 1` charges 1 as lost WHILE BOTH
+    // ENTRIES ARRIVED. Measured on `runs/t34_run1_2char_2026-08-09_1938`, that read
+    // 122 / 129 per mille against a ~11 per mille pass condition — and it was
+    // measuring the burst rate: the run's `[RelayFlush] entriesPerRoundX100` was
+    // 112-113, and 1 - 1/1.13 = 115 per mille. The instrument was reporting, as
+    // loss, precisely the thing the flush now delivers instead of losing.
+    //
+    //   lostCaptureTicks     Sum(gap - delivered) over the window's accepted
+    //                        arrivals, where `delivered` is how many NEW capture
+    //                        ticks that arrival actually carried (the caller's
+    //                        count; see noteArrival). EXACT, not estimated: the
+    //                        watermark advanced by `gap`, `delivered` of those ticks
+    //                        arrived, so the remainder provably never did. Wire loss
+    //                        + scheduler-skip loss + everything, i.e. exactly the
+    //                        total the user's acceptance is priced on.
+    //                        ⭐ IT REDUCES TO Sum(gap - 1) AT DEPTH 1, so every
+    //                        archived comparison and the replace-latest
+    //                        counterfactual stay meaningful.
+    //   deliveredCaptureTicks
+    //                        Sum(delivered), clamped per sample to `gap`. Reported
+    //                        so the window is SELF-CHECKING: `lost + delivered ==
+    //                        expected` must hold exactly, on the log line as well as
+    //                        in a test. Without it a reader cannot tell a window
+    //                        that lost nothing from a window whose delivered count
+    //                        was never plumbed through.
+    //   expectedCaptureTicks Sum(gap) — the capture ticks the senders PRODUCED over
+    //                        the span this window covers. The only honest
+    //                        denominator: it is derived from the same samples, so
+    //                        it stays correct across window edges, across a varying
+    //                        number of remote characters, and on a client whose own
+    //                        frame rate has nothing to do with the senders'.
+    //   lostCaptureTicksX1000
+    //                        per mille of expected. STEADY-STATE EXPECTATION ~ 11
+    //                        (the measured 1.122 % wire loss). Sustained material
+    //                        excess over the server's `[RelayProbe.Budget] lost=`
+    //                        rate means scheduler SKIPS are happening on top of wire
+    //                        loss, which is the evidence-driven trigger to re-check
+    //                        the diet margins or put R = 1 back on the table
+    //                        (T38 §13.4). It must be reported for the join-settling
+    //                        window SEPARATELY from steady state (T43 finding 3).
+    //
+    // WHY IT RIDES THE EXISTING WINDOW RATHER THAN A NEW ONE: it is a ratio of two
+    // quantities this probe already computes per sample, and a second window over
+    // the same samples would be a second clock to keep honest for no new
+    // information. The window is shared across remote ids (as it always has been),
+    // and the ratio aggregates correctly across them because both numerator and
+    // denominator are sums over the same sample set.
+    //
+    // ⚠ A no-advance arrival is NOT a sample and contributes to NONE of the three
+    // terms — it advanced no capture tick, so it says nothing about loss.
+    // `noAdvance` above already reports those separately.
+    // -----------------------------------------------------------------------
+    std::uint32_t lostCaptureTicks      = 0u;
+    std::uint32_t deliveredCaptureTicks = 0u;
+    std::uint32_t expectedCaptureTicks  = 0u;
+    std::uint32_t lostCaptureTicksX1000 = 0u;
+
+    // ⭐ [T34 rework] Gaps this window RE-CLASSIFIED rather than charged, per
+    // kRelayArrivalDiscontinuityTicks. Non-zero means the window covers less
+    // continuous capture stream than its `samples` suggests.
+    //
+    // ⚠ THE OPERATOR RULE, and it is the reason this field exists at all: a window
+    // reporting `discont=` > 0 is DISCARDED, not averaged in — exactly as
+    // `RelayWriteProbe::discontinuities` is. `lostCaptureTicksX1000` is still
+    // honest for the samples it kept, but the excluded event was real and the
+    // window no longer covers a contiguous span.
+    //
+    // `maxDiscontinuityGap` is the largest EXCLUDED gap, exact. Without it the guard
+    // would silently swallow the one number that says how bad the interruption was —
+    // and before the guard existed, `max=` was the only tell those windows had.
+    std::uint32_t discontinuities      = 0u;
+    std::uint32_t maxDiscontinuityGap  = 0u;
 };
 
 // ---------------------------------------------------------------------------
@@ -717,14 +864,40 @@ public:
     }
 
     // Record one relay-ring arrival for `id`, carrying the newest capture tick the
-    // ring held. Returns true — filling `outSummary` and resetting the histogram —
-    // when this sample completed a window.
+    // ring held AND how many NEW capture ticks that ring actually delivered.
+    // Returns true — filling `outSummary` and resetting the histogram — when this
+    // sample completed a window.
+    //
+    // ⛔ [T34 loss-counter fix] `newCaptureTicksDelivered` IS REQUIRED AND HAS NO
+    // DEFAULT, DELIBERATELY. A default of 1 is exactly the retired replace-latest
+    // premise — "one arrival carries one entry" — and silently re-defaulting to it
+    // is how this instrument came to report ~120 per mille on a flush that lost
+    // nothing (see RelayArrivalWindowSummary's loss block). Making it a positional
+    // requirement turns every call site into a statement of what that arrival
+    // delivered, and makes a pre-fix call site a compile error rather than a
+    // silently-wrong number.
+    //
+    // WHERE THE COUNT COMES FROM at the shipped call site:
+    // `RelayedInputIngestReport::newCaptureTicksIngested`, which the ingest already
+    // computes while walking the ring. It counts entries whose capture tick was NOT
+    // already resident, because re-delivery of a tick this receiver already holds is
+    // not new coverage.
+    //
+    // IT IS CLAMPED TO `gap` before it is used. The exactness argument — "the
+    // watermark advanced by `gap`, `delivered` of those ticks arrived, so the rest
+    // never did" — is an argument about the half-open interval
+    // `(previousNewest, newestCaptureTick]`, which holds exactly `gap` tick slots.
+    // An arrival that additionally back-fills a hole BELOW the previous watermark
+    // (not reachable under R = 0's monotonic single-publish stream, but not
+    // excluded by any type) would otherwise subtract coverage that belongs to an
+    // earlier interval, and could underflow the unsigned difference. The clamp
+    // makes the counter unable to report negative loss as an enormous positive one.
     //
     // `outGapCaptureTicks` receives the gap this arrival contributed, or 0 when it
     // contributed none (first arrival for this id, or no advance). It exists so the
     // caller can emit its per-event Verbose line without re-deriving the gap.
     //
-    // THREE ARRIVALS ARE NOT SAMPLES, and each is a different thing:
+    // FOUR ARRIVALS ARE NOT SAMPLES, and each is a different thing:
     //   * the FIRST arrival for an id — there is no previous newest to subtract, so
     //     there is no gap. Counted nowhere; it only seeds the watermark.
     //   * an arrival whose newest capture tick did NOT advance — see
@@ -734,8 +907,14 @@ public:
     //     `parked && acceptedNew`), so this should not happen; if it ever does, a
     //     signed-negative "gap" would be nonsense, so it is treated as a no-advance
     //     and the watermark is left alone rather than being rewound.
+    //   * [T34 rework] an arrival whose gap EXCEEDS
+    //     kRelayArrivalDiscontinuityTicks — a stall or an interruption, not
+    //     `gap - 1` lost inputs. Counted in `discontinuities`, magnitude kept in
+    //     `maxDiscontinuityGap`, and the watermark IS advanced so the next arrival
+    //     measures from the far side of it.
     bool noteArrival(unsigned int   id,
                      std::uint32_t  newestCaptureTick,
+                     std::uint32_t  newCaptureTicksDelivered,
                      RelayArrivalWindowSummary& outSummary,
                      std::uint32_t* outGapCaptureTicks = nullptr)
     {
@@ -758,7 +937,39 @@ public:
         }
 
         const std::uint32_t gap = newestCaptureTick - it->second;
-        it->second = newestCaptureTick;
+        it->second = newestCaptureTick;                 // re-seeds either way
+
+        // ⭐ [T34 rework] THE DISCONTINUITY GUARD. See
+        // kRelayArrivalDiscontinuityTicks for why 16 and why this is not optional:
+        // without it a single stall reports ~355 per mille loss on a window whose
+        // other 118 samples are perfect, against a pass condition of ~11.
+        //
+        // The watermark has already been advanced above, so the NEXT arrival
+        // measures from the far side of the interruption rather than re-charging it.
+        // This is a sample of nothing: no histogram bucket, no `maxGap`, no
+        // `m_samples`, NONE of the three accumulators — and therefore it cannot
+        // close a window either, which is deliberate. A window must close on 120
+        // real samples.
+        //
+        // ⚠ [T34 loss-counter fix] It composes with the delivered count the only way
+        // that is coherent: `newCaptureTicksDelivered` is discarded here TOO. A
+        // discontinuous arrival may well carry a full burst, but the interval it
+        // spans is not a contiguous capture stream, so neither its loss nor its
+        // coverage is a statement about the wire. Crediting its delivered ticks
+        // while not charging its gap would let an interruption IMPROVE the reported
+        // rate — an instrument that reads healthier the worse the connection gets.
+        if (gap > kRelayArrivalDiscontinuityTicks)
+        {
+            ++m_discontinuities;
+            if (gap > m_maxDiscontinuityGap)
+            {
+                m_maxDiscontinuityGap = gap;
+            }
+            // `*outGapCaptureTicks` stays 0: its documented contract is "the gap
+            // this arrival CONTRIBUTED", and this one contributed none. The
+            // magnitude is not lost — it rides the window line as `discontMax=`.
+            return false;
+        }
 
         if (outGapCaptureTicks != nullptr)
         {
@@ -780,6 +991,24 @@ public:
             m_maxGap = gap;
         }
 
+        // [T34] THE R = 0 LOSS COUNTER. Accumulated on the same accepted-arrival
+        // path as the histogram, so the two can never disagree about which samples
+        // they cover. See RelayArrivalWindowSummary's block for why
+        // `gap - delivered` IS the permanently-lost count and why `gap` is the right
+        // denominator.
+        //
+        // ⛔ [T34 loss-counter fix] The clamp is not defensive tidiness: it is what
+        // keeps the subtraction below an honest statement about the interval
+        // (previousNewest, newestCaptureTick], which holds exactly `gap` ticks. See
+        // the block above noteArrival.
+        const std::uint32_t delivered = (newCaptureTicksDelivered > gap)
+            ? gap
+            : newCaptureTicksDelivered;
+
+        m_lostCaptureTicks      += (gap - delivered);
+        m_deliveredCaptureTicks += delivered;
+        m_expectedCaptureTicks  += gap;
+
         if (m_samples < m_windowSamples)
         {
             return false;
@@ -796,9 +1025,10 @@ public:
     }
 
     // --- introspection; tests and diagnostics only -------------------------
-    std::uint32_t sampleCount() const { return m_samples; }
-    std::uint32_t maxGap()      const { return m_maxGap; }
-    std::uint32_t noAdvance()   const { return m_noAdvance; }
+    std::uint32_t sampleCount()     const { return m_samples; }
+    std::uint32_t maxGap()          const { return m_maxGap; }
+    std::uint32_t noAdvance()       const { return m_noAdvance; }
+    std::uint32_t discontinuities() const { return m_discontinuities; }
 
     // The percentile the window WOULD report right now. Exposed so a test can
     // assert a distribution without having to fill an exact window.
@@ -847,15 +1077,35 @@ private:
         out.maxGap           = m_maxGap;
         out.noAdvance        = m_noAdvance;
         out.saturatedSamples = m_saturatedSamples;
+
+        out.lostCaptureTicks      = m_lostCaptureTicks;
+        out.deliveredCaptureTicks = m_deliveredCaptureTicks;
+        out.expectedCaptureTicks  = m_expectedCaptureTicks;
+        out.lostCaptureTicksX1000 = (m_expectedCaptureTicks == 0u)
+            ? 0u
+            : static_cast<std::uint32_t>(
+                  (static_cast<std::uint64_t>(m_lostCaptureTicks) * 1000u)
+                  / m_expectedCaptureTicks);
+
+        out.discontinuities     = m_discontinuities;
+        out.maxDiscontinuityGap = m_maxDiscontinuityGap;
     }
 
     void resetWindow()
     {
         m_buckets.fill(0u);
-        m_samples          = 0u;
-        m_maxGap           = 0u;
-        m_noAdvance        = 0u;
-        m_saturatedSamples = 0u;
+        m_samples             = 0u;
+        m_maxGap              = 0u;
+        m_noAdvance           = 0u;
+        m_saturatedSamples    = 0u;
+        m_lostCaptureTicks    = 0u;
+        m_deliveredCaptureTicks = 0u;
+        m_expectedCaptureTicks = 0u;
+        // [T34 rework] Per-window, like ServerFrameProbe's: the field's job is to
+        // tell an operator whether THIS window was interrupted, and a cumulative
+        // count would mark every window after the first as suspect forever.
+        m_discontinuities     = 0u;
+        m_maxDiscontinuityGap = 0u;
         // The per-id watermark deliberately SURVIVES the window boundary: the gap
         // across a window edge is a real gap, and dropping the watermark would
         // silently discard one sample per component per window.
@@ -871,6 +1121,19 @@ private:
     std::uint32_t m_maxGap           = 0u;
     std::uint32_t m_noAdvance        = 0u;
     std::uint32_t m_saturatedSamples = 0u;
+
+    // [T34] The R = 0 loss counter's accumulators. All reset with the window; the
+    // per-id watermark that produces the gaps deliberately does not.
+    // [T34 loss-counter fix] `m_deliveredCaptureTicks` is the third term, and the
+    // invariant `lost + delivered == expected` is what makes the window checkable.
+    std::uint32_t m_lostCaptureTicks      = 0u;
+    std::uint32_t m_deliveredCaptureTicks = 0u;
+    std::uint32_t m_expectedCaptureTicks  = 0u;
+
+    // [T34 rework] The discontinuity guard's tally. See
+    // kRelayArrivalDiscontinuityTicks.
+    std::uint32_t m_discontinuities     = 0u;
+    std::uint32_t m_maxDiscontinuityGap = 0u;
 };
 
 // ---------------------------------------------------------------------------

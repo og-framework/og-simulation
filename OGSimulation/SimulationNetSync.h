@@ -12,6 +12,7 @@
 
 #include "OGSimulation/CorrectionStateBufferCodec.h"
 #include "OGSimulation/Network/ClientInputDelayLine.h"
+#include "OGSimulation/Network/CorrectionRotation.h"
 #include "OGSimulation/Network/CorrectionVerdictProbe.h"
 #include "OGSimulation/Network/RelayReadProbe.h"
 #include "OGSimulation/Network/RelayedInputStore.h"
@@ -846,8 +847,21 @@ public:
                     {
                         RelayArrivalWindowSummary arrival;
                         std::uint32_t gapCaptureTicks = 0u;
+                        // ⛔ [T34 loss-counter fix] `newCaptureTicksIngested`, NOT
+                        // `entriesIngested` and NOT a hard-coded 1. It is the count
+                        // of capture ticks this arrival made newly resident, and it
+                        // is what turns `lostCaptureTicksX1000` from a measure of
+                        // the BURST RATE into a measure of loss. `entriesIngested`
+                        // would count re-delivered ticks as new coverage and hide
+                        // real loss; a hard-coded 1 is the retired replace-latest
+                        // premise and is exactly what reported ~120 per mille on a
+                        // working flush.
                         const bool windowClosed = m_relayArrivalProbe.noteArrival(
-                            id, report.newestCaptureTick, arrival, &gapCaptureTicks);
+                            id,
+                            report.newestCaptureTick,
+                            static_cast<std::uint32_t>(report.newCaptureTicksIngested),
+                            arrival,
+                            &gapCaptureTicks);
 
                         // Per-event Verbose, and only when the cadence actually
                         // hiccuped. A gap of exactly 1 is the healthy depth-1
@@ -868,13 +882,49 @@ public:
                             // `depth >= gap_p99 + margin` rule reads; the mean is
                             // deliberately absent because it hides the tail that
                             // sets depth.
+                            //
+                            // ⭐ [T34] `lostCaptureTicksX1000` IS THE R = 0 LOSS
+                            // INSTRUMENT, and it is on this line rather than its
+                            // own because it is derived from these same samples.
+                            // WARNING, not Log, is load-bearing:
+                            // `Config/DefaultEngine.ini` sets `LogOGNet=Warning`, so
+                            // a Log line does not exist on a dedicated server —
+                            // items 35 and 36 each cost this initiative a proof line
+                            // for exactly that. Steady-state expectation ~ 11 per
+                            // mille (the measured 1.122 % wire loss); the raw
+                            // numerator and denominator ride along so a window can
+                            // be re-derived rather than trusted.
+                            //
+                            // ⭐ [T34 rework] `discont=` IS PART OF THE GATE, not
+                            // garnish. A window reporting `discont=` > 0 was
+                            // interrupted (see kRelayArrivalDiscontinuityTicks) and
+                            // must be DISCARDED rather than averaged in — the same
+                            // rule `[RelayProbe.Write] discont=` already carries.
+                            // `discontMax=` is the largest excluded gap, exact, so
+                            // discarding a window never hides how bad it was.
+                            //
+                            // ⭐ [T34 loss-counter fix] `delivered=` IS THE FIELD
+                            // THAT MAKES THIS LINE SELF-CHECKING. `lost + delivered
+                            // == expected` must hold on every window; a reader who
+                            // sees it fail knows the delivered count is not being
+                            // plumbed and that `lostCaptureTicksX1000` is measuring
+                            // the burst rate again. Before this field existed, that
+                            // failure mode was indistinguishable from a lossy wire.
                             SIMLOG(m_logger,
                                 "[Warning][RelayProbe.Arrival] samples=%u gapCaptureTicks "
-                                "p50=%u p99=%u%s max=%u noAdvance=%u saturated=%u",
+                                "p50=%u p99=%u%s max=%u noAdvance=%u saturated=%u "
+                                "lostCaptureTicksX1000=%u lost=%u delivered=%u expected=%u "
+                                "discont=%u discontMax=%u",
                                 arrival.samples, arrival.p50, arrival.p99,
                                 arrival.p99Saturated ? "+" : "",
                                 arrival.maxGap, arrival.noAdvance,
-                                arrival.saturatedSamples);
+                                arrival.saturatedSamples,
+                                arrival.lostCaptureTicksX1000,
+                                arrival.lostCaptureTicks,
+                                arrival.deliveredCaptureTicks,
+                                arrival.expectedCaptureTicks,
+                                arrival.discontinuities,
+                                arrival.maxDiscontinuityGap);
                         }
                     }
 
@@ -1746,17 +1796,100 @@ public:
     // masking argument above is exactly the every-frame-correction argument, and
     // it is the same premise the deferred stale-hold rule rests on (design §8.7).
     // A sparse-state increment must re-examine this drop, not assume it.
+    //
+    // ---- ⭐ [T39] THAT INCREMENT HAS LANDED. STATE IS NO LONGER EVERY-FRAME. ---
+    // The paragraph above was written as a fence; this is the task that crossed it,
+    // deliberately and with the trade priced, so the fence is now a RECORD of what
+    // was traded rather than a warning about what must not be
+    // (design_task38_input_first_replication.md §2.3, §13.1).
+    //
+    // WHAT CHANGED. `correctionRotationK` characters' states are written per tick,
+    // round-robin (correctionRotation::isInRound below), so each character's state
+    // replicates at `tickFrequency * K / N` Hz instead of `tickFrequency`. At the
+    // shipped K = 2 that is unchanged at two characters and 40/30/20 Hz at 3/4/6.
+    //
+    // WHY THE OWN-CHARACTER INPUT-ECHO DROP SURVIVES IT — the re-examination this
+    // block demanded, performed rather than assumed:
+    //   * The masking argument WEAKENS but does not invert. A correction snapshot
+    //     is a COMPLETE anchor with no delta chain (see §2.1 / the codec), so a
+    //     skipped tick costs REPAIR LATENCY, never repair ability: the next
+    //     snapshot still detects a divergence introduced during the gap and still
+    //     drives the resim. The rotation wait is bounded — every writer is written
+    //     within ceil(N/K) sends by construction — so the added latency is at most
+    //     ceil(N/K) - 1 ticks, i.e. ~1-2 ticks at the shipped numbers.
+    //   * The thing that made the drop safe in the first place is unchanged: the
+    //     T4 applied-capture-tick ref still travels with every snapshot, so the
+    //     client can still answer "which of my captures did the server run at tick
+    //     T" from its own delay line, at whatever cadence the snapshots arrive.
+    //   * The trade is strongly favourable and is the POINT of the change: the
+    //     payload that lengthens its repair window is the SELF-HEALING one, and it
+    //     lengthens so that the IRREPLACEABLE one (the relay ring, which has no
+    //     recovery path anywhere) can no longer be displaced by it under packet
+    //     pressure. Before T39 both shared one atomic Iris batch and died together
+    //     (finding_task37_depth_regression.md).
+    //   * It is MEASURED, not asserted: `[DivergenceProbe.Window]` reports
+    //     corrections/s per character per class, so the delivered cadence is a
+    //     number a run reads back rather than a claim this comment makes.
+    // The one thing that would re-open THIS: driving K low enough that ceil(N/K)
+    // approaches the rollback window. Nothing does today (K >= 1 and N <= 6 give
+    // at most 6), and the clamp's floor of 1 is what bounds it.
     // -------------------------------------------------------------------------
 
-    void sendCorrectionAll(const SimulationTimeStep& step)
+    // `correctionRotationK` is NOT defaulted, on purpose. The whole deliverable of
+    // T39 is that the state cadence is a DECIDED, configured number rather than an
+    // emergent consequence of Iris dropping things; a default here would let a
+    // future call site acquire a cadence by accident, which is the exact failure
+    // mode the task exists to remove. The production caller
+    // (SimulationManager::onPostSimulationGameThread) passes
+    // TimeConfig::correctionRotationK; tests that are not about cadence pass an
+    // explicit every-frame value.
+    void sendCorrectionAll(const SimulationTimeStep& step, int32 correctionRotationK)
     {
         // Wire format is fully encapsulated by the buffer's write(composite, tick,
         // appliedCaptureTick). Must stay in lockstep with the client-side readInto()
         // in SimulationReconciliation::injectCorrectionState.
         const uint32 tick = step.getTick();
+
+        // Read ONCE for the whole send so every type map in the tuple is scheduled
+        // against the same round, and advance ONCE at the end. Advancing per type
+        // would make one type's registration count re-phase the other's schedule.
+        const std::size_t roundBase = m_correctionRotationRound;
+
         forEachTypeMap(m_authorityWriters, [&]<typename T>(auto& perTypeMap) {
+            // N for THIS type. The round base is monotonic and unwrapped precisely
+            // so it can be wrapped per type here — see CorrectionRotation.h.
+            const std::size_t writerCount = perTypeMap.size();
+            std::size_t position = 0u;
+
             for (auto& [id, w] : perTypeMap)
             {
+                const std::size_t thisPosition = position++;
+
+                // [T39] THE ROTATION GATE. A character not written is not dirty,
+                // and Iris rolls back the batch header of a clean object, so this
+                // `continue` costs ZERO wire bytes rather than deferring a write.
+                //
+                // POSITION, NOT ID. The cursor walks the enumeration order of this
+                // map rather than a separately maintained registration-order list.
+                // That is a deliberate simplification of the scoped design: the
+                // coverage guarantee is a property of POSITIONS (every position is
+                // covered within ceil(N/K) rounds regardless of which id occupies
+                // it), so a parallel id-order container would buy identity
+                // determinism that nothing reads, at the cost of a second structure
+                // to keep in sync with registration/unregistration. A registration
+                // change re-phases who is in a given frame's window and nothing
+                // more; coverage is unaffected and self-heals within one round.
+                //
+                // NO PER-SKIP LOG. At 6 characters and K=2 that would be 240
+                // suppressed-but-formatted lines per second for information the
+                // `[DivergenceProbe.Window]` corrections/s figure already reports
+                // as a delivered rate.
+                if (!correctionRotation::isInRound(
+                        thisPosition, roundBase, writerCount, correctionRotationK))
+                {
+                    continue;
+                }
+
                 auto& stored = m_storage.template get<T>(id);
                 // [T4] The join key travels WITH the state it belongs to: the
                 // capture tick behind the input this character's authority applied
@@ -1775,6 +1908,9 @@ public:
                 // retirement block above.
             }
         });
+
+        m_correctionRotationRound =
+            correctionRotation::advanceRound(m_correctionRotationRound, correctionRotationK);
     }
 
     // -----------------------------------------------------------------------
@@ -2121,6 +2257,18 @@ private:
     // per tick on the PHYSICS thread. Atomic — and ONLY atomic — for the reasons
     // spelled out on setClientEffectiveInputDelayTicks. 0 = pre-T9 behaviour.
     std::atomic<int32> m_clientEffectiveInputDelayTicks{ 0 };
+
+    // [T39] THE STATE-ROTATION CURSOR. Monotonic, advanced by K once per
+    // sendCorrectionAll, wrapped per type map at the point of use — see the
+    // per-type wrapping note in Network/CorrectionRotation.h. Plain (non-atomic):
+    // sendCorrectionAll runs on the GAME thread only, from
+    // SimulationManager::onPostSimulationGameThread.
+    //
+    // NOT WIPED BY wipeAllForResync, and that is intentional: a hard resync jumps
+    // the CLOCK, and this is a position in a round-robin over characters, not a
+    // tick-keyed quantity. Re-phasing it would skip or double-write a character
+    // for one round and buy nothing.
+    std::size_t m_correctionRotationRound = 0u;
 };
 
 // ---------------------------------------------------------------------------
@@ -2129,9 +2277,12 @@ private:
 
 template <typename T, typename... SimulatableTs>
 concept SimulationNetSyncConcept = requires(
-    T& t, const SimulationTimeStep& step, uint32 tick, int32 rollbackWindow)
+    T& t, const SimulationTimeStep& step, uint32 tick, int32 rollbackWindow,
+    int32 correctionRotationK)
 {
-    { t.sendCorrectionAll(step) };
+    // [T39] sendCorrectionAll gained the state-rotation width. It is a required
+    // argument rather than a defaulted one — see the note at the definition.
+    { t.sendCorrectionAll(step, correctionRotationK) };
     { t.sendLocalInputToAuthorityAll(tick, tick) };
     { t.collectInputAll(step) } -> std::convertible_to<ResolvedInputs<SimulatableTs...>>;
     // [T6] MOVED here from SimulationReconciliationConcept along with the method:

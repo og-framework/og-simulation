@@ -66,10 +66,70 @@
 //
 // Building the clamp is genuine DESIGN work, not wiring — the site (naturally
 // the resim-anchor selection) and the partial-resim semantics both have to be
-// specified. It is deliberately DEFERRED to the sparse-state increment, where
+// specified. It was deliberately DEFERRED to the sparse-state increment, where
 // corrections stop landing every tick and deep resims become real. While state
-// replicates every frame the need is theoretical: resim depth stays ~= client
+// replicated every frame the need was theoretical: resim depth stayed ~= client
 // lead + downlink, comfortably under every configured ceiling.
+//
+// ---------------------------------------------------------------------------
+// ⚠ THE DEFERRAL'S TRIGGER HAS FIRED — RE-SCOPED, STILL DEFERRED
+// (recorded 2026-08-08; og-netcode-v2-input-relay T39)
+//
+// **T39 IS the sparse-state increment.** `SimulationNetSync::sendCorrectionAll`
+// now writes `correctionRotationK` characters' state buffers per tick,
+// round-robin, so corrections have stopped landing every tick: each character is
+// corrected at `tickFrequency * K / N` Hz — 60 Hz at two characters, 20 Hz at
+// six, with the shipped K = 2. The condition the paragraph above defers on is
+// therefore satisfied, and this note exists so that fact is not left silent.
+//
+// **DECISION: the clamp stays deferred, and the trigger is re-scoped from a
+// binary condition to a measured bound.** The re-derivation, because the
+// deferral names TWO clauses and only the first has fired:
+//
+//   * The resim span really is anchored on the newest LANDED correction, so
+//     rotation really does lengthen it. `CorrectionCache::getLastResimulationTick`
+//     walks back from the prediction frontier to the first slot flagged
+//     `m_isResimulated` or `m_containsCorrectTick`; a landing correction CLEARS
+//     the resimulated flag at its own slot, and `pushPredictionTick` propagates
+//     the frontier's flag forward, so the walk goes quiet after a resim and wakes
+//     at exactly `predictionTick - lastCorrectTick`.
+//   * That distance grows by the ROTATION AGE of the newest correction, which is
+//     bounded by construction at `ceil(N/K) - 1` ticks — 0 at two characters
+//     (K >= N is every-frame), 1 at three or four, **2 at six**. Add the Iris
+//     skip-and-accumulate tail, itself bounded by the 4.0-vs-1.0 static-priority
+//     ratio to roughly 4 frames, and one lost correction at the measured ~1.1 %
+//     wire loss, and the worst modelled addition is ~6-9 ticks.
+//   * Against what: `rollbackWindowTicks` (12) and `rollbackWindowHardCap` (20)
+//     both remain UNIMPLEMENTED for this purpose — the first has no client
+//     consumer at all and the second only gates a diagnostic — while the bound
+//     that actually binds is `CorrectionCache::StateBufferSize` (**60 slots**).
+//     Typical depth today is client lead + transit ~= 5 ticks; the worst case is
+//     a high-RTT client (predOffset ~13 at 150 ms) at six characters, i.e. ~20-23
+//     ticks. That crosses the two configured ceilings, which is NEW — but it is
+//     still under a third of the ring, so nothing is dropped, nothing is
+//     unbounded, and no new diagnostic fires (`isAnomalousMiss` gates on a MISSED
+//     tick's distance from the frontier, a clock-offset quantity, not on resim
+//     depth).
+//
+// So the first clause fired and the second did not: corrections are sparse, deep
+// resims are not yet real. Re-scoping rather than re-deferring on the same words,
+// because "the sparse-state increment" is now a condition that has already
+// happened and cannot fire again.
+//
+// **THE RE-SCOPED TRIGGER — build the clamp when any of these becomes true:**
+//   1. modelled worst-case resim depth exceeds ~half of `StateBufferSize` (30
+//      ticks) — reached by raising N above ~8 at K = 2, or by driving K to 1;
+//   2. a measured resim-depth distribution (not a model) shows a p99 above
+//      `rollbackWindowHardCap`, which would make the existing log gate's
+//      companion assumption stale as well;
+//   3. `rollbackWindowTicks` acquires a real client-side consumer for any other
+//      reason, at which point the clamp is wiring rather than design.
+// ⚠ Note the direction of travel is AWAY from this, not toward it: step 4 of the
+// shipping plan (Candidate E, K = N) puts state back at 60 Hz and un-fires the
+// trigger entirely, and the wire diet in between does not touch cadence. Item 34
+// (bare-C1 flush) changes the INPUT channel only. Re-read this note if that plan
+// changes — the quantity to re-derive is `ceil(N/K)`, and nothing else here
+// depends on the design of those steps.
 // ---------------------------------------------------------------------------
 //
 // See OGBrawlerNetworkModelResearch/arch/proposal_ogbrawler_netcode.md §4 for
@@ -282,12 +342,23 @@ struct TimeConfig
 	//
 	//     depth >= (measured ticks between successful relay replications) + margin
 	//
-	// That measurement does not exist yet — the T9 relay-cadence probe produces it
-	// (its acceptance criterion is to emit a measured `depth >= gap_p99 + margin`
-	// recommendation). UNTIL THEN THE DEFAULT IS 1: at floor 0 the scheduled read
-	// nearly always misses anyway and falls back to the peer's last-known input,
-	// which is the degenerate, no-bandwidth-increase behaviour this increment
-	// ships. Do not raise this on intuition — raise it against the probe's number.
+	// [T22/T33] THAT MEASUREMENT NOW EXISTS — do not go looking for it again. The
+	// relay write-path probe's burst histogram (server writes per game-thread
+	// frame, one measured 90 s run: 75 windows max=2, 3 windows max=3, none >= 4)
+	// is the number the sizing rule wants, and `impl/impl_notes_task33.md` §4
+	// derives depth 2 from it (~99.6-99.9 % end-to-end delivered, +71.5 B/tick per
+	// character over depth 1). The rule is unchanged and still binds: raise this
+	// against a re-measured histogram, never on intuition. A steady-state
+	// `writesPerFrame max` of 3 means depth 2 has no headroom left and is the
+	// escalation trigger, not a reason to nudge the number.
+	//
+	// THE COMPILED DEFAULT STAYS 1 — degenerate, byte-for-byte today's behaviour
+	// when nothing overrides it. The session value is CONFIGURED, not recompiled:
+	// [T35] the composition root reads `[OGNetcode] RelayRedundancyDepthTicks` from
+	// the ini on the SERVER (the relay tap is authority-side) and pushes it through
+	// `SimulationManager::setRelayRedundancyDepthTicks`. Server-only and NOT
+	// replicated — depth is passed per write and never rides the wire, because the
+	// receiver just iterates what arrived (RelayedInputRingCodec.h).
 	//
 	// DELIBERATELY INDEPENDENT OF `relayDelayFloorTicks` (§11 Q3): the floor sets
 	// how far ahead inputs are scheduled, this sets how much history survives a
@@ -296,9 +367,27 @@ struct TimeConfig
 	// exists. Raising the floor without raising this simply means more scheduled
 	// misses (self-healed by the next correction), not a correctness break.
 	//
-	// Clamped to [1, relayedInputRing::kMaxDepth = 8] at the write site: 0 would
-	// silently disable the relay, and the upper bound is the per-character wire
-	// budget (RelayedInputRingCodec.h).
+	// Clamped to [1, relayedInputRing::kMaxDepth = 8] by ONE shared guard,
+	// `relayedInputRing::clampDepth`, called at every point that can set it: the
+	// ini intake at the composition root, `setRelayRedundancyDepthTicks`, and once
+	// more at the ring write site. It is idempotent, which is what makes the
+	// repetition safe. 0 and negatives clamp UP to 1 — 0 is not "off", it is a ring
+	// that retains nothing, i.e. a silently disabled relay. The upper bound is the
+	// per-character wire budget (RelayedInputRingCodec.h).
+	//
+	// ⛔ [T34] INERT UNDER FLUSH-ON-POLL — READ THIS BEFORE TUNING IT. Item 34
+	// replaced the replace-latest write path with bare C1 flush-on-poll: arrivals
+	// are STAGED and the whole stage is published into the ring once per Iris poll
+	// (`relayedInputRing::stageArrival` / `flushStagedInto`). The stage's capacity is
+	// `relayedInputRing::kMaxDepth` — a CONSTANT, taken directly — so nothing on the
+	// live relay path reads this field any more. Its meaning is UNCHANGED
+	// ("retention depth of the replace-latest write path"); that path simply stopped
+	// running, which is precisely why it was left with one meaning rather than
+	// acquiring a second (T43 finding 5). Raising it now changes nothing on the wire.
+	// The clamp, the ini intake, the setter and the `[RelayDepth] session depth`
+	// proof line all stay live and correct — item 35's Gate-1 tooling keeps working —
+	// and that line carries an `(inert under flush)` suffix so it cannot lie by
+	// omission.
 	// Default: 1
 	int32_t relayRedundancyDepthTicks = 1;
 
@@ -365,6 +454,76 @@ struct TimeConfig
 	// how much history survives a replication gap.
 	// Default: 0 (degenerate — today's behaviour, byte-for-byte)
 	int32_t relayDelayFloorTicks = 0;
+
+	// THE STATE CADENCE LEVER — how many characters' correction-state buffers
+	// `SimulationNetSync::sendCorrectionAll` writes per tick, round-robin.
+	// (og-netcode-v2-input-relay T39;
+	//  design_task38_input_first_replication.md §5.4, §6 Candidate A, §13.2.)
+	//
+	// WHAT IT BUYS. The correction state is the LARGE payload (311 B on the wire
+	// per character per tick) and the SELF-HEALING one: a missed snapshot costs
+	// correction latency only, because every snapshot is a complete anchor and the
+	// client always reconciles against the newest landed one (T38 §2.1). The relay
+	// ring is the small, IRREPLACEABLE payload — a dropped relayed input has no
+	// recovery path anywhere (T38 §2.2). Before T39 both shared one atomic Iris
+	// batch, so packet overflow killed them together (T37). Stage 1 splits them and
+	// ranks the ring above the state; THIS knob is the other half: instead of
+	// writing every character's state every tick and letting the packet decide who
+	// loses, the write site rotates through the characters at a decided cadence.
+	//
+	// THE ARITHMETIC. With N registered authority writers, each character's state
+	// replicates at `tickFrequency * K / N` Hz — 60 Hz at N <= K; at the SHIPPED
+	// K=1 that is 30/20/15 Hz at N=2/3/4, and at K=2 it would be 60/40/30 Hz and
+	// 20 Hz at N=6. A character not written is not dirty
+	// and costs ZERO bytes (Iris rolls back headers of clean objects), so the
+	// saving is real wire bytes, not a deferred write.
+	//
+	// ⛔ THE COMPILED DEFAULT IS 1, AND IT IS 1 FOR THE DURATION OF THE PRE-DIET
+	// WINDOW ONLY — item 40 (the wire diet) restores 2 in the same change that
+	// deletes `kPreDietCharacterCap`. [T39 shipped 2; T34 lowered it, T38 §16.2.]
+	//
+	// The reason is a specific engine fork, not a byte budget. `FReplicationWriter::
+	// HandleObjectBatchFailure` routes a batch that fails to fit through
+	// `SplitHugeObject` — chunked, reliable-attachment-backed delivery that BLOCKS
+	// that object's newer snapshots until acked — whenever the failure leaves more
+	// than `GetBitCountSplitThreshold` (1,536 bits ~ 192 B) of space free. With
+	// un-dieted 316 B states and bare C1's VARIABLE-length rings, K=2 at four
+	// characters puts the second state's failure at ~270-312 B remaining, i.e.
+	// INSIDE that window, on roughly a third of frames. At K=1 and N <= 4 the round
+	// fits outright on average and correlated-p99 frames, and the residual failures
+	// land BELOW the window => a clean `Abort` => the state ships in packet 2 of the
+	// same tick. Cadence at K=1 is 30/20/15 Hz at 2/3/4 characters — the floor of
+	// the accepted 15-20 Hz band, deliberately.
+	//
+	// COST OF THE CHANGE, STATED: at TWO characters K=2 was every-frame, i.e.
+	// bit-identical to pre-T39 cadence, which is what kept the archived 2-character
+	// baselines comparable. At K=1 a two-character session corrects at 30 Hz, so a
+	// correction-cadence comparison against those baselines must expect exactly half
+	// — that is designed, not a regression. Do NOT special-case K by character count.
+	//
+	// ⚠ IT INTERACTS WITH A DOCUMENTED PREMISE. The retirement block at
+	// `SimulationNetSync::sendCorrectionAll` records that the own-character
+	// input-echo drop is safe BECAUSE corrections ship every frame, and names
+	// sparse state as the one thing that would re-open it. This knob is that
+	// thing, deliberately and with the trade priced (T38 §2.3, §13.1): input
+	// delivery rises far more than repair latency lengthens. Read that block
+	// before tightening K further.
+	//
+	// SESSION-SCOPED, SERVER-ONLY, NOT REPLICATED — like the ring depth and unlike
+	// the delay floor. Only the authority runs sendCorrectionAll, so a client copy
+	// would have no reader; nothing about the cadence needs to ride the wire,
+	// because a receiver just reconciles against whatever corrections arrive.
+	// The composition root reads `[OGNetcode] CorrectionRotationK` on the SERVER
+	// and pushes it through `SimulationManager::setCorrectionRotationK`.
+	//
+	// Clamped to [1, 16] by ONE shared idempotent guard,
+	// `correctionRotation::clampK`, called at the ini intake, at the setter, and
+	// once more inside the selection predicate. 0 and negatives clamp UP to 1: a
+	// K of 0 is not "off", it is a correction channel that never publishes, i.e. a
+	// permanent desync. The ceiling only has to stop a typo becoming nonsense —
+	// K >= N is the legitimate every-frame setting.
+	// Default: 1  (pre-diet; returns to 2 with the wire diet — see the block above)
+	int32_t correctionRotationK = 1;
 
 	// -------------------------------------------------------------------------
 	// Test harness mode selector (Catch2 determinism harness)

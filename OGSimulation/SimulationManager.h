@@ -7,6 +7,8 @@
 
 #include "OGAssert.h"
 #include "OGSimulation/Network/ConnectionTierTable.h"   // clampRelayDelayFloorTicks (T11)
+#include "OGSimulation/Network/CorrectionRotation.h"    // correctionRotation::clampK (T39)
+#include "OGSimulation/RelayedInputRingCodec.h"         // relayedInputRing::clampDepth (T35)
 #include "OGSimulation/PCTimeManagement/ServerTickClock.h"
 #include "OGSimulation/PCTimeManagement/NetworkTimeEstimator.h"
 #include "OGSimulation/PCTimeManagement/ClientPredictionClock.h"
@@ -165,6 +167,59 @@ public:
             clampRelayDelayFloorTicks(requestedFloorTicks, m_timeConfig);
     }
 
+    // [T35 / og-netcode-v2-input-relay] THE one writable location for the session
+    // relay ring depth — the door the composition root's
+    // `[OGNetcode] RelayRedundancyDepthTicks` ini override writes through.
+    //
+    // SERVER-ONLY, and unlike the floor above it is NOT replicated. The depth is
+    // passed per write into the ring codec and is deliberately absent from the
+    // wire: a receiver never needs it, it just iterates whatever entries arrived
+    // (see the DEPTH IS SESSION-FIXED note in RelayedInputRingCodec.h). So this
+    // setter has no OnRep counterpart and no client-side intake point.
+    //
+    // ONE-SHOT AT COMPOSITION. The same codec note records that SHRINKING the
+    // depth mid-session does not reclaim already-allocated ring entries — a
+    // documented non-scenario, safe only because TimeConfig is built once per
+    // session, before the first relay write. This setter exists to serve that one
+    // call; it is not a runtime tuning knob and must not acquire a cvar.
+    //
+    // CLAMPED HERE TOO, with the same shared guard the intake and the write site
+    // call (`relayedInputRing::clampDepth`, idempotent). 0 and negatives clamp UP
+    // to 1: a depth-0 ring retains nothing, which is a silently disabled relay,
+    // not "off".
+    void setRelayRedundancyDepthTicks(int32_t requestedDepthTicks)
+    {
+        m_timeConfig.relayRedundancyDepthTicks =
+            static_cast<int32_t>(relayedInputRing::clampDepth(requestedDepthTicks));
+    }
+
+    // [T39 / og-netcode-v2-input-relay] THE one writable location for the session
+    // correction-state rotation width — the door the composition root's
+    // `[OGNetcode] CorrectionRotationK` ini override writes through.
+    //
+    // SERVER-ONLY and NOT replicated, for the same reason as the ring depth above
+    // and unlike the delay floor: only the authority runs
+    // `SimulationNetSync::sendCorrectionAll`, so a client's copy of this value
+    // would have no reader, and a receiver reconciles against whatever
+    // corrections arrive without needing to know the sender's cadence. So this
+    // setter has no OnRep counterpart and no client-side intake point.
+    //
+    // ONE-SHOT AT COMPOSITION. Not a hard requirement the way the depth's is (K
+    // holds no allocated state, so changing it mid-session would merely re-phase
+    // the schedule), but it is deliberately kept to the same discipline: the
+    // cadence is a DESIGNED number that a session's probe output is read against,
+    // and a value that can move mid-run makes those readings unattributable.
+    // It must not acquire a cvar.
+    //
+    // CLAMPED HERE TOO, with the same shared idempotent guard the intake and the
+    // selection predicate call (`correctionRotation::clampK`). 0 and negatives
+    // clamp UP to 1: a K of 0 is a correction channel that never publishes, which
+    // is a permanent desync, not "off".
+    void setCorrectionRotationK(int32_t requestedK)
+    {
+        m_timeConfig.correctionRotationK = correctionRotation::clampK(requestedK);
+    }
+
     ServerTickClock& editServerClock()
     {
         if (!m_serverClock.has_value()) { std::terminate(); }
@@ -300,7 +355,11 @@ public:
     void onPostSimulationGameThread()
     {
         const SimulationTimeStep step = currentStep();
-        m_netSync.sendCorrectionAll(step);
+        // [T39] The state-rotation width — how many characters' correction buffers
+        // are written this tick. Read live from TimeConfig for the same reason the
+        // redundancy depth below is: it is the configured session value, and
+        // caching it here would make an ini-driven setting silently ineffective.
+        m_netSync.sendCorrectionAll(step, m_timeConfig.correctionRotationK);
         // redundancy depth tracks the runtime tick rate via
         // TimeConfig::redundancyDepthTicks (5 @ 100 Hz interim / 3 @ 60 Hz target).
         m_netSync.sendLocalInputToAuthorityAll(

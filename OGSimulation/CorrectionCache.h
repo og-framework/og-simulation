@@ -320,11 +320,32 @@ public:
 	//   3. Post-Skip holes — a graduated Skip advances the frontier by two,
 	//      leaving a gap that backfillSkippedTick does not always cover.
 	//
-	// Corrections are an unthrottled per-tick stream and reconciliation anchors on
-	// the newest LANDED correction rather than a specific tick, so a miss costs at
-	// most one tick of delayed reconciliation. Logging these at Warning cried wolf
-	// badly enough to cost real diagnostic time during that session, because the
-	// shape resembled the v1 T23/T24 hard-lock bug signature.
+	// Reconciliation anchors on the newest LANDED correction rather than on a
+	// specific tick, so a miss costs delayed reconciliation rather than lost
+	// reconciliation.
+	//
+	// ⚠ [og-netcode-v2-input-relay T39] THE COST IS NO LONGER "AT MOST ONE TICK",
+	// AND CORRECTIONS ARE NO LONGER AN UNTHROTTLED PER-TICK STREAM. Both clauses
+	// were true when this block was written and both are now false:
+	// `SimulationNetSync::sendCorrectionAll` writes `TimeConfig::correctionRotationK`
+	// characters' state buffers per tick, round-robin, so each character is
+	// corrected at `tickFrequency * K / N` Hz — 60 Hz at N <= K, and 20 Hz at the
+	// shipped K = 2 with six characters. A miss therefore costs up to one ROTATION
+	// SLOT of delayed reconciliation: bounded by ceil(N/K) ticks (3 at K=2/N=6),
+	// not by 1.
+	//
+	// ⛔ THE GATE BELOW IS UNAFFECTED, AND THAT IS A DERIVED FACT, NOT AN
+	// OVERSIGHT — do not "update" it for the new cadence. The gate compares the
+	// missed tick's DISTANCE FROM THE PREDICTION FRONTIER against
+	// rollbackWindowHardCap. That distance is a CLOCK-OFFSET quantity (how far the
+	// client is predicting ahead of the authority tick the correction describes);
+	// it does not depend on how OFTEN corrections are sent. Rotation changes the
+	// number of corrections per second, not the distance any one of them lands at.
+	// The 2026-07-20 verification numbers below therefore still bind unchanged.
+	//
+	// Logging these at Warning cried wolf badly enough to cost real diagnostic time
+	// during that session, because the shape resembled the v1 T23/T24 hard-lock bug
+	// signature.
 	//
 	// GATE: warn only when the missed tick is FURTHER than rollbackWindowHardCap
 	// from the prediction frontier. That bound is the maximum depth the reconciler

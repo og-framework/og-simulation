@@ -69,7 +69,22 @@
 // These are DELIBERATELY the same four method names as
 // InputRedundancyBundleCodec.h's BUFFER CONCEPT, so one buffer type (the UE
 // TArray-backed USTRUCT, or a std::vector-backed test buffer) can back either
-// codec without a second adapter surface. The per-entry input serialization
+// codec without a second adapter surface.
+//
+// [og-netcode-v2-input-relay T34] THE FLUSH PATH NEEDS A FIFTH METHOD, and it is
+// scoped so the shared four above are untouched:
+//   - void bundleTruncateTo(std::int32_t byteCount);        // shrink, never grow
+// It is required ONLY by `resetEntries` and `flushStagedInto` at the bottom of
+// this file. `writeLatest`, `findEntry`, `forEachEntry`, `entryCount` and
+// `getWireFormatVersion` still need exactly the four, so a buffer written against
+// InputRedundancyBundleCodec.h's concept still backs every read/write operation
+// here and that header is NOT touched (T43 finding 6 — no shared-contract
+// change). Only a buffer that is FLUSHED has to grow the fifth method.
+//
+// WHY A SHRINK IS UNAVOIDABLE ON THE FLUSH PATH: the transport ships
+// `bundleByteNum()` bytes (FRelayedInputRing::NetSerialize's `used`), so zeroing
+// the entry count without shrinking would leave the payload at its high-water
+// mark and send stale trailing entries forever. The per-entry input serialization
 // reuses the same field-wise machinery as the sync buffers
 // (SimulationSerialization.h / SimulationComposite.h), so the serialized size of
 // one input is a compile-time constant for a given InputType and entries are a
@@ -88,6 +103,12 @@
 // reclaim already-allocated entries — a lowered depth degenerates to
 // replace-oldest at the larger size. TimeConfig is constructed once per session,
 // so this is a documented non-scenario rather than a supported one.
+// ⛔ [T34] THE FLUSH PATH DOES NOT TAKE ITS CAPACITY FROM THAT KNOB. `stageArrival`
+// below passes `kMaxDepth` directly and never reads
+// `TimeConfig::relayRedundancyDepthTicks`; under flush-on-poll that knob is INERT
+// (it configures the retired replace-latest write path). Reading it on the flush
+// path would cap every round at one entry and silently reproduce replace-latest —
+// T43 finding 1, the one defect that review found in item 34's text.
 //
 // WIRE VERSION. This payload carries its OWN version byte, starting at 1. It is
 // NOT the `kWireFormatVersion` fence on FSimulationStateSyncBuffer that T4 bumps
@@ -116,6 +137,30 @@ namespace relayedInputRing
 	// deliberate wire-budget decision, not a tuning tweak — depth 8 already costs
 	// 8x the per-character input bytes of today's depth-1 default.
 	inline constexpr std::uint8_t kMaxDepth = 8;
+
+	// THE SHARED DEPTH GUARD. Runtime depth, clamped into [1, kMaxDepth].
+	//
+	// A configured 0 (or negative) would make the ring unwritable, which would
+	// SILENTLY DISABLE the relay — far worse than the degenerate depth-1 behaviour
+	// the initiative ships with. So 0 and negatives clamp UP to 1; 0 is not "off".
+	//
+	// [og-netcode-v2-input-relay T35] PUBLIC, and deliberately so: this is now the
+	// ONE function every intake point calls. The composition root's
+	// `[OGNetcode] RelayRedundancyDepthTicks` ini read clamps with it before it
+	// logs the effective depth (an unclamped intake would make that log line lie),
+	// `SimulationManager::setRelayRedundancyDepthTicks` clamps with it again at the
+	// single write site, and `writeLatest` below clamps with it once more on every
+	// write. It is idempotent, which is what makes triple-clamping safe — the same
+	// shape `clampRelayDelayFloorTicks` established for the sibling floor knob, and
+	// for the same reason: two clamps that can drift is the hazard.
+	inline std::uint8_t clampDepth(std::int32_t requestedDepth)
+	{
+		if (requestedDepth < 1)
+			return 1;
+		if (requestedDepth > static_cast<std::int32_t>(kMaxDepth))
+			return kMaxDepth;
+		return static_cast<std::uint8_t>(requestedDepth);
+	}
 
 	// Wire-payload header layout.
 	inline constexpr std::uint32_t kVersionOffset    = 0;
@@ -246,18 +291,6 @@ namespace relayedInputRing
 				buf.writeToBuffer(kEntryCountOffset, static_cast<std::uint8_t>(0));
 			}
 		}
-
-		// Runtime depth, clamped into [1, kMaxDepth]. A configured 0 (or negative)
-		// would make the ring unwritable, which would silently disable the relay —
-		// far worse than the degenerate depth-1 behaviour the initiative ships with.
-		inline std::uint8_t clampDepth(std::int32_t requestedDepth)
-		{
-			if (requestedDepth < 1)
-				return 1;
-			if (requestedDepth > static_cast<std::int32_t>(kMaxDepth))
-				return kMaxDepth;
-			return static_cast<std::uint8_t>(requestedDepth);
-		}
 	} // namespace detail
 
 	// Reads the version byte. Returns 0 on an empty ring (no header written yet)
@@ -356,7 +389,7 @@ namespace relayedInputRing
 	{
 		detail::initHeaderIfEmpty(buf);
 
-		const std::uint8_t  effectiveDepth = detail::clampDepth(depth);
+		const std::uint8_t  effectiveDepth = clampDepth(depth);
 		const std::uint32_t stride         = detail::entryStride<InputType>();
 		const std::uint8_t  count          = entryCount(buf);
 
@@ -411,6 +444,170 @@ namespace relayedInputRing
 			offset + static_cast<std::uint32_t>(sizeof(std::uint32_t) + sizeof(std::uint8_t)),
 			input);
 		return true;
+	}
+
+	// -----------------------------------------------------------------------
+	// ⭐ [og-netcode-v2-input-relay T34] FLUSH-ON-POLL — BARE C1, R = 0.
+	//
+	// THE PROBLEM THIS SOLVES. `writeLatest` is called from the RPC RECEIPT path,
+	// which is paced by packet arrival; Iris polls the replicated ring once per
+	// server game-thread frame. At the shipped depth of 1 a second arrival in the
+	// same frame OVERWRITES the first in server memory before replication ever
+	// compares the property — measured at ~89.3 % of relayed inputs surviving, and
+	// from a client that loss is indistinguishable from a wire drop
+	// (Network/RelayWritePathProbe.h states the whole elimination chain).
+	//
+	// THE SHAPE. Arrivals are staged into a SEPARATE ring buffer of the same wire
+	// format; once per poll the stage is PUBLISHED into the replicated ring and
+	// emptied. The ring at poll N therefore carries exactly `arrivals(N)`, not
+	// "the newest arrival of N".
+	//
+	// R = 0 — NO RETENTION. A published round is not kept for a second round; a
+	// packet that carries it and is lost takes those inputs permanently (~1.1 %
+	// measured wire loss, accepted by the user 2026-08-08 under the self-healing
+	// correction model, T38 §13). The 2-generation hybrid in
+	// design_task30_c1_flush_on_poll.md §11.5 is the recorded ESCALATION, not this.
+	// Because there is no send-success signal anywhere in Iris that game code can
+	// read (T38 §4.3), that loss is invisible by construction on this side — the
+	// binding instrument is the CLIENT-side `lostCaptureTicksX1000` in
+	// Network/RelayReadProbe.h, which counts the arithmetic gaps in the per-
+	// character monotonic capture-tick stream.
+	// ⚠ [T34 loss-counter fix] COMMENT-ONLY CORRECTION, no behaviour here changed.
+	// It counts the UNFILLED PART of those gaps — `Sum(gap - delivered)`, not
+	// `Sum(gap - 1)`. The `-1` form was written for the replace-latest write path
+	// this section replaced, where one arrival carried one entry; against a FLUSH it
+	// measures the burst rate and reported ~120 per mille on a run that lost ~1 %.
+	// See RelayArrivalWindowSummary's loss block.
+	//
+	// THREADING: none. Receipt (staging) and the flush are both the game thread,
+	// in the same UWorld::Tick, receipt first (BroadcastTickDispatch runs early,
+	// BroadcastTickFlush at the end). Plain members, no lock, no atomics.
+	// -----------------------------------------------------------------------
+
+	// What one staging write did. `droppedOldest` is the ONLY loss this side can
+	// see and it must never be silent — this initiative's standing lesson is that
+	// silent is the expensive kind.
+	struct StageArrivalOutcome
+	{
+		// The entry is now resident in the stage.
+		bool accepted = false;
+		// The stage was already at capacity, so the OLDEST staged entry was
+		// superseded to make room. A burst longer than kMaxDepth in ONE frame is
+		// the only way to reach this; the ring could not have carried those
+		// entries either (kMaxDepth is its own hard bound), so this is a ceiling,
+		// not a regression against the pre-flush behaviour.
+		bool droppedOldest = false;
+	};
+
+	// ⭐⭐ THE CAPACITY RULE, EXPRESSED AS THE ONLY WAY TO WRITE THE STAGE.
+	//
+	// Stage one arrival. The capacity is `kMaxDepth`, PASSED HERE AS A CONSTANT and
+	// deliberately not a parameter: the flush path must never read
+	// `TimeConfig::relayRedundancyDepthTicks`, whose session value is 1, because at
+	// depth 1 the second and every later staged entry would supersede the first,
+	// the ring would carry exactly one entry per round, and bare C1 would
+	// degenerate into the replace-latest behaviour it exists to replace — with no
+	// compile error and no warning (T43 finding 1). There is no overload of this
+	// function that takes a depth, and that absence is the fence.
+	template <typename InputType, typename Buffer>
+	StageArrivalOutcome stageArrival(Buffer& stage,
+	                                 std::uint32_t captureTick,
+	                                 std::uint8_t dA,
+	                                 const InputType& input)
+	{
+		StageArrivalOutcome outcome;
+
+		// Predicted BEFORE the write, because writeLatest's arm (3) supersedes in
+		// place and leaves nothing behind to detect afterwards. A capture tick that
+		// is already resident is a re-stamp (arm 1) and evicts nothing.
+		const bool atCapacity = entryCount(stage) >= kMaxDepth;
+		const bool wouldEvict = atCapacity && !containsCaptureTick<InputType>(stage, captureTick);
+
+		outcome.accepted = writeLatest<InputType>(
+			stage, captureTick, dA, input, static_cast<std::int32_t>(kMaxDepth));
+
+		// A refused write (arm 3's stale guard) evicted nothing — the buffer is
+		// byte-for-byte untouched in that arm.
+		outcome.droppedOldest = wouldEvict && outcome.accepted;
+		return outcome;
+	}
+
+	// Empties a ring without destroying its identity: entry count -> 0, buffer
+	// truncated to `kHeaderBytes`, VERSION BYTE PRESERVED.
+	//
+	// ⚠ TRUNCATE TO kHeaderBytes, NEVER TO 0. `detail::initHeaderIfEmpty` is lazy —
+	// it writes the header only when the buffer is completely empty — so truncating
+	// to 0 would re-arm that laziness and, for one round, emit a version-0 ring,
+	// which `populateRelayedInputStore` classifies as NeverWritten and silently
+	// drops. Truncating to the header keeps the version byte and costs nothing.
+	//
+	// No-op on a never-written buffer (it has no header to preserve and no bytes to
+	// reclaim).
+	template <typename Buffer>
+	void resetEntries(Buffer& buf)
+	{
+		if (buf.bundleByteNum() < static_cast<std::int32_t>(kHeaderBytes))
+			return;
+
+		buf.writeToBuffer(kEntryCountOffset, static_cast<std::uint8_t>(0));
+		buf.bundleTruncateTo(static_cast<std::int32_t>(kHeaderBytes));
+	}
+
+	// ⭐ THE FLUSH. Publish everything staged since the last poll into `dst`, then
+	// empty the stage. Returns the number of entries published.
+	//
+	// ⭐ SUPPRESS-CLEAR-ON-EMPTY IS THE SKIP-RECOVERY MECHANISM, NOT AN
+	// OPTIMIZATION (T43 finding 3, which PROMOTED it to a requirement). With an
+	// empty stage this function touches NOTHING: `dst` stays byte-identical, so
+	// `FProperty::Identical` finds no change, so the property is not dirty, so the
+	// object is not scheduled and costs zero bytes — and, load-bearingly, a round
+	// that Iris SKIPPED under packet pressure stays resident and dirty across the
+	// empty frames that follow and gets retried, instead of being overwritten by an
+	// empty flush and losing its whole burst. Under R = 0 that retry is the only
+	// recovery that exists. Join-settling is precisely when empty frames are common
+	// (measured `emptyFrames` median 14, up to 98 per window), so it frequently
+	// wins.
+	//
+	// TYPE-ERASED BY CONSTRUCTION. The copy is byte-wise, so no InputType is named:
+	// the stage and the ring share one wire format, and the entry stride never has
+	// to be re-derived here. That is what lets the flush run on the ring's UE host
+	// actor, which must not know the game's input type.
+	//
+	// WIRE FORMAT UNCHANGED, NO VERSION BUMP. Only the number of RESIDENT entries
+	// moves, and `entryCount` is already on the wire and already varies from 0 to
+	// depth as a ring fills. The version byte written below references
+	// `kWireFormatVersion` as a CONSTANT, never a literal, so a future bump carries
+	// the flush with it.
+	template <typename DstBuffer, typename StageBuffer>
+	std::uint8_t flushStagedInto(DstBuffer& dst, StageBuffer& stage)
+	{
+		const std::uint8_t stagedCount = entryCount(stage);
+		if (stagedCount == 0u)
+			return 0u;                      // SUPPRESS-CLEAR-ON-EMPTY — see above
+
+		const std::int32_t stagedBytes = stage.bundleByteNum();
+
+		// Re-shape `dst` to exactly the staged payload. initHeaderIfEmpty covers the
+		// never-written destination; the truncate/grow pair is what makes the ring
+		// SHRINK when a quiet round follows a burst, which the transport requires
+		// (it ships bundleByteNum() bytes, so a stale tail would ride the wire).
+		detail::initHeaderIfEmpty(dst);
+		dst.bundleTruncateTo(static_cast<std::int32_t>(kHeaderBytes));
+		dst.bundleAddZeroedBytes(stagedBytes - static_cast<std::int32_t>(kHeaderBytes));
+
+		for (std::int32_t offset = static_cast<std::int32_t>(kHeaderBytes);
+		     offset < stagedBytes; ++offset)
+		{
+			dst.writeToBuffer(
+				static_cast<std::uint32_t>(offset),
+				stage.template readFromBuffer<std::uint8_t>(static_cast<std::uint32_t>(offset)));
+		}
+
+		dst.writeToBuffer(kVersionOffset,    kWireFormatVersion);
+		dst.writeToBuffer(kEntryCountOffset, stagedCount);
+
+		resetEntries(stage);
+		return stagedCount;
 	}
 
 	// Consumer-side iteration: invokes callback(captureTick, dA, input) once per

@@ -110,6 +110,20 @@ enum class PredictedCharacterClass : std::uint8_t
 // second per window, i.e. ~2 Warning lines per second — three orders of
 // magnitude below the volume class T19 was filed to fix.
 //
+// ⚠ [og-netcode-v2-input-relay T39] THAT CADENCE IS NO LONGER 60 PER SECOND PER
+// CHARACTER, and the volume argument has been re-derived rather than assumed.
+// `SimulationNetSync::sendCorrectionAll` now writes `correctionRotationK`
+// characters' buffers per tick, round-robin, so the per-character rate is
+// `tickFrequency * K / N` — at the shipped K = 2 that is 60/s at two characters,
+// 40/s at three (still inside the parenthetical band above, so the three-character
+// figure stands unchanged) and 20/s at six. The window is driven by the TOTAL
+// across characters, which is `tickFrequency * K` and therefore **independent of
+// the character count**: 120 corrections at 120/s = one window per second, at any
+// N. So the volume conclusion is not merely still true, it is now CONSTANT — the
+// worst case this constant has to survive no longer grows with the roster.
+// (Read the per-CHARACTER rate out of the window line, not the window period:
+// it is the total that closes the window.)
+//
 // [T24] Free constant beside the probe rather than a TimeConfig field: it is a
 // telemetry knob with no simulation meaning, and TimeConfig is the wrong place
 // for a value that no integrator, clock or gate ever reads. This also mirrors

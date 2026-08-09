@@ -593,6 +593,37 @@ struct RelayedInputIngestReport
     std::uint8_t              versionOnWire   = 0u;
     std::uint8_t              entriesIngested = 0u;
 
+    // -----------------------------------------------------------------------
+    // [T34 loss-counter fix] HOW MANY CAPTURE TICKS THIS ARRIVAL ACTUALLY ADDED.
+    //
+    // `entriesIngested` is the count of entries PUSHED, and under the re-consume
+    // ingest above that includes every already-resident entry the ring carried
+    // again. This field counts only the entries whose capture tick was NOT
+    // resident when the arrival began — i.e. the NEW COVERAGE this arrival
+    // delivered — and it is what `RelayArrivalProbe::noteArrival` charges loss
+    // against.
+    //
+    // WHY THE DISTINCTION IS LOAD-BEARING, and it is the whole defect this field
+    // exists to close: under the retired replace-latest write path one arrival
+    // carried exactly one new capture tick, so "the newest watermark advanced by
+    // g" and "g-1 ticks were lost" were the same statement. Under flush-on-poll
+    // ONE ARRIVAL CARRIES THE WHOLE BURST, so a 2-entry burst advances the
+    // watermark by 2 while losing nothing — and a probe that assumes 1 charges
+    // the burst RATE as loss. The measured Run 1 consequence: ~120 per mille
+    // reported against a ~11 per mille pass condition, on a flush that was
+    // working perfectly.
+    //
+    // RE-DELIVERY IS NOT COVERAGE. A ring that carries a tick this store already
+    // holds (a dA re-stamp, or the flush republishing an entry that had not yet
+    // been evicted from the ring) adds nothing, so it is deliberately NOT counted
+    // — counting it would let a stalled sender re-delivering the same entry look
+    // like a sender delivering new ones.
+    //
+    // FREE: `has()` is an O(1) slot probe and the ingest already visits every
+    // entry, so this costs one comparison per entry and no second walk.
+    // -----------------------------------------------------------------------
+    std::uint8_t              newCaptureTicksIngested = 0u;
+
     // [T19] THE NEWEST CAPTURE TICK THIS ARRIVAL CARRIED — the replication-cadence
     // probe's entire data source (Network/RelayReadProbe.h, probe 2).
     //
@@ -637,9 +668,17 @@ RelayedInputIngestReport populateRelayedInputStore(RelayedInputStore<InputType>&
         ring,
         [&store, &report](std::uint32_t captureTick, std::uint8_t dA, const InputType& input)
         {
+            // [T34 loss-counter fix] Asked BEFORE the push, because the push is
+            // what makes it resident. See `newCaptureTicksIngested`.
+            const bool wasAlreadyResident = store.has(captureTick);
+
             if (store.push(captureTick, dA, input))
             {
                 ++report.entriesIngested;
+                if (!wasAlreadyResident)
+                {
+                    ++report.newCaptureTicksIngested;
+                }
 
                 // [T19] Track the maximum over the entries that were ACCEPTED, so
                 // a rejected sentinel can never become the reported newest.
