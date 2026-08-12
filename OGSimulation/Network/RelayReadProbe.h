@@ -41,14 +41,17 @@
 //                      simulation tick to hand, and inventing one would be a
 //                      second clock to keep honest.
 //
-//   ServerFrameProbe   [T20] GAME thread, and the SERVER SIDE — the one object here
-//                      that is not client telemetry. Fed from the game-thread hook
-//                      that precedes each physics frame. Window driven by SAMPLE
-//                      COUNT. See its own banner at the bottom of this file for why
-//                      a server-side probe belongs beside the client ones: it
-//                      measures the CAUSE of what RelayArrivalProbe measures the
-//                      EFFECT of, and the two numbers are only meaningful side by
-//                      side.
+//   FrameHealthProbe   [T20; renamed T49] GAME thread, on EITHER role. Fed from the
+//                      game-thread hook that precedes each physics frame. Window
+//                      driven by SAMPLE COUNT. Originally SERVER-only (named
+//                      `ServerFrameProbe`) because only the server had a call site
+//                      that fed it; T49 gives the client a call site too, since the
+//                      math here was always role-neutral (see its own banner at the
+//                      bottom of this file). The two roles emit under DIFFERENT log
+//                      tags and categories — see the call site in
+//                      SimulationManagerUImpl.cpp — because a line that cannot be
+//                      told apart from the other role's by grep alone has already
+//                      cost this initiative one mis-attributed analysis (item 49).
 //
 // They are SEPARATE OBJECTS with SEPARATE WINDOWS. A single shared window would
 // have one thread reset counters the other thread is mid-increment on, corrupting
@@ -683,7 +686,7 @@ inline constexpr std::uint32_t kRelayArrivalProbeWindowSamples = 120u;
 
 // ---------------------------------------------------------------------------
 // ⭐ [T34 rework] THE DISCONTINUITY GUARD — the same guard, for the same reason,
-// that `ServerFrameProbe` (`kServerFrameDiscontinuityTicks`) and `RelayWriteProbe`
+// that `FrameHealthProbe` (`kFrameHealthDiscontinuityTicks`) and `RelayWriteProbe`
 // (`kRelayWriteDiscontinuityTicks`) already carry. A capture-tick jump larger than
 // this is a SINGLE CORRELATED EVENT — a connection hiccup, a host stall, a
 // relevancy pause, a re-join, the client's game thread blocking so OnReps queue —
@@ -1101,7 +1104,7 @@ private:
         m_lostCaptureTicks    = 0u;
         m_deliveredCaptureTicks = 0u;
         m_expectedCaptureTicks = 0u;
-        // [T34 rework] Per-window, like ServerFrameProbe's: the field's job is to
+        // [T34 rework] Per-window, like FrameHealthProbe's: the field's job is to
         // tell an operator whether THIS window was interrupted, and a cumulative
         // count would mark every window after the first as suspect forever.
         m_discontinuities     = 0u;
@@ -1137,14 +1140,15 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// [T20] PROBE 4 — SERVER SIM-TICKS PER GAME-THREAD FRAME. THE SERVER SIDE.
+// [T20; renamed + extended to both roles T49] PROBE 4 — SIM TICKS PER
+// GAME-THREAD FRAME, i.e. FRAME HEALTH.
 //
-// EVERY OTHER OBJECT IN THIS FILE IS CLIENT-SIDE. This one is not, and the reason
-// it lives here anyway is that it measures the CAUSE of the quantity probe 2
-// measures the EFFECT of. Probe 2 reports `gapCaptureTicks` — how many capture
-// ticks a client's relay ring skipped between two arrivals. This probe reports how
-// many sim ticks the SERVER advanced between two game-thread frames. The two are
-// predicted to be the same number, and that prediction is the whole experiment:
+// ORIGIN, SERVER-ONLY. This probe was built to measure the CAUSE of the quantity
+// probe 2 measures the EFFECT of. Probe 2 reports `gapCaptureTicks` — how many
+// capture ticks a client's relay ring skipped between two arrivals. This probe
+// reports how many sim ticks a game thread advanced between two frames. On the
+// SERVER the two are predicted to be the same number, and that prediction was the
+// whole T20 experiment:
 //
 //   * UE property replication runs once per server GAME-THREAD FRAME, and
 //     NetServerMaxTickRate is a CAP on that rate, never a floor.
@@ -1158,49 +1162,75 @@ private:
 //     ticks-per-frame is 1 while the gap is still 2, replication is being skipped
 //     for some other reason and the depth hypothesis is not the explanation.
 //
+// [T49] EXTENDED TO THE CLIENT. Nothing above is server-specific — it is a
+// hook-independent ratio over two caller-supplied counters (see below) — and item
+// 49 named the gap directly: `[RelayProbe.Frame]` was the ONLY wall-clock timing
+// instrument anywhere in this netcode surface, and it was server-only by
+// construction even though the server never resims and the client does. On a
+// client this same ratio, plus its own `meanFrameMicros`/p99/max, is frame HEALTH
+// under resim load — the quantity every client cost figure in
+// `finding_task43_resim_gate_live.md` §4 had to be DERIVED from `ResimGateProbe`
+// cadence instead of measured, because nothing sampled wall-clock time on that
+// thread. The type was renamed from `ServerFrameProbe` (its T20 name) to
+// `FrameHealthProbe` accordingly — nothing role-specific survives in its math, so
+// nothing role-specific should survive in its name.
+//
 // TWO ROUTES TO A RATIO ABOVE 1, AND THEY ARE NOT THE SAME DEFECT. Chaos may run
 // several fixed sub-steps inside one game frame (`numSteps > 1`), or the game
 // thread may simply be slow. Both show up as ticks-per-frame > 1 and they need
 // different fixes, so this probe reports the sub-step count ALONGSIDE the ratio and
-// never collapses them.
+// never collapses them. ON A RESIMMING CLIENT THIS SEPARATION IS THE WHOLE POINT:
+// a resim burst folds extra sim ticks into `numSteps` at the SAME hook, so a ratio
+// above 1 with `numStepsAboveOne > 0` reads as "resim ran", not "the game thread
+// hitched" — the two client-cost questions item 49 exists to keep apart.
 //
 // HOOK-INDEPENDENT BY CONSTRUCTION. The caller supplies a GLOBAL frame counter, not
 // an invocation count, so the ratio is correct no matter which game-thread hook
-// feeds it and no matter how often that hook fires. The probe additionally reports
-// how its own invocations distributed over frames — `dFrame == 1` (once per frame,
-// the assumed case), `dFrame == 0` (fired more than once in a frame, i.e. per
-// sub-step) and `dFrame > 1` (frames it did not fire on). THAT IS THE VERIFICATION
-// THE TASK ASKS FOR: the hook's cadence is measured, never assumed.
+// feeds it and no matter how often that hook fires — the same property that let
+// this probe move to a second role without a second implementation. The probe
+// additionally reports how its own invocations distributed over frames —
+// `dFrame == 1` (once per frame, the assumed case), `dFrame == 0` (fired more than
+// once in a frame, i.e. per sub-step) and `dFrame > 1` (frames it did not fire on).
+// THAT IS THE VERIFICATION THE TASK ASKS FOR: the hook's cadence is measured, never
+// assumed — on EITHER role, from its own counters, independent of which hook the
+// caller chose.
 //
-// GAME THREAD ONLY, and on the SERVER only. Like the other two objects here it
-// holds no lock and needs none — it is touched from exactly one thread.
+// GAME THREAD ONLY, on WHICHEVER ROLE the owning object runs on. Like the other two
+// objects here it holds no lock and needs none — it is touched from exactly one
+// thread. Each role gets its OWN instance (SimulationManagerUImpl's
+// `m_frameHealthProbe` is a plain member, constructed once per actor, and both a
+// server-role and a client-role actor exist as separate UObjects in the same
+// process under PIE) — never shared, so there is no cross-role synchronization
+// question either.
 //
 // TICK SOURCE IS THE CALLER'S PROBLEM, and there is only one right answer on the
-// game thread: the Chaos tick mapper's atomic offset. The server clock is written on
-// the physics thread and must not be read here. This probe takes a plain number and
+// game thread: the Chaos tick mapper's atomic offset. The underlying clock (the
+// server tick or the client's prediction tick) is written on the physics thread and
+// must not be read here on either role. This probe takes a plain number and
 // therefore cannot make that mistake on the caller's behalf — the call site carries
-// the comment.
+// the comment, including item 49's argument for why the SAME atomic read that was
+// already proven safe for the server call site is equally safe for the client one.
 // ---------------------------------------------------------------------------
 
 // Exact buckets for 0..64 sim ticks per frame; anything larger saturates. 0 is a
 // real observation here (a frame in which physics did not step), which is why the
 // range starts at 0 rather than at 1 as the arrival histogram's does.
-inline constexpr std::uint32_t kServerFrameMaxTrackedTicks = 64u;
-inline constexpr std::size_t   kServerFrameOverflowBucket  =
-    static_cast<std::size_t>(kServerFrameMaxTrackedTicks) + 1u;
+inline constexpr std::uint32_t kFrameHealthMaxTrackedTicks = 64u;
+inline constexpr std::size_t   kFrameHealthOverflowBucket  =
+    static_cast<std::size_t>(kFrameHealthMaxTrackedTicks) + 1u;
 
 // One summary per this many samples. At an intended 60 fps that is ~2 s, the same
 // feel as the other two windows; on a 30 fps server it is ~4 s, which is itself
 // informative — the summaries thin out exactly when the measured thing is bad.
-inline constexpr std::uint32_t kServerFrameProbeWindowSamples = 120u;
+inline constexpr std::uint32_t kFrameHealthProbeWindowSamples = 120u;
 
 // A sim-tick jump larger than this is a DISCONTINUITY (the mapper offset being
 // established, a level transition, a multi-second editor stall), not a hitch.
 // Sampling it would put a five-digit outlier in `max` and hide every real number
 // behind it. Counted and reported, never silently dropped.
-inline constexpr std::uint32_t kServerFrameDiscontinuityTicks = 600u;
+inline constexpr std::uint32_t kFrameHealthDiscontinuityTicks = 600u;
 
-struct ServerFrameWindowSummary
+struct FrameHealthWindowSummary
 {
     // --- the ratio, over samples where EXACTLY ONE frame elapsed -------------
     std::uint32_t samples          = 0u;
@@ -1233,11 +1263,11 @@ struct ServerFrameWindowSummary
     std::uint32_t numStepsAboveOne = 0u;
 };
 
-class ServerFrameProbe
+class FrameHealthProbe
 {
 public:
-    explicit ServerFrameProbe(std::uint32_t windowSamples = kServerFrameProbeWindowSamples)
-        : m_windowSamples(windowSamples == 0u ? kServerFrameProbeWindowSamples : windowSamples)
+    explicit FrameHealthProbe(std::uint32_t windowSamples = kFrameHealthProbeWindowSamples)
+        : m_windowSamples(windowSamples == 0u ? kFrameHealthProbeWindowSamples : windowSamples)
     {
     }
 
@@ -1255,7 +1285,7 @@ public:
                    std::uint32_t simTick,
                    std::uint32_t numSteps,
                    std::uint64_t nowMicros,
-                   ServerFrameWindowSummary& out)
+                   FrameHealthWindowSummary& out)
     {
         // The sub-step cross-check is per INVOCATION and is accumulated before any
         // of the frame-delta reasoning, so it stays correct whatever the cadence
@@ -1275,7 +1305,7 @@ public:
         // Re-seed from it rather than recording it.
         if (simTick < m_lastSimTick
             || frameCounter < m_lastFrameCounter
-            || (simTick - m_lastSimTick) > kServerFrameDiscontinuityTicks)
+            || (simTick - m_lastSimTick) > kFrameHealthDiscontinuityTicks)
         {
             ++m_discontinuities;
             reseedAnchors(frameCounter, simTick, nowMicros);
@@ -1292,8 +1322,8 @@ public:
         else if (frameDelta == 1u)
         {
             ++m_oncePerFrameSamples;
-            const std::size_t bucket = (tickDelta > kServerFrameMaxTrackedTicks)
-                ? kServerFrameOverflowBucket
+            const std::size_t bucket = (tickDelta > kFrameHealthMaxTrackedTicks)
+                ? kFrameHealthOverflowBucket
                 : static_cast<std::size_t>(tickDelta);
             ++m_buckets[bucket];
             ++m_ratioSamples;
@@ -1327,7 +1357,7 @@ public:
 
     // The summary the window WOULD report right now, given the caller's current
     // counters. Exposed so a test can assert a distribution without filling a window.
-    void peekSummary(ServerFrameWindowSummary& out,
+    void peekSummary(FrameHealthWindowSummary& out,
                      std::uint64_t frameCounter,
                      std::uint32_t simTick,
                      std::uint64_t nowMicros) const
@@ -1362,12 +1392,12 @@ private:
         const std::uint64_t rank = (scaled + 99u) / 100u;
 
         std::uint64_t cumulative = 0u;
-        for (std::size_t bucket = 0u; bucket <= kServerFrameOverflowBucket; ++bucket)
+        for (std::size_t bucket = 0u; bucket <= kFrameHealthOverflowBucket; ++bucket)
         {
             cumulative += m_buckets[bucket];
             if (cumulative >= rank)
             {
-                outSaturated = (bucket == kServerFrameOverflowBucket);
+                outSaturated = (bucket == kFrameHealthOverflowBucket);
                 return static_cast<std::uint32_t>(bucket);
             }
         }
@@ -1375,7 +1405,7 @@ private:
         return m_maxTicksPerFrame;
     }
 
-    void fillSummary(ServerFrameWindowSummary& out,
+    void fillSummary(FrameHealthWindowSummary& out,
                      std::uint64_t frameCounter,
                      std::uint32_t simTick,
                      std::uint64_t nowMicros) const
@@ -1443,7 +1473,7 @@ private:
     std::uint32_t m_windowStartSimTick = 0u;
     std::uint64_t m_windowStartMicros  = 0u;
 
-    std::array<std::uint32_t, kServerFrameOverflowBucket + 1u> m_buckets{};
+    std::array<std::uint32_t, kFrameHealthOverflowBucket + 1u> m_buckets{};
     std::uint32_t m_ratioSamples      = 0u;
     std::uint32_t m_maxTicksPerFrame  = 0u;
     std::uint32_t m_samplesThisWindow = 0u;

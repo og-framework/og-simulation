@@ -31,8 +31,10 @@
 //               clamps to the window and accepts a partial resim (older ticks
 //               beyond the ring-buffer window are not corrected). Degraded
 //               mobile may raise this up to `rollbackWindowHardCap`.
-//               *** THIS BULLET IS INTENDED DESIGN, NOT SHIPPED BEHAVIOUR —
-//               see the status note below before relying on it. ***
+//               *** THE CLAMP DESCRIBED HERE IS STILL INTENDED DESIGN, NOT
+//               SHIPPED BEHAVIOUR — but `rollbackWindowTicks` NOW HAS A REAL
+//               CLIENT-SIDE CONSUMER, and it SKIPS rather than clamps. Read the
+//               status note below before relying on either word. ***
 //   * HardResync — ABSOLUTE FAILSAFE BACKSTOP. The legacy drift threshold,
 //               repurposed: it fires only when the soft cap has failed and the
 //               client ends up further adrift than `rollbackWindowHardCap`
@@ -46,6 +48,9 @@
 // ---------------------------------------------------------------------------
 // STATUS NOTE — the RollbackWindow CLAMP is INTENDED, NOT IMPLEMENTED
 // (recorded 2026-08-04; og-netcode-v2-input-relay T13)
+// (⚠ SUPERSEDED IN PART 2026-08-11 by item 45 — read the ITEM 45 AMENDMENT below
+//  before quoting any bullet here; the third bullet's "clamps nothing" is now
+//  FALSE for `rollbackWindowTicks`, and the deferral's condition 3 has FIRED.)
 //
 // "The client clamps to the window and accepts a partial resim" describes an
 // INTENDED mechanism that does not exist in the shipped code. Established by an
@@ -93,6 +98,13 @@
 //     the resimulated flag at its own slot, and `pushPredictionTick` propagates
 //     the frontier's flag forward, so the walk goes quiet after a resim and wakes
 //     at exactly `predictionTick - lastCorrectTick`.
+//     ⚠ THAT SENTENCE DESCRIBES A MECHANISM THAT NO LONGER EXISTS (item 45,
+//     2026-08-11): there is no walk, no `m_isResimulated`, and no inheritance.
+//     The anchor is now an explicitly SET pending tick — see the amendment below.
+//     The DEPTH CONCLUSION it supports is unchanged, because the anchor still
+//     coalesces to the newest landed correction, so the span is still
+//     `frontier - newestLandedCorrection`. Kept, annotated rather than deleted,
+//     because it is the derivation the T39 ruling was made on.
 //   * That distance grows by the ROTATION AGE of the newest correction, which is
 //     bounded by construction at `ceil(N/K) - 1` ticks — 0 at two characters
 //     (K >= N is every-frame), 1 at three or four, **2 at six**. Add the Iris
@@ -124,12 +136,50 @@
 //      companion assumption stale as well;
 //   3. `rollbackWindowTicks` acquires a real client-side consumer for any other
 //      reason, at which point the clamp is wiring rather than design.
+//      ⚠⚠ CONDITION 3 HAS FIRED — item 45, 2026-08-11. See the amendment below.
 // ⚠ Note the direction of travel is AWAY from this, not toward it: step 4 of the
 // shipping plan (Candidate E, K = N) puts state back at 60 Hz and un-fires the
 // trigger entirely, and the wire diet in between does not touch cadence. Item 34
 // (bare-C1 flush) changes the INPUT channel only. Re-read this note if that plan
 // changes — the quantity to re-derive is `ceil(N/K)`, and nothing else here
 // depends on the design of those steps.
+//
+// ---------------------------------------------------------------------------
+// ⚠⚠ ITEM 45 AMENDMENT — CONDITION 3 HAS FIRED, AND WHAT SHIPPED IS A SKIP, NOT
+// A CLAMP (recorded 2026-08-11; og-netcode-v2-input-relay item 45,
+// design_task43_resim_gate_fix.md §3 candidate D (b))
+//
+// **`rollbackWindowTicks` NOW HAS A REAL CLIENT-SIDE CONSUMER.** The
+// edge-triggered resim gate reads it as the maximum admissible resim DEPTH:
+// `SimulationReconciliation::checkDivergenceAll` excludes any character whose
+// pending resim anchor sits more than `rollbackWindowTicks` below that
+// character's prediction frontier (`resimGate::isAnchorWithinDepthPolicy`). So
+// the third bullet of the status note above — "client-side this value clamps
+// nothing" — is now FALSE for this field. It remains true for
+// `rollbackWindowHardCap`, whose only client-side reads are still the
+// `CorrectionCache` log gate and T26's flat release gate.
+//
+// **IT SKIPS, IT DOES NOT CLAMP, AND THE CLAMP IS STILL UNBUILT.** The ADR
+// bullet's "clamps to the window and accepts a partial resim" is NOT what
+// shipped, and the difference is deliberate rather than partial: restoring at
+// `frontier - rollbackWindowTicks` would restore a mid-window slot that no
+// correction ever landed in, so the replay would re-integrate identical inputs
+// from identical state and reproduce the same prediction — a guaranteed no-op
+// costing a full Chaos rewind. A too-deep anchor is therefore SKIPPED AND
+// COUNTED (`ResimGateWindowSummary::deepAnchorExclusions`), leaving recovery to a
+// newer correction (which raises the anchor) or to the HardResync failsafe. If
+// the partial-resim clamp is ever genuinely wanted, its semantics still have to
+// be specified; this consumer does not pre-empt that design, it only removes the
+// "no client-side consumer" half of the deferral.
+//
+// **THE CONSUMER IS DORMANT AT THE SHIPPED DEFAULT.** It is consulted only under
+// `resimTriggerPolicy == OnDisagreement`, and the shipped default is
+// `FrontierExact` (see that field for why the ceilings are policy-scoped). So on
+// today's build the depth policy is reachable but inactive; item 46's flip
+// activates it together with the trigger it bounds. That is why the deferral
+// ruling above is amended rather than closed: the escalation path it describes
+// (build the real clamp) is unchanged, and conditions 1 and 2 still read as they
+// did.
 // ---------------------------------------------------------------------------
 //
 // See OGBrawlerNetworkModelResearch/arch/proposal_ogbrawler_netcode.md §4 for
@@ -295,11 +345,23 @@ struct TimeConfig
 	// ticks, the client clamps to the window and accepts a partial resim.
 	// Derived from the Quantum formula on OGBrawler's cellular profile.
 	//
-	// THE CLIENT-SIDE CLAMP IS INTENDED, NOT IMPLEMENTED (ADR status note at the
-	// top of this file; ruling in RelayDelaySpectrumDesign.md §7). The field IS
-	// live — but its only production consumer is the SERVER-side late-input
-	// future-guard context, not a client resim clamp. Deferred to the
-	// sparse-state increment.
+	// THE CLIENT-SIDE CLAMP IS STILL INTENDED, NOT IMPLEMENTED (ADR status note at
+	// the top of this file; ruling in RelayDelaySpectrumDesign.md §7) — BUT THE
+	// FIELD IS NO LONGER SERVER-ONLY. It now has TWO production consumers:
+	//   * the SERVER-side late-input future-guard context (`SimulationManager.h`),
+	//     as before; and
+	//   * [item 45] the CLIENT-side resim gate's DEPTH POLICY — a pending resim
+	//     anchor more than this many ticks below that character's prediction
+	//     frontier is SKIPPED AND COUNTED, never clamped
+	//     (`SimulationReconciliation::checkDivergenceAll` ->
+	//     `resimGate::isAnchorWithinDepthPolicy`). Skip, not clamp, because
+	//     restoring at an uncorrected mid-window slot replays the same prediction:
+	//     a no-op costing a full Chaos rewind. The depth policy is consulted only
+	//     under `resimTriggerPolicy == OnDisagreement`, so at the shipped legacy
+	//     default it is reachable but inactive.
+	// This is what fired condition 3 of the re-scoped deferral trigger; see the
+	// ITEM 45 AMENDMENT in the ADR block at the top of this file before adding a
+	// third consumer.
 	// Default: 12
 	int32_t rollbackWindowTicks = 12;
 
@@ -314,6 +376,78 @@ struct TimeConfig
 	// release gate — both real, neither a clamp.
 	// Default: 20
 	int32_t rollbackWindowHardCap = 20;
+
+	// -------------------------------------------------------------------------
+	// The RESIM GATE — trigger policy and its rate ceiling
+	// (og-netcode-v2-input-relay item 45; design_task43_resim_gate_fix.md §3
+	//  candidate D, §4. The defect: impl/finding_task31_resim_rate.md.)
+	//
+	// The gate is now EDGE-TRIGGERED: a landed correction sets a per-character
+	// pending resim ANCHOR TICK, and the resim-completion edge consumes it with a
+	// CAS. `resimGate::` (OGSimulation/ResimGatePolicy.h) holds the predicates;
+	// `StateCorrectionCache` holds the anchor. ONE field is the whole configurable
+	// surface — see the ruling below for the rate ceiling that deliberately is not
+	// one.
+	// -------------------------------------------------------------------------
+
+	// WHICH LANDED CORRECTIONS SET THE PENDING ANCHOR.
+	//   FrontierExact   — only a correction whose tick equals the prediction
+	//                     frontier at insert time. Reproduces the LEGACY gate's
+	//                     observable behaviour, and deliberately does NOT consult
+	//                     the divergence verdict (the legacy gate never did).
+	//   OnDisagreement  — any landed correction whose authority state disagrees
+	//                     with the local prediction. THE DESIGNED TRIGGER.
+	enum class ResimTriggerPolicy { FrontierExact, OnDisagreement };
+
+	// ⛔ THE COMPILED DEFAULT IS `FrontierExact` AND THAT IS THE WHOLE POINT OF
+	// HOW ITEM 45 LANDED: the new mechanism ships DORMANT, reproducing the gate it
+	// replaces, so nothing observable changes by default. Flipping this to
+	// `OnDisagreement` is backlog item 46 and is HARD-BLOCKED on item 30 — with
+	// today's degenerately always-false verdict, "disagrees" is EVERY landing
+	// (~8,759 per 150 s run), i.e. one Chaos rewind per landing: the modelled
+	// 3-6x sustained physics cost of design §4. That is a verdict defect (item 30,
+	// itself behind item 28's magnitude measurement), not a gate defect, and the
+	// 28 -> 30 -> 46 sequencing exists to keep them apart. Do not flip it early
+	// "to see what happens" — the fix-preview measurement design §2.3 describes is
+	// the safe way to ask that question.
+	//
+	// ⚠ IT SELECTS A REGIME, NOT JUST A CONDITION. The `rollbackWindowTicks` depth
+	// skip is consulted ONLY under `OnDisagreement`
+	// (`resimGate::policyEnforcesDepthCeiling`). That ceiling exists to bound the
+	// disagreement trigger's worst-case depth; under the legacy policy the trigger
+	// rate is already bounded by frontier-exact coincidence, and applying it there
+	// would cost the behaviour-neutrality this item is defined by (it would DROP an
+	// anchor the legacy gate retries). The full argument is at that predicate.
+	//
+	// CLIENT-SIDE ONLY in effect: the gate is consulted from
+	// `SimulationReconciliation::checkDivergenceAll` on a predicting client, and an
+	// authority allocates no correction caches at all. The value is still read and
+	// applied on both roles so the two TimeConfigs stay identical (the composition
+	// root's `[OGNetcode] ResimTriggerPolicy` intake is role-agnostic); on a server
+	// it simply has no reader.
+	// Default: ResimTriggerPolicy::FrontierExact  (legacy — item 46 flips it)
+	ResimTriggerPolicy resimTriggerPolicy = ResimTriggerPolicy::FrontierExact;
+
+	// ⛔ THERE IS NO `resimCooldownTicks`, AND ITS ABSENCE IS A RULING, NOT AN
+	// OMISSION. (User ruling, 2026-08-11, during item 45's implementation.)
+	//
+	// Design §4 and backlog items 45/46 both name a trigger-rate ceiling in ticks
+	// (placeholder 12). It was built on the four-step config path and then REMOVED,
+	// because a rate ceiling defers acting on a correction already KNOWN to disagree
+	// with prediction — which is the defect item 45 exists to repair, with a smaller
+	// constant. The throttle that replaces it is STRUCTURAL and demand-driven: the
+	// gate is consulted only on non-resim physics frames and the anchor is consumed
+	// only on the resim-completion edge, so at most one resim is in flight and at
+	// most one more is pending, and corrections arriving mid-replay COALESCE into the
+	// pending anchor and fire once as a single deeper replay.
+	//
+	// A correction arriving mid-replay therefore RE-ANCHORS rather than restarting or
+	// waiting. Full argument, including why the cost concern is already handled by
+	// item 46's hard block on item 30 and why per-class triggering (not a delay) is
+	// the escalation if a measured rate is unaffordable, is at
+	// `resimGate::policyEnforcesDepthCeiling`'s neighbouring block in
+	// OGSimulation/ResimGatePolicy.h. If a future task reintroduces a cooldown,
+	// it must argue against that block, not merely cite design §4.
 
 	// -------------------------------------------------------------------------
 	// Input redundancy (FInputRedundancyBundle)

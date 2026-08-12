@@ -14,6 +14,10 @@
 #include "OGSimulation/Network/ClientInputDelayLine.h"
 #include "OGSimulation/Network/CorrectionRotation.h"
 #include "OGSimulation/Network/CorrectionVerdictProbe.h"
+// [og-netcode-v2-input-relay item 42] The game-thread half of the resim-gate
+// telemetry — where each landed correction sat relative to the prediction
+// frontier. Fed from the same OnRep-bound callback as the verdict probe.
+#include "OGSimulation/ResimGateProbe.h"
 #include "OGSimulation/Network/RelayReadProbe.h"
 #include "OGSimulation/Network/RelayedInputStore.h"
 #include "OGSimulation/SimulationLog.h"
@@ -772,6 +776,16 @@ public:
     const CorrectionVerdictProbe& getCorrectionVerdictProbe() const
     { return m_correctionVerdictProbe; }
 
+    // [og-netcode-v2-input-relay item 42 / I2] Same contract, same consumer, same
+    // reason as the verdict probe's accessor directly above: the three-way
+    // classification is swept as a unit in og-simulation-tests, but only a suite
+    // that can register a real local and a real remote character against the real
+    // callback can show that the shipped site feeds it, files each landing under
+    // the right class, and puts a DISCARD in the discarded bucket rather than
+    // dropping it on the verdict probe's early return.
+    const CorrectionLandingProbe& getCorrectionLandingProbe() const
+    { return m_correctionLandingProbe; }
+
     // -----------------------------------------------------------------------
     // Registration — free functions delegate here; not called directly by users
     // -----------------------------------------------------------------------
@@ -984,23 +998,116 @@ public:
                 m_reconciliation.template injectCorrectionState<SimulatableT>(
                     id, buffer, &verdict);
 
-                // A correction whose tick had no slot was DISCARDED — no comparison
-                // happened. Counting it would put a denominator under a verdict that
-                // was never reached, and the discard path already logs itself
-                // (isAnomalousMiss-gated, in the cache).
-                if (!verdict.landed)
-                    return;
-
                 // THE CLASS TEST IS PROVIDER-PRESENCE — the SAME lookup
                 // registerPredictionOwner forked on above and collectInputAll forks
                 // on every tick, not a second notion of "remote". Read live rather
                 // than captured at bind time so it cannot drift from the map that
                 // actually decides behaviour.
+                //
+                // [item 42] HOISTED ABOVE THE LANDED GATE, unchanged in every other
+                // respect. The landing-site probe below counts DISCARDS as
+                // first-class samples (they are item 41's `aboveNewest` population),
+                // so it needs the class on a path the verdict probe returns early
+                // from.
                 const bool hasProvider =
                     std::get<InputProviderMapFor<SimulatableT>>(m_inputProviders).count(id) != 0u;
                 const PredictedCharacterClass characterClass = hasProvider
                     ? PredictedCharacterClass::LocallyPredicted
                     : PredictedCharacterClass::RemoteProxy;
+
+                // ---------------------------------------------------------------
+                // [og-netcode-v2-input-relay item 42 / I2] WHERE DID IT LAND?
+                //
+                // THE FIRST-GATE DISCRIMINATOR. Item 31 established that resim
+                // triggers were gated by the prediction-frontier slot's INHERITED
+                // `m_isResimulated` bit: `getLastResimulationTick` scanned from the
+                // frontier at offset 0, so that bit shadowed every older corrected
+                // slot, and the ONLY event that re-opened the gate in play was a
+                // correction landing EXACTLY ON the frontier. A correction landing
+                // behind it set its own slot's flag, was never seen by the scan, was
+                // never replayed through (resims restore at the NEWEST corrected
+                // slot) and therefore never touched live state at all.
+                //
+                // So this three-way split is the measurement the whole item turns
+                // on: `landedBehind` large while triggers track only
+                // `landedAtFrontier` IS the demonstrated under-resimulation
+                // statement. Full statement at CorrectionLandingProbe in
+                // OGSimulation/ResimGateProbe.h.
+                //
+                // ⚠ [item 45] THAT MECHANISM IS GONE — the gate is now edge-triggered
+                // on an explicit pending anchor, and `m_isResimulated`, the scan and
+                // the inheritance are retired. THIS PROBE IS UNCHANGED AND STILL
+                // CORRECT, for a reason worth stating rather than re-deriving: it
+                // classifies a landing's POSITION relative to the frontier, which is
+                // a fact about the correction stream, not about the gate. What
+                // changed is only what that position IMPLIES: on a default build the
+                // `FrontierExact` policy makes `AtFrontier` exactly the anchor-set
+                // condition (same predicate, same value), so `requested` still tracks
+                // `atFrontier`; after item 46's flip to `OnDisagreement` the trigger
+                // population becomes the DISAGREEING landings — mostly this
+                // `Behind` bucket — and the tracking claim above inverts by design.
+                // Read `[ResimGate] session policy` in the log before reading a
+                // ratio.
+                //
+                // ⚠ THE FRONTIER IS READ THROUGH THE EXISTING RECONCILIATION
+                // ACCESSOR, not by giving the cache an identity. `findInputCache`
+                // is the nullable route every other accessor on that class already
+                // takes, and it answers nullptr on the authority (no caches are
+                // allocated there), which is exactly the right answer: this
+                // callback is OnRep-dispatched and can never fire on an authority
+                // world anyway. Pushing id-awareness down into StateCorrectionCache
+                // to carry the frontier out with the verdict is the placement T24
+                // ruled against, and this needs no such thing.
+                //
+                // ⚠ READ AFTER THE INSERT, WHICH IS SAFE AND ±1 RACY, and both
+                // halves of that matter. Safe: `tryInsertingCorrectState` never
+                // touches `m_tickBuffer`, so the frontier it saw and the frontier
+                // read here are the same value on this thread. Racy: the frontier
+                // is ADVANCED by `pushPredictionTick` on the PHYSICS thread, and
+                // the whole cache is already a formally unsynchronized GT/PT
+                // structure (finding §1). A physics frame landing between the
+                // insert and this read misfiles one sample from AtFrontier to
+                // Behind. That is a per-sample ±1 on a 120-sample window, it does
+                // not accumulate, and it is a property of the mechanism being
+                // measured rather than of this instrument: whether a correction
+                // hits the frontier slot at all is decided by that same
+                // interleaving.
+                const auto* landingCache =
+                    m_reconciliation.template findInputCache<SimulatableT>(id);
+                const CorrectionLandingSite landingSite = classifyCorrectionLanding(
+                    verdict.landed, verdict.tick,
+                    landingCache != nullptr ? landingCache->getPredictionTick() : 0u);
+
+                SIMLOG(m_logger,
+                    "[Verbose][ResimProbe.Landing] id=%u tick=%u class=%s site=%s",
+                    id, verdict.tick,
+                    predictedCharacterClassName(characterClass),
+                    correctionLandingSiteName(landingSite));
+
+                CorrectionLandingWindowSummary landingWindow;
+                if (m_correctionLandingProbe.noteLanding(
+                        characterClass, landingSite, landingWindow))
+                {
+                    emitCorrectionLandingClassLine(
+                        PredictedCharacterClass::LocallyPredicted,
+                        landingWindow.local, landingWindow.samples);
+                    emitCorrectionLandingClassLine(
+                        PredictedCharacterClass::RemoteProxy,
+                        landingWindow.remote, landingWindow.samples);
+                }
+                // ---------------------------------------------------------------
+
+                // A correction whose tick had no slot was DISCARDED — no comparison
+                // happened. Counting it would put a denominator under a verdict that
+                // was never reached, and the discard path already logs itself
+                // (isAnomalousMiss-gated, in the cache).
+                //
+                // [item 42] THE LANDING PROBE ABOVE DELIBERATELY SITS ON THE OTHER
+                // SIDE OF THIS RETURN. Its `discarded` bucket is the one place the
+                // two probes' sample sets are required to differ, and moving this
+                // gate up would silently empty it.
+                if (!verdict.landed)
+                    return;
 
                 // PER-EVENT DETAIL AT VERBOSE — off under the shipped
                 // LogOGDivergenceProbe=Warning. Emitted on EVERY landed correction
@@ -2047,6 +2154,44 @@ private:
             classSummary.disagreementRatePerMille, windowSamples);
     }
 
+    // [og-netcode-v2-input-relay item 42 / I2] ONE per-window class block of the
+    // frontier-landing split. Called twice — once per class — from the correction
+    // callback, and ONLY when a window closed.
+    //
+    // SILENT ON AN EMPTY CLASS, same rule and same reason as the verdict line
+    // above: printing `behind=0 atFrontier=0 discarded=0` would assert a perfect
+    // record where there is no record at all, and that is the misreading this whole
+    // instrument exists to prevent. It is also the steady state for the remote
+    // block on a client with no proxies.
+    //
+    // ⭐ HOW TO READ THE PAIR THIS LINE FORMS WITH `[ResimProbe.Gate]`. Under the
+    // mechanism, resim triggers track `atFrontier` and are blind to `behind`. So:
+    //   * `atFrontierPerMille` here ~= `requestedPerMille` on the Gate line  ⇒ the
+    //     finding's central claim reproducing live;
+    //   * `behind` large with the Gate line's `requested` small  ⇒ the suppressed-
+    //     correction population, i.e. the under-resimulation statement itself;
+    //   * `discarded` large  ⇒ item 41's `aboveNewest` anomaly, whose fix will MOVE
+    //     this mix (it is referenced here, not solved here).
+    // The two lines cannot be merged into one: they are fed by different threads
+    // and item 42 requires one probe per thread with no sharing. See the cost note
+    // at the top of ResimGateProbe.h.
+    void emitCorrectionLandingClassLine(PredictedCharacterClass characterClass,
+                                        const CorrectionLandingClassSummary& classSummary,
+                                        std::uint32_t windowSamples)
+    {
+        if (classSummary.total() == 0u)
+        {
+            return;
+        }
+
+        SIMLOG(m_logger,
+            "[Warning][ResimProbe.Landing] class=%s behind=%u atFrontier=%u discarded=%u "
+            "atFrontierPerMille=%u windowSamples=%u",
+            predictedCharacterClassName(characterClass),
+            classSummary.landedBehind, classSummary.landedAtFrontier,
+            classSummary.discarded, classSummary.atFrontierRatePerMille, windowSamples);
+    }
+
     // [T19] PROBES 1 + 3 — the per-window summary. Called once per prediction tick
     // from collectInputAll; silent unless a window both CLOSED and carried at least
     // one scheduled read, so the authority (no relay stores, so neither call site is
@@ -2239,6 +2384,19 @@ private:
     // relay probes and not this one. Full statement at the top of
     // Network/CorrectionVerdictProbe.h.
     CorrectionVerdictProbe m_correctionVerdictProbe;
+
+    // [og-netcode-v2-input-relay item 42 / I2] THE FRONTIER-LANDING SPLIT. Same
+    // feeder, same thread and same no-per-id-state rule as the verdict probe above
+    // — it is deliberately a second object on the same site rather than three more
+    // fields on the first, because the two answer different questions on different
+    // denominators (a DISCARDED correction is a non-event for the verdict and a
+    // first-class observation for the landing site) and merging them would have
+    // forced one of the two to adopt the other's sample set.
+    //
+    // ITS PHYSICS-THREAD SIBLING IS ON SimulationManager (ResimGateProbe). The two
+    // are never shared and never atomic — see the two-object rule at the top of
+    // OGSimulation/ResimGateProbe.h.
+    CorrectionLandingProbe m_correctionLandingProbe;
 
     SimulationObjectStorage<SimulatableTs...>&   m_storage;
     SimulationReconciliation<SimulatableTs...>&  m_reconciliation;

@@ -10,7 +10,7 @@
 // RelayWriteProbe / ConnectionBudgetProbe — the SERVER-side relay telemetry
 // T22 needs, and the two numbers nobody has ever measured.
 // (og-netcode-v2-input-relay T22. Companion to Network/RelayReadProbe.h, which
-// holds the CLIENT-side arrival/read probes plus ServerFrameProbe.)
+// holds the CLIENT-side arrival/read probes plus FrameHealthProbe.)
 //
 // ---------------------------------------------------------------------------
 // WHY A SEPARATE FILE. This is a DIAGNOSTIC UNIT with a stated end date. T22 is a
@@ -139,7 +139,7 @@ inline constexpr std::uint32_t kRelayWriteProbeWindowRuns = 120u;
 // re-join, the tick domain being re-established), not a coverage hole. Counted
 // separately and never allowed into `missedCaptureTicks`, where a five-digit
 // outlier would swamp every real number — the same guard, for the same reason, as
-// ServerFrameProbe's `kServerFrameDiscontinuityTicks`.
+// FrameHealthProbe's `kFrameHealthDiscontinuityTicks`.
 inline constexpr std::uint32_t kRelayWriteDiscontinuityTicks = 600u;
 
 struct RelayWriteWindowSummary
@@ -301,7 +301,7 @@ public:
         // tick that jumped by more than a plausible stall — or went backwards,
         // which the monotonic relay gate makes unreachable today — breaks the
         // `captureSpan` denominator, and a span that no longer matches the writes
-        // it spans makes every fraction below meaningless. ServerFrameProbe
+        // it spans makes every fraction below meaningless. FrameHealthProbe
         // re-seeds for the same reason. `discontinuities` survives the restart so
         // the NEXT emitted line still says the window was interrupted.
         const bool backwards   = (captureTick <= s.lastCaptureTick);
@@ -572,7 +572,7 @@ private:
 //     loss rate rather than the configured `PktLoss` percentage. That is candidate
 //     1's evidence without changing a single config value.
 //
-// TAKES PLAIN NUMBERS, exactly like ServerFrameProbe, so it is engine-free and
+// TAKES PLAIN NUMBERS, exactly like FrameHealthProbe, so it is engine-free and
 // unit-testable; the caller reads the UNetConnection fields.
 // ---------------------------------------------------------------------------
 
