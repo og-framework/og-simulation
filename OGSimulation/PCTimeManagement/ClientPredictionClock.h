@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 #include "OGSimulation/OGExport.h"
+#include <cstdint>
 #include <functional>
 #include <limits>
 #include <vector>
@@ -49,6 +50,43 @@ using PCClockLoggerFn = std::function<void(const char*)>;
 
     OGSIMULATION_API unsigned int getPredictionTick()  const;
     OGSIMULATION_API SimulationTimeStep getPredictionStep() const;
+
+    // -----------------------------------------------------------------------
+    // Input-delay-increase stall (T11, D5.3)
+    //
+    // NOTE ON THE NAME: this mechanism never resimulates anything — it only
+    // declines to advance the prediction frontier for N calls (an AdvanceResult
+    // Stall). It is unrelated to the resimulation-depth machinery in TimeConfig,
+    // which owns the codebase's other vocabulary for "give ticks back".
+    // -----------------------------------------------------------------------
+
+    // Register the effective-input-delay change produced by an authoritative
+    // RTT tier transition, as reported by `tierDelayDeltaTicks(oldTier, newTier)`
+    // (ConnectionTierTable.h). Called on the CLIENT from the replicated-tier
+    // OnRep handler — under Option A that OnRep delta is the only transition
+    // signal the client has.
+    //
+    // WHY A STALL AT ALL. An upward transition RAISES the effective input
+    // delay: an input captured at tick T now lands at T + newDelay instead of
+    // T + oldDelay. Every already-predicted tick ahead of the frontier was
+    // computed against the OLD, smaller delay, so the frontier now sits
+    // `delta` ticks further ahead of where the new delay says it should. The
+    // client must give those ticks back.
+    //
+    // POSITIVE DELTAS ONLY. `deltaDelayTicks <= 0` is a no-op: a DOWNWARD
+    // transition lets the client predict FURTHER ahead, which the ordinary
+    // drift path reaches on its own by advancing normally. There is nothing to
+    // undo, so forcing a forward jump here would be an unnecessary
+    // discontinuity.
+    //
+    // ACCUMULATES. Consecutive upward transitions add their deltas: two
+    // unpaid transitions owe the sum, never just the most recent one.
+    OGSIMULATION_API void requestInputDelayIncreaseStall(int32_t deltaDelayTicks);
+
+    // Ticks of stall still owed. Nonzero means advancePrediction() will
+    // return Stall on the next call(s) instead of applying ordinary drift
+    // correction. Exposed for tests and telemetry.
+    OGSIMULATION_API unsigned int getRequiredInputDelayIncreaseStallTicks() const;
 
     // -----------------------------------------------------------------------
     // Resimulation
@@ -100,6 +138,10 @@ private:
     unsigned int m_predictionTick           = 0;
     unsigned int m_resimulationTick         = 0;
     unsigned int m_gradualCorrectionCounter = 0;  // cycles 0 .. gradualCorrectionRate-1
+
+    // [T11] Unpaid input-delay-increase stall, in ticks. Paid down one tick per
+    // advancePrediction() call (as a Stall), cleared by a hard resync.
+    unsigned int m_requiredInputDelayIncreaseStallTicks = 0;
 
     std::vector<ResyncCallback> m_resyncCallbacks;
     PCClockLoggerFn m_logger;

@@ -30,7 +30,8 @@ concept SimulatableState = requires(T& t)
 
 // Canonical free alias for per-type id→input maps.
 // Stack-scoped; passed by const ref to SimulationIntegrationExecutor::integrateAll
-// and returned from SimulationNetSync::collectInputAll / SimulationReconciliation::collectResimInputAll.
+// and returned from SimulationNetSync::collectInputAll / SimulationNetSync::collectResimInputAll
+// (the latter relocated off SimulationReconciliation by the input-relay T6).
 template <typename... Ts>
 using ResolvedInputs = std::tuple<
     std::unordered_map<unsigned int, typename Ts::InputType>...>;
