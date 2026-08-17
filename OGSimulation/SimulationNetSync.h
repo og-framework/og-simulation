@@ -11,7 +11,7 @@
 #include <unordered_map>
 
 #include "OGSimulation/CorrectionStateBufferCodec.h"
-#include "OGSimulation/Network/ClientInputDelayLine.h"
+#include "OGSimulation/Network/LocalInputCache.h"
 #include "OGSimulation/Network/CorrectionRotation.h"
 #include "OGSimulation/Network/CorrectionVerdictProbe.h"
 // [og-netcode-v2-input-relay item 42] The game-thread half of the resim-gate
@@ -19,7 +19,7 @@
 // frontier. Fed from the same OnRep-bound callback as the verdict probe.
 #include "OGSimulation/ResimGateProbe.h"
 #include "OGSimulation/Network/RelayReadProbe.h"
-#include "OGSimulation/Network/RelayedInputStore.h"
+#include "OGSimulation/Network/RemoteInputCache.h"
 #include "OGSimulation/SimulationLog.h"
 #include "OGSimulation/SimulationObjectStorage.h"
 #include "OGSimulation/SimulationQueues.h"
@@ -71,7 +71,7 @@ struct LocalInputSender
 
 // [T15 / input relay] THE PROVIDER TAKES THE DELAY LINE AS A PARAMETER.
 //
-// The second argument is the character's own ClientInputDelayLine — its raw
+// The second argument is the character's own LocalInputCache — its raw
 // capture history, keyed by capture tick. It is here because the motion-sequence
 // matcher (the game's Hadouken detector, which runs INSIDE the provider) needs
 // contiguous raw captures up to `tick - 1`, and passing them in is what makes
@@ -91,7 +91,7 @@ template <typename T>
 using InputProviderMapFor = std::unordered_map<
     unsigned int,
     std::function<typename T::InputType(const SimulationTimeStep&,
-                                        const ClientInputDelayLine<typename T::InputType>&)>>;
+                                        const LocalInputCache<typename T::InputType>&)>>;
 
 template <typename T>
 using RemoteMoveQueueMapFor = std::unordered_map<
@@ -148,18 +148,18 @@ struct LastUsedCaptureTickMapFor
 // [T9 parts 3+4] Per-locally-controlled-simulatable ring of the client's own raw
 // input captures. Populated ONLY for ids that have an input provider, i.e. the
 // exact set for which m_pendingInputQueues is populated. See
-// Network/ClientInputDelayLine.h for why this is a separate structure from the
+// Network/LocalInputCache.h for why this is a separate structure from the
 // correction cache — the short version is that the cache's slot T already means
 // "input APPLIED at tick T" and resim reads it with no offset.
 template <typename T>
-using ClientInputDelayLineMapFor = std::unordered_map<
+using LocalInputCacheMapFor = std::unordered_map<
     unsigned int,
-    ClientInputDelayLine<typename T::InputType>>;
+    LocalInputCache<typename T::InputType>>;
 
 // [T5 / input relay] Per-REMOTE-simulatable store of the inputs the server
 // relayed for that character, keyed by the SENDER's capture tick.
 //
-// THE EXACT COMPLEMENT of ClientInputDelayLineMapFor above: that map is populated
+// THE EXACT COMPLEMENT of LocalInputCacheMapFor above: that map is populated
 // for the ids that HAVE an input provider (locally controlled), this one for the
 // ids that do NOT (remote proxies). Provider-presence is the local-vs-remote test
 // throughout this file, and it is the one that stays correct under COUCH CO-OP,
@@ -168,12 +168,12 @@ using ClientInputDelayLineMapFor = std::unordered_map<
 // hand the others a relay store they must not have.
 //
 // NOT wiped by wipeAllForResync — see the deliberate non-wipe note there, and the
-// naming ruling in Network/RelayedInputStore.h for why this is its own type rather
-// than a second ClientInputDelayLine.
+// naming ruling in Network/RemoteInputCache.h for why this is its own type rather
+// than a second LocalInputCache.
 template <typename T>
-using RelayedInputStoreMapFor = std::unordered_map<
+using RemoteInputCacheMapFor = std::unordered_map<
     unsigned int,
-    RelayedInputStore<typename T::InputType>>;
+    RemoteInputCache<typename T::InputType>>;
 
 // ---------------------------------------------------------------------------
 // [T6] resolveScheduledRelayedInput — THE UNIFIED SCHEDULED READ, in one place.
@@ -185,7 +185,7 @@ using RelayedInputStoreMapFor = std::unordered_map<
 //   0. nothing has ever arrived (`!findLatest().valid`) -> TERMINAL FALLBACK, and
 //      specifically NO PROBE AT ALL. `find(N)` can genuinely hit for a LAN peer,
 //      so probing with a default dA of 0 would be accidentally-safe-because-a-
-//      later-check-catches-it rather than correct (RelayedInputStore.h's
+//      later-check-catches-it rather than correct (RemoteInputCache.h's
 //      initial-state contract states and requires this skip).
 //   1. probe `find(N - dLatest)`;
 //   2. VERIFY the candidate's own stamp equals `dLatest`. This means "the delay
@@ -208,19 +208,155 @@ using RelayedInputStoreMapFor = std::unordered_map<
 // that produced it would manufacture divergence out of nothing. T7 calls this
 // from collectInputAll's proxy branch; it is deliberately not a private member so
 // the ladder can also be unit-tested on its own.
-// ---------------------------------------------------------------------------
-// Returns BY VALUE: `find` copies into an out-param, so the hit arm has a local
-// to hand back and the two arms must agree on a return type.
 //
+// CLASSIFICATION NOTE — the `tick < dA` guard reports Miss, not NoProbe. Rung 0 is
+// specifically `!findLatest().valid`, "nothing has EVER arrived": the join window.
+// The underflow guard is a different situation — data HAS arrived, we simply cannot
+// form a probe tick for a session younger than the delay. Since the D4 stale-run
+// rule (review F5) is stated exactly as "count fallback serves where
+// `findLatest().valid` is true", this case belongs in the run and NoProbe does not.
 // ---------------------------------------------------------------------------
-// [T19] `outReport` — THE OUTCOME, REPORTED TO THE CALLER RATHER THAN COUNTED HERE.
+// [RN-8 / task 58] DECIDE, THEN PROJECT — the ladder above is 14 load-bearing
+// lines; T19/T20 grew ~50 lines of diagnostic scaffolding (three lambdas) in front
+// of the first one of them. This is option B from ReviewNotes.md RN-8: the ladder
+// is factored into a PURE decision (`decideScheduledRelayedRead`, below) and a
+// thin projection (`resolveScheduledRelayedInput`, further below) that turns the
+// decision into candidate-or-fallback and, only if asked, into the diagnostic
+// report. THIS IS THE SHAPE TASKS 60 (part C) and 61 COPY — keep it clean.
+//
+// THREE PROPERTIES THIS SPLIT MUST PRESERVE, none obvious from either half alone:
+//
+//   1. THE NO-REPORT PATH STAYS BYTE-FOR-BYTE AS CHEAP. `decideScheduledRelayedRead`
+//      never touches the reporting out-param at all — it cannot, it is not passed
+//      one — and returns a small POD-ish struct by value: the same integer/enum
+//      scalars the old lambdas captured, plus the one `InputT` copy `find` already
+//      produced on the ladder's own stack. No new scan, no new allocation.
+//   2. THE `residentSpan()` SECOND SCAN IS PAID ONLY ON A MISS AND ONLY WHEN A
+//      REPORT WAS ASKED FOR. `decideScheduledRelayedRead` NEVER calls
+//      `residentSpan()` — it cannot classify InSpan/AboveNewest/BelowOldest at all,
+//      only whether a probe tick was formed. That classification is the
+//      PROJECTION's job, inside `resolveScheduledRelayedInput`'s
+//      `outDiagnosticReport != nullptr` guard, exactly where T20 already paid it.
+//   3. `NoProbeTick` STAYS DISTINCT FROM `BelowOldest`. The decision struct carries
+//      `isUnderflowMiss` as its OWN field rather than folding the tick<dA guard into
+//      the ordinary Miss arm — this is precisely where the two would get merged by
+//      someone reaching for the smallest struct. One IS an early-session artefact,
+//      the other a clock/capacity fault, and telling them apart is the whole point
+//      (see the classification note above `decideScheduledRelayedRead`'s underflow
+//      arm, and `RelayMissClass: the tick < dA underflow guard is its OWN class,
+//      not belowOldest` in RelayReadProbeTest.cpp).
+// ---------------------------------------------------------------------------
+
+// What the ladder decided, before any of it is turned into a report. Returned BY
+// VALUE for the same reason `resolveScheduledRelayedInput` always has: `find`
+// copies into an out-param, so the Hit arm has a local to hand back, and a decision
+// struct is just that local plus the classification scalars the old lambdas used to
+// capture. Every field is meaningless on the outcomes the comment beside it excludes
+// — same convention `ScheduledRelayedReadReport` (RelayReadProbe.h) already uses.
+template <typename InputT>
+struct ScheduledRelayedReadDecision
+{
+    ScheduledRelayedReadOutcome outcome = ScheduledRelayedReadOutcome::NoProbe;
+
+    // The probed capture tick. 0u — and meaningless — on NoProbe and on the
+    // tick<dA underflow guard, matching what the pre-split ladder reported on
+    // those two rungs (neither ever formed a real probe tick).
+    uint32       probeTick   = 0u;
+    std::uint8_t dLatest     = 0u;   // meaningless on NoProbe
+    std::uint8_t candidateDA = 0u;   // meaningful on Hit / VerifyFail only
+
+    // The candidate PROJECT should serve when `useCandidate` is true (Hit only);
+    // every other outcome projects to `store.fallback()`. Filled unconditionally by
+    // `find`'s out-param, same as the pre-split ladder's `candidate` local — no
+    // extra cost on the no-report path.
+    InputT candidateInput{};
+    bool   useCandidate = false;
+
+    // Whether a probe tick was actually FORMED — false on rung 0 (NoProbe) and on
+    // the tick<dA underflow guard, true on Hit/VerifyFail/every other Miss. Gates
+    // both the delta projection and the `isUnderflowMiss` short-circuit below.
+    bool probeTickFormed = false;
+
+    // FREE when set — `latest.captureTick`, which `decide` already has in hand from
+    // its first line (T20's comment on the old `reportDelta`). Meaningless unless
+    // `probeTickFormed`.
+    uint32 newestResident = 0u;
+
+    // Set ONLY on the tick<dA underflow guard. `decide` already knows the miss
+    // class there without a scan; PROJECT must not re-derive it and must not pay
+    // `residentSpan()` for this rung (property 3 above).
+    bool isUnderflowMiss = false;
+};
+
+// THE PURE LADDER — property 1's whole reason for existing. Side-effect-free,
+// `const` over the store, callable with no reporting out-param because it has none
+// to take. Byte-for-byte the same arms, conditions, order and returned values T6/T7
+// shipped and T19/T20 left alone; only the SHAPE of what leaves the function changed.
+template <typename InputT>
+ScheduledRelayedReadDecision<InputT> decideScheduledRelayedRead(
+    const RemoteInputCache<InputT>& store, uint32 tick)
+{
+    ScheduledRelayedReadDecision<InputT> decision;
+
+    const auto latest = store.findLatest();
+    if (!latest.valid)
+    {
+        return decision;                             // rung 0 — no probe at all
+    }
+
+    // Guard the subtraction rather than wrapping into a ~4-billion capture tick:
+    // a session fewer than dA ticks old has no scheduled entry yet, which is the
+    // same "nothing to read" situation as rung 0 — but see the classification note
+    // above for why it is reported as Miss, not NoProbe.
+    if (tick < static_cast<uint32>(latest.dA))
+    {
+        decision.outcome         = ScheduledRelayedReadOutcome::Miss;
+        decision.dLatest         = latest.dA;
+        decision.isUnderflowMiss = true;
+        return decision;
+    }
+
+    const uint32 probeTick   = tick - static_cast<uint32>(latest.dA);
+    decision.probeTick       = probeTick;
+    decision.dLatest         = latest.dA;
+    decision.probeTickFormed = true;
+    decision.newestResident  = latest.captureTick;
+
+    std::uint8_t candidateDA = 0u;
+    InputT       candidate{};
+    if (store.find(probeTick, candidateDA, candidate))
+    {
+        decision.candidateDA = candidateDA;
+        if (candidateDA == latest.dA)
+        {
+            decision.outcome        = ScheduledRelayedReadOutcome::Hit;
+            decision.candidateInput = candidate;
+            decision.useCandidate   = true;
+            return decision;
+        }
+
+        // A candidate WAS resident, but stamped against a delay that is no longer
+        // the current one. The delay REGIME shifted under us — a transition, not
+        // starvation. Same fallback, completely different diagnosis.
+        decision.outcome = ScheduledRelayedReadOutcome::VerifyFail;
+        return decision;
+    }
+
+    decision.outcome = ScheduledRelayedReadOutcome::Miss;
+    return decision;
+}
+
+// ---------------------------------------------------------------------------
+// [T19, updated RN-8] `outDiagnosticReport` (renamed from the old, undifferentiated
+// out-param name, matching DiagnosticsConventions.md's `outDiagnostic…` prefix) —
+// THE OUTCOME, REPORTED TO THE CALLER RATHER THAN COUNTED HERE.
 //
 // The relay hit-rate probe needs to know WHICH rung answered. The counters for it
 // deliberately do NOT live in this function, and that is a design constraint rather
 // than a style choice:
 //
-//   * this is a free function over a CONST store, deliberately side-effect-free, so
-//     that it can be reasoned about (and unit-tested) as a pure classification;
+//   * `decideScheduledRelayedRead` is side-effect-free so that it can be reasoned
+//     about (and unit-tested) as a pure classification;
 //   * it is SHARED by T6's resim frontier row and T7's prediction branch precisely
 //     so the two can never disagree — a resim that resolved a frontier tick
 //     differently from the prediction that produced it would manufacture divergence
@@ -234,146 +370,95 @@ using RelayedInputStoreMapFor = std::unordered_map<
 // The parameter is a defaulted OUT-POINTER rather than a widened return type so
 // that every existing call site — and every existing test — compiles and behaves
 // unchanged. Writing through a pointer the CALLER owns is not a side effect on the
-// store, and mirrors `RelayedInputStore::find`, which already answers through
+// store, and mirrors `RemoteInputCache::find`, which already answers through
 // out-params for the same reason.
 //
-// CLASSIFICATION NOTE — the `tick < dA` guard reports Miss, not NoProbe. Rung 0 is
-// specifically `!findLatest().valid`, "nothing has EVER arrived": the join window.
-// The underflow guard is a different situation — data HAS arrived, we simply cannot
-// form a probe tick for a session younger than the delay. Since the D4 stale-run
-// rule (review F5) is stated exactly as "count fallback serves where
-// `findLatest().valid` is true", this case belongs in the run and NoProbe does not.
-//
-// ---------------------------------------------------------------------------
-// [T20] STILL SIDE-EFFECT-FREE, STILL `const`, AND THAT IS THE CONSTRAINT THIS
-// TASK WAS GIVEN EXPLICITLY. T20 adds a WHY to the miss — the store's resident span
-// classifies it as an in-span coverage hole, an ask above the newest arrival, or an
-// ask below the oldest — plus the signed distance from the probe to the newest
-// resident. Every one of those is written through the SAME caller-owned out-pointer
-// and derived from `const` reads of the store. Nothing was added to the ladder's
-// control flow: the arms, their conditions, their order and their returned values
-// are byte-for-byte what T6/T7 shipped and T19 left alone.
+// [RN-8] THIS FUNCTION IS NOW A PROJECTION: it calls `decideScheduledRelayedRead`
+// once, turns the decision into candidate-or-fallback, and — only when
+// `outDiagnosticReport != nullptr` — projects the SAME decision into the report.
+// The `residentSpan()` second scan (T20 PROBE B, half two — WHY the miss happened)
+// lives here, inside that guard, and ONLY on the Miss/non-underflow arm: this is
+// property 2 from the banner above `decideScheduledRelayedRead`.
 // ---------------------------------------------------------------------------
 template <typename InputT>
-InputT resolveScheduledRelayedInput(const RelayedInputStore<InputT>& store, uint32 tick,
-                                    ScheduledRelayedReadReport* outReport = nullptr)
+InputT resolveScheduledRelayedInput(const RemoteInputCache<InputT>& store, uint32 tick,
+                                    ScheduledRelayedReadReport* outDiagnosticReport = nullptr)
 {
-    const auto report = [outReport](ScheduledRelayedReadOutcome outcome,
-                                    uint32 probeTick, std::uint8_t dLatest,
-                                    std::uint8_t candidateDA) {
-        if (outReport != nullptr)
-        {
-            outReport->outcome     = outcome;
-            outReport->probeTick   = probeTick;
-            outReport->dLatest     = dLatest;
-            outReport->candidateDA = candidateDA;
-        }
-    };
+    const auto decision = decideScheduledRelayedRead(store, tick);
 
-    // [T20] PROBE B, half one — the SIGNED DISTANCE from the probe tick to the
-    // newest thing the store holds. Attached on every rung that formed a probe tick,
-    // Hit included: the hit deltas are the calibration the miss deltas are read
-    // against. FREE — `newestResident` here is `findLatest().captureTick`, which the
-    // ladder computed on its first line, so this adds an integer subtraction and no
-    // scan. Written through the caller's pointer only; nothing here touches `store`.
-    const auto reportDelta = [outReport](uint32 probeTick, uint32 newestResident) {
-        if (outReport != nullptr)
-        {
-            outReport->newestResident     = newestResident;
-            outReport->deltaToNewestValid = true;
-            outReport->deltaToNewest      = static_cast<std::int32_t>(
-                static_cast<std::int64_t>(probeTick) - static_cast<std::int64_t>(newestResident));
-        }
-    };
-
-    // [T20] PROBE B, half two — WHY the miss happened, from the store's RESIDENT
-    // SPAN. This is the one addition that costs anything: a second scan of the
-    // store's slots. It is paid ONLY on a miss and ONLY when a report was asked for,
-    // so a caller that passes no report (the pure-classification unit tests, and any
-    // future non-probing consumer) is byte-for-byte as cheap as before T20.
-    //
-    // THE SPAN IS THE STORE'S, NOT THE RING'S. The ring carries `depth` entries per
-    // replication; the store accumulates up to 64 arrivals. That is exactly why an
-    // in-span hole is meaningful at depth 1 — it IS the hole the replace-latest ring
-    // punched between two replications. Reading the ring's span here instead would
-    // make every miss trivially "out of span" and the classification worthless.
-    const auto reportMissClass = [outReport, &store](uint32 probeTick) {
-        if (outReport == nullptr)
-        {
-            return;
-        }
-
-        const auto span = store.residentSpan();
-        outReport->spanValid      = span.valid;
-        outReport->oldestResident = span.oldest;
-        outReport->newestResident = span.newest;
-        outReport->residentCount  = static_cast<std::uint32_t>(span.count);
-
-        if (!span.valid)
-        {
-            // Unreachable: this lambda only runs below the rung-0 gate, so at least
-            // one slot is occupied. Classified rather than asserted because a probe
-            // must never be the thing that brings a session down.
-            outReport->missClass = ScheduledRelayedReadMissClass::NoProbeTick;
-            return;
-        }
-
-        outReport->missClass =
-              (probeTick > span.newest) ? ScheduledRelayedReadMissClass::AboveNewest
-            : (probeTick < span.oldest) ? ScheduledRelayedReadMissClass::BelowOldest
-                                        : ScheduledRelayedReadMissClass::InSpan;
-    };
-
-    const auto latest = store.findLatest();
-    if (!latest.valid)
+    if (outDiagnosticReport != nullptr)
     {
-        report(ScheduledRelayedReadOutcome::NoProbe, 0u, 0u, 0u);
-        return store.fallback();                    // rung 0 — no probe at all
+        outDiagnosticReport->outcome     = decision.outcome;
+        outDiagnosticReport->probeTick   = decision.probeTick;
+        outDiagnosticReport->dLatest     = decision.dLatest;
+        outDiagnosticReport->candidateDA = decision.candidateDA;
+
+        // [T20] PROBE B, half one — the SIGNED DISTANCE from the probe tick to the
+        // newest thing the store holds. Set on every rung that formed a probe tick,
+        // Hit included: the hit deltas are the calibration the miss deltas are read
+        // against. FREE — `decision.newestResident` is `latest.captureTick`, which
+        // `decide` computed on its first line, so this is an integer subtraction and
+        // no scan.
+        if (decision.probeTickFormed)
+        {
+            outDiagnosticReport->newestResident     = decision.newestResident;
+            outDiagnosticReport->deltaToNewestValid = true;
+            outDiagnosticReport->deltaToNewest      = static_cast<std::int32_t>(
+                static_cast<std::int64_t>(decision.probeTick)
+                - static_cast<std::int64_t>(decision.newestResident));
+        }
+
+        // [T20] PROBE B, half two — WHY the miss happened, from the store's
+        // RESIDENT SPAN. This is the one addition that costs anything: a second
+        // scan of the store's slots. Paid ONLY on a miss and ONLY when a report was
+        // asked for (this whole block sits behind `outDiagnosticReport != nullptr`),
+        // so a caller that passes no report is byte-for-byte as cheap as before T20.
+        //
+        // THE SPAN IS THE STORE'S, NOT THE RING'S. The ring carries `depth` entries
+        // per replication; the store accumulates up to 64 arrivals. That is exactly
+        // why an in-span hole is meaningful at depth 1 — it IS the hole the
+        // replace-latest ring punched between two replications. Reading the ring's
+        // span here instead would make every miss trivially "out of span" and the
+        // classification worthless.
+        if (decision.outcome == ScheduledRelayedReadOutcome::Miss)
+        {
+            if (decision.isUnderflowMiss)
+            {
+                // NO PROBE TICK EXISTS, so there is no delta and no span comparison
+                // to make. Kept as its own miss class rather than folded into
+                // BelowOldest, which it superficially resembles: this is an
+                // early-session artefact and that one is a clock/capacity fault, and
+                // the whole point of the split is to tell causes apart.
+                outDiagnosticReport->missClass = ScheduledRelayedReadMissClass::NoProbeTick;
+            }
+            else
+            {
+                const auto span = store.residentSpan();
+                outDiagnosticReport->spanValid      = span.valid;
+                outDiagnosticReport->oldestResident = span.oldest;
+                outDiagnosticReport->newestResident = span.newest;
+                outDiagnosticReport->residentCount  = static_cast<std::uint32_t>(span.count);
+
+                if (!span.valid)
+                {
+                    // Unreachable: this arm only runs on a Miss below the rung-0
+                    // gate, so at least one slot is occupied. Classified rather than
+                    // asserted because a probe must never be the thing that brings a
+                    // session down.
+                    outDiagnosticReport->missClass = ScheduledRelayedReadMissClass::NoProbeTick;
+                }
+                else
+                {
+                    outDiagnosticReport->missClass =
+                          (decision.probeTick > span.newest) ? ScheduledRelayedReadMissClass::AboveNewest
+                        : (decision.probeTick < span.oldest) ? ScheduledRelayedReadMissClass::BelowOldest
+                                                              : ScheduledRelayedReadMissClass::InSpan;
+                }
+            }
+        }
     }
 
-    // Guard the subtraction rather than wrapping into a ~4-billion capture tick:
-    // a session fewer than dA ticks old has no scheduled entry yet, which is the
-    // same "nothing to read" situation as rung 0.
-    if (tick < static_cast<uint32>(latest.dA))
-    {
-        report(ScheduledRelayedReadOutcome::Miss, 0u, latest.dA, 0u);
-        // [T20] NO PROBE TICK EXISTS, so there is no delta and no span comparison to
-        // make. Kept as its own miss class rather than folded into BelowOldest,
-        // which it superficially resembles: this is an early-session artefact and
-        // that one is a clock/capacity fault, and the whole point of the split is to
-        // tell causes apart.
-        if (outReport != nullptr)
-        {
-            outReport->missClass = ScheduledRelayedReadMissClass::NoProbeTick;
-        }
-        return store.fallback();
-    }
-
-    const uint32 probeTick = tick - static_cast<uint32>(latest.dA);
-
-    std::uint8_t candidateDA = 0u;
-    InputT       candidate{};
-    if (store.find(probeTick, candidateDA, candidate))
-    {
-        if (candidateDA == latest.dA)
-        {
-            report(ScheduledRelayedReadOutcome::Hit, probeTick, latest.dA, candidateDA);
-            reportDelta(probeTick, latest.captureTick);
-            return candidate;
-        }
-
-        // A candidate WAS resident, but stamped against a delay that is no longer
-        // the current one. The delay REGIME shifted under us — a transition, not
-        // starvation. Same fallback, completely different diagnosis.
-        report(ScheduledRelayedReadOutcome::VerifyFail, probeTick, latest.dA, candidateDA);
-        reportDelta(probeTick, latest.captureTick);
-        return store.fallback();
-    }
-
-    report(ScheduledRelayedReadOutcome::Miss, probeTick, latest.dA, 0u);
-    reportDelta(probeTick, latest.captureTick);
-    reportMissClass(probeTick);
-    return store.fallback();
+    return decision.useCandidate ? decision.candidateInput : store.fallback();
 }
 
 // Per-SIMULATABLE-TYPE (not per-id) neutral input. Wrapped in a struct keyed on
@@ -393,7 +478,7 @@ InputT resolveScheduledRelayedInput(const RelayedInputStore<InputT>& store, uint
 // becomes reachable by the branch below.) A composition root that injects on the
 // client role only
 // would silently reintroduce the value-initialised `InputType{}` — whose (0,0,0)
-// forward vectors are exactly the value ClientInputDelayLine.h documents as
+// forward vectors are exactly the value LocalInputCache.h documents as
 // normalisation-breaking. Before T17 the miss was invisible; the flag turns it
 // into a warning at the registration site where it bites.
 template <typename T>
@@ -641,12 +726,12 @@ public:
         neutral.value    = neutralInput;
         neutral.injected = true;
         for (auto& [id, line] :
-             std::get<ClientInputDelayLineMapFor<SimulatableT>>(m_clientInputDelayLines))
+             std::get<LocalInputCacheMapFor<SimulatableT>>(m_localInputCaches))
         {
             line.setNeutralInput(neutralInput);
         }
         for (auto& [id, store] :
-             std::get<RelayedInputStoreMapFor<SimulatableT>>(m_relayedInputStores))
+             std::get<RemoteInputCacheMapFor<SimulatableT>>(m_remoteInputCaches))
         {
             store.setNeutralInput(neutralInput);
         }
@@ -687,17 +772,17 @@ public:
     // THROWING `getCacheFor`, so calling it on the authority (which keeps no
     // caches) threw rather than answering "nothing here".
     template <typename SimulatableT>
-    RelayedInputStore<typename SimulatableT::InputType>* findRelayedInputStore(unsigned int id)
+    RemoteInputCache<typename SimulatableT::InputType>* findRemoteInputCache(unsigned int id)
     {
-        auto& map = std::get<RelayedInputStoreMapFor<SimulatableT>>(m_relayedInputStores);
+        auto& map = std::get<RemoteInputCacheMapFor<SimulatableT>>(m_remoteInputCaches);
         const auto it = map.find(id);
         return it == map.end() ? nullptr : &it->second;
     }
 
     template <typename SimulatableT>
-    const RelayedInputStore<typename SimulatableT::InputType>* findRelayedInputStore(unsigned int id) const
+    const RemoteInputCache<typename SimulatableT::InputType>* findRemoteInputCache(unsigned int id) const
     {
-        const auto& map = std::get<RelayedInputStoreMapFor<SimulatableT>>(m_relayedInputStores);
+        const auto& map = std::get<RemoteInputCacheMapFor<SimulatableT>>(m_remoteInputCaches);
         const auto it = map.find(id);
         return it == map.end() ? nullptr : &it->second;
     }
@@ -736,13 +821,13 @@ public:
     // THREADING. This is the ONE reader of the store on the GAME thread, which is
     // the store's WRITER thread (OnRep_RelayedInputRing -> populate). It therefore
     // does not participate in the accepted GT-write/PT-read tear documented in
-    // RelayedInputStore.h — it is same-thread with the writer, and strictly safer
+    // RemoteInputCache.h — it is same-thread with the writer, and strictly safer
     // than the physics-thread readers. It returns a COPY, so no reference into the
     // slots outlives the call.
     template <typename SimulatableT>
     std::optional<typename SimulatableT::InputType> getLastRelayedInput(unsigned int id) const
     {
-        const auto* store = this->template findRelayedInputStore<SimulatableT>(id);
+        const auto* store = this->template findRemoteInputCache<SimulatableT>(id);
         if (store == nullptr)
             return std::nullopt;
 
@@ -753,38 +838,70 @@ public:
         return std::optional<typename SimulatableT::InputType>(latest.input);
     }
 
-    // [T19] Read-only access to the two relay probes.
+    // =======================================================================
+    // [og-netcode-v2-input-relay task 59] THE FOUR PROBE ACCESSORS' DIAGNOSTIC
+    // VIEW — RN-9 + amendment, grouped per `docs/DiagnosticsConventions.md`
+    // (the classification rule these views follow is centralised there, not
+    // re-derived here). A sibling ruling groups `SimulationManager`'s own
+    // resim-gate probe accessor the same way, in the same task.
     //
-    // CONST-ONLY AND DELIBERATELY SO: the only writers are the three call sites in
-    // this class, each on its own thread, and a mutable handle handed out here would
-    // be an invitation to increment a physics-thread counter from the game thread —
-    // the exact hazard the two-object split exists to prevent.
+    // ⛔ ONLY THESE FOUR READ-ONLY ACCESSORS MOVE. The probe MEMBERS
+    // (`m_relayReadProbe` etc., declared further down this class), the
+    // `note*` call sites that feed them every frame, and the private
+    // `emit*` helpers further down (RN-11) are production instrumentation and
+    // are UNTOUCHED — see the fence comment on each probe member's own
+    // declaration and `docs/DiagnosticsConventions.md` §2/§3 for the current
+    // roster and count.
     //
-    // Its consumer is the og-brawler-tests wiring block, which drives the REAL
-    // collectInputAll and asserts the counters the log lines are built from. That
-    // proof cannot be written against the probe types alone: they are unit-tested in
-    // og-simulation-tests, but only a suite with SimulatableOwnerTraits bound to
-    // concrete owners can show that the shipped branch actually feeds them.
-    const RelayReadProbe&    getRelayReadProbe()    const { return m_relayReadProbe; }
-    const RelayArrivalProbe& getRelayArrivalProbe() const { return m_relayArrivalProbe; }
+    // CONST-ONLY AND DELIBERATELY SO: the only writers are the three call sites
+    // in this class, each on its own thread, and a mutable handle handed out
+    // here would be an invitation to increment a physics-thread counter from
+    // the game thread — the exact hazard the two-object split exists to
+    // prevent. There is therefore no `MutableDiagnostics` / `editDiagnostics()`
+    // on this class, unlike `StateCorrectionCache`'s pair.
+    //
+    // Nested class, not a free function: it has the same access to
+    // SimulationNetSync's private members as any other member function — no
+    // friend declaration needed, and the view holds nothing but a reference.
+    // =======================================================================
+    class Diagnostics
+    {
+    public:
+        explicit Diagnostics(const SimulationNetSync& netSync) : m_netSync(netSync) {}
 
-    // [T24] Same contract, same reason. Its consumer is the og-brawler-tests
-    // wiring block: the probe's arithmetic is unit-tested in og-simulation-tests,
-    // but only a suite with SimulatableOwnerTraits bound to concrete owners can
-    // show that the shipped correction callback actually feeds it AND classifies
-    // by the same provider-presence test the rest of this class uses.
-    const CorrectionVerdictProbe& getCorrectionVerdictProbe() const
-    { return m_correctionVerdictProbe; }
+        // [T19] The two relay probes. Its consumer is the og-brawler-tests
+        // wiring block, which drives the REAL collectInputAll and asserts the
+        // counters the log lines are built from. That proof cannot be written
+        // against the probe types alone: they are unit-tested in
+        // og-simulation-tests, but only a suite with SimulatableOwnerTraits
+        // bound to concrete owners can show that the shipped branch actually
+        // feeds them.
+        const RelayReadProbe&    relayReadProbe()    const { return m_netSync.m_relayReadProbe; }
+        const RelayArrivalProbe& relayArrivalProbe() const { return m_netSync.m_relayArrivalProbe; }
 
-    // [og-netcode-v2-input-relay item 42 / I2] Same contract, same consumer, same
-    // reason as the verdict probe's accessor directly above: the three-way
-    // classification is swept as a unit in og-simulation-tests, but only a suite
-    // that can register a real local and a real remote character against the real
-    // callback can show that the shipped site feeds it, files each landing under
-    // the right class, and puts a DISCARD in the discarded bucket rather than
-    // dropping it on the verdict probe's early return.
-    const CorrectionLandingProbe& getCorrectionLandingProbe() const
-    { return m_correctionLandingProbe; }
+        // [T24] Same contract, same reason. Its consumer is the og-brawler-tests
+        // wiring block: the probe's arithmetic is unit-tested in og-simulation-tests,
+        // but only a suite with SimulatableOwnerTraits bound to concrete owners can
+        // show that the shipped correction callback actually feeds it AND classifies
+        // by the same provider-presence test the rest of this class uses.
+        const CorrectionVerdictProbe& correctionVerdictProbe() const
+        { return m_netSync.m_correctionVerdictProbe; }
+
+        // [og-netcode-v2-input-relay item 42 / I2] Same contract, same consumer, same
+        // reason as the verdict probe's accessor directly above: the three-way
+        // classification is swept as a unit in og-simulation-tests, but only a suite
+        // that can register a real local and a real remote character against the real
+        // callback can show that the shipped site feeds it, files each landing under
+        // the right class, and puts a DISCARD in the discarded bucket rather than
+        // dropping it on the verdict probe's early return.
+        const CorrectionLandingProbe& correctionLandingProbe() const
+        { return m_netSync.m_correctionLandingProbe; }
+
+    private:
+        const SimulationNetSync& m_netSync;
+    };
+
+    Diagnostics getDiagnostics() const { return Diagnostics(*this); }
 
     // -----------------------------------------------------------------------
     // Registration — free functions delegate here; not called directly by users
@@ -801,7 +918,7 @@ public:
         PredictionOwnerFor<SimulatableT>& predictionOwner,
         std::function<typename SimulatableT::InputType(
             const SimulationTimeStep&,
-            const ClientInputDelayLine<typename SimulatableT::InputType>&)> inputProvider)
+            const LocalInputCache<typename SimulatableT::InputType>&)> inputProvider)
     {
         // Input provider is present iff this owner drives a locally-controlled
         // simulatable. Keep m_inputProviders / m_pendingInputQueues / m_localInputSenders
@@ -822,7 +939,7 @@ public:
             // no capture of its own to delay, so it must not get a line —
             // collectInputAll's proxy branch reads no delay line at all (post-T7
             // it reads that character's relay store instead).
-            std::get<ClientInputDelayLineMapFor<SimulatableT>>(m_clientInputDelayLines)
+            std::get<LocalInputCacheMapFor<SimulatableT>>(m_localInputCaches)
                 .try_emplace(id,
                     std::get<NeutralInputFor<SimulatableT>>(m_neutralInputs).value);
 
@@ -836,123 +953,17 @@ public:
             // store: its inputs come from its own provider, and the server does not
             // relay a character's input back to the client that produced it.
             auto& store =
-                std::get<RelayedInputStoreMapFor<SimulatableT>>(m_relayedInputStores)
+                std::get<RemoteInputCacheMapFor<SimulatableT>>(m_remoteInputCaches)
                     .try_emplace(id,
                         std::get<NeutralInputFor<SimulatableT>>(m_neutralInputs).value)
                     .first->second;
 
             // CALL SITE 1 — arrival. Fires on the GAME thread (see the THREADING
-            // section in Network/RelayedInputStore.h); the store is read on the
+            // section in Network/RemoteInputCache.h); the store is read on the
             // physics thread.
             predictionOwner.setOnRelayedInputReceivedCallback(
                 [this, id, &store](const typename PredictionOwnerFor<SimulatableT>::RelayedInputRingType& ring) {
-                    const RelayedInputIngestReport report =
-                        populateRelayedInputStore<typename SimulatableT::InputType>(store, ring);
-
-                    // [T19] PROBE 2 — replication cadence, measured in CAPTURE
-                    // TICKS. GAME-THREAD window, a different object from the
-                    // physics-side read probe; see the two-thread statement at the
-                    // top of Network/RelayReadProbe.h.
-                    //
-                    // `report.newestCaptureTick` is the newest tick THIS RING
-                    // carried, not the newest the store holds — the distinction is
-                    // load-bearing and the report field's own comment explains it.
-                    if (report.newestCaptureTickValid)
-                    {
-                        RelayArrivalWindowSummary arrival;
-                        std::uint32_t gapCaptureTicks = 0u;
-                        // ⛔ [T34 loss-counter fix] `newCaptureTicksIngested`, NOT
-                        // `entriesIngested` and NOT a hard-coded 1. It is the count
-                        // of capture ticks this arrival made newly resident, and it
-                        // is what turns `lostCaptureTicksX1000` from a measure of
-                        // the BURST RATE into a measure of loss. `entriesIngested`
-                        // would count re-delivered ticks as new coverage and hide
-                        // real loss; a hard-coded 1 is the retired replace-latest
-                        // premise and is exactly what reported ~120 per mille on a
-                        // working flush.
-                        const bool windowClosed = m_relayArrivalProbe.noteArrival(
-                            id,
-                            report.newestCaptureTick,
-                            static_cast<std::uint32_t>(report.newCaptureTicksIngested),
-                            arrival,
-                            &gapCaptureTicks);
-
-                        // Per-event Verbose, and only when the cadence actually
-                        // hiccuped. A gap of exactly 1 is the healthy depth-1
-                        // steady state and would be a per-tick line; the interesting
-                        // events are the stalls, which are what set the depth rule.
-                        if (gapCaptureTicks > 1u)
-                        {
-                            SIMLOG(m_logger,
-                                "[Verbose][RelayProbe.Arrival] id=%u newestCapture=%u "
-                                "gapCaptureTicks=%u",
-                                id, report.newestCaptureTick, gapCaptureTicks);
-                        }
-
-                        if (windowClosed)
-                        {
-                            // PER-WINDOW SUMMARY AT WARNING — the cadence
-                            // [InputStats] already uses. p99 is what the
-                            // `depth >= gap_p99 + margin` rule reads; the mean is
-                            // deliberately absent because it hides the tail that
-                            // sets depth.
-                            //
-                            // ⭐ [T34] `lostCaptureTicksX1000` IS THE R = 0 LOSS
-                            // INSTRUMENT, and it is on this line rather than its
-                            // own because it is derived from these same samples.
-                            // WARNING, not Log, is load-bearing:
-                            // `Config/DefaultEngine.ini` sets `LogOGNet=Warning`, so
-                            // a Log line does not exist on a dedicated server —
-                            // items 35 and 36 each cost this initiative a proof line
-                            // for exactly that. Steady-state expectation ~ 11 per
-                            // mille (the measured 1.122 % wire loss); the raw
-                            // numerator and denominator ride along so a window can
-                            // be re-derived rather than trusted.
-                            //
-                            // ⭐ [T34 rework] `discont=` IS PART OF THE GATE, not
-                            // garnish. A window reporting `discont=` > 0 was
-                            // interrupted (see kRelayArrivalDiscontinuityTicks) and
-                            // must be DISCARDED rather than averaged in — the same
-                            // rule `[RelayProbe.Write] discont=` already carries.
-                            // `discontMax=` is the largest excluded gap, exact, so
-                            // discarding a window never hides how bad it was.
-                            //
-                            // ⭐ [T34 loss-counter fix] `delivered=` IS THE FIELD
-                            // THAT MAKES THIS LINE SELF-CHECKING. `lost + delivered
-                            // == expected` must hold on every window; a reader who
-                            // sees it fail knows the delivered count is not being
-                            // plumbed and that `lostCaptureTicksX1000` is measuring
-                            // the burst rate again. Before this field existed, that
-                            // failure mode was indistinguishable from a lossy wire.
-                            SIMLOG(m_logger,
-                                "[Warning][RelayProbe.Arrival] samples=%u gapCaptureTicks "
-                                "p50=%u p99=%u%s max=%u noAdvance=%u saturated=%u "
-                                "lostCaptureTicksX1000=%u lost=%u delivered=%u expected=%u "
-                                "discont=%u discontMax=%u",
-                                arrival.samples, arrival.p50, arrival.p99,
-                                arrival.p99Saturated ? "+" : "",
-                                arrival.maxGap, arrival.noAdvance,
-                                arrival.saturatedSamples,
-                                arrival.lostCaptureTicksX1000,
-                                arrival.lostCaptureTicks,
-                                arrival.deliveredCaptureTicks,
-                                arrival.expectedCaptureTicks,
-                                arrival.discontinuities,
-                                arrival.maxDiscontinuityGap);
-                        }
-                    }
-
-                    if (report.outcome == RelayedInputIngestOutcome::VersionMismatch
-                        && store.shouldLogVersionMismatchOnce())
-                    {
-                        // ONCE per component per session — an incompatible peer
-                        // re-replicates its ring forever.
-                        SIMLOG(m_logger,
-                            "[Warning][RelayedInput] DROP wire-version mismatch id=%u onWire=%u expected=%u",
-                            id,
-                            static_cast<unsigned int>(report.versionOnWire),
-                            static_cast<unsigned int>(relayedInputRing::kWireFormatVersion));
-                    }
+                    onRelayedInputReceived<SimulatableT>(id, store, ring);
                 });
 
             // CALL SITE 2 — POPULATE ONCE AT BIND. Closes the hole where the ring
@@ -980,168 +991,13 @@ public:
             // The cost is that the first real OnRep seeds the watermark instead of
             // producing a gap, which is exactly one lost sample per component per
             // session.
-            populateRelayedInputStore<typename SimulatableT::InputType>(
+            populateRemoteInputCache<typename SimulatableT::InputType>(
                 store, predictionOwner.getRelayedInputRing());
         }
 
         predictionOwner.setOnCorrectionStateReceivedCallback(
             [this, id](const typename PredictionOwnerFor<SimulatableT>::SyncedCorrectionBufferType& buffer) {
-                // [T24] THE DIVERGENCE VERDICT, SURFACED AND ATTRIBUTED.
-                //
-                // The comparison itself is unchanged and happens where it always
-                // has — StateCorrectionCache::tryInsertingCorrectState's
-                // `isSimilarTo`, on every correction, for every character. All that
-                // is new is that the verdict now comes back out, and that THIS site
-                // adds the two facts the cache could never supply: the character
-                // `id`, and its CLASS.
-                CorrectionInsertVerdict verdict;
-                m_reconciliation.template injectCorrectionState<SimulatableT>(
-                    id, buffer, &verdict);
-
-                // THE CLASS TEST IS PROVIDER-PRESENCE — the SAME lookup
-                // registerPredictionOwner forked on above and collectInputAll forks
-                // on every tick, not a second notion of "remote". Read live rather
-                // than captured at bind time so it cannot drift from the map that
-                // actually decides behaviour.
-                //
-                // [item 42] HOISTED ABOVE THE LANDED GATE, unchanged in every other
-                // respect. The landing-site probe below counts DISCARDS as
-                // first-class samples (they are item 41's `aboveNewest` population),
-                // so it needs the class on a path the verdict probe returns early
-                // from.
-                const bool hasProvider =
-                    std::get<InputProviderMapFor<SimulatableT>>(m_inputProviders).count(id) != 0u;
-                const PredictedCharacterClass characterClass = hasProvider
-                    ? PredictedCharacterClass::LocallyPredicted
-                    : PredictedCharacterClass::RemoteProxy;
-
-                // ---------------------------------------------------------------
-                // [og-netcode-v2-input-relay item 42 / I2] WHERE DID IT LAND?
-                //
-                // THE FIRST-GATE DISCRIMINATOR. Item 31 established that resim
-                // triggers were gated by the prediction-frontier slot's INHERITED
-                // `m_isResimulated` bit: `getLastResimulationTick` scanned from the
-                // frontier at offset 0, so that bit shadowed every older corrected
-                // slot, and the ONLY event that re-opened the gate in play was a
-                // correction landing EXACTLY ON the frontier. A correction landing
-                // behind it set its own slot's flag, was never seen by the scan, was
-                // never replayed through (resims restore at the NEWEST corrected
-                // slot) and therefore never touched live state at all.
-                //
-                // So this three-way split is the measurement the whole item turns
-                // on: `landedBehind` large while triggers track only
-                // `landedAtFrontier` IS the demonstrated under-resimulation
-                // statement. Full statement at CorrectionLandingProbe in
-                // OGSimulation/ResimGateProbe.h.
-                //
-                // ⚠ [item 45] THAT MECHANISM IS GONE — the gate is now edge-triggered
-                // on an explicit pending anchor, and `m_isResimulated`, the scan and
-                // the inheritance are retired. THIS PROBE IS UNCHANGED AND STILL
-                // CORRECT, for a reason worth stating rather than re-deriving: it
-                // classifies a landing's POSITION relative to the frontier, which is
-                // a fact about the correction stream, not about the gate. What
-                // changed is only what that position IMPLIES: on a default build the
-                // `FrontierExact` policy makes `AtFrontier` exactly the anchor-set
-                // condition (same predicate, same value), so `requested` still tracks
-                // `atFrontier`; after item 46's flip to `OnDisagreement` the trigger
-                // population becomes the DISAGREEING landings — mostly this
-                // `Behind` bucket — and the tracking claim above inverts by design.
-                // Read `[ResimGate] session policy` in the log before reading a
-                // ratio.
-                //
-                // ⚠ THE FRONTIER IS READ THROUGH THE EXISTING RECONCILIATION
-                // ACCESSOR, not by giving the cache an identity. `findInputCache`
-                // is the nullable route every other accessor on that class already
-                // takes, and it answers nullptr on the authority (no caches are
-                // allocated there), which is exactly the right answer: this
-                // callback is OnRep-dispatched and can never fire on an authority
-                // world anyway. Pushing id-awareness down into StateCorrectionCache
-                // to carry the frontier out with the verdict is the placement T24
-                // ruled against, and this needs no such thing.
-                //
-                // ⚠ READ AFTER THE INSERT, WHICH IS SAFE AND ±1 RACY, and both
-                // halves of that matter. Safe: `tryInsertingCorrectState` never
-                // touches `m_tickBuffer`, so the frontier it saw and the frontier
-                // read here are the same value on this thread. Racy: the frontier
-                // is ADVANCED by `pushPredictionTick` on the PHYSICS thread, and
-                // the whole cache is already a formally unsynchronized GT/PT
-                // structure (finding §1). A physics frame landing between the
-                // insert and this read misfiles one sample from AtFrontier to
-                // Behind. That is a per-sample ±1 on a 120-sample window, it does
-                // not accumulate, and it is a property of the mechanism being
-                // measured rather than of this instrument: whether a correction
-                // hits the frontier slot at all is decided by that same
-                // interleaving.
-                const auto* landingCache =
-                    m_reconciliation.template findInputCache<SimulatableT>(id);
-                const CorrectionLandingSite landingSite = classifyCorrectionLanding(
-                    verdict.landed, verdict.tick,
-                    landingCache != nullptr ? landingCache->getPredictionTick() : 0u);
-
-                SIMLOG(m_logger,
-                    "[Verbose][ResimProbe.Landing] id=%u tick=%u class=%s site=%s",
-                    id, verdict.tick,
-                    predictedCharacterClassName(characterClass),
-                    correctionLandingSiteName(landingSite));
-
-                CorrectionLandingWindowSummary landingWindow;
-                if (m_correctionLandingProbe.noteLanding(
-                        characterClass, landingSite, landingWindow))
-                {
-                    emitCorrectionLandingClassLine(
-                        PredictedCharacterClass::LocallyPredicted,
-                        landingWindow.local, landingWindow.samples);
-                    emitCorrectionLandingClassLine(
-                        PredictedCharacterClass::RemoteProxy,
-                        landingWindow.remote, landingWindow.samples);
-                }
-                // ---------------------------------------------------------------
-
-                // A correction whose tick had no slot was DISCARDED — no comparison
-                // happened. Counting it would put a denominator under a verdict that
-                // was never reached, and the discard path already logs itself
-                // (isAnomalousMiss-gated, in the cache).
-                //
-                // [item 42] THE LANDING PROBE ABOVE DELIBERATELY SITS ON THE OTHER
-                // SIDE OF THIS RETURN. Its `discarded` bucket is the one place the
-                // two probes' sample sets are required to differ, and moving this
-                // gate up would silently empty it.
-                if (!verdict.landed)
-                    return;
-
-                // PER-EVENT DETAIL AT VERBOSE — off under the shipped
-                // LogOGDivergenceProbe=Warning. Emitted on EVERY landed correction
-                // rather than on disagreements only, because "per-correction verdict
-                // observable with id and class" is the acceptance criterion and a
-                // disagreement-only line cannot distinguish "predicted correctly"
-                // from "no correction arrived". The cost is one snprintf at a site
-                // that already performs two per correction ([InjectCorrectionState]
-                // and the cache's own line), so this adds no new volume CLASS — the
-                // thing T19 was filed to stop.
-                SIMLOG(m_logger,
-                    "[Verbose][DivergenceProbe.Correction] id=%u tick=%u class=%s correct=%u",
-                    id, verdict.tick,
-                    predictedCharacterClassName(characterClass),
-                    verdict.predictionWasCorrect ? 1u : 0u);
-
-                CorrectionVerdictWindowSummary window;
-                if (!m_correctionVerdictProbe.noteCorrection(
-                        characterClass, verdict.predictionWasCorrect, window))
-                    return;
-
-                // PER-WINDOW SUMMARY AT WARNING, ONE LINE PER CLASS. Never one
-                // pooled line: only the remote half can move with the relay delay
-                // floor, and summing it with a locally-predicted population that
-                // cannot move would dilute exactly the signal T23 scenario 4 reads.
-                //
-                // A class with no corrections in the window is SKIPPED rather than
-                // printed as `rate=0`, which would read as a perfect record instead
-                // of as no observation. That is also the steady state on a client
-                // with no remote proxies.
-                emitCorrectionVerdictClassLine(
-                    PredictedCharacterClass::LocallyPredicted, window.local, window.samples);
-                emitCorrectionVerdictClassLine(
-                    PredictedCharacterClass::RemoteProxy, window.remote, window.samples);
+                onCorrectionReceived<SimulatableT>(id, buffer);
             });
 
         // [og-netcode-v2-input-relay T8] The correction-INPUT arrival binding that
@@ -1253,7 +1109,7 @@ public:
             // unbound is retired, so there is nothing to clear.
             // [T5] Same ordering requirement as the authority's remote-move
             // callback below: the relay lambda captures `&store` into
-            // m_relayedInputStores, so it must be cleared before step 3 erases it.
+            // m_remoteInputCaches, so it must be cleared before step 3 erases it.
             predictionOwner->clearOnRelayedInputReceivedCallback();
         }
         if (authorityOwner)
@@ -1269,9 +1125,9 @@ public:
         std::get<InputProviderMapFor<T>>(m_inputProviders).erase(id);
         std::get<RemoteMoveQueueMapFor<T>>(m_remoteMoveQueues).erase(id);
         std::get<PendingInputQueueMapFor<T>>(m_pendingInputQueues).erase(id);
-        std::get<ClientInputDelayLineMapFor<T>>(m_clientInputDelayLines).erase(id);
+        std::get<LocalInputCacheMapFor<T>>(m_localInputCaches).erase(id);
         // [T5] Erased on UNREGISTRATION only — never on resync (see wipeAllForResync).
-        std::get<RelayedInputStoreMapFor<T>>(m_relayedInputStores).erase(id);
+        std::get<RemoteInputCacheMapFor<T>>(m_remoteInputCaches).erase(id);
         // [T2] Erased here, populated in registerAuthorityOwner. ([T8] its twin
         // m_lastUsedInputs used to be erased on the line above; retired.)
         std::get<LastUsedCaptureTickMapFor<T>>(m_lastUsedCaptureTicks).value.erase(id);
@@ -1316,6 +1172,11 @@ public:
     // Per-tick input resolution (physics thread)
     // -----------------------------------------------------------------------
 
+    // [item 61 / RN-11] SKELETON — the per-character dispatch lives in
+    // `collectInputForCharacter`, extracted below (straight fold, Pattern 1: no
+    // branch in the old lambda body contained a `return`, so nothing here needed
+    // the RN-8/task-58 decide/project split — see the banner on
+    // `collectInputForCharacter` for the full argument).
     ResolvedInputs<SimulatableTs...> collectInputAll(const SimulationTimeStep& step)
     {
         ResolvedInputs<SimulatableTs...> inputs;
@@ -1328,303 +1189,7 @@ public:
 
         m_storage.forEachSimulatable([&](unsigned int id, auto& simulatable) {
             using T = std::remove_reference_t<decltype(simulatable)>;
-            auto& providerMap   = std::get<InputProviderMapFor<T>>(m_inputProviders);
-            auto& queueMap      = std::get<RemoteMoveQueueMapFor<T>>(m_remoteMoveQueues);
-            auto& map           = std::get<std::unordered_map<unsigned int, typename T::InputType>>(inputs);
-
-            if (auto it = providerMap.find(id); it != providerMap.end())
-            {
-                // [T15] HOISTED ABOVE THE PROVIDER CALL — this used to be looked
-                // up further down, right before the delayed read.
-                //
-                // The line is passed INTO the provider because the provider runs
-                // the game's motion-sequence matcher, which needs raw capture
-                // history. Reading it here and handing it over puts two facts
-                // side by side that used to live in different files:
-                //
-                //   * the provider sees history up to `tick - 1` ONLY — the push
-                //     below is the next statement it does not get to observe;
-                //   * the current tick's sample is the provider's own return
-                //     value, so it never needs to look for it.
-                //
-                // `.at(id)` rather than a nullable lookup on purpose: the line is
-                // created iff a provider is registered (see
-                // registerPredictionOwner), so provider-present and line-present
-                // are the same condition by construction. A throw here would mean
-                // that invariant had been broken, which is exactly when a silent
-                // fallback would be wrong.
-                auto& delayLine =
-                    std::get<ClientInputDelayLineMapFor<T>>(m_clientInputDelayLines).at(id);
-
-                // The RAW capture, as the local player produced it THIS tick.
-                const auto capture = it->second(step, delayLine);
-
-                // [T9 parts 3+4] Layer-1 client input delay.
-                //
-                // Two different values leave this branch and the distinction is
-                // the whole point of the task:
-                //
-                //   `capture` — the ORIGINAL, undelayed input, stamped at the
-                //     CURRENT tick. This is what goes on the wire. The server
-                //     parks it in its own ServerInputDelayQueue and applies the
-                //     same delay itself; sending an already-delayed input would
-                //     have the server delay it a SECOND time and the two ends
-                //     would diverge by exactly `effectiveDelay` ticks.
-                //
-                //   `applied`  — the capture from `tick - effectiveDelay`. This
-                //     is what the integrator predicts with.
-                //
-                //     [T16] It used to ALSO be pushed into the correction cache's
-                //     input column, because that column's slot T meant "the input
-                //     APPLIED at tick T" — matching both the server's replicated
-                //     correction-input write and the no-offset read the pre-T6
-                //     collectResimInputAll did. All three of those are retired:
-                //     the channel at T8, the resim read at T6 (it resolves by the
-                //     T4 capture-tick REF now), and the column itself at T16. The
-                //     `applied` value is consumed by the integrator and by nothing
-                //     else on this line; the RAW capture is what persists, in the
-                //     delay line, which is where the resim and the motion matcher
-                //     both read it from.
-                //
-                // With `effectiveDelay == 0` this is exactly the pre-T9 path:
-                // resolveDelayedInput returns the live capture untouched.
-                //
-                // [T15] `delayLine` is bound ABOVE, before the provider call.
-                if (step.getStepKind() != StepKind::Stall)
-                {
-                    delayLine.push(static_cast<int32>(step.getTick()), capture);
-                }
-
-                typename T::InputType applied = resolveDelayedInput(
-                    delayLine, static_cast<int32>(step.getTick()), effectiveDelay, capture);
-
-                SIMLOG(m_logger,
-                    "[CollectInput] id=%u tick=%u source=Provider kind=%s delay=%d",
-                    id, step.getTick(), stepKindName(step.getStepKind()), effectiveDelay);
-
-                if (step.getStepKind() == StepKind::Skip)
-                    m_reconciliation.template backfillSkippedTick<T>(
-                        id, step.getTick() - 1, simulatable.getAllState().getState());
-
-                if (step.getStepKind() != StepKind::Stall)
-                {
-                    m_reconciliation.template pushPredictionTick<T>(id, step.getTick());
-                    // [T16] The `pushPredictionInput<T>(id, applied)` that stood
-                    // here is gone with the cache's input column. The tick push
-                    // above is what allocates the slot; only the input write went.
-                    // ORIGINAL capture, current tick — see above. Do not pass
-                    // `applied` here.
-                    std::get<PendingInputQueueMapFor<T>>(m_pendingInputQueues)
-                        .at(id).enqueue(step.getTick(), capture);
-                }
-
-                map.emplace(id, std::move(applied));
-            }
-            else if (auto qit = queueMap.find(id); qit != queueMap.end())
-            {
-                // [T2] UNDERRUN MUST BE DETECTED HERE, BEFORE THE DEQUEUE.
-                //
-                // dequeueMove() on an empty queue returns a value-initialised
-                // Move{} whose `tick` is 0 (SimulationQueues.h) — and 0 is a
-                // perfectly ordinary real capture tick at session start. So the
-                // RETURNED tick cannot distinguish "the authority substituted an
-                // input" from "the authority applied the client's tick-0 capture".
-                // Only the pre-dequeue empty() gate can, which is why the flag is
-                // taken first and the returned tick is never used to infer it.
-                const bool underrun = qit->second.empty();
-                auto move = qit->second.dequeueMove();
-                SIMLOG(m_logger, "[CollectInput] id=%u tick=%u source=RemoteQueue queuedTick=%u",
-                    id, step.getTick(), move.tick);
-                // [T2] The relay's join key: the ORIGINAL capture tick of the input
-                // just applied. move.tick is that original capture tick: the drain
-                // (ServerReceptionCoordinator::releaseDelayedInputs) delivers the
-                // entry's STORED captureTick rather than a reconstructed
-                // `simTick - delay`, so it survives an overdue release intact.
-                // The sentinel replaces it when the input was a substitute and no
-                // client capture stands behind it.
-                //
-                // [T17] UNCHANGED by the substitution below — the ref stays the
-                // sentinel on an underrun, which remains exactly true: no client
-                // capture stands behind the game's zero input either. T17 fixes
-                // WHICH input is substituted, not how it is classified.
-                std::get<LastUsedCaptureTickMapFor<T>>(m_lastUsedCaptureTicks).value.at(id) =
-                    underrun ? kNoInputCaptureTick : move.tick;
-
-                if (underrun)
-                {
-                    // [T17] THE SUBSTITUTE IS THE GAME'S ZERO INPUT.
-                    //
-                    // dequeueMove() on an empty queue hands back a value-initialised
-                    // Move (SimulationQueues.h), so `move.input` here is an
-                    // `InputType{}` — for the brawler that is (0,0,0) forward
-                    // vectors, the value ClientInputDelayLine.h names as the one
-                    // that "would be carried into normalisation and break". The
-                    // injected neutral is the game's real zero ((0,0,1) forwards),
-                    // it is already present on both roles, and it was simply unused
-                    // on this path.
-                    //
-                    // This is NOT a loss-only path: the remote branch runs from
-                    // registerAuthorityOwner onward, so every tick between
-                    // registration and the client's first input arriving underruns
-                    // — i.e. every join window, in ordinary play.
-                    //
-                    // [T8] T17 also wrote this value into `m_lastUsedInputs` here,
-                    // because that map was replicated as "the input applied" on the
-                    // correction-input channel. Both the map and the channel are
-                    // retired; what the substitution feeds now is the integration
-                    // (and, through it, the correction STATE peers actually consume).
-                    // The T17 fix is undiminished — this is still the only value the
-                    // authority simulates on an underrun tick — it simply has one
-                    // consumer instead of two.
-                    const auto& neutral = std::get<NeutralInputFor<T>>(m_neutralInputs).value;
-                    map.emplace(id, neutral);
-                }
-                else
-                {
-                    // The dequeued input passes through UNTOUCHED — this arm is
-                    // byte-for-byte the pre-T17 behaviour.
-                    map.emplace(id, std::move(move.input));
-                }
-            }
-            else
-            {
-                // -----------------------------------------------------------
-                // [T7] SIMULATED-PROXY BRANCH — THE UNIFIED SCHEDULED READ.
-                // -----------------------------------------------------------
-                //
-                // The client is predicting a character it does not control. Until
-                // T7 this read the CORRECTION CACHE's last server-reported input
-                // — "hold whatever the server last told us this player did",
-                // about one RTT stale and with no notion of WHEN the authority
-                // would apply it. It now asks the relay store the same question
-                // the resim asks: which relayed input does tick N run on.
-                //
-                // ONE CODE PATH, NO REGIME FLAG — the emergent-regime property
-                // (RelayDelaySpectrumDesign.md §4). resolveScheduledRelayedInput
-                // probes `N - dLatest` and verifies the stamp:
-                //
-                //   * at relay delay floor 0 the probe nearly always MISSES (the
-                //     sender's capture for tick N has not reached us yet, because
-                //     nothing was scheduled to make it) and the ladder degenerates
-                //     to last-known — byte-for-byte the pre-relay behaviour;
-                //   * at a high floor it nearly always HITS and the proxy consumes
-                //     the server's actual schedule, tick for tick.
-                //
-                // Nothing here selects between those. The regime is decided per
-                // input, per receiver, by whether the data is there — which is why
-                // raising the floor needs no second implementation and no switch.
-                //
-                // And "nearly always" is deliberate on BOTH ends: a hit at floor 0
-                // is legitimate, not a bug. A mixed pair — a WAN sender stamped
-                // dA=4 against a LAN receiver whose lead wobbles down inside the
-                // dead band — can satisfy the schedule, and the answer is then the
-                // server's REAL scheduled input rather than a stale hold. That is
-                // a non-regression, and it is why the degenerate-equivalence test
-                // pins byte-equivalence to empty/behind-store conditions only
-                // rather than asserting it absolutely at floor 0 (review A4).
-                //
-                // THE SAME FUNCTION T6'S RESIM CALLS, on purpose: a resim that
-                // resolved a frontier tick differently from the prediction that
-                // produced it would manufacture divergence out of nothing. Do not
-                // inline a second copy of the ladder here.
-                //
-                // THE TERMINAL VALUE IS THE INJECTED GAME ZERO. This branch used
-                // to read `cached.value_or(typename T::InputType{})` — the same
-                // (0,0,0)-forward poison T17 removed from the authority path, and
-                // reached on EVERY tick of the D4 pre-registration / idle window
-                // rather than only on loss. Rung 0 of the ladder answers
-                // `store.fallback()`, which is the injected neutral until anything
-                // arrives; a missing store answers the same neutral directly.
-                // Sentinel-aware for free: `kNoInputCaptureTick` is never a store
-                // key (push rejects it), so a sentinel can only ever resolve
-                // through the same neutral, never through an InputType{}.
-                //
-                // Nullable store lookup for the reason T5 documents on the
-                // accessor: this branch iterates every simulatable, and a
-                // character can be seen here before its registration completes.
-                //
-                // The prediction tick is still advanced in lockstep with the
-                // provider branch below — otherwise postPredictionAll keeps
-                // overwriting a stale tick slot and every correction lands outside
-                // the cache window. That part is unchanged by T7, and by T16:
-                // the tick push is the slot allocation and it stays; only the
-                // paired input write went with the column.
-                //
-                // [T19] The read is CLASSIFIED here (probe 1 + probe 3). The ladder
-                // itself stays stateless — it reports which rung answered through
-                // `readReport` and this call site does the counting, which is also
-                // what keeps prediction and resim counted separately. A missing
-                // store is not a read at all and is deliberately not counted: there
-                // was no probe to hit or miss, and folding it in would make a
-                // not-yet-registered proxy look like starvation.
-                const auto* store = this->template findRelayedInputStore<T>(id);
-                ScheduledRelayedReadReport readReport;
-                typename T::InputType input =
-                    store != nullptr
-                        ? resolveScheduledRelayedInput(*store, step.getTick(), &readReport)
-                        : std::get<NeutralInputFor<T>>(m_neutralInputs).value;
-
-                if (store != nullptr)
-                {
-                    // [T20] The WHOLE report, not just the outcome: the miss class
-                    // and the signed probe-to-newest delta are tallied here too.
-                    m_relayReadProbe.notePredictionRead(id, readReport);
-
-                    // PER-EVENT DETAIL AT VERBOSE, AND ONLY FOR THE OUTCOME THAT IS
-                    // SILENT IN THE STEADY STATE — the [RelaySkip] precedent exactly.
-                    // A verify-fail means the delay regime moved under this reader,
-                    // which does not happen while the schedule is stable, so this
-                    // costs nothing per tick in the ordinary case. Hits and misses
-                    // are RATES and are reported by the per-window summary; emitting
-                    // them per event would be another per-tick line, which is the
-                    // thing this task exists to stop adding.
-                    if (readReport.outcome == ScheduledRelayedReadOutcome::VerifyFail)
-                    {
-                        SIMLOG(m_logger,
-                            "[Verbose][RelayProbe.Read] id=%u tick=%u VERIFY-FAIL probeTick=%u "
-                            "candidateDA=%u dLatest=%u src=Prediction",
-                            id, step.getTick(), readReport.probeTick,
-                            static_cast<unsigned int>(readReport.candidateDA),
-                            static_cast<unsigned int>(readReport.dLatest));
-                    }
-
-                    // [T20] THE OTHER OUTCOME THAT IS SILENT IN THE STEADY STATE.
-                    // missInSpan and missAboveNewest are the two expected classes and
-                    // are RATES — the per-window summary reports them. A read landing
-                    // BELOW the oldest resident entry is different in kind: it means
-                    // the receiver's clock has drifted out of the store's 64-tick
-                    // reach, which should not happen at all, so it gets the same
-                    // rare-event treatment the verify-fail line gets.
-                    if (readReport.missClass == ScheduledRelayedReadMissClass::BelowOldest)
-                    {
-                        SIMLOG(m_logger,
-                            "[Verbose][RelayProbe.Read] id=%u tick=%u BELOW-OLDEST probeTick=%u "
-                            "oldest=%u newest=%u resident=%u src=Prediction",
-                            id, step.getTick(), readReport.probeTick,
-                            readReport.oldestResident, readReport.newestResident,
-                            readReport.residentCount);
-                    }
-                }
-
-                SIMLOG(m_logger, "[CollectInput] id=%u tick=%u source=RelayStore hasStore=%d",
-                    id, step.getTick(), store != nullptr ? 1 : 0);
-
-                if (step.getStepKind() == StepKind::Skip)
-                    m_reconciliation.template backfillSkippedTick<T>(
-                        id, step.getTick() - 1, simulatable.getAllState().getState());
-
-                if (step.getStepKind() != StepKind::Stall)
-                {
-                    m_reconciliation.template pushPredictionTick<T>(id, step.getTick());
-                    // [T16] The remote `pushPredictionInput<T>(id, input)` that
-                    // stood here is gone. It was the write that made a REMOTE
-                    // column look alive while holding only this client's guess —
-                    // spectrum doc §14.2 amendment 2. Nothing stores that guess
-                    // now; the relay store holds what the proxy actually sent.
-                }
-
-                map.emplace(id, std::move(input));
-            }
+            collectInputForCharacter<T>(id, simulatable, step, effectiveDelay, inputs);
         });
 
         // [T19] PROBES 1 + 3, per-window summary. Driven from here — once per
@@ -1708,6 +1273,10 @@ public:
     // window local ticks resolve to the neutral, exactly as they did pre-T6, while
     // remote proxies keep resolving from surviving entries. Strictly better than
     // the pre-T6 behaviour, in which the wiped cache blinded both.
+    // [item 61 / RN-11] SKELETON — see `collectResimInputForCharacter`'s banner
+    // for why this is also a straight fold (Pattern 1), same reasoning as
+    // `collectInputAll`, applied per rung of the resolution table below rather
+    // than per branch.
     ResolvedInputs<SimulatableTs...> collectResimInputAll(uint32 simTick)
     {
         ResolvedInputs<SimulatableTs...> inputs;
@@ -1726,124 +1295,7 @@ public:
 
         m_storage.forEachSimulatable([&](unsigned int id, auto& simulatable) {
             using T = std::remove_reference_t<decltype(simulatable)>;
-            auto& map = std::get<std::unordered_map<unsigned int, typename T::InputType>>(inputs);
-
-            const AppliedCaptureRef ref =
-                m_reconciliation.template getAppliedCaptureTickRef<T>(id, simTick);
-
-            if (ref.kind == AppliedCaptureRefKind::NoSlot)
-            {
-                SIMLOG(m_logger, "[Verbose][Resim.Input] id=%u tick=%u class=NoSlot", id, simTick);
-                return;
-            }
-
-            const auto& neutral = std::get<NeutralInputFor<T>>(m_neutralInputs).value;
-
-            if (ref.kind == AppliedCaptureRefKind::Sentinel)
-            {
-                // BOTH character classes, one answer: the authority told us it
-                // applied no client capture at this tick, and T17 made the value
-                // it substituted the INJECTED GAME ZERO. Reproducing an authority
-                // decision means applying what the authority applied — never a
-                // value-initialised InputType{}, which is the exact poison T17
-                // removed from that path.
-                SIMLOG(m_logger, "[Verbose][Resim.Input] id=%u tick=%u class=Sentinel", id, simTick);
-                map.emplace(id, neutral);
-                return;
-            }
-
-            auto& providerMap  = std::get<InputProviderMapFor<T>>(m_inputProviders);
-            const bool isLocal = providerMap.find(id) != providerMap.end();
-
-            if (isLocal)
-            {
-                // `.at(id)` for the same reason collectInputAll uses it: the line
-                // is created iff a provider is registered, so provider-present and
-                // line-present are the same condition by construction.
-                const auto& delayLine =
-                    std::get<ClientInputDelayLineMapFor<T>>(m_clientInputDelayLines).at(id);
-
-                const int32 captureTick = (ref.kind == AppliedCaptureRefKind::Ref)
-                    ? static_cast<int32>(ref.captureTick)
-                    : static_cast<int32>(simTick) - effectiveDelay;
-
-                // A line miss answers with the line's own INJECTED neutral (never
-                // InputT{}) — the store-miss/local cell. Post-resync that is the
-                // only reachable way to get here, and it is today's behaviour.
-                //
-                // NOT resolveDelayedInput: that helper exists to protect the LIVE
-                // capture at delay 0, and a resim has no live capture. Reading
-                // at(simTick) at delay 0 is right precisely because the original
-                // prediction pass pushed that tick's capture into the line.
-                SIMLOG(m_logger, "[Verbose][Resim.Input] id=%u tick=%u class=%s src=DelayLine capture=%d",
-                    id, simTick, ref.kind == AppliedCaptureRefKind::Ref ? "Ref" : "NoRef", captureTick);
-                map.emplace(id, delayLine.at(captureTick));
-                return;
-            }
-
-            // REMOTE. Nullable by design (T5): the authority allocates no stores
-            // for ids it owns, and a character can be iterated before its
-            // registration completes. Neutral rather than a throw, matching every
-            // other reader of this accessor.
-            const auto* store = findRelayedInputStore<T>(id);
-            if (store == nullptr)
-            {
-                SIMLOG(m_logger, "[Verbose][Resim.Input] id=%u tick=%u class=Remote src=NoStore", id, simTick);
-                map.emplace(id, neutral);
-                return;
-            }
-
-            if (ref.kind == AppliedCaptureRefKind::Ref)
-            {
-                // THE REF WINS — see the precedence block above. `outDA` is bound
-                // only because `find` requires an out-param; its value is
-                // deliberately never read. The stamp is the intended schedule and
-                // has no authority over a tick the server has already ruled on.
-                std::uint8_t   ignoredScheduleStamp = 0u;
-                typename T::InputType relayed{};
-                const bool hit = store->find(ref.captureTick, ignoredScheduleStamp, relayed);
-                SIMLOG(m_logger, "[Verbose][Resim.Input] id=%u tick=%u class=Ref src=RelayStore ref=%u hit=%d",
-                    id, simTick, ref.captureTick, hit ? 1 : 0);
-                // THE SELF-HEAL: a miss degrades THIS TICK's replay input to
-                // last-known, never the injected state. The state is a complete
-                // anchor, so the next every-frame correction supersedes the error.
-                map.emplace(id, hit ? relayed : store->fallback());
-                return;
-            }
-
-            // NoRef / REMOTE — no authoritative answer for this tick, so run the
-            // same scheduled read the prediction pass runs (T7). Sharing the ladder
-            // is what stops a resim from disagreeing with the prediction it replays.
-            //
-            // [T19] SECOND CALL SITE OF PROBE 1 — counted into its OWN counter block,
-            // never summed with the prediction one. Resim resolves ticks the
-            // prediction already ran, and entries missing then may have landed since,
-            // so a resim hit rate materially above the prediction's is real
-            // information about the frontier rather than noise.
-            //
-            // It does NOT feed the stale run (probe 3): a run is "consecutive ticks
-            // this character was served a fallback", and resim revisits ticks out of
-            // order and repeatedly. It also does not advance the window — the window
-            // is keyed to the monotonic prediction tick, and a resim's `simTick`
-            // walks backwards.
-            ScheduledRelayedReadReport readReport;
-            typename T::InputType scheduled =
-                resolveScheduledRelayedInput(*store, simTick, &readReport);
-            // [T20] The whole report — same reason as the prediction site.
-            m_relayReadProbe.noteResimRead(readReport);
-
-            if (readReport.outcome == ScheduledRelayedReadOutcome::VerifyFail)
-            {
-                SIMLOG(m_logger,
-                    "[Verbose][RelayProbe.Read] id=%u tick=%u VERIFY-FAIL probeTick=%u "
-                    "candidateDA=%u dLatest=%u src=Resim",
-                    id, simTick, readReport.probeTick,
-                    static_cast<unsigned int>(readReport.candidateDA),
-                    static_cast<unsigned int>(readReport.dLatest));
-            }
-
-            SIMLOG(m_logger, "[Verbose][Resim.Input] id=%u tick=%u class=NoRef src=ScheduledRead", id, simTick);
-            map.emplace(id, std::move(scheduled));
+            collectResimInputForCharacter<T>(id, simTick, effectiveDelay, inputs);
         });
 
         return inputs;
@@ -1888,7 +1340,7 @@ public:
     // WHY THAT IS SAFE THIS INCREMENT, stated so a future reader does not have to
     // re-derive it:
     //   * Nothing consumed it. The local resim resolves its own input from
-    //     ClientInputDelayLine by the T4 ref (T6), the local viz reads the live
+    //     LocalInputCache by the T4 ref (T6), the local viz reads the live
     //     sampler (T13's hasLiveLocalInput branch), and the motion matcher reads
     //     raw captures (T15). The last reader of the echoed value was re-pointed
     //     before this task landed.
@@ -2080,17 +1532,17 @@ public:
         // assembled from ticks that no longer mean what they meant. Going cold is
         // the honest answer, and it costs at most half a second of matcher
         // availability on an event that already visibly jumps the simulation.
-        forEachTypeMap(m_clientInputDelayLines, [&]<typename T>(auto& perTypeMap) {
+        forEachTypeMap(m_localInputCaches, [&]<typename T>(auto& perTypeMap) {
             for (auto& [id, line] : perTypeMap)
             {
                 SIMLOG(m_logger,
-                    "[TimeResync.WipeInputDelayLine] id=%u newPredictionTick=%u",
+                    "[TimeResync.WipeLocalInputCache] id=%u newPredictionTick=%u",
                     id, newPredictionTick);
                 line.clear();
             }
         });
 
-        // [T5 / input relay] m_relayedInputStores is DELIBERATELY NOT WIPED HERE,
+        // [T5 / input relay] m_remoteInputCaches is DELIBERATELY NOT WIPED HERE,
         // and this comment exists because the loop above is the obvious thing to
         // mirror.
         //
@@ -2103,12 +1555,539 @@ public:
         // every remote proxy for a window after every resync, for no reason.
         //
         // (This wipe divergence is also the decisive reason the store is its own
-        // type rather than a reused ClientInputDelayLine — see the naming ruling in
-        // Network/RelayedInputStore.h. A reused type would have been swept by
+        // type rather than a reused LocalInputCache — see the naming ruling in
+        // Network/RemoteInputCache.h. A reused type would have been swept by
         // whoever next mirrored these per-id map loops.)
     }
 
 private:
+    // [item 61 / RN-11] `collectInputAll`'s per-character body, lifted out
+    // verbatim (RN-10 part A precedent) — three mutually exclusive branches
+    // (local provider / remote queue / simulated proxy), each ending in a
+    // `map.emplace`, none containing a `return`. PATTERN 1 — STRAIGHT FOLD
+    // applies to every branch's diagnostics: the dispatch's fence is "no branch
+    // is a return affecting the caller", and there is exactly one `return`
+    // anywhere in this function (the implicit one at the end of each branch,
+    // same as before the split) — never one interleaved BETWEEN two probe/log
+    // calls the way `decideCorrectionArrival` had to guard against. Each
+    // branch's SIMLOG/probe tail folds into its own `emit*` call below.
+    template <typename T>
+    void collectInputForCharacter(unsigned int id, T& simulatable, const SimulationTimeStep& step,
+                                  int32 effectiveDelay, ResolvedInputs<SimulatableTs...>& inputs)
+    {
+        auto& providerMap = std::get<InputProviderMapFor<T>>(m_inputProviders);
+        auto& queueMap    = std::get<RemoteMoveQueueMapFor<T>>(m_remoteMoveQueues);
+        auto& map         = std::get<std::unordered_map<unsigned int, typename T::InputType>>(inputs);
+
+        if (auto it = providerMap.find(id); it != providerMap.end())
+        {
+            // [T15] HOISTED ABOVE THE PROVIDER CALL — this used to be looked
+            // up further down, right before the delayed read.
+            //
+            // The line is passed INTO the provider because the provider runs
+            // the game's motion-sequence matcher, which needs raw capture
+            // history. Reading it here and handing it over puts two facts
+            // side by side that used to live in different files:
+            //
+            //   * the provider sees history up to `tick - 1` ONLY — the push
+            //     below is the next statement it does not get to observe;
+            //   * the current tick's sample is the provider's own return
+            //     value, so it never needs to look for it.
+            //
+            // `.at(id)` rather than a nullable lookup on purpose: the line is
+            // created iff a provider is registered (see
+            // registerPredictionOwner), so provider-present and line-present
+            // are the same condition by construction. A throw here would mean
+            // that invariant had been broken, which is exactly when a silent
+            // fallback would be wrong.
+            auto& delayLine =
+                std::get<LocalInputCacheMapFor<T>>(m_localInputCaches).at(id);
+
+            // The RAW capture, as the local player produced it THIS tick.
+            const auto capture = it->second(step, delayLine);
+
+            // [T9 parts 3+4] Layer-1 client input delay.
+            //
+            // Two different values leave this branch and the distinction is
+            // the whole point of the task:
+            //
+            //   `capture` — the ORIGINAL, undelayed input, stamped at the
+            //     CURRENT tick. This is what goes on the wire. The server
+            //     parks it in its own ServerInputDelayQueue and applies the
+            //     same delay itself; sending an already-delayed input would
+            //     have the server delay it a SECOND time and the two ends
+            //     would diverge by exactly `effectiveDelay` ticks.
+            //
+            //   `applied`  — the capture from `tick - effectiveDelay`. This
+            //     is what the integrator predicts with.
+            //
+            //     [T16] It used to ALSO be pushed into the correction cache's
+            //     input column, because that column's slot T meant "the input
+            //     APPLIED at tick T" — matching both the server's replicated
+            //     correction-input write and the no-offset read the pre-T6
+            //     collectResimInputAll did. All three of those are retired:
+            //     the channel at T8, the resim read at T6 (it resolves by the
+            //     T4 capture-tick REF now), and the column itself at T16. The
+            //     `applied` value is consumed by the integrator and by nothing
+            //     else on this line; the RAW capture is what persists, in the
+            //     delay line, which is where the resim and the motion matcher
+            //     both read it from.
+            //
+            // With `effectiveDelay == 0` this is exactly the pre-T9 path:
+            // resolveDelayedInput returns the live capture untouched.
+            //
+            // [T15] `delayLine` is bound ABOVE, before the provider call.
+            if (step.getStepKind() != StepKind::Stall)
+            {
+                delayLine.push(static_cast<int32>(step.getTick()), capture);
+            }
+
+            typename T::InputType applied = resolveDelayedInput(
+                delayLine, static_cast<int32>(step.getTick()), effectiveDelay, capture);
+
+            emitLocalInputRead(id, step.getTick(), step.getStepKind(), effectiveDelay);
+
+            if (step.getStepKind() == StepKind::Skip)
+                m_reconciliation.template backfillSkippedTick<T>(
+                    id, step.getTick() - 1, simulatable.getAllState().getState());
+
+            if (step.getStepKind() != StepKind::Stall)
+            {
+                m_reconciliation.template pushPredictionTick<T>(id, step.getTick());
+                // [T16] The `pushPredictionInput<T>(id, applied)` that stood
+                // here is gone with the cache's input column. The tick push
+                // above is what allocates the slot; only the input write went.
+                // ORIGINAL capture, current tick — see above. Do not pass
+                // `applied` here.
+                std::get<PendingInputQueueMapFor<T>>(m_pendingInputQueues)
+                    .at(id).enqueue(step.getTick(), capture);
+            }
+
+            map.emplace(id, std::move(applied));
+        }
+        else if (auto qit = queueMap.find(id); qit != queueMap.end())
+        {
+            // [T2] UNDERRUN MUST BE DETECTED HERE, BEFORE THE DEQUEUE.
+            //
+            // dequeueMove() on an empty queue returns a value-initialised
+            // Move{} whose `tick` is 0 (SimulationQueues.h) — and 0 is a
+            // perfectly ordinary real capture tick at session start. So the
+            // RETURNED tick cannot distinguish "the authority substituted an
+            // input" from "the authority applied the client's tick-0 capture".
+            // Only the pre-dequeue empty() gate can, which is why the flag is
+            // taken first and the returned tick is never used to infer it.
+            const bool underrun = qit->second.empty();
+            auto move = qit->second.dequeueMove();
+            emitRemoteQueueRead(id, step.getTick(), move.tick);
+            // [T2] The relay's join key: the ORIGINAL capture tick of the input
+            // just applied. move.tick is that original capture tick: the drain
+            // (ServerReceptionCoordinator::releaseDelayedInputs) delivers the
+            // entry's STORED captureTick rather than a reconstructed
+            // `simTick - delay`, so it survives an overdue release intact.
+            // The sentinel replaces it when the input was a substitute and no
+            // client capture stands behind it.
+            //
+            // [T17] UNCHANGED by the substitution below — the ref stays the
+            // sentinel on an underrun, which remains exactly true: no client
+            // capture stands behind the game's zero input either. T17 fixes
+            // WHICH input is substituted, not how it is classified.
+            std::get<LastUsedCaptureTickMapFor<T>>(m_lastUsedCaptureTicks).value.at(id) =
+                underrun ? kNoInputCaptureTick : move.tick;
+
+            if (underrun)
+            {
+                // [T17] THE SUBSTITUTE IS THE GAME'S ZERO INPUT.
+                //
+                // dequeueMove() on an empty queue hands back a value-initialised
+                // Move (SimulationQueues.h), so `move.input` here is an
+                // `InputType{}` — for the brawler that is (0,0,0) forward
+                // vectors, the value LocalInputCache.h names as the one
+                // that "would be carried into normalisation and break". The
+                // injected neutral is the game's real zero ((0,0,1) forwards),
+                // it is already present on both roles, and it was simply unused
+                // on this path.
+                //
+                // This is NOT a loss-only path: the remote branch runs from
+                // registerAuthorityOwner onward, so every tick between
+                // registration and the client's first input arriving underruns
+                // — i.e. every join window, in ordinary play.
+                //
+                // [T8] T17 also wrote this value into `m_lastUsedInputs` here,
+                // because that map was replicated as "the input applied" on the
+                // correction-input channel. Both the map and the channel are
+                // retired; what the substitution feeds now is the integration
+                // (and, through it, the correction STATE peers actually consume).
+                // The T17 fix is undiminished — this is still the only value the
+                // authority simulates on an underrun tick — it simply has one
+                // consumer instead of two.
+                const auto& neutral = std::get<NeutralInputFor<T>>(m_neutralInputs).value;
+                map.emplace(id, neutral);
+            }
+            else
+            {
+                // The dequeued input passes through UNTOUCHED — this arm is
+                // byte-for-byte the pre-T17 behaviour.
+                map.emplace(id, std::move(move.input));
+            }
+        }
+        else
+        {
+            // -----------------------------------------------------------
+            // [T7] SIMULATED-PROXY BRANCH — THE UNIFIED SCHEDULED READ.
+            // -----------------------------------------------------------
+            //
+            // The client is predicting a character it does not control. Until
+            // T7 this read the CORRECTION CACHE's last server-reported input
+            // — "hold whatever the server last told us this player did",
+            // about one RTT stale and with no notion of WHEN the authority
+            // would apply it. It now asks the relay store the same question
+            // the resim asks: which relayed input does tick N run on.
+            //
+            // ONE CODE PATH, NO REGIME FLAG — the emergent-regime property
+            // (RelayDelaySpectrumDesign.md §4). resolveScheduledRelayedInput
+            // probes `N - dLatest` and verifies the stamp:
+            //
+            //   * at relay delay floor 0 the probe nearly always MISSES (the
+            //     sender's capture for tick N has not reached us yet, because
+            //     nothing was scheduled to make it) and the ladder degenerates
+            //     to last-known — byte-for-byte the pre-relay behaviour;
+            //   * at a high floor it nearly always HITS and the proxy consumes
+            //     the server's actual schedule, tick for tick.
+            //
+            // Nothing here selects between those. The regime is decided per
+            // input, per receiver, by whether the data is there — which is why
+            // raising the floor needs no second implementation and no switch.
+            //
+            // And "nearly always" is deliberate on BOTH ends: a hit at floor 0
+            // is legitimate, not a bug. A mixed pair — a WAN sender stamped
+            // dA=4 against a LAN receiver whose lead wobbles down inside the
+            // dead band — can satisfy the schedule, and the answer is then the
+            // server's REAL scheduled input rather than a stale hold. That is
+            // a non-regression, and it is why the degenerate-equivalence test
+            // pins byte-equivalence to empty/behind-store conditions only
+            // rather than asserting it absolutely at floor 0 (review A4).
+            //
+            // THE SAME FUNCTION T6'S RESIM CALLS, on purpose: a resim that
+            // resolved a frontier tick differently from the prediction that
+            // produced it would manufacture divergence out of nothing. Do not
+            // inline a second copy of the ladder here.
+            //
+            // THE TERMINAL VALUE IS THE INJECTED GAME ZERO. This branch used
+            // to read `cached.value_or(typename T::InputType{})` — the same
+            // (0,0,0)-forward poison T17 removed from the authority path, and
+            // reached on EVERY tick of the D4 pre-registration / idle window
+            // rather than only on loss. Rung 0 of the ladder answers
+            // `store.fallback()`, which is the injected neutral until anything
+            // arrives; a missing store answers the same neutral directly.
+            // Sentinel-aware for free: `kNoInputCaptureTick` is never a store
+            // key (push rejects it), so a sentinel can only ever resolve
+            // through the same neutral, never through an InputType{}.
+            //
+            // Nullable store lookup for the reason T5 documents on the
+            // accessor: this branch iterates every simulatable, and a
+            // character can be seen here before its registration completes.
+            //
+            // The prediction tick is still advanced in lockstep with the
+            // provider branch below — otherwise postPredictionAll keeps
+            // overwriting a stale tick slot and every correction lands outside
+            // the cache window. That part is unchanged by T7, and by T16:
+            // the tick push is the slot allocation and it stays; only the
+            // paired input write went with the column.
+            //
+            // [T19] The read is CLASSIFIED here (probe 1 + probe 3). The ladder
+            // itself stays stateless — it reports which rung answered through
+            // `readReport` and this call site does the counting, which is also
+            // what keeps prediction and resim counted separately. A missing
+            // store is not a read at all and is deliberately not counted: there
+            // was no probe to hit or miss, and folding it in would make a
+            // not-yet-registered proxy look like starvation.
+            const auto* store = this->template findRemoteInputCache<T>(id);
+            ScheduledRelayedReadReport readReport;
+            typename T::InputType input =
+                store != nullptr
+                    ? resolveScheduledRelayedInput(*store, step.getTick(), &readReport)
+                    : std::get<NeutralInputFor<T>>(m_neutralInputs).value;
+
+            // [item 61] The `if (store != nullptr)` probe/log block plus the
+            // unconditional `[CollectInput]` line below are ALL folded into
+            // ONE emit* call — safe because nothing after this point branches
+            // on whether the fold happened: the Skip/Stall handling and the
+            // final `map.emplace` below run unconditionally either way,
+            // exactly as they did with the diagnostics inline.
+            emitPredictionInputRead(id, step.getTick(), store, readReport);
+
+            if (step.getStepKind() == StepKind::Skip)
+                m_reconciliation.template backfillSkippedTick<T>(
+                    id, step.getTick() - 1, simulatable.getAllState().getState());
+
+            if (step.getStepKind() != StepKind::Stall)
+            {
+                m_reconciliation.template pushPredictionTick<T>(id, step.getTick());
+                // [T16] The remote `pushPredictionInput<T>(id, input)` that
+                // stood here is gone. It was the write that made a REMOTE
+                // column look alive while holding only this client's guess —
+                // spectrum doc §14.2 amendment 2. Nothing stores that guess
+                // now; the relay store holds what the proxy actually sent.
+            }
+
+            map.emplace(id, std::move(input));
+        }
+    }
+
+    // [item 61] Local-provider branch's classification line — a plain,
+    // unconditional single-statement fold (Pattern 1); nothing gates it.
+    void emitLocalInputRead(unsigned int id, uint32 tick, StepKind stepKind, int32 effectiveDelay)
+    {
+        SIMLOG(m_logger,
+            "[CollectInput] id=%u tick=%u source=Provider kind=%s delay=%d",
+            id, tick, stepKindName(stepKind), effectiveDelay);
+    }
+
+    // [item 61] Remote-queue branch's classification line — same shape as
+    // `emitLocalInputRead` above.
+    void emitRemoteQueueRead(unsigned int id, uint32 tick, uint32 queuedTick)
+    {
+        SIMLOG(m_logger, "[CollectInput] id=%u tick=%u source=RemoteQueue queuedTick=%u",
+            id, tick, queuedTick);
+    }
+
+    // [item 61] Simulated-proxy branch's WHOLE probing tail: the T19/T20 probe
+    // write (only when a store exists), its two rare-event Verbose lines, and
+    // the unconditional per-tick [CollectInput] classification line. Templated
+    // on the store's InputT (deduced from `store`, nullable) exactly like
+    // `emitRelayArrival` — the store can be null (not-yet-registered proxy),
+    // in which case only the final unconditional line fires, matching the
+    // original inline `if (store != nullptr)` gate byte-for-byte.
+    template <typename InputT>
+    void emitPredictionInputRead(unsigned int id, uint32 tick,
+                                 const RemoteInputCache<InputT>* store,
+                                 const ScheduledRelayedReadReport& readReport)
+    {
+        if (store != nullptr)
+        {
+            // [T20] The WHOLE report, not just the outcome: the miss class
+            // and the signed probe-to-newest delta are tallied here too.
+            m_relayReadProbe.notePredictionRead(id, readReport);
+
+            // PER-EVENT DETAIL AT VERBOSE, AND ONLY FOR THE OUTCOME THAT IS
+            // SILENT IN THE STEADY STATE — the [RelaySkip] precedent exactly.
+            // A verify-fail means the delay regime moved under this reader,
+            // which does not happen while the schedule is stable, so this
+            // costs nothing per tick in the ordinary case. Hits and misses
+            // are RATES and are reported by the per-window summary; emitting
+            // them per event would be another per-tick line, which is the
+            // thing this task exists to stop adding.
+            if (readReport.outcome == ScheduledRelayedReadOutcome::VerifyFail)
+            {
+                SIMLOG(m_logger,
+                    "[Verbose][RelayProbe.Read] id=%u tick=%u VERIFY-FAIL probeTick=%u "
+                    "candidateDA=%u dLatest=%u src=Prediction",
+                    id, tick, readReport.probeTick,
+                    static_cast<unsigned int>(readReport.candidateDA),
+                    static_cast<unsigned int>(readReport.dLatest));
+            }
+
+            // [T20] THE OTHER OUTCOME THAT IS SILENT IN THE STEADY STATE.
+            // missInSpan and missAboveNewest are the two expected classes and
+            // are RATES — the per-window summary reports them. A read landing
+            // BELOW the oldest resident entry is different in kind: it means
+            // the receiver's clock has drifted out of the store's 64-tick
+            // reach, which should not happen at all, so it gets the same
+            // rare-event treatment the verify-fail line gets.
+            if (readReport.missClass == ScheduledRelayedReadMissClass::BelowOldest)
+            {
+                SIMLOG(m_logger,
+                    "[Verbose][RelayProbe.Read] id=%u tick=%u BELOW-OLDEST probeTick=%u "
+                    "oldest=%u newest=%u resident=%u src=Prediction",
+                    id, tick, readReport.probeTick,
+                    readReport.oldestResident, readReport.newestResident,
+                    readReport.residentCount);
+            }
+        }
+
+        SIMLOG(m_logger, "[CollectInput] id=%u tick=%u source=RemoteInputCache hasStore=%d",
+            id, tick, store != nullptr ? 1 : 0);
+    }
+
+    // [item 61 / RN-11] `collectResimInputAll`'s per-character body, lifted out
+    // verbatim. This is the TWO-LEVEL RESOLUTION TABLE described in the banner
+    // above `collectResimInputAll` — a ladder of mutually exclusive rungs, each
+    // a guard clause ending in its own `return`. PATTERN 1 — STRAIGHT FOLD
+    // applies at the PER-RUNG granularity: within any single rung, the
+    // diagnostics (one SIMLOG, or — the last rung — one probe write plus two
+    // SIMLOGs) are never split by a `return`; the `return` always comes AFTER
+    // the diagnostics and the `map.emplace`, exactly like the guard clauses in
+    // `decideCorrectionArrival`'s CALLER (`onCorrectionReceived`), never like
+    // `decideCorrectionArrival` itself. There is also only ONE probe write in
+    // this whole function (`noteResimRead`, last rung) — none of it shares a
+    // counter with a sibling probe the way the correction callback's two probes
+    // did, so there is no discard-population hazard to guard against here.
+    // Each rung's tail folds into its own `emit*` call below.
+    template <typename T>
+    void collectResimInputForCharacter(unsigned int id, uint32 simTick, int32 effectiveDelay,
+                                       ResolvedInputs<SimulatableTs...>& inputs)
+    {
+        auto& map = std::get<std::unordered_map<unsigned int, typename T::InputType>>(inputs);
+
+        const AppliedCaptureRef ref =
+            m_reconciliation.template getAppliedCaptureTickRef<T>(id, simTick);
+
+        if (ref.kind == AppliedCaptureRefKind::NoSlot)
+        {
+            emitResimNoSlot(id, simTick);
+            return;
+        }
+
+        const auto& neutral = std::get<NeutralInputFor<T>>(m_neutralInputs).value;
+
+        if (ref.kind == AppliedCaptureRefKind::Sentinel)
+        {
+            // BOTH character classes, one answer: the authority told us it
+            // applied no client capture at this tick, and T17 made the value
+            // it substituted the INJECTED GAME ZERO. Reproducing an authority
+            // decision means applying what the authority applied — never a
+            // value-initialised InputType{}, which is the exact poison T17
+            // removed from that path.
+            emitResimSentinel(id, simTick);
+            map.emplace(id, neutral);
+            return;
+        }
+
+        auto& providerMap  = std::get<InputProviderMapFor<T>>(m_inputProviders);
+        const bool isLocal = providerMap.find(id) != providerMap.end();
+
+        if (isLocal)
+        {
+            // `.at(id)` for the same reason collectInputAll uses it: the line
+            // is created iff a provider is registered, so provider-present and
+            // line-present are the same condition by construction.
+            const auto& delayLine =
+                std::get<LocalInputCacheMapFor<T>>(m_localInputCaches).at(id);
+
+            const int32 captureTick = (ref.kind == AppliedCaptureRefKind::Ref)
+                ? static_cast<int32>(ref.captureTick)
+                : static_cast<int32>(simTick) - effectiveDelay;
+
+            // A line miss answers with the line's own INJECTED neutral (never
+            // InputT{}) — the store-miss/local cell. Post-resync that is the
+            // only reachable way to get here, and it is today's behaviour.
+            //
+            // NOT resolveDelayedInput: that helper exists to protect the LIVE
+            // capture at delay 0, and a resim has no live capture. Reading
+            // at(simTick) at delay 0 is right precisely because the original
+            // prediction pass pushed that tick's capture into the line.
+            emitResimLocalRead(id, simTick, ref.kind, captureTick);
+            map.emplace(id, delayLine.at(captureTick));
+            return;
+        }
+
+        // REMOTE. Nullable by design (T5): the authority allocates no stores
+        // for ids it owns, and a character can be iterated before its
+        // registration completes. Neutral rather than a throw, matching every
+        // other reader of this accessor.
+        const auto* store = findRemoteInputCache<T>(id);
+        if (store == nullptr)
+        {
+            emitResimNoStore(id, simTick);
+            map.emplace(id, neutral);
+            return;
+        }
+
+        if (ref.kind == AppliedCaptureRefKind::Ref)
+        {
+            // THE REF WINS — see the precedence block above. `outDA` is bound
+            // only because `find` requires an out-param; its value is
+            // deliberately never read. The stamp is the intended schedule and
+            // has no authority over a tick the server has already ruled on.
+            std::uint8_t   ignoredScheduleStamp = 0u;
+            typename T::InputType relayed{};
+            const bool hit = store->find(ref.captureTick, ignoredScheduleStamp, relayed);
+            emitResimRefRead(id, simTick, ref.captureTick, hit);
+            // THE SELF-HEAL: a miss degrades THIS TICK's replay input to
+            // last-known, never the injected state. The state is a complete
+            // anchor, so the next every-frame correction supersedes the error.
+            map.emplace(id, hit ? relayed : store->fallback());
+            return;
+        }
+
+        // NoRef / REMOTE — no authoritative answer for this tick, so run the
+        // same scheduled read the prediction pass runs (T7). Sharing the ladder
+        // is what stops a resim from disagreeing with the prediction it replays.
+        //
+        // [T19] SECOND CALL SITE OF PROBE 1 — counted into its OWN counter block,
+        // never summed with the prediction one. Resim resolves ticks the
+        // prediction already ran, and entries missing then may have landed since,
+        // so a resim hit rate materially above the prediction's is real
+        // information about the frontier rather than noise.
+        //
+        // It does NOT feed the stale run (probe 3): a run is "consecutive ticks
+        // this character was served a fallback", and resim revisits ticks out of
+        // order and repeatedly. It also does not advance the window — the window
+        // is keyed to the monotonic prediction tick, and a resim's `simTick`
+        // walks backwards.
+        ScheduledRelayedReadReport readReport;
+        typename T::InputType scheduled =
+            resolveScheduledRelayedInput(*store, simTick, &readReport);
+        emitResimScheduledRead(id, simTick, readReport);
+        map.emplace(id, std::move(scheduled));
+    }
+
+    // [item 61] NoSlot rung — single unconditional line, straight fold.
+    void emitResimNoSlot(unsigned int id, uint32 tick)
+    {
+        SIMLOG(m_logger, "[Verbose][Resim.Input] id=%u tick=%u class=NoSlot", id, tick);
+    }
+
+    // [item 61] Sentinel rung — same shape as `emitResimNoSlot` above.
+    void emitResimSentinel(unsigned int id, uint32 tick)
+    {
+        SIMLOG(m_logger, "[Verbose][Resim.Input] id=%u tick=%u class=Sentinel", id, tick);
+    }
+
+    // [item 61] Local/delay-line rung.
+    void emitResimLocalRead(unsigned int id, uint32 tick, AppliedCaptureRefKind refKind, int32 captureTick)
+    {
+        SIMLOG(m_logger, "[Verbose][Resim.Input] id=%u tick=%u class=%s src=LocalInputCache capture=%d",
+            id, tick, refKind == AppliedCaptureRefKind::Ref ? "Ref" : "NoRef", captureTick);
+    }
+
+    // [item 61] Remote/no-store rung.
+    void emitResimNoStore(unsigned int id, uint32 tick)
+    {
+        SIMLOG(m_logger, "[Verbose][Resim.Input] id=%u tick=%u class=Remote src=NoStore", id, tick);
+    }
+
+    // [item 61] Remote/Ref rung.
+    void emitResimRefRead(unsigned int id, uint32 tick, uint32 captureTick, bool hit)
+    {
+        SIMLOG(m_logger, "[Verbose][Resim.Input] id=%u tick=%u class=Ref src=RemoteInputCache ref=%u hit=%d",
+            id, tick, captureTick, hit ? 1 : 0);
+    }
+
+    // [item 61] Remote/NoRef rung — the ONE rung with a probe write
+    // (`noteResimRead`) plus two SIMLOGs (one gated on VerifyFail, one
+    // unconditional). Folds cleanly: nothing after this call in
+    // `collectResimInputForCharacter` branches on whether the probe fired —
+    // the `map.emplace`/`return` below run unconditionally either way, same as
+    // they did with the diagnostics inline.
+    void emitResimScheduledRead(unsigned int id, uint32 tick, const ScheduledRelayedReadReport& readReport)
+    {
+        // [T20] The whole report — same reason as the prediction site.
+        m_relayReadProbe.noteResimRead(readReport);
+
+        if (readReport.outcome == ScheduledRelayedReadOutcome::VerifyFail)
+        {
+            SIMLOG(m_logger,
+                "[Verbose][RelayProbe.Read] id=%u tick=%u VERIFY-FAIL probeTick=%u "
+                "candidateDA=%u dLatest=%u src=Resim",
+                id, tick, readReport.probeTick,
+                static_cast<unsigned int>(readReport.candidateDA),
+                static_cast<unsigned int>(readReport.dLatest));
+        }
+
+        SIMLOG(m_logger, "[Verbose][Resim.Input] id=%u tick=%u class=NoRef src=ScheduledRead", id, tick);
+    }
+
     // Variadic helper: expands over each per-type tuple slot using index_sequence.
     // Calls fn<SimulatableT>(perTypeMap) for each SimulatableT in the pack.
     template <typename TupleT, typename Fn, std::size_t... Is>
@@ -2124,9 +2103,397 @@ private:
         forEachTypeMapImpl(tup, std::forward<Fn>(fn), std::index_sequence_for<SimulatableTs...>{});
     }
 
-    // [T24] ONE per-window class block of the correction-verdict summary. Called
-    // twice — once per class — from the correction callback bound in
-    // registerPredictionOwner, and ONLY when a window closed.
+    // -----------------------------------------------------------------------
+    // [task 60 / RN-10] registerPredictionOwner's two named callbacks.
+    //
+    // RN-10 measured registerPredictionOwner at 358 lines, 59% comments, with
+    // two ~140-line lambdas burying a ~30-line registration skeleton. Part A
+    // lifted each lambda into a named member below, unchanged in every
+    // probe-call semantic. Part B (arrival, immediately below) then collapsed
+    // the tail probing behind ONE `emit*` call, safe because nothing in that
+    // tail alters control flow. Part C (correction, further below) could NOT
+    // take the same lift-and-fold: its probing has an early `return`
+    // interleaved between two probe calls, and folding "the probing" into one
+    // helper would move what that `return` returns from — see
+    // `decideCorrectionArrival` / `CorrectionArrivalDecision` below, which
+    // apply the RN-8/task-58 decide-then-project shape instead.
+    // -----------------------------------------------------------------------
+
+    // [RN-10 part A+B] CALL SITE 1's callback (registerPredictionOwner),
+    // lifted out verbatim and its probing tail folded behind ONE `emit*`
+    // call. Safe as a straight fold — unlike the correction callback below —
+    // because nothing past the ingest line alters control flow: every branch
+    // in the old lambda was a logging gate, never a `return`.
+    template <typename SimulatableT>
+    void onRelayedInputReceived(
+        unsigned int id,
+        RemoteInputCache<typename SimulatableT::InputType>& store,
+        const typename PredictionOwnerFor<SimulatableT>::RelayedInputRingType& ring)
+    {
+        const RelayedInputIngestReport report =
+            populateRemoteInputCache<typename SimulatableT::InputType>(store, ring);
+        emitRelayArrival(id, report, store);
+    }
+
+    // [RN-10 part B] ALL of CALL SITE 1's probing + logging, moved here
+    // verbatim from the old inline lambda — REUSING the existing `emit*` verb
+    // rather than coining a new one. See `docs/DiagnosticsConventions.md` §3
+    // for the current private `emit*` roster; this and
+    // `emitCorrectionArrival` extend that convention rather than inventing a
+    // second one. Templated on the store's InputT (deduced from `store` at
+    // the call site) purely so it can take the store by reference; nothing in
+    // the body depends on SimulatableT beyond that.
+    template <typename InputT>
+    void emitRelayArrival(unsigned int id, const RelayedInputIngestReport& report,
+                          RemoteInputCache<InputT>& store)
+    {
+        // [T19] PROBE 2 — replication cadence, measured in CAPTURE
+        // TICKS. GAME-THREAD window, a different object from the
+        // physics-side read probe; see the two-thread statement at the
+        // top of Network/RelayReadProbe.h.
+        //
+        // `report.newestCaptureTick` is the newest tick THIS RING
+        // carried, not the newest the store holds — the distinction is
+        // load-bearing and the report field's own comment explains it.
+        if (report.newestCaptureTickValid)
+        {
+            RelayArrivalWindowSummary arrival;
+            std::uint32_t gapCaptureTicks = 0u;
+            // ⛔ [T34 loss-counter fix] `newCaptureTicksIngested`, NOT
+            // `entriesIngested` and NOT a hard-coded 1. It is the count
+            // of capture ticks this arrival made newly resident, and it
+            // is what turns `lostCaptureTicksX1000` from a measure of
+            // the BURST RATE into a measure of loss. `entriesIngested`
+            // would count re-delivered ticks as new coverage and hide
+            // real loss; a hard-coded 1 is the retired replace-latest
+            // premise and is exactly what reported ~120 per mille on a
+            // working flush.
+            const bool windowClosed = m_relayArrivalProbe.noteArrival(
+                id,
+                report.newestCaptureTick,
+                static_cast<std::uint32_t>(report.newCaptureTicksIngested),
+                arrival,
+                &gapCaptureTicks);
+
+            // Per-event Verbose, and only when the cadence actually
+            // hiccuped. A gap of exactly 1 is the healthy depth-1
+            // steady state and would be a per-tick line; the interesting
+            // events are the stalls, which are what set the depth rule.
+            if (gapCaptureTicks > 1u)
+            {
+                SIMLOG(m_logger,
+                    "[Verbose][RelayProbe.Arrival] id=%u newestCapture=%u "
+                    "gapCaptureTicks=%u",
+                    id, report.newestCaptureTick, gapCaptureTicks);
+            }
+
+            if (windowClosed)
+            {
+                // PER-WINDOW SUMMARY AT WARNING — the cadence
+                // [InputStats] already uses. p99 is what the
+                // `depth >= gap_p99 + margin` rule reads; the mean is
+                // deliberately absent because it hides the tail that
+                // sets depth.
+                //
+                // ⭐ [T34] `lostCaptureTicksX1000` IS THE R = 0 LOSS
+                // INSTRUMENT, and it is on this line rather than its
+                // own because it is derived from these same samples.
+                // WARNING, not Log, is load-bearing:
+                // `Config/DefaultEngine.ini` sets `LogOGNet=Warning`, so
+                // a Log line does not exist on a dedicated server —
+                // items 35 and 36 each cost this initiative a proof line
+                // for exactly that. Steady-state expectation ~ 11 per
+                // mille (the measured 1.122 % wire loss); the raw
+                // numerator and denominator ride along so a window can
+                // be re-derived rather than trusted.
+                //
+                // ⭐ [T34 rework] `discont=` IS PART OF THE GATE, not
+                // garnish. A window reporting `discont=` > 0 was
+                // interrupted (see kRelayArrivalDiscontinuityTicks) and
+                // must be DISCARDED rather than averaged in — the same
+                // rule `[RelayProbe.Write] discont=` already carries.
+                // `discontMax=` is the largest excluded gap, exact, so
+                // discarding a window never hides how bad it was.
+                //
+                // ⭐ [T34 loss-counter fix] `delivered=` IS THE FIELD
+                // THAT MAKES THIS LINE SELF-CHECKING. `lost + delivered
+                // == expected` must hold on every window; a reader who
+                // sees it fail knows the delivered count is not being
+                // plumbed and that `lostCaptureTicksX1000` is measuring
+                // the burst rate again. Before this field existed, that
+                // failure mode was indistinguishable from a lossy wire.
+                SIMLOG(m_logger,
+                    "[Warning][RelayProbe.Arrival] samples=%u gapCaptureTicks "
+                    "p50=%u p99=%u%s max=%u noAdvance=%u saturated=%u "
+                    "lostCaptureTicksX1000=%u lost=%u delivered=%u expected=%u "
+                    "discont=%u discontMax=%u",
+                    arrival.samples, arrival.p50, arrival.p99,
+                    arrival.p99Saturated ? "+" : "",
+                    arrival.maxGap, arrival.noAdvance,
+                    arrival.saturatedSamples,
+                    arrival.lostCaptureTicksX1000,
+                    arrival.lostCaptureTicks,
+                    arrival.deliveredCaptureTicks,
+                    arrival.expectedCaptureTicks,
+                    arrival.discontinuities,
+                    arrival.maxDiscontinuityGap);
+            }
+        }
+
+        if (report.outcome == RelayedInputIngestOutcome::VersionMismatch
+            && store.shouldLogVersionMismatchOnce())
+        {
+            // ONCE per component per session — an incompatible peer
+            // re-replicates its ring forever.
+            SIMLOG(m_logger,
+                "[Warning][RelayedInput] DROP wire-version mismatch id=%u onWire=%u expected=%u",
+                id,
+                static_cast<unsigned int>(report.versionOnWire),
+                static_cast<unsigned int>(relayedInputRing::kWireFormatVersion));
+        }
+    }
+
+    // [RN-10 part A] CALL SITE 2's callback (registerPredictionOwner), lifted
+    // out verbatim — a pure lift; the production call and the two helpers it
+    // now delegates to below are unchanged in every semantic, only their
+    // location moved.
+    template <typename SimulatableT>
+    void onCorrectionReceived(
+        unsigned int id,
+        const typename PredictionOwnerFor<SimulatableT>::SyncedCorrectionBufferType& buffer)
+    {
+        // [T24] THE DIVERGENCE VERDICT, SURFACED AND ATTRIBUTED.
+        //
+        // The comparison itself is unchanged and happens where it always
+        // has — StateCorrectionCache::tryInsertingCorrectState's
+        // `isSimilarTo`, on every correction, for every character. All that
+        // is new is that the verdict now comes back out, and that THIS site
+        // adds the two facts the cache could never supply: the character
+        // `id`, and its CLASS.
+        CorrectionInsertVerdict verdict;
+        m_reconciliation.template injectCorrectionState<SimulatableT>(id, buffer, &verdict);
+
+        const CorrectionArrivalDecision decision =
+            decideCorrectionArrival<SimulatableT>(id, verdict);
+        emitCorrectionArrival(id, decision);
+    }
+
+    // [task 60 / RN-10 part C] THE CORRECTION-ARRIVAL DECISION.
+    //
+    // Task 58/RN-8's shape, reused rather than reinvented: this callback's
+    // probing has an early `return` interleaved between two probe calls
+    // (`noteLanding` always runs; `noteCorrection` must NOT run on a
+    // discard), so folding "the probing" into one helper the way
+    // `emitRelayArrival` does would move what that `return` returns from —
+    // the verdict probe would then run on discarded corrections and silently
+    // corrupt item 41's `aboveNewest` population (the discard bucket
+    // `CorrectionLandingProbe` counts). `landed` is therefore a FIELD of the
+    // decision, not a mid-block `return`, exactly as
+    // `ScheduledRelayedReadDecision::isUnderflowMiss` is a field rather than
+    // a re-derivable fact (see the banner above that struct). `characterClass`
+    // / `landingSite` are meaningful even when `!landed` — the landing probe
+    // needs them unconditionally, see the "hoisted above the gate" note in
+    // `decideCorrectionArrival` below.
+    struct CorrectionArrivalDecision
+    {
+        PredictedCharacterClass characterClass = PredictedCharacterClass::LocallyPredicted;
+        CorrectionLandingSite   landingSite    = CorrectionLandingSite::Discarded;
+
+        // Mirrors CorrectionInsertVerdict::landed. Kept as its own field —
+        // rather than re-derived from `landingSite == Discarded` — so the two
+        // notions can never silently diverge in the projection below.
+        bool landed = false;
+
+        // The correction's tick, echoed back so the caller's log line needs no
+        // second decode of the wire buffer. Set on BOTH paths — mirrors
+        // CorrectionInsertVerdict::tick's own rule. `emitCorrectionArrival`'s
+        // `[Verbose][ResimProbe.Landing]` SIMLOG relies on this: it prints
+        // `decision.tick` unconditionally, BEFORE the `!landed` gate below, so a
+        // discarded correction's landing-probe line still carries the wire tick.
+        uint32 tick = 0u;
+
+        // Meaningless when `!landed` (CorrectionInsertVerdict's own rule) — unlike
+        // `tick` above, this one really is discard-invalid: no comparison happened,
+        // so it must never be read as either an agreement or a disagreement.
+        bool predictionWasCorrect = false;
+    };
+
+    // [RN-10 part C] THE PURE HALF — computes the decision, touches no probe
+    // and calls no `note*`/`emit*`/`log*`. `characterClass` and `landingSite`
+    // are computed UNCONDITIONALLY, before `landed` is even consulted,
+    // because the landing probe needs them on every correction including
+    // discards (item 42's "hoisted above the landed gate" — the class/site
+    // facts must exist on the path the verdict probe returns early from).
+    template <typename SimulatableT>
+    CorrectionArrivalDecision decideCorrectionArrival(
+        unsigned int id, const CorrectionInsertVerdict& verdict)
+    {
+        // THE CLASS TEST IS PROVIDER-PRESENCE — the SAME lookup
+        // registerPredictionOwner forks on above and collectInputAll forks
+        // on every tick, not a second notion of "remote". Read live rather
+        // than captured at bind time so it cannot drift from the map that
+        // actually decides behaviour.
+        const bool hasProvider =
+            std::get<InputProviderMapFor<SimulatableT>>(m_inputProviders).count(id) != 0u;
+        const PredictedCharacterClass characterClass = hasProvider
+            ? PredictedCharacterClass::LocallyPredicted
+            : PredictedCharacterClass::RemoteProxy;
+
+        // ---------------------------------------------------------------
+        // [og-netcode-v2-input-relay item 42 / I2] WHERE DID IT LAND?
+        //
+        // THE FIRST-GATE DISCRIMINATOR. Item 31 established that resim
+        // triggers were gated by the prediction-frontier slot's INHERITED
+        // `m_isResimulated` bit: `getLastResimulationTick` scanned from the
+        // frontier at offset 0, so that bit shadowed every older corrected
+        // slot, and the ONLY event that re-opened the gate in play was a
+        // correction landing EXACTLY ON the frontier. A correction landing
+        // behind it set its own slot's flag, was never seen by the scan, was
+        // never replayed through (resims restore at the NEWEST corrected
+        // slot) and therefore never touched live state at all.
+        //
+        // So this three-way split is the measurement the whole item turns
+        // on: `landedBehind` large while triggers track only
+        // `landedAtFrontier` IS the demonstrated under-resimulation
+        // statement. Full statement at CorrectionLandingProbe in
+        // OGSimulation/ResimGateProbe.h.
+        //
+        // ⚠ [item 45] THAT MECHANISM IS GONE — the gate is now edge-triggered
+        // on an explicit pending anchor, and `m_isResimulated`, the scan and
+        // the inheritance are retired. THIS PROBE IS UNCHANGED AND STILL
+        // CORRECT, for a reason worth stating rather than re-deriving: it
+        // classifies a landing's POSITION relative to the frontier, which is
+        // a fact about the correction stream, not about the gate. What
+        // changed is only what that position IMPLIES: on a default build the
+        // `FrontierExact` policy makes `AtFrontier` exactly the anchor-set
+        // condition (same predicate, same value), so `requested` still tracks
+        // `atFrontier`; after item 46's flip to `OnDisagreement` the trigger
+        // population becomes the DISAGREEING landings — mostly this
+        // `Behind` bucket — and the tracking claim above inverts by design.
+        // Read `[ResimGate] session policy` in the log before reading a
+        // ratio.
+        //
+        // ⚠ THE FRONTIER IS READ THROUGH THE EXISTING RECONCILIATION
+        // ACCESSOR, not by giving the cache an identity. `findInputCache`
+        // is the nullable route every other accessor on that class already
+        // takes, and it answers nullptr on the authority (no caches are
+        // allocated there), which is exactly the right answer: this
+        // callback is OnRep-dispatched and can never fire on an authority
+        // world anyway. Pushing id-awareness down into StateCorrectionCache
+        // to carry the frontier out with the verdict is the placement T24
+        // ruled against, and this needs no such thing.
+        //
+        // ⚠ READ AFTER THE INSERT, WHICH IS SAFE AND ±1 RACY, and both
+        // halves of that matter. Safe: `tryInsertingCorrectState` never
+        // touches `m_tickBuffer`, so the frontier it saw and the frontier
+        // read here are the same value on this thread. Racy: the frontier
+        // is ADVANCED by `pushPredictionTick` on the PHYSICS thread, and
+        // the whole cache is already a formally unsynchronized GT/PT
+        // structure (finding §1). A physics frame landing between the
+        // insert and this read misfiles one sample from AtFrontier to
+        // Behind. That is a per-sample ±1 on a 120-sample window, it does
+        // not accumulate, and it is a property of the mechanism being
+        // measured rather than of this instrument: whether a correction
+        // hits the frontier slot at all is decided by that same
+        // interleaving.
+        const auto* landingCache =
+            m_reconciliation.template findInputCache<SimulatableT>(id);
+        const CorrectionLandingSite landingSite = classifyCorrectionLanding(
+            verdict.landed, verdict.tick,
+            landingCache != nullptr ? landingCache->getPredictionTick() : 0u);
+        // ---------------------------------------------------------------
+
+        CorrectionArrivalDecision decision;
+        decision.characterClass       = characterClass;
+        decision.landingSite          = landingSite;
+        decision.landed               = verdict.landed;
+        decision.tick                 = verdict.tick;
+        decision.predictionWasCorrect = verdict.predictionWasCorrect;
+        return decision;
+    }
+
+    // [RN-10 part C] THE PROJECTION — the landing probe fires
+    // UNCONDITIONALLY (a discard IS an observation, item 41's `aboveNewest`
+    // population); the verdict probe only if `decision.landed`. THIS
+    // `return` IS THE SAME CONTROL-FLOW FACT the old inline lambda encoded
+    // with its mid-block `if (!verdict.landed) return;` — moved here, not
+    // removed, and reading `decision.landed` rather than re-deriving it from
+    // `landingSite`, per the struct's own comment above.
+    void emitCorrectionArrival(unsigned int id, const CorrectionArrivalDecision& decision)
+    {
+        SIMLOG(m_logger,
+            "[Verbose][ResimProbe.Landing] id=%u tick=%u class=%s site=%s",
+            id, decision.tick,
+            predictedCharacterClassName(decision.characterClass),
+            correctionLandingSiteName(decision.landingSite));
+
+        CorrectionLandingWindowSummary landingWindow;
+        if (m_correctionLandingProbe.noteLanding(
+                decision.characterClass, decision.landingSite, landingWindow))
+        {
+            emitCorrectionLandingClassLine(
+                PredictedCharacterClass::LocallyPredicted,
+                landingWindow.local, landingWindow.samples);
+            emitCorrectionLandingClassLine(
+                PredictedCharacterClass::RemoteProxy,
+                landingWindow.remote, landingWindow.samples);
+        }
+
+        // A correction whose tick had no slot was DISCARDED — no comparison
+        // happened. Counting it would put a denominator under a verdict that
+        // was never reached, and the discard path already logs itself
+        // (isAnomalousMiss-gated, in the cache).
+        //
+        // [item 42] THE LANDING PROBE ABOVE DELIBERATELY SITS ON THE OTHER
+        // SIDE OF THIS RETURN. Its `discarded` bucket is the one place the
+        // two probes' sample sets are required to differ, and moving this
+        // gate up would silently empty it. [RN-10 part C] `decision.landed`
+        // carries the exact same fact `verdict.landed` did before the split
+        // — see `decideCorrectionArrival`'s comment above for why it is a
+        // field rather than re-derived here.
+        if (!decision.landed)
+            return;
+
+        // PER-EVENT DETAIL AT VERBOSE — off under the shipped
+        // LogOGDivergenceProbe=Warning. Emitted on EVERY landed correction
+        // rather than on disagreements only, because "per-correction verdict
+        // observable with id and class" is the acceptance criterion and a
+        // disagreement-only line cannot distinguish "predicted correctly"
+        // from "no correction arrived". The cost is one snprintf at a site
+        // that already performs two per correction ([InjectCorrectionState]
+        // and the cache's own line), so this adds no new volume CLASS — the
+        // thing T19 was filed to stop.
+        SIMLOG(m_logger,
+            "[Verbose][DivergenceProbe.Correction] id=%u tick=%u class=%s correct=%u",
+            id, decision.tick,
+            predictedCharacterClassName(decision.characterClass),
+            decision.predictionWasCorrect ? 1u : 0u);
+
+        CorrectionVerdictWindowSummary window;
+        if (!m_correctionVerdictProbe.noteCorrection(
+                decision.characterClass, decision.predictionWasCorrect, window))
+            return;
+
+        // PER-WINDOW SUMMARY AT WARNING, ONE LINE PER CLASS. Never one
+        // pooled line: only the remote half can move with the relay delay
+        // floor, and summing it with a locally-predicted population that
+        // cannot move would dilute exactly the signal T23 scenario 4 reads.
+        //
+        // A class with no corrections in the window is SKIPPED rather than
+        // printed as `rate=0`, which would read as a perfect record instead
+        // of as no observation. That is also the steady state on a client
+        // with no remote proxies.
+        emitCorrectionVerdictClassLine(
+            PredictedCharacterClass::LocallyPredicted, window.local, window.samples);
+        emitCorrectionVerdictClassLine(
+            PredictedCharacterClass::RemoteProxy, window.remote, window.samples);
+    }
+
+    // [T24] ONE per-window class block of the correction-verdict summary.
+    // Called twice — once per class — from `emitCorrectionArrival` (RN-10
+    // part C), itself called from the correction callback
+    // (`onCorrectionReceived`) bound in registerPredictionOwner, and ONLY
+    // when a window closed.
     //
     // SILENT ON AN EMPTY CLASS. `corrections == 0` means this window observed
     // nothing about that class; printing `disagreed=0 ratePerMille=0` would assert
@@ -2155,8 +2522,8 @@ private:
     }
 
     // [og-netcode-v2-input-relay item 42 / I2] ONE per-window class block of the
-    // frontier-landing split. Called twice — once per class — from the correction
-    // callback, and ONLY when a window closed.
+    // frontier-landing split. Called twice — once per class — from
+    // `emitCorrectionArrival` (RN-10 part C), and ONLY when a window closed.
     //
     // SILENT ON AN EMPTY CLASS, same rule and same reason as the verdict line
     // above: printing `behind=0 atFrontier=0 discarded=0` would assert a perfect
@@ -2326,7 +2693,7 @@ private:
     // [T9 parts 3+4] Client Layer-1 input delay. Populated for provider-owning
     // ids only; touched exclusively from collectInputAll (physics thread) and
     // wipeAllForResync.
-    std::tuple<ClientInputDelayLineMapFor<SimulatableTs>...> m_clientInputDelayLines;
+    std::tuple<LocalInputCacheMapFor<SimulatableTs>...> m_localInputCaches;
 
     // [T9 part 4, RENAMED by T17] The game's zero input, per simulatable type.
     // NOT "client" neutral inputs any more: the AUTHORITY reads this too (the
@@ -2340,7 +2707,7 @@ private:
     std::tuple<NeutralInputFor<SimulatableTs>...>            m_neutralInputs;
 
     // [T5 / input relay] The client's relayed-input stores, one per REMOTE
-    // character (provider-ABSENT ids — the complement of m_clientInputDelayLines).
+    // character (provider-ABSENT ids — the complement of m_localInputCaches).
     //
     // WRITTEN ON THE GAME THREAD (the OnRep_RelayedInputRing callback bound in
     // registerPredictionOwner), READ ON THE PHYSICS THREAD (T7's proxy branch of
@@ -2348,8 +2715,8 @@ private:
     // the correction path, which already does exactly this, and its full rationale
     // — the torn-slot-not-container-UB argument, the correction heal, and the
     // named deferred SPSC-seam cleanup — is in the THREADING section of
-    // Network/RelayedInputStore.h. Do not restate it here; do not weaken it there.
-    std::tuple<RelayedInputStoreMapFor<SimulatableTs>...> m_relayedInputStores;
+    // Network/RemoteInputCache.h. Do not restate it here; do not weaken it there.
+    std::tuple<RemoteInputCacheMapFor<SimulatableTs>...> m_remoteInputCaches;
 
     // [T19] THE TWO CLIENT-SIDE RELAY PROBES. Pure telemetry: nothing in the
     // resolution path reads them, and every consumer is a SIMLOG.
@@ -2477,7 +2844,7 @@ void registerSimulatable(
     PredictionOwnerFor<SimulatableT>&      owner,
     std::function<typename SimulatableT::InputType(
         const SimulationTimeStep&,
-        const ClientInputDelayLine<typename SimulatableT::InputType>&)> inputProvider = nullptr)
+        const LocalInputCache<typename SimulatableT::InputType>&)> inputProvider = nullptr)
 {
     // Order matters: cache must exist before storage, because the physics thread
     // iterates m_storage.forEachSimulatable and looks up each id in the cache map

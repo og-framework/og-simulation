@@ -64,6 +64,30 @@ struct AppliedCaptureRef
 };
 
 // ---------------------------------------------------------------------------
+// [og-netcode-v2-input-relay item 55] ResimSweepDiagnostics — the whole report
+// of one `postResimulationAll` sweep, replacing the return value + two
+// defaulted out-pointers that carried `discards` / `freshProtections` /
+// `staleProtections` separately (RN-3, option B — see
+// docs/DiagnosticsConventions.md §4: the SWEEP that produces these is
+// production, this struct's fields are its report, and all three must keep
+// coming from the SAME pass — a second pass would run against a cache the
+// first one already mutated).
+//
+// 📌 `staleProtections` has never been observed nonzero in the field (item 43's
+// live run measured 0 on both clients, matching item 47's review prediction
+// that `ReplayedOverCorrection` is unreachable under protect-all). The field's
+// value is that it CAN move, not that it does — reading 0 is not evidence the
+// counter is broken, and it is not evidence it is unneeded either.
+// ---------------------------------------------------------------------------
+
+struct ResimSweepDiagnostics
+{
+    unsigned int discards         = 0u;
+    unsigned int freshProtections = 0u;
+    unsigned int staleProtections = 0u;
+};
+
+// ---------------------------------------------------------------------------
 // SimulationReconciliation<SimulatableTs...>
 //
 // Owns per-simulatable StateCorrectionCache instances and every operation that
@@ -187,34 +211,37 @@ public:
     // replay tick wrote gate state, the gate would again be derivable from what the
     // replay just did, and a completed resim could re-trigger itself.
     //
-    // [og-netcode-v2-input-relay item 42] RETURNS THE NUMBER OF DISCARDS — replayed
-    // ticks whose slot had already left the 60-slot cache window. Observational
-    // only; the caller (SimulationManager) hands it to the resim-gate probe as I6's
-    // `replayOverruns`. Behaviour is unchanged: every character is still swept, the
-    // cache's own Warning line still fires per discard, and the previous `void`
-    // return had no reader. The baseline is 1-2 per RUN, so a nonzero window
-    // reading is the over-replay / domain-skew evidence finding §3 predicts and
-    // could not previously count.
+    // [og-netcode-v2-input-relay item 42] `discards` COUNTS replayed ticks whose
+    // slot had already left the 60-slot cache window. Observational only; the
+    // caller (SimulationManager) hands it to the resim-gate probe as I6's
+    // `replayOverruns`. Behaviour is unchanged: every character is still swept,
+    // the cache's own Warning line still fires per discard, and nothing in this
+    // sweep's own logic reads its own tallies back. The baseline is 1-2 per RUN,
+    // so a nonzero window reading is the over-replay / domain-skew evidence
+    // finding §3 predicts and could not previously count.
     //
     // ⛔ [item 47] AND A REPLAY TICK NO LONGER OVERWRITES A CORRECTED SLOT. The
     // per-slot rule, its two invariants and the fresh/stale classifier live in
     // `resimGate::classifyResimSlotWrite`; what is visible from HERE is the
-    // sweep's report of it. `outFreshProtections` / `outStaleProtections` are
-    // DEFAULTED out-pointers on the item 42 pattern, so the call site that does
-    // not want them is byte-identical.
+    // sweep's report of it, via `freshProtections` / `staleProtections`.
     //
-    // ⚠ A PROTECTED SLOT IS NOT A DISCARD. The return value keeps its item 42
-    // meaning exactly — replayed ticks whose slot had left the 60-slot window —
-    // because `replayOverruns` has an archived baseline (1-2 per RUN) that a
-    // redefinition would silently invalidate. Protections are a different
-    // population and get their own two counters.
-    unsigned int postResimulationAll(const SimulationTimeStep& step,
-                                     unsigned int* outFreshProtections = nullptr,
-                                     unsigned int* outStaleProtections = nullptr)
+    // ⚠ A PROTECTED SLOT IS NOT A DISCARD. `discards` keeps its item 42 meaning
+    // exactly — replayed ticks whose slot had left the 60-slot window — because
+    // `replayOverruns` has an archived baseline (1-2 per RUN) that a redefinition
+    // would silently invalidate. Protections are a different population and get
+    // their own two counters.
+    //
+    // [item 55] ALL THREE TALLIES NOW TRAVEL ONE MECHANISM — the
+    // `ResimSweepDiagnostics` returned by value (RN-3, option B; the two
+    // out-pointers this used to take are gone). ⛔ ONE SWEEP, ONE TICK, ALL
+    // THREE COUNTS: they are derived from the same per-character pass below, and
+    // computing any of them in a follow-up pass would run against a cache this
+    // pass already mutated — same failure mode as `noteDeepAnchorSkips` needing
+    // to be called before `noteCheck`. See the type's own comment and
+    // docs/DiagnosticsConventions.md §4.
+    ResimSweepDiagnostics postResimulationAll(const SimulationTimeStep& step)
     {
-        unsigned int discards          = 0u;
-        unsigned int freshProtections  = 0u;
-        unsigned int staleProtections  = 0u;
+        ResimSweepDiagnostics diagnostics;
         m_storage.forEachSimulatable([&](unsigned int id, auto& simulatable) {
             using T = std::remove_reference_t<decltype(simulatable)>;
             SIMLOG(m_logger, "[Resim.Post] id=%u tick=%u", id, step.getTick());
@@ -224,19 +251,15 @@ public:
                     typename T::StateType(simulatable.getAllState().getState()),
                     step.getTick(), &outcome))
             {
-                ++discards;
+                ++diagnostics.discards;
                 return;
             }
             if (outcome == resimGate::ResimSlotWriteOutcome::ProtectedFresh)
-                ++freshProtections;
+                ++diagnostics.freshProtections;
             else if (outcome == resimGate::ResimSlotWriteOutcome::ProtectedStale)
-                ++staleProtections;
+                ++diagnostics.staleProtections;
         });
-        if (outFreshProtections != nullptr)
-            *outFreshProtections = freshProtections;
-        if (outStaleProtections != nullptr)
-            *outStaleProtections = staleProtections;
-        return discards;
+        return diagnostics;
     }
 
     // -----------------------------------------------------------------------
@@ -255,12 +278,15 @@ public:
     // readInto: the ref is a fixed-offset header field, and the state read has
     // already paid for the composite.
     //
-    // [og-netcode-v2-input-relay T24] `outVerdict` forwards the cache's existing
+    // [og-netcode-v2-input-relay T24] `outDiagnosticVerdict` forwards the cache's existing
     // prediction-vs-authority verdict to the caller. It is DEFAULTED and purely
     // observational — see CorrectionInsertVerdict in CorrectionCache.h for why the
     // verdict has to leave the cache at all (the cache is id-agnostic; the
     // attribution this initiative needs is by id AND by character class, and
-    // neither fact exists down there).
+    // neither fact exists down there). The marker names the reporting CHANNEL,
+    // not the fact it carries — see `tryInsertingCorrectState` in CorrectionCache.h
+    // and docs/DiagnosticsConventions.md §4 for why the underlying verdict is
+    // production, not diagnostic.
     //
     // THIS CLASS IS NOT THE PLACE THE VERDICT IS INTERPRETED, and deliberately so.
     // It knows the `id` but not whether that id is locally controlled or a remote
@@ -270,7 +296,7 @@ public:
     // this method only relays.
     template <typename T, typename BufferT>
     void injectCorrectionState(unsigned int id, const BufferT& buffer,
-                               CorrectionInsertVerdict* outVerdict = nullptr)
+                               CorrectionInsertVerdict* outDiagnosticVerdict = nullptr)
     {
         typename T::StateType state;
         const uint32 tick = buffer.readInto(state);
@@ -278,7 +304,7 @@ public:
         SIMLOG(m_logger, "[InjectCorrectionState] id=%u tick=%u appliedCaptureTick=%u",
             id, tick, appliedCaptureTick);
         getCacheFor<T>(id).tryInsertingCorrectState(
-            std::move(state), tick, appliedCaptureTick, outVerdict);
+            std::move(state), tick, appliedCaptureTick, outDiagnosticVerdict);
     }
 
     // [og-netcode-v2-input-relay T8] `injectCorrectionInput` IS GONE. It was the
@@ -314,16 +340,28 @@ public:
     // inputs from identical state, and reproduce the same prediction: a guaranteed
     // no-op costing a full Chaos rewind. Skipping leaves the anchor PENDING — it is
     // not consumed here — so recovery is a newer correction raising it back inside
-    // the window, or the HardResync failsafe. That is also why `outDeepAnchorSkips`
-    // counts CHARACTER-FRAMES rather than distinct anchors: a stranded deep anchor is
-    // re-examined and re-counted every frame it stays stranded, which is the shape
-    // `refusedFrames` already uses for the second gate and the reading that makes a
-    // stuck one visible.
+    // the window, or the HardResync failsafe. That is also why
+    // `outDiagnosticDeepAnchorSkips` counts CHARACTER-FRAMES rather than distinct
+    // anchors: a stranded deep anchor is re-examined and re-counted every frame it
+    // stays stranded, which is the shape `refusedFrames` already uses for the
+    // second gate and the reading that makes a stuck one visible.
+    //
+    // ⛔ THE SKIP IS PRODUCTION, THE COUNT OF SKIPS IS DIAGNOSTIC
+    // (docs/DiagnosticsConventions.md §4). Below, `if (!withinDepth) { ++...;
+    // return; }` — the `return` IS the depth policy doing its job (item 45): it
+    // excludes this character from the min-fold. Only the `++` is observation.
+    // `outDiagnosticDeepAnchorSkips` marks that reporting channel; it must never be
+    // read as license to touch the four DUAL-USE locals that feed both the
+    // decision and the `[ResimCheck.Check]` log line — `needsResim`, `anchorTick`,
+    // `predictionTick`, `withinDepth` (the last comes from
+    // `resimGate::isAnchorWithinDepthPolicy` and gates the skip itself). Marking,
+    // moving, or guarding any of those four behind a diagnostic branch breaks the
+    // depth policy silently.
     unsigned int checkDivergenceAll(uint32 maxAnchorDepthTicks,
-                                    unsigned int* outDeepAnchorSkips = nullptr)
+                                    unsigned int* outDiagnosticDeepAnchorSkips = nullptr)
     {
         unsigned int correctionTick = std::numeric_limits<unsigned int>::max();
-        unsigned int deepAnchorSkips = 0u;
+        unsigned int diagnosticDeepAnchorSkips = 0u;
         m_storage.forEachSimulatable([&](unsigned int id, auto& simulatable) {
             using T = std::remove_reference_t<decltype(simulatable)>;
             auto& cache = getCacheFor<T>(id);
@@ -339,14 +377,14 @@ public:
                 return;
             if (!withinDepth)
             {
-                ++deepAnchorSkips;
+                ++diagnosticDeepAnchorSkips;
                 return;
             }
             correctionTick = std::min(correctionTick,
                 static_cast<unsigned int>(anchorTick));
         });
-        if (outDeepAnchorSkips != nullptr)
-            *outDeepAnchorSkips = deepAnchorSkips;
+        if (outDiagnosticDeepAnchorSkips != nullptr)
+            *outDiagnosticDeepAnchorSkips = diagnosticDeepAnchorSkips;
         return correctionTick == std::numeric_limits<unsigned int>::max() ? 0u : correctionTick;
     }
 
@@ -420,21 +458,45 @@ public:
     // ~20 % of prepares doing exactly that (the stranded-cursor class) — and the
     // correction it stood for would never be replayed by anybody.
     //
-    // ⛔ AND IT EMITS NO LOG LINE, deliberately: item 45 forbids new `[Resim.` /
-    // `[ResimCheck.`-prefixed lines outright (`[Resim.` inherits `LogOGSim=Verbose`,
-    // T19's 10 MB defect) and a per-character-per-resim line is exactly that volume
-    // class. It needs none, which is the design's best maintainability property: a
-    // surviving anchor leaves the gate OPEN, so the next frame requests again with a
-    // DIFFERENT anchor — visible in item 42's existing `requests` without a matching
-    // `repeatRequests`, at Warning, in one probe window.
+    // ⛔ AND THIS FUNCTION ITSELF STILL EMITS NO LOG LINE, deliberately: item 45
+    // forbids new `[Resim.` / `[ResimCheck.`-prefixed lines outright (`[Resim.`
+    // inherits `LogOGSim=Verbose`, T19's 10 MB defect) and a per-character-per-resim
+    // line is exactly that volume class. A surviving anchor leaves the gate OPEN, so
+    // the next frame requests again with a DIFFERENT anchor — visible in item 42's
+    // existing `requests` without a matching `repeatRequests`, at Warning, in one
+    // probe window; that cross-check is unchanged by the promotion below, it is just
+    // no longer the ONLY way to see this count.
     //
-    // The RETURN VALUE is purely observational — the count of caches whose anchor
-    // survived the CAS, i.e. characters that took a mid-replay landing and will
-    // re-trigger. Its only reader today is the LLT that pins this sweep
-    // (og-brawler-tests `[SimulationReconciliation]`), which is the same bargain item
-    // 42 struck for `tryInsertingResimulatedState`'s bool: a `void` here would make
-    // the sweep unobservable from a test at all, and the alternative — asserting it
-    // through a probe field — would add a shipped counter that reads 0 until item 46.
+    // [RN-6, item 57 — LANDED] The RETURN VALUE is fed to `ResimGateProbe::
+    // noteSurvivingAnchors` at the sole call site (`SimulationManager.h`'s
+    // `[Resim.Finish]` block) and surfaced as a field on the existing
+    // `[ResimProbe.Gate]` Warning line — no new log line, per the paragraph above.
+    // ⛔ THE RETURN'S DIAGNOSTIC PROMOTION DOES NOT MAKE THE CALL OPTIONAL. The CAS
+    // inside this sweep is what closes the gate for every anchor that does NOT
+    // survive (see the item-45 comment above `postResimulationAll`, this file,
+    // "the gate is closed once, explicitly, by the CAS on the completion edge").
+    // That is production-load-bearing regardless of whether anything reads the
+    // count back — do not group this function under `getDiagnostics()` or
+    // otherwise treat it as read-only/removable on the strength of its return
+    // being diagnostic; RN-7/task 56 moved `logSlotProvenanceAll` there for the
+    // opposite reason (its one caller only logs, decides nothing) and this
+    // function is the shape that rule is meant to keep OUT.
+    // ⚠ HISTORICAL, kept so a stale rationale cannot mislead a future reader: this
+    // comment used to end "...the alternative — asserting it through a probe field —
+    // would add a shipped counter that reads 0 until item 46." Item 46
+    // (`ResimTriggerPolicy=OnDisagreement`) shipped 2026-08-13, which made that
+    // rationale stale on the same day (RN-6) — a surviving anchor is exactly the
+    // population item 47's protect-all fires on, and item 43 measured ~1,400 fresh
+    // protections per client per run, so the count was almost certainly nonzero and
+    // discarded in the field the whole time.
+    //
+    // The SIGNATURE IS UNCHANGED — the concept constrains the return
+    // (`{ t.consumeResimAnchorsAll() } -> std::convertible_to<unsigned int>`, this
+    // file's own `SimulationReconciliationConcept`, below), so `void` was never
+    // available; this only adds a reader. Its LLT readers — the two
+    // `REQUIRE(... == 0u)` assertions in og-brawler-tests
+    // `SimulationReconciliationTest.cpp` — keep passing unchanged, and a third case
+    // there now constructs the surviving branch too (RN-6/item 57).
     unsigned int consumeResimAnchorsAll()
     {
         unsigned int survivingAnchors = 0u;
@@ -490,9 +552,21 @@ public:
     }
 
     // =======================================================================
-    // [og-netcode-v2-input-relay item 48] THE SLOT-PROVENANCE DUMP — the one
-    // SHIPPED reader of `StateCorrectionCache`'s diagnostic provenance column,
-    // and the reason that column satisfies T16 instead of re-breaking it.
+    // [og-netcode-v2-input-relay item 48] THE SLOT-PROVENANCE DIAGNOSTIC VIEW —
+    // the one SHIPPED reader of `StateCorrectionCache`'s diagnostic provenance
+    // column, and the reason that column satisfies T16 instead of re-breaking
+    // it.
+    //
+    // [T53 / RN-7, task 56 — LANDED] `logSlotProvenanceAll` is `const` — it
+    // returns nothing and mutates nothing observable, but has a side effect
+    // (logging), so it is neither a plain `getDiagnostics()` read nor an
+    // `editDiagnostics()` mutator by the letter. RN-7's ruling is that it
+    // groups here anyway because the fence that actually decides every case is
+    // "who calls it, and what breaks if it is deleted" (see
+    // `docs/DiagnosticsConventions.md` §2), and this method has no production
+    // role at all. This is a deliberate ONE-MEMBER view: a convention with
+    // unexplained exceptions is worse than a view with one member today, and it
+    // gives a home to any future diagnostics on this class.
     //
     //     [Verbose][ResimProbe.SlotMap] id=%u frontier=%u map=<60 chars>
     //
@@ -504,23 +578,37 @@ public:
     // feeds no decision anywhere, which is machine-checked one level down by
     // `…TheProvenanceColumnCannotReachAnyProductionOutput`.
     // =======================================================================
-    // CALL SITE 1 of 2 — ONE COMPLETED RESIM. Called from the `[Resim.Finish]`
-    // block in `SimulationManager::onPostGameSimulation`, after `applyResimAll`
-    // and the anchor consume, because that is the only point at which a replay's
-    // whole effect on the cache is finished and visible: the span has been
-    // written, the protections have been taken and the frontier slot has been
-    // published. Emitting at prepare would show the map the resim was ABOUT to
-    // change.
-    void dumpSlotProvenanceAll()
+    class Diagnostics
     {
-        if (!m_logger)
-            return;
+    public:
+        explicit Diagnostics(const SimulationReconciliation& reconciliation)
+            : m_reconciliation(reconciliation)
+        {
+        }
 
-        m_storage.forEachSimulatable([&](unsigned int id, auto& simulatable) {
-            using T = std::remove_reference_t<decltype(simulatable)>;
-            logSlotProvenanceFor(id, getCacheFor<T>(id));
-        });
-    }
+        // CALL SITE 1 of 2 — ONE COMPLETED RESIM. Called from the `[Resim.Finish]`
+        // block in `SimulationManager::onPostGameSimulation`, after `applyResimAll`
+        // and the anchor consume, because that is the only point at which a replay's
+        // whole effect on the cache is finished and visible: the span has been
+        // written, the protections have been taken and the frontier slot has been
+        // published. Emitting at prepare would show the map the resim was ABOUT to
+        // change.
+        void logSlotProvenanceAll() const
+        {
+            if (!m_reconciliation.m_logger)
+                return;
+
+            m_reconciliation.m_storage.forEachSimulatable([&](unsigned int id, auto& simulatable) {
+                using T = std::remove_reference_t<decltype(simulatable)>;
+                m_reconciliation.logSlotProvenanceFor(id, m_reconciliation.getCacheFor<T>(id));
+            });
+        }
+
+    private:
+        const SimulationReconciliation& m_reconciliation;
+    };
+
+    Diagnostics getDiagnostics() const { return Diagnostics(*this); }
 
     // -----------------------------------------------------------------------
     // Resim wipe — called via clock callback on hard resync
@@ -592,7 +680,7 @@ public:
     // an input reader despite the name, which is pre-initiative), plus the two
     // applied-capture-tick queries. A slot answers "WHICH capture the authority
     // applied at tick T", never "what that capture WAS". The value comes from
-    // ClientInputDelayLine (local) or RelayedInputStore (remote), both owned by
+    // LocalInputCache (local) or RemoteInputCache (remote), both owned by
     // SimulationNetSync.
 
     // [T4 / D3] The join key stored for `tick` — "which capture tick did the
@@ -689,6 +777,16 @@ private:
         return std::get<CacheMapFor<T>>(m_caches).at(id);
     }
 
+    // [RN-7 / task 56] Const overload, added so `Diagnostics::logSlotProvenanceAll`
+    // can look up a cache through a `const SimulationReconciliation&`. The
+    // non-const overload above and its production callers (`applyResimAll`,
+    // `wipeAllForResync`, the correction/prediction sweeps) are unchanged.
+    template <typename T>
+    const auto& getCacheFor(unsigned int id) const
+    {
+        return std::get<CacheMapFor<T>>(m_caches).at(id);
+    }
+
     // [og-netcode-v2-input-relay item 48] THE ONE FORMATTING SITE for the
     // slot-provenance map, shared by both call sites above so the two cannot
     // print different shapes for the same column.
@@ -723,7 +821,7 @@ private:
     // SlotStateProvenance.h for what fence 2's "production output" excludes and
     // why this line is not one.
     template <typename CacheT>
-    void logSlotProvenanceFor(unsigned int id, const CacheT& cache)
+    void logSlotProvenanceFor(unsigned int id, const CacheT& cache) const
     {
         if (!m_logger)
             return;
@@ -733,7 +831,7 @@ private:
         // into a half-truth.
         char map[CacheT::StateBufferSize + 1u];
         for (uint32 slot = 0u; slot < static_cast<uint32>(CacheT::StateBufferSize); ++slot)
-            map[slot] = slotStateProvenanceChar(cache.getDiagnosticStateProvenance(slot));
+            map[slot] = slotStateProvenanceChar(cache.getDiagnostics().stateProvenance(slot));
         map[CacheT::StateBufferSize] = '\0';
 
         SIMLOG(m_logger, "[Verbose][ResimProbe.SlotMap] id=%u frontier=%u map=%s",

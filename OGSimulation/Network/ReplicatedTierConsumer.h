@@ -45,13 +45,16 @@
 // rather than two parallel paths racing to write one atomic.
 //
 // PRE-ARRIVAL FALLBACK. Until the first OnRep actually lands, there is no
-// authoritative tier and `TimeConfig::forcedInputLatencyTicks` — the documented
-// "no per-connection tier is available" baseline, floored by
-// `relayDelayFloorTicks` since the 2026-08-03 C2 amendment — is used instead. This is
-// deliberately keyed on ARRIVAL, not on the tier VALUE: the replicated property
-// defaults to 0, which is also a perfectly legal tier, so a value test could not
-// tell "server says tier 0" from "server has not spoken yet", and a client that
-// had never heard from the server would silently adopt tier-0 timing.
+// authoritative tier and the no-tier fallback — `rttTierInputDelays[
+// kMaxConnectionTierIndex]` (the WORST tier; item 62 / RN-12 retired the
+// dedicated no-tier-baseline field this used to read — its old identifier is on
+// record in RN-12, ReviewNotes.md), floored by `relayDelayFloorTicks` since the
+// 2026-08-03 C2 amendment — is used
+// instead. This is deliberately keyed on ARRIVAL, not on the tier VALUE: the
+// replicated property defaults to 0, which is also a perfectly legal tier, so a
+// value test could not tell "server says tier 0" from "server has not spoken
+// yet", and a client that had never heard from the server would silently adopt
+// tier-0 timing.
 //
 // ENGINE-AGNOSTIC. Sim core: STL plus `OGSimulation/` headers only. The
 // replicated value arrives as a plain integer; the UE transport
@@ -109,22 +112,25 @@ public:
     }
 
     // THE C2 FORMULA, client side. Once a tier has arrived the effective delay is
-    // `rttTierInputDelays[tier]` — it REPLACES the baseline and is NOT added to
+    // `rttTierInputDelays[tier]` — it REPLACES the fallback and is NOT added to
     // it (locked 2026-07-19, backlog C2; the earlier additive draft algebraically
-    // cancelled to a constant). Before arrival it is `forcedInputLatencyTicks`.
+    // cancelled to a constant). Before arrival it is the no-tier fallback —
+    // `rttTierInputDelays[kMaxConnectionTierIndex]` since item 62 / RN-12 retired
+    // the dedicated no-tier-baseline field this used to be.
     //
     // AMENDED 2026-08-03 (RelayDelaySpectrumDesign.md §6, review C2/A2a+A2b). Both
     // arms are floored by the session relay delay floor. In full:
     //
     //     effective = max(relayDelayFloorTicks,
-    //                     tierKnown ? tierInputDelayTicks(tier) : forcedInputLatencyTicks)
+    //                     tierKnown ? tierInputDelayTicks(tier)
+    //                               : rttTierInputDelays[kMaxConnectionTierIndex])
     //
     // THE NO-TIER ARM IS NOT OPTIONAL. This method IS the client's half of the
     // shared recompute, and both channels feeding it (the per-connection tier
     // relay and the session floor relay) are independent OnReps that can land in
     // either order. If the floor arm silently assumed a tier, a floor OnRep
     // arriving first would compute tier 0's delay (1) while the server's
-    // no-entry fallback still answers max(floor, 2) — the exact two-ends-diverge
+    // no-entry fallback still answers max(floor, 4) — the exact two-ends-diverge
     // bug the C2 ruling exists to prevent. Keying on ARRIVAL (below) is what
     // makes the two ends agree during that window.
     //
@@ -138,7 +144,7 @@ public:
     {
         if (!m_hasReceivedTier)
         {
-            return applyRelayDelayFloor(m_config.forcedInputLatencyTicks, m_config);
+            return applyRelayDelayFloor(m_config.rttTierInputDelays[kMaxConnectionTierIndex], m_config);
         }
         return tierInputDelayTicks(m_tierIndex, m_config);   // floored inside
     }

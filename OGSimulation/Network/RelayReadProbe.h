@@ -16,7 +16,7 @@
 //   * "is the SCHEDULE being CONSUMED?" — `resolveScheduledRelayedInput` had zero
 //     log calls, so a proxy that missed on every single probe and a proxy that hit
 //     on every single probe produced byte-identical logs. `[CollectInput] …
-//     source=RelayStore hasStore=1` reports that a store EXISTS, which is a
+//     source=RemoteInputCache hasStore=1` reports that a store EXISTS, which is a
 //     different claim and is present either way.
 //   * "how often does the relay ring actually ARRIVE?" — the OnRep was unlogged, so
 //     T9's `depth >= gap_p99 + margin` rule had no gap distribution to be derived
@@ -36,7 +36,7 @@
 //                      tick.
 //   RelayArrivalProbe  GAME thread. Fed from the relay-ring arrival callback bound
 //                      in registerPredictionOwner (USimmableUpdateComponent::
-//                      OnRep_RelayedInputRing -> populateRelayedInputStore).
+//                      OnRep_RelayedInputRing -> populateRemoteInputCache).
 //                      Window driven by SAMPLE COUNT — the game thread has no
 //                      simulation tick to hand, and inventing one would be a
 //                      second clock to keep honest.
@@ -56,13 +56,13 @@
 // They are SEPARATE OBJECTS with SEPARATE WINDOWS. A single shared window would
 // have one thread reset counters the other thread is mid-increment on, corrupting
 // a whole window's totals — strictly worse than the torn-SLOT debt
-// RelayedInputStore.h documents and accepts, because a torn slot costs one input
+// RemoteInputCache.h documents and accepts, because a torn slot costs one input
 // on one proxy for one tick while a torn window reset costs the entire
 // measurement. Neither object is touched by the other's thread, so no atomics and
 // no seam are needed; that is the whole reason for the split.
 //
 // NEITHER OBJECT LOGS. They accumulate and hand back a summary struct; the caller
-// owns the logger and does the SIMLOG. Same convention `populateRelayedInputStore`
+// owns the logger and does the SIMLOG. Same convention `populateRemoteInputCache`
 // and `RemoteMoveQueue` already follow (core containers do not log), and it is
 // what lets the Low-Level-Tests assert on the numbers rather than on strings.
 //
@@ -129,8 +129,9 @@ enum class ScheduledRelayedReadOutcome : std::uint8_t
 //                capture ticks and is ABSENT. A COVERAGE HOLE: the sender produced
 //                that tick and it was clobbered in the replace-latest relay ring
 //                before UE replicated it. THIS is the class the depth hypothesis
-//                predicts, and the only one raising `relayRedundancyDepthTicks`
-//                would move.
+//                predicts, and the only one raising the ring's retention depth
+//                would move (item 63 / RN-13, 2026-08-16: that was a session-
+//                configurable knob; it is retired — see RN-13, ReviewNotes.md).
 //   AboveNewest  probeTick is NEWER than anything the store holds. The receiver is
 //                asking for a capture that has not been produced or has not landed.
 //                DEPTH IS IRRELEVANT here — no amount of ring redundancy delivers a
@@ -654,7 +655,7 @@ private:
 //
 // The measurement is therefore: the newest `captureTick` in the ring on THIS
 // arrival minus the newest on the PREVIOUS arrival, per component. Same units as
-// depth, immune to local clock skew, and free — `populateRelayedInputStore` already
+// depth, immune to local clock skew, and free — `populateRemoteInputCache` already
 // walks every entry, so T19 added the newest-captureTick field to the report it
 // already returned rather than adding a second walk.
 //

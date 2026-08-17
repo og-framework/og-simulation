@@ -10,7 +10,7 @@
 #include <vector>
 
 // ---------------------------------------------------------------------------
-// RelayedInputStore<InputT> — the CLIENT-side read cache of RELAYED inputs.
+// RemoteInputCache<InputT> — the CLIENT-side read cache of RELAYED inputs.
 // (og-netcode-v2-input-relay T5; RelayDelaySpectrumDesign.md §4, §5.2, §8.6/§8.7.)
 //
 // WHAT IT IS. One store per REMOTE character (a character this client does not
@@ -25,15 +25,15 @@
 //     the correction state carries, i.e. replay exactly what the authority did.
 //
 // ---------------------------------------------------------------------------
-// THE THREE NAMES, AND WHY THIS IS NOT A ClientInputDelayLine
+// THE THREE NAMES, AND WHY THIS IS NOT A LocalInputCache
 // (architect ruling 2026-08-04; vocabulary lockdown in the design doc's §4 table).
 //
-//   ClientInputDelayLine<InputT>  the LOCAL character's own captures, read at
+//   LocalInputCache<InputT>       the LOCAL character's own captures, read at
 //                                 `T - d`. Sender-side delay mechanism.
 //   FRelayedInputRing (+ codec)   the WIRE payload, server -> peers. Bytes.
-//   RelayedInputStore<InputT>     THIS: the client's typed read-side cache.
+//   RemoteInputCache<InputT>      THIS: the client's typed read-side cache.
 //
-// The earlier plan was to reuse ClientInputDelayLine. Three accumulated facts
+// The earlier plan was to reuse LocalInputCache. Three accumulated facts
 // flipped that trade, and the third is decisive:
 //
 //   1. THE PAYLOAD DIFFERS. A slot here is `(dA, input)`, not `InputT` — reuse
@@ -43,7 +43,7 @@
 //      T7's ladder must SEE the miss in order to fall back to last-known. The
 //      store has no neutral on the lookup path at all.
 //   3. THE WIPE DIVERGES — and this is the one that makes reuse unsafe rather
-//      than merely awkward. `ClientInputDelayLine::clear()` is CONTRACTUALLY swept
+//      than merely awkward. `LocalInputCache::clear()` is CONTRACTUALLY swept
 //      by SimulationNetSync::wipeAllForResync, because a local capture is keyed
 //      to the pre-resync PREDICTION clock and stops meaning anything when that
 //      clock jumps. A relayed entry is keyed to the SENDER's capture tick — a
@@ -117,7 +117,7 @@
 // the max consecutive `fallback()` run so K is set from data.
 //
 // THE NEUTRAL IS INJECTED, NEVER `InputT{}` — the same load-bearing distinction
-// ClientInputDelayLine documents: `simulatableBrawler::getZeroPlayerInput()`
+// LocalInputCache documents: `simulatableBrawler::getZeroPlayerInput()`
 // builds forward vectors of (0,0,1), while a value-initialised PlayerInput would
 // carry a (0,0,0) forward vector into normalisation. The default `InputT{}` here
 // exists purely so an engine-free unit test can construct a store without a game
@@ -144,13 +144,13 @@
 //  2026-08-04 pre-dispatch review and are stated here as FACT, not as hope.)
 //
 // WRITER: `USimmableUpdateComponent::OnRep_RelayedInputRing` fires on the GAME
-// thread and calls straight through to `populateRelayedInputStore` below.
+// thread and calls straight through to `populateRemoteInputCache` below.
 // READER: `SimulationNetSync::collectInputAll` (T7) and
 // `SimulationNetSync::collectResimInputAll` (T6, which relocated it off
 // SimulationReconciliation) read on the PHYSICS
 // thread under `bTickPhysicsAsync`.
 //
-// DO NOT COPY ClientInputDelayLine's "NOT thread-safe; single-threaded by
+// DO NOT COPY LocalInputCache's "NOT thread-safe; single-threaded by
 // construction... both on the PHYSICS thread" claim along with the ring mechanics.
 // That sentence is TRUE for the delay line (its push and its read are two
 // statements inside one `collectInputAll` call) and FALSE for this type. A false
@@ -200,13 +200,13 @@
 // Low-Level-Tests drive the REAL ingest path against a std::vector-backed buffer.
 //
 // NAMESPACE NOTE: global namespace, matching the rest of the OGSim core (same note
-// as ClientInputDelayLine / ConnectionTierTable / SimulatableList). The design
+// as LocalInputCache / ConnectionTierTable / SimulatableList). The design
 // corpus writes `ogsim::` but no such namespace exists in this tree.
 // ---------------------------------------------------------------------------
 
-// Slot count of a default-constructed RelayedInputStore.
+// Slot count of a default-constructed RemoteInputCache.
 //
-// Declared as a FREE constant — exactly like `kClientInputDelayLineCapacityTicks`,
+// Declared as a FREE constant — exactly like `kLocalInputCacheCapacityTicks`,
 // and for the same reason: config-layer code must be able to derive bounds from it
 // without naming an arbitrary `InputT` to reach a static member of a class
 // template.
@@ -219,10 +219,25 @@
 // `captureTick + capacity + wire`, so `dA <= capacity - rollbackWindowHardCap`.
 // Lower this number and the floor's hard cap must follow it down, or a configured
 // floor silently schedules reads against entries that have already been evicted.
-inline constexpr std::size_t kRelayedInputStoreCapacityTicks = 64u;
+inline constexpr std::size_t kRemoteInputCacheCapacityTicks = 64u;
+
+// ---------------------------------------------------------------------------
+// Formerly RelayedInputStore (renamed 2026-08-16, RN-14).
+//
+// WIPE ASYMMETRY — THE SIGNAL THE OLD, ASYMMETRIC NAMES WERE CARRYING.
+// This cache is SENDER-KEYED and is deliberately NOT wiped by
+// SimulationNetSync::wipeAllForResync — see "THE WIPE DIVERGES" above and the
+// non-wipe comment at the wipeAllForResync call site. Its counterpart,
+// LocalInputCache (Network/LocalInputCache.h), is CLOCK-KEYED and IS wiped:
+// its keys are the local prediction clock's tick numbers, which a hard resync
+// invalidates. `LocalInputCache` / `RemoteInputCache` are now symmetric
+// names; wiping this cache too would leave a proxy blind for a window after
+// every resync (the 2026-08-04 failure) — restated here because the symmetric
+// names no longer carry that warning on their own.
+// ---------------------------------------------------------------------------
 
 template <typename InputT>
-class RelayedInputStore
+class RemoteInputCache
 {
 public:
     // The result of the `findLatest()` DERIVATION. Returned by value because it is
@@ -236,17 +251,17 @@ public:
         InputT        input{};
     };
 
-    static constexpr std::size_t kDefaultCapacityTicks = kRelayedInputStoreCapacityTicks;
+    static constexpr std::size_t kDefaultCapacityTicks = kRemoteInputCacheCapacityTicks;
 
-    explicit RelayedInputStore(InputT neutralInput = InputT{},
-                               std::size_t capacity = kDefaultCapacityTicks)
+    explicit RemoteInputCache(InputT neutralInput = InputT{},
+                              std::size_t capacity = kDefaultCapacityTicks)
         : m_neutral(std::move(neutralInput))
         , m_slots(capacity == 0u ? kDefaultCapacityTicks : capacity)
     {
     }
 
     // Replace the injected game zero after construction — the same
-    // order-independence ClientInputDelayLine::setNeutralInput provides, so the
+    // order-independence LocalInputCache::setNeutralInput provides, so the
     // composition root need not order itself before every registration.
     void setNeutralInput(const InputT& neutralInput)
     {
@@ -266,11 +281,11 @@ public:
     // Record a relayed entry.
     //
     // LAST-WINS on an already-resident capture tick, matching both
-    // ClientInputDelayLine::push and the wire codec's writeLatest: the codec
+    // LocalInputCache::push and the wire codec's writeLatest: the codec
     // explicitly permits REWRITING a resident tick with a fresher `dA` (a re-stamp
     // after a delay change), so the store must accept the same rewrite rather than
     // treating the first arrival as immutable. This is also what makes the ingest
-    // idempotent, which is what lets `populateRelayedInputStore` re-consume the
+    // idempotent, which is what lets `populateRemoteInputCache` re-consume the
     // whole ring on every arrival instead of diffing.
     //
     // Returns false — changing nothing — only for `kNoInputCaptureTick`, which is
@@ -303,7 +318,7 @@ public:
 
     // PURE HIT/MISS lookup — the store NEVER invents a neutral on this path.
     //
-    // That is the whole difference from ClientInputDelayLine::at(), and it is what
+    // That is the whole difference from LocalInputCache::at(), and it is what
     // keeps a miss VISIBLE to T7's three-step ladder (probe -> verify -> fallback)
     // and to T6's resolution table, instead of being silently swallowed as a
     // neutral that both layers would then be unable to distinguish from a real
@@ -455,7 +470,7 @@ public:
     // requires, because an incompatible peer re-replicates its ring forever and an
     // ungated log would fire on every single replication. The latch lives on the
     // store because the store is the only per-character object the ingest path
-    // has; `populateRelayedInputStore` itself is stateless and logger-free (core
+    // has; `populateRemoteInputCache` itself is stateless and logger-free (core
     // containers do not log — the caller owns the logger, exactly as
     // RemoteMoveQueue's too-far-future drop is warned by SimulationNetSync).
     bool shouldLogVersionMismatchOnce()
@@ -523,7 +538,7 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// populateRelayedInputStore — THE ingest, in one place, carrying the wire fence.
+// populateRemoteInputCache — THE ingest, in one place, carrying the wire fence.
 //
 // Lives in core beside the store (the RelayedInputRingCodec precedent) so the
 // UE-free Low-Level-Tests exercise the REAL path rather than a mirror of it: the
@@ -646,8 +661,8 @@ struct RelayedInputIngestReport
 };
 
 template <typename InputType, typename RingT>
-RelayedInputIngestReport populateRelayedInputStore(RelayedInputStore<InputType>& store,
-                                                   const RingT&                  ring)
+RelayedInputIngestReport populateRemoteInputCache(RemoteInputCache<InputType>& store,
+                                                  const RingT&                  ring)
 {
     RelayedInputIngestReport report;
     report.versionOnWire = relayedInputRing::getWireFormatVersion(ring);

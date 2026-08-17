@@ -209,6 +209,37 @@ struct ResimGateWindowSummary
     // ~22 per mille (1-3 %).
     std::uint32_t requestRatePerMille = 0u;
 
+    // --- [item 57 / RN-6] THE SURVIVING-ANCHOR COUNT. -------------------------
+    // Fed from `SimulationReconciliation::consumeResimAnchorsAll()`'s return, at
+    // the SAME call site `noteFinish` is fed from — the `[Resim.Finish]` apply
+    // edge in `SimulationManager::onPostGameSimulation` — NOT from `noteCheck`'s
+    // `checkDivergenceAll` call site like `checks`/`declined`/`requested` above.
+    // It still lands in THIS window because the window is driven by `noteCheck`
+    // alone and every other apply-edge counter (`prepares`, `finishes`,
+    // `replayTicks`, `replayOverruns`, `freshClobbersAvoided`) already
+    // accumulates the same way.
+    //
+    // Characters whose anchor SURVIVED the completion-edge CAS — i.e. a
+    // correction landed on the game thread mid-replay, raising the anchor past
+    // the value `prepareResimAll` captured, so the CAS comparing the two failed
+    // and the anchor stays pending. That is the mechanism working, not a defect:
+    // the gate stays OPEN and re-requests next frame with a DIFFERENT anchor,
+    // which is why a nonzero reading here should be visible in `requests` above
+    // WITHOUT a matching `repeatRequests` (the next request's anchor differs from
+    // this one's) — see `SimulationReconciliation::consumeResimAnchorsAll`'s own
+    // comment for the full argument.
+    //
+    // Placed on the `[ResimProbe.Gate]` line by explicit ruling (RN-6), not on
+    // `[ResimProbe.Apply]` where its call site would otherwise suggest: a
+    // surviving anchor is a property of the GATE (it stays open), not of the
+    // apply edge that observed it.
+    //
+    // ⚠ EXPECT NONZERO, POSSIBLY LARGE, under the shipped `OnDisagreement`
+    // policy (item 46) — it was STRUCTURALLY near-0 only under the legacy
+    // `FrontierExact` default this probe was archived against; do not read a
+    // nonzero window here as a regression without checking which policy shipped.
+    std::uint32_t survivingAnchors = 0u;
+
     // --- [item 45] THE DEPTH-POLICY EXCLUSION COUNT. --------------------------
     // CHARACTER-FRAMES on which a character reported `needsResimulation()` but its
     // pending anchor sat more than `rollbackWindowTicks` below that character's own
@@ -453,6 +484,16 @@ public:
         return true;
     }
 
+    // --- [item 57 / RN-6] one completed resim's surviving-anchor count ------
+    // Takes a count rather than being a per-character call, matching
+    // `noteReplayOverruns`/`noteCorrectionProtections`: `consumeResimAnchorsAll`
+    // sweeps every character in one call and hands back one total. Fed from the
+    // `[Resim.Finish]` apply edge, beside `noteFinish` — see
+    // `ResimGateWindowSummary::survivingAnchors` for why that call site's count
+    // still lands correctly in the window `noteCheck` drives, and why it is
+    // surfaced on the Gate line rather than the Apply line despite the call site.
+    void noteSurvivingAnchors(std::uint32_t count) { m_survivingAnchors += count; }
+
     // --- [item 45] the depth-policy exclusion count for THIS frame ----------
     // Takes a count rather than being a per-event call, for the same reason
     // `noteReplayOverruns` does: `checkDivergenceAll` sweeps every character and can
@@ -607,6 +648,7 @@ public:
         out.declined            = m_declined;
         out.requested           = m_requested;
         out.requestRatePerMille = perMille(m_requested, m_checks);
+        out.survivingAnchors    = m_survivingAnchors;
         out.deepAnchorExclusions = m_deepAnchorExclusions;
 
         out.requests            = m_requests;
@@ -643,6 +685,7 @@ private:
     void resetWindow()
     {
         m_checks = m_declined = m_requested = 0u;
+        m_survivingAnchors = 0u;
         m_deepAnchorExclusions = 0u;
         m_requests = m_grants = m_repeatRequests = 0u;
         m_clampedGrants = 0u;
@@ -667,6 +710,11 @@ private:
     std::uint32_t m_checks    = 0u;
     std::uint32_t m_declined  = 0u;
     std::uint32_t m_requested = 0u;
+
+    // [item 57 / RN-6] Surviving-anchor count this window; see
+    // ResimGateWindowSummary::survivingAnchors. Fed from the apply edge, not from
+    // `noteCheck` — see `noteSurvivingAnchors`.
+    std::uint32_t m_survivingAnchors = 0u;
 
     // [item 45] Depth-policy exclusions this window; see deepAnchorExclusions.
     std::uint32_t m_deepAnchorExclusions = 0u;

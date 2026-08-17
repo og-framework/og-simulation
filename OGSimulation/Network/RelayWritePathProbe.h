@@ -44,7 +44,10 @@
 //   * "1.003 sim ticks per frame" measures the SIM's pacing. The relay writes are
 //     paced by PACKET ARRIVAL, which is a different clock with different jitter.
 //
-// And the ring ships at `relayRedundancyDepthTicks = 1` — REPLACE-LATEST. Iris
+// And the ring shipped, at the time this probe was built, at a compiled
+// retention depth of 1 entry — REPLACE-LATEST (item 34 later replaced that
+// write path; item 63 / RN-13 then retired the now-inert depth field itself —
+// see RN-13, ReviewNotes.md). Iris
 // polls a replicated property ONCE PER SERVER GAME-THREAD FRAME and compares the
 // live value against its shadow copy (T20 §4.4 for the cadence, §4.5 for the
 // compare-against-latest semantics: "three writes produce one compare against the

@@ -163,7 +163,7 @@ concept RemoteInputDeliverySink =
 // the sender's tier is replicated owner-only — so stamping is what makes the
 // receiver's scheduled read possible at all (§5.1, decision D5). `uint8_t` is
 // deliberate: the delay is a small tick count (tier delays 1..4 today, floored at
-// most to the ClientInputDelayLine's residency ceiling), and one byte per entry is
+// most to the LocalInputCache's residency ceiling), and one byte per entry is
 // the entire wire cost of the schedule.
 //
 // TWO-PARAMETER (T, InputT) for the same reason RemoteInputDeliverySink is: the

@@ -8,7 +8,6 @@
 #include "OGAssert.h"
 #include "OGSimulation/Network/ConnectionTierTable.h"   // clampRelayDelayFloorTicks (T11)
 #include "OGSimulation/Network/CorrectionRotation.h"    // correctionRotation::clampK (T39)
-#include "OGSimulation/RelayedInputRingCodec.h"         // relayedInputRing::clampDepth (T35)
 #include "OGSimulation/PCTimeManagement/ServerTickClock.h"
 #include "OGSimulation/PCTimeManagement/NetworkTimeEstimator.h"
 #include "OGSimulation/PCTimeManagement/ClientPredictionClock.h"
@@ -115,7 +114,7 @@ public:
                 [this](unsigned int newPredictionTick)
                 {
                     SIMLOG(m_logger, "[TimeResync.Wipe] newPredictionTick=%u", newPredictionTick);
-                    // [item 48] THE SLOT-PROVENANCE DUMP's SECOND CALL SITE IS NOT
+                    // [item 48] THE SLOT-PROVENANCE LOG's SECOND CALL SITE IS NOT
                     // HERE — it is inside `wipeAllForResync`, one line down, and
                     // that placement is deliberate rather than incidental. Putting
                     // it here would have added a method to the four mock
@@ -180,38 +179,21 @@ public:
             clampRelayDelayFloorTicks(requestedFloorTicks, m_timeConfig);
     }
 
-    // [T35 / og-netcode-v2-input-relay] THE one writable location for the session
-    // relay ring depth — the door the composition root's
-    // `[OGNetcode] RelayRedundancyDepthTicks` ini override writes through.
-    //
-    // SERVER-ONLY, and unlike the floor above it is NOT replicated. The depth is
-    // passed per write into the ring codec and is deliberately absent from the
-    // wire: a receiver never needs it, it just iterates whatever entries arrived
-    // (see the DEPTH IS SESSION-FIXED note in RelayedInputRingCodec.h). So this
-    // setter has no OnRep counterpart and no client-side intake point.
-    //
-    // ONE-SHOT AT COMPOSITION. The same codec note records that SHRINKING the
-    // depth mid-session does not reclaim already-allocated ring entries — a
-    // documented non-scenario, safe only because TimeConfig is built once per
-    // session, before the first relay write. This setter exists to serve that one
-    // call; it is not a runtime tuning knob and must not acquire a cvar.
-    //
-    // CLAMPED HERE TOO, with the same shared guard the intake and the write site
-    // call (`relayedInputRing::clampDepth`, idempotent). 0 and negatives clamp UP
-    // to 1: a depth-0 ring retains nothing, which is a silently disabled relay,
-    // not "off".
-    void setRelayRedundancyDepthTicks(int32_t requestedDepthTicks)
-    {
-        m_timeConfig.relayRedundancyDepthTicks =
-            static_cast<int32_t>(relayedInputRing::clampDepth(requestedDepthTicks));
-    }
+    // ⛔ RETIRED (og-netcode-v2-input-relay item 63 / RN-13, 2026-08-16): there is
+    // deliberately no relay-ring-depth setter here any more (its old identifier
+    // is on record in RN-13, ReviewNotes.md). It wrote a session-configurable
+    // retention depth into the outbound relay ring's replace-latest write path;
+    // item 34 replaced that write path with bare-C1 flush-on-poll, whose stage
+    // capacity is `relayedInputRing::kMaxDepth` — a compile-time constant with no
+    // setter to receive a configured value — and item 63 removed the now-inert
+    // setter along with the field and its ini intake chain.
 
     // [T39 / og-netcode-v2-input-relay] THE one writable location for the session
     // correction-state rotation width — the door the composition root's
     // `[OGNetcode] CorrectionRotationK` ini override writes through.
     //
-    // SERVER-ONLY and NOT replicated, for the same reason as the ring depth above
-    // and unlike the delay floor: only the authority runs
+    // SERVER-ONLY and NOT replicated, for the same reason as the delay floor's
+    // ONE-SHOT siblings: only the authority runs
     // `SimulationNetSync::sendCorrectionAll`, so a client's copy of this value
     // would have no reader, and a receiver reconciles against whatever
     // corrections arrive without needing to know the sender's cadence. So this
@@ -237,7 +219,7 @@ public:
     // session RESIM-GATE TRIGGER POLICY — the door the composition root's
     // `[OGNetcode] ResimTriggerPolicy` ini override writes through.
     //
-    // ROLE-AGNOSTIC, and unlike the three knobs above that is the simplest correct
+    // ROLE-AGNOSTIC, and unlike the two knobs above that is the simplest correct
     // answer rather than a considered exception: the gate only exists on a
     // predicting client (an authority allocates no correction caches and never
     // rewinds), so applying the value on a server is inert. Writing it on both keeps
@@ -347,18 +329,22 @@ public:
                 //
                 // [item 47] AND the same sweep now reports how many corrected
                 // slots it was refused permission to overwrite, split fresh/stale.
-                // Both counts ride this ONE call rather than a second sweep — they
-                // are derived from the same per-character pass, and separating
-                // them would let the two describe different replay ticks. No new
-                // log line: they appear as two fields on the existing
+                // All three counts ride this ONE call rather than a second sweep —
+                // they are derived from the same per-character pass, and
+                // separating them would let them describe different replay ticks.
+                // No new log line: they appear as fields on the existing
                 // `[ResimProbe.Apply]` line (T19 volume discipline; item 47
                 // forbids new `[Resim.` / `[ResimCheck.` lines outright).
-                unsigned int freshProtections = 0u;
-                unsigned int staleProtections = 0u;
-                m_resimGateProbe.noteReplayOverruns(
-                    m_reconciliation.postResimulationAll(
-                        *m_lastStep, &freshProtections, &staleProtections));
-                m_resimGateProbe.noteCorrectionProtections(freshProtections, staleProtections);
+                //
+                // [item 55] The sweep returns one `ResimSweepDiagnostics` by value
+                // (RN-3, option B) instead of a return value plus two out-pointers
+                // — `auto` here keeps this call site duck-typed on the
+                // reconciliation peer, exactly as `m_netSync.collectInputAll`'s
+                // return is captured a few lines up.
+                const auto resimDiagnostics = m_reconciliation.postResimulationAll(*m_lastStep);
+                m_resimGateProbe.noteReplayOverruns(resimDiagnostics.discards);
+                m_resimGateProbe.noteCorrectionProtections(
+                    resimDiagnostics.freshProtections, resimDiagnostics.staleProtections);
 
                 // Apply-resim edge: Chaos still in resim mode but our clock has
                 // caught up (advanceResimulation brought m_resimulationTick up
@@ -394,8 +380,15 @@ public:
                     // And on THIS edge rather than at prepare, because ~20 % of
                     // prepares never reach here (item 42's stranded class) and an
                     // anchor consumed at prepare would take its correction with it.
-                    m_reconciliation.consumeResimAnchorsAll();
-                    // [item 48] THE SLOT-PROVENANCE DUMP — one Verbose line per
+                    //
+                    // [item 57 / RN-6] THE RETURN VALUE IS NO LONGER DISCARDED. It is
+                    // fed to `m_resimGateProbe.noteSurvivingAnchors`, surfaced as a
+                    // field on the `[ResimProbe.Gate]` line — see
+                    // `SimulationReconciliation::consumeResimAnchorsAll`'s comment for
+                    // why that promotion's old blocker ("reads 0 until item 46")
+                    // expired the day item 46 shipped.
+                    m_resimGateProbe.noteSurvivingAnchors(m_reconciliation.consumeResimAnchorsAll());
+                    // [item 48] THE SLOT-PROVENANCE LOG — one Verbose line per
                     // character, ONCE PER COMPLETED RESIM. This edge is chosen
                     // because it is the only point at which a replay's whole
                     // effect on the cache is finished and visible: the span has
@@ -404,11 +397,12 @@ public:
                     // show the map the resim was ABOUT to change.
                     //
                     // ⛔ It is VERBOSE-ONLY and reads nothing any decision uses —
-                    // see `SimulationReconciliation::dumpSlotProvenanceAll` and
-                    // SlotStateProvenance.h. At the shipped `LogOGResimProbe=
-                    // Warning` these lines do not exist, which is why a per-resim
-                    // 60-character-per-character dump is affordable at all.
-                    m_reconciliation.dumpSlotProvenanceAll();
+                    // see `SimulationReconciliation::getDiagnostics().
+                    // logSlotProvenanceAll` and SlotStateProvenance.h. At the
+                    // shipped `LogOGResimProbe=Warning` these lines do not exist,
+                    // which is why a per-resim 60-character-per-character line is
+                    // affordable at all.
+                    m_reconciliation.getDiagnostics().logSlotProvenanceAll();
                 }
             }
             else
@@ -437,9 +431,9 @@ public:
                 ? static_cast<uint32_t>(m_timeConfig.rollbackWindowTicks)
                 : 0u;
 
-        unsigned int deepAnchorSkips = 0u;
+        unsigned int diagnosticDeepAnchorSkips = 0u;
         const unsigned int correctionTick =
-            m_reconciliation.checkDivergenceAll(maxAnchorDepthTicks, &deepAnchorSkips);
+            m_reconciliation.checkDivergenceAll(maxAnchorDepthTicks, &diagnosticDeepAnchorSkips);
 
         // ⛔ [item 45] THERE IS NO RATE CEILING HERE, AND THAT IS A RULING RATHER THAN
         // AN OMISSION — a `resimCooldownTicks` suppression branch stood on this line
@@ -463,12 +457,14 @@ public:
         // always been read against nothing. This counts instead of logging, and the
         // per-window flush below is at Warning on its own category.
         //
-        // [item 45] `deepAnchorSkips` rides the same call rather than a new log line:
-        // T19 volume discipline, and item 45 forbids new `[Resim.` / `[ResimCheck.`
-        // lines outright. It appears as one extra field on the existing
-        // `[ResimProbe.Gate]` line, and it reads a structural 0 under the shipped
-        // legacy policy (which enforces no depth policy for the anchor to fail).
-        m_resimGateProbe.noteDeepAnchorSkips(deepAnchorSkips);
+        // [item 45] `diagnosticDeepAnchorSkips` rides the same call rather than a new
+        // log line: T19 volume discipline, and item 45 forbids new `[Resim.` /
+        // `[ResimCheck.` lines outright. It appears as one extra field on the
+        // existing `[ResimProbe.Gate]` line, and it reads a structural 0 under the
+        // shipped legacy policy (which enforces no depth policy for the anchor to
+        // fail). The count is diagnostic; `checkDivergenceAll`'s underlying skip is
+        // production (see its declaration, `docs/DiagnosticsConventions.md` §4).
+        m_resimGateProbe.noteDeepAnchorSkips(diagnosticDeepAnchorSkips);
         noteDivergenceCheck(requestingResim);
 
         if (!requestingResim)
@@ -515,8 +511,56 @@ public:
     // in ResimGateProbe.h). The adapter reaches it through two NARROW named
     // passthroughs on ASimulationManagerUImpl, not through this accessor, for the
     // same reason `requestInputDelayIncreaseStall` is narrow.
+    //
+    // [T53 / task 59] `editResimGateProbe()` STAYS exactly here — it is a
+    // production write handle (two adapter-side feeders, above), not a
+    // diagnostic read seam, and `getDiagnostics()` / `editDiagnostics()` group
+    // read seams only (see `docs/DiagnosticsConventions.md` §2). Only the
+    // read-only probe accessor that used to sit beside it moves — see the
+    // `Diagnostics` view directly below.
     ResimGateProbe&       editResimGateProbe()       { return m_resimGateProbe; }
-    const ResimGateProbe& getResimGateProbe() const  { return m_resimGateProbe; }
+
+    // =======================================================================
+    // [og-netcode-v2-input-relay task 59] THE RESIM-GATE PROBE'S DIAGNOSTIC
+    // VIEW — RN-9 + amendment, grouped per `docs/DiagnosticsConventions.md`. A
+    // sibling ruling groups `SimulationNetSync`'s four probe accessors the
+    // same way, in the same task.
+    //
+    // ⛔ ONLY THIS READ-ONLY ACCESSOR MOVES. `m_resimGateProbe` itself, every
+    // `note*` call site that feeds it (this class's own `noteDivergenceCheck`
+    // included — private, one production caller every frame, feeds this probe
+    // directly) and `editResimGateProbe()` above are production and are
+    // UNTOUCHED. See `docs/DiagnosticsConventions.md` §2.
+    //
+    // ⚠ [task 59 RULING] Unlike the other four probe accessors this task
+    // groups, this class's pre-existing read-only accessor had ZERO callers
+    // anywhere — no production, no test — before this task. That made the
+    // resim gate probe the one
+    // instrument in the family whose SHIPPED wiring was unproven, on the
+    // family that carried every measurement the `OnDisagreement` ship decision
+    // rested on. RULING: wire a test rather than delete it — see
+    // `ResimGate.Policy.TheResimGateProbeAccessorObservesTheShippedFeed` in
+    // `ResimGatePolicyTest.cpp`, which drives the real `onCheckIsSimilar()`
+    // through a duck-typed manager rig and asserts this view's probe observed
+    // it. Deleting the accessor because "production never calls it" would have
+    // removed the only mechanism that could ever prove this family is wired.
+    //
+    // Nested class, not a free function: it has the same access to
+    // SimulationManager's private members as any other member function — no
+    // friend declaration needed, and the view holds nothing but a reference.
+    // =======================================================================
+    class Diagnostics
+    {
+    public:
+        explicit Diagnostics(const SimulationManager& manager) : m_manager(manager) {}
+
+        const ResimGateProbe& resimGateProbe() const { return m_manager.m_resimGateProbe; }
+
+    private:
+        const SimulationManager& m_manager;
+    };
+
+    Diagnostics getDiagnostics() const { return Diagnostics(*this); }
 
     // Tick of the most recently integrated step — authority tick / prediction tick /
     // resim tick, i.e. whichever step integrateAll just ran. Consumed by the manager's
@@ -601,11 +645,19 @@ private:
         // under the shipped legacy policy, which enforces no depth policy at all.
         // A nonzero reading after item 46's flip means anchors are being stranded and
         // is read against `requested`, not against `checks`.
+        //
+        // [item 57 / RN-6] `survivingAnchors` APPENDED, not inserted, for the same
+        // grep-stability reason `deepSkips` was appended rather than inserted: every
+        // archived line keying on `checks=`/`declined=`/`requested=`/`deepSkips=`
+        // still matches. It is fed from the `[Resim.Finish]` apply edge, not from
+        // this call's own `checkDivergenceAll` sweep — see
+        // `ResimGateWindowSummary::survivingAnchors` for why it still lands in this
+        // window, and why it is on THIS line rather than `[ResimProbe.Apply]`.
         SIMLOG(m_logger,
             "[Warning][ResimProbe.Gate] checks=%u declined=%u requested=%u requestedPerMille=%u "
-            "deepSkips=%u",
+            "deepSkips=%u survivingAnchors=%u",
             window.checks, window.declined, window.requested, window.requestRatePerMille,
-            window.deepAnchorExclusions);
+            window.deepAnchorExclusions, window.survivingAnchors);
 
         // I3 + I4 — the second gate. `refused` is trustworthy as a refusal count
         // because a refusal leaves needsResimulation() true and the request repeats

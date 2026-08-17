@@ -172,14 +172,16 @@
 // be specified; this consumer does not pre-empt that design, it only removes the
 // "no client-side consumer" half of the deferral.
 //
-// **THE CONSUMER IS DORMANT AT THE SHIPPED DEFAULT.** It is consulted only under
-// `resimTriggerPolicy == OnDisagreement`, and the shipped default is
-// `FrontierExact` (see that field for why the ceilings are policy-scoped). So on
-// today's build the depth policy is reachable but inactive; item 46's flip
-// activates it together with the trigger it bounds. That is why the deferral
-// ruling above is amended rather than closed: the escalation path it describes
-// (build the real clamp) is unchanged, and conditions 1 and 2 still read as they
-// did.
+// **THE CONSUMER IS DORMANT ONLY AT THE COMPILED DEFAULT.** It is consulted
+// only under `resimTriggerPolicy == OnDisagreement` (see that field for why
+// the ceilings are policy-scoped), and `FrontierExact` is the compiled
+// default — but NOT the shipped configuration: `OnDisagreement` has been the
+// SHIPPED CONFIGURATION since item 43 (`Config/DefaultEngine.ini:371`), so
+// the depth policy is ACTIVE on today's build, not dormant. Item 46's flip
+// activates it at the compiled-default level too, for a build with no ini
+// override. That is why the deferral ruling above is amended rather than
+// closed: the escalation path it describes (build the real clamp) is
+// unchanged, and conditions 1 and 2 still read as they did.
 // ---------------------------------------------------------------------------
 //
 // See OGBrawlerNetworkModelResearch/arch/proposal_ogbrawler_netcode.md §4 for
@@ -399,17 +401,27 @@ struct TimeConfig
 	//                     with the local prediction. THE DESIGNED TRIGGER.
 	enum class ResimTriggerPolicy { FrontierExact, OnDisagreement };
 
-	// ⛔ THE COMPILED DEFAULT IS `FrontierExact` AND THAT IS THE WHOLE POINT OF
-	// HOW ITEM 45 LANDED: the new mechanism ships DORMANT, reproducing the gate it
-	// replaces, so nothing observable changes by default. Flipping this to
-	// `OnDisagreement` is backlog item 46 and is HARD-BLOCKED on item 30 — with
-	// today's degenerately always-false verdict, "disagrees" is EVERY landing
-	// (~8,759 per 150 s run), i.e. one Chaos rewind per landing: the modelled
-	// 3-6x sustained physics cost of design §4. That is a verdict defect (item 30,
-	// itself behind item 28's magnitude measurement), not a gate defect, and the
-	// 28 -> 30 -> 46 sequencing exists to keep them apart. Do not flip it early
-	// "to see what happens" — the fix-preview measurement design §2.3 describes is
-	// the safe way to ask that question.
+	// ⛔ THE COMPILED DEFAULT IS `FrontierExact` — that is the CODE DEFAULT this
+	// field takes with no ini override, and it is what item 45 landed: the new
+	// mechanism shipped DORMANT at the compiled-default level, reproducing the
+	// gate it replaces, so a build with no override observes no behaviour
+	// change. That is NOT the same question as what actually ships:
+	// `OnDisagreement` has been the SHIPPED CONFIGURATION since item 43
+	// (`Config/DefaultEngine.ini:371` — check that file for the current value,
+	// not this comment), which overrides this compiled default at runtime.
+	// Under today's degenerately always-false verdict, "disagrees" fires on
+	// nearly every landing — item 43 measured `OnDisagreement` triggering on
+	// 86-87% of physics frames at 6.35x/4.18x integration cost, superseding
+	// design §4's earlier 3-6x model. That is a verdict defect (item 30,
+	// itself behind item 28's magnitude measurement), not a gate defect.
+	// Items 28 -> 30 are sequenced as COST REDUCTIONS for a trigger that
+	// already ships, not as blockers preventing it from shipping; item 46
+	// (the *compiled default's* own flip to `OnDisagreement`) remains blocked
+	// on item 30 — that only governs what a build with no ini override runs.
+	// Do not flip the compiled default early "to see what happens" — the
+	// fix-preview measurement design §2.3 describes is the safe way to ask
+	// that question. Full argument: `docs/ResimGatePolicy-rationale.md` §3
+	// point 3, §5, §10.
 	//
 	// ⚠ IT SELECTS A REGIME, NOT JUST A CONDITION. The `rollbackWindowTicks` depth
 	// skip is consulted ONLY under `OnDisagreement`
@@ -425,7 +437,9 @@ struct TimeConfig
 	// applied on both roles so the two TimeConfigs stay identical (the composition
 	// root's `[OGNetcode] ResimTriggerPolicy` intake is role-agnostic); on a server
 	// it simply has no reader.
-	// Default: ResimTriggerPolicy::FrontierExact  (legacy — item 46 flips it)
+	// Code default: ResimTriggerPolicy::FrontierExact — item 46 flips this
+	// compiled default, not what ships. The SHIPPED CONFIGURATION is
+	// `OnDisagreement` (`Config/DefaultEngine.ini:371`, since item 43).
 	ResimTriggerPolicy resimTriggerPolicy = ResimTriggerPolicy::FrontierExact;
 
 	// ⛔ THERE IS NO `resimCooldownTicks`, AND ITS ABSENCE IS A RULING, NOT AN
@@ -463,67 +477,40 @@ struct TimeConfig
 	// Outbound input relay (FRelayedInputRing) — og-netcode-v2-input-relay
 	// -------------------------------------------------------------------------
 
-	// Entry count of the OUTBOUND relay ring — how many of a character's most
-	// recent (captureTick, dA, input) entries the server keeps replicated to the
-	// other clients. NOT the same knob as `redundancyDepthTicks` above: that one
-	// sizes the INBOUND client->server redundancy bundle. The two directions have
-	// different payloads and different failure modes and are tuned separately.
+	// ⛔ RETIRED (og-netcode-v2-input-relay item 63 / RN-13, 2026-08-16): there is
+	// deliberately no session-configurable retention-depth field here any more
+	// (its old identifier is on record in RN-13, ReviewNotes.md, if a future
+	// reader needs it), and its absence is a ruling, not an omission.
 	//
-	// SIZING RULE (RelayDelaySpectrumDesign.md §8.2): once the delay floor is
-	// above zero, a peer READS this ring on a schedule (`captureTick + dA`), so
-	// every capture tick that never made it onto the wire between two successful
-	// replications is a scheduled MISS. Therefore
+	// It used to size the OUTBOUND relay ring's replace-latest write path: how
+	// many of a character's most recent (captureTick, dA, input) entries the
+	// server kept replicated. Item 34 replaced that write path with bare-C1
+	// flush-on-poll (`relayedInputRing::stageArrival` / `flushStagedInto`), whose
+	// stage capacity is `relayedInputRing::kMaxDepth` — a CONSTANT, taken
+	// directly — so the field had named a quantity that no longer existed on the
+	// live relay path since item 34, and stayed only as an inert, correctly-
+	// clamped knob (T43 finding 5). Item 63 removed it, its ini key, its intake
+	// chain and its startup proof line outright.
 	//
-	//     depth >= (measured ticks between successful relay replications) + margin
+	// THE TRAP THIS RETIREMENT MUST NOT REOPEN, carried forward rather than
+	// re-discovered: wiring ANY depth knob into the flush stage's capacity
+	// degenerates bare-C1 back into replace-latest — silently, no assert, no log
+	// line — and it cost T37 plus item 34 to find the first time. RN-13 declined
+	// a tombstone comment at `kMaxDepth` itself (RelayedInputRingCodec.h); the
+	// machine-checked fence that replaces it lives in
+	// `Network/RelayRedundancyDepthTest.cpp` instead, and it is a compile error
+	// (not a silent regression) if a future change gives `stageArrival` a depth
+	// parameter to receive one.
 	//
-	// [T22/T33] THAT MEASUREMENT NOW EXISTS — do not go looking for it again. The
-	// relay write-path probe's burst histogram (server writes per game-thread
-	// frame, one measured 90 s run: 75 windows max=2, 3 windows max=3, none >= 4)
-	// is the number the sizing rule wants, and `impl/impl_notes_task33.md` §4
-	// derives depth 2 from it (~99.6-99.9 % end-to-end delivered, +71.5 B/tick per
-	// character over depth 1). The rule is unchanged and still binds: raise this
-	// against a re-measured histogram, never on intuition. A steady-state
-	// `writesPerFrame max` of 3 means depth 2 has no headroom left and is the
-	// escalation trigger, not a reason to nudge the number.
+	// A genuine redundancy successor is filed and gated on item 40 (the wire
+	// diet) — see RN-13 in ReviewNotes.md for the sizing argument. If it ships,
+	// it is a NEW, differently-named knob: "entries retained by a write path"
+	// and "already-sent ticks re-included in a flush" are different quantities,
+	// and reusing this field's old identifier would make every archived
+	// measurement that quotes it ambiguous.
 	//
-	// THE COMPILED DEFAULT STAYS 1 — degenerate, byte-for-byte today's behaviour
-	// when nothing overrides it. The session value is CONFIGURED, not recompiled:
-	// [T35] the composition root reads `[OGNetcode] RelayRedundancyDepthTicks` from
-	// the ini on the SERVER (the relay tap is authority-side) and pushes it through
-	// `SimulationManager::setRelayRedundancyDepthTicks`. Server-only and NOT
-	// replicated — depth is passed per write and never rides the wire, because the
-	// receiver just iterates what arrived (RelayedInputRingCodec.h).
-	//
-	// DELIBERATELY INDEPENDENT OF `relayDelayFloorTicks` (§11 Q3): the floor sets
-	// how far ahead inputs are scheduled, this sets how much history survives a
-	// replication gap. A `depth = f(floor)` derivation was considered and REJECTED
-	// for now — it cannot be written honestly before the T9 cadence measurement
-	// exists. Raising the floor without raising this simply means more scheduled
-	// misses (self-healed by the next correction), not a correctness break.
-	//
-	// Clamped to [1, relayedInputRing::kMaxDepth = 8] by ONE shared guard,
-	// `relayedInputRing::clampDepth`, called at every point that can set it: the
-	// ini intake at the composition root, `setRelayRedundancyDepthTicks`, and once
-	// more at the ring write site. It is idempotent, which is what makes the
-	// repetition safe. 0 and negatives clamp UP to 1 — 0 is not "off", it is a ring
-	// that retains nothing, i.e. a silently disabled relay. The upper bound is the
-	// per-character wire budget (RelayedInputRingCodec.h).
-	//
-	// ⛔ [T34] INERT UNDER FLUSH-ON-POLL — READ THIS BEFORE TUNING IT. Item 34
-	// replaced the replace-latest write path with bare C1 flush-on-poll: arrivals
-	// are STAGED and the whole stage is published into the ring once per Iris poll
-	// (`relayedInputRing::stageArrival` / `flushStagedInto`). The stage's capacity is
-	// `relayedInputRing::kMaxDepth` — a CONSTANT, taken directly — so nothing on the
-	// live relay path reads this field any more. Its meaning is UNCHANGED
-	// ("retention depth of the replace-latest write path"); that path simply stopped
-	// running, which is precisely why it was left with one meaning rather than
-	// acquiring a second (T43 finding 5). Raising it now changes nothing on the wire.
-	// The clamp, the ini intake, the setter and the `[RelayDepth] session depth`
-	// proof line all stay live and correct — item 35's Gate-1 tooling keeps working —
-	// and that line carries an `(inert under flush)` suffix so it cannot lie by
-	// omission.
-	// Default: 1
-	int32_t relayRedundancyDepthTicks = 1;
+	// If a depth knob is ever reintroduced here, argue against this block, not
+	// merely against its absence.
 
 	// THE FLOOR LEVER — the session-scoped minimum effective Layer-1 input delay,
 	// in ticks. (RelayDelaySpectrumDesign.md §3, §6, §10, §11 Q1/Q2/Q5.)
@@ -560,15 +547,27 @@ struct TimeConfig
 	//
 	// UNIFORM-D FAIRNESS MODE (§11 Q5) is a config VALUE, not a feature: once
 	// `relayDelayFloorTicks >= max(rttTierInputDelays)` every derivation path —
-	// tier, LAN override, and the no-tier `forcedInputLatencyTicks` fallback —
-	// collapses to exactly this value, so every sender is scheduled with the same
-	// D and no player is advantaged by their connection.
+	// tier, LAN override, and the no-tier fallback (`rttTierInputDelays[
+	// kMaxConnectionTierIndex]` since item 62 / RN-12) — collapses to exactly this
+	// value, so every sender is scheduled with the same D and no player is
+	// advantaged by their connection. ACTIVE on the shipped config today (floor 6
+	// vs max tier delay 4) and otherwise invisible in the logs — see
+	// `classifyRelayDelayFloor` (ConnectionTierTable.h), which item 62 added
+	// specifically to surface this at startup.
+	//
+	// [item 62 / RN-12] ALSO OWNS THE HICCUP-ABSORPTION RATIONALE the retired
+	// no-tier-baseline field (see RN-12, ReviewNotes.md, for its old identifier)
+	// used to carry: deliberately trading a small constant input lag for the
+	// ability to absorb short network hiccups without a visible re-simulation
+	// pop. That rationale now describes THIS field, not the no-tier fallback —
+	// the fallback is a policy choice about which tier to assume before one is
+	// known, not a hiccup-absorption mechanism in its own right.
 	//
 	// CLAMPED, and the ceiling is DERIVED, not a literal (review finding A5):
 	// effective values are capped at
-	// `kClientInputDelayLineCapacityTicks - rollbackWindowHardCap` (= 64 - 20 = 44
+	// `kLocalInputCacheCapacityTicks - rollbackWindowHardCap` (= 64 - 20 = 44
 	// at current defaults). Beyond that cap the client's own capture for the
-	// scheduled tick has already been evicted from `ClientInputDelayLine` before
+	// scheduled tick has already been evicted from `LocalInputCache` before
 	// it can be consumed, and the whole scheduled regime silently degenerates
 	// instead of failing loudly. The clamp is enforced at BOTH intake points (the
 	// ini override at the composition root and the client's floor OnRep) and once
@@ -583,9 +582,11 @@ struct TimeConfig
 	// this field is written from that OnRep. §11 Q6's deferred dynamic-floor policy
 	// needs no new mechanism: it writes this field and the property again.
 	//
-	// RELATED KNOB: `relayRedundancyDepthTicks` above. Deliberately independent
-	// (§11 Q3) — the floor sets how far ahead inputs are scheduled, the depth sets
-	// how much history survives a replication gap.
+	// RELATED, RETIRED KNOB (§11 Q3): this field used to be deliberately
+	// independent of a session-configurable relay ring retention depth — the
+	// floor sets how far ahead inputs are scheduled, that depth set how much
+	// history survived a replication gap. That depth field is gone (item 63 /
+	// RN-13 — see the retirement block just above this one).
 	// Default: 0 (degenerate — today's behaviour, byte-for-byte)
 	int32_t relayDelayFloorTicks = 0;
 
@@ -697,27 +698,35 @@ struct TimeConfig
 	// max is the identity, so everything documented in this section is unchanged.
 	// -------------------------------------------------------------------------
 
-	// Baseline Layer-1 input-delay in ticks, applied when NO per-connection tier
-	// is available: before the first authoritative tier replicates to a client,
-	// and for any Address the server has never sampled. Once a tier IS known, the
-	// per-tier value in `rttTierInputDelays` REPLACES this baseline — the two are
-	// NOT additive (locked 2026-07-19, backlog C2; the earlier additive draft
-	// algebraically cancelled to a constant).
+	// ⛔ RETIRED (og-netcode-v2-input-relay item 62 / RN-12, 2026-08-16): there is
+	// deliberately no dedicated no-tier-baseline field here any more (its old
+	// identifier is on record in RN-12, ReviewNotes.md, if a future reader needs
+	// it), and its absence is a ruling, not an omission. It used to hold the
+	// baseline Layer-1 input-delay applied when NO per-connection tier is
+	// available (before the first
+	// authoritative tier replicates to a client, and for any Address the server
+	// has never sampled). The window it served is bounded to a handful of
+	// frames — `ConnectionTierTable::onRttSample` seeds a brand-new connection at
+	// tier 0 on its FIRST RTT sample (it does not sit tierless accumulating
+	// statistics; `tierMinDwellTicks` gates TRANSITIONS, not the initial
+	// assignment) — so carrying a whole separate constant, lint entry and pair of
+	// fallback call sites for that window was not worth it.
 	//
-	// C2 AMENDED (RelayDelaySpectrumDesign.md §6 / §9, 2026-08-03). The replacement
-	// rule is now floored by the session lever:
+	// THE REPLACEMENT: both no-tier fallback sites (`ServerInputDelayQueue::
+	// effectiveDelay` and `ReplicatedTierConsumer::effectiveInputDelayTicks`) now
+	// read `rttTierInputDelays[kMaxConnectionTierIndex]` — the WORST tier —
+	// still wrapped by `applyRelayDelayFloor`. Chosen over the best tier (1) or a
+	// bare floor (0) because the costs are asymmetric: under-estimating in the
+	// join window schedules inputs too early and they are MISSED (item 41's
+	// `aboveNewest` population), while over-estimating only costs a couple of
+	// extra ticks of lag in a window the player is not yet in combat. A bare
+	// floor of 0 was rejected too — it reintroduces the two-ends-disagree shape
+	// `relayDelayFloorTicks` exists to prevent. See RN-12 in ReviewNotes.md for
+	// the full argument, including the reversal recorded there (domination by a
+	// reversible session lever is NOT the same thing as redundancy).
 	//
-	//     effectiveDelay = max(relayDelayFloorTicks, <tier-or-fallback value>)
-	//
-	// so THIS baseline is itself floored on the no-tier path. Both no-tier
-	// fallback sites (`ServerInputDelayQueue::effectiveDelay` and
-	// `ReplicatedTierConsumer::effectiveInputDelayTicks`) route this field through
-	// `applyRelayDelayFloor`; with the default floor of 0 the max is the identity
-	// and the pre-amendment value is preserved exactly.
-	// Deliberately trading a small constant input lag for the ability to absorb
-	// short network hiccups without a visible re-simulation pop.
-	// Default: 2
-	int32_t forcedInputLatencyTicks = 2;
+	// If this field is ever reintroduced, argue against this block, not merely
+	// against its absence.
 
 	// Inclusive UPPER bounds, in milliseconds, of each RTT tier bucket. Entry N is
 	// the highest smoothed RTT that still counts as tier N, so the buckets are
@@ -731,12 +740,20 @@ struct TimeConfig
 	int32_t rttTierBoundariesMs[4] = { 30, 80, 150, 999 };
 
 	// Per-tier Layer-1 input delay, in ticks. Indexed by tier index 0..3. This IS
-	// the effective input delay once a tier is known (see `forcedInputLatencyTicks`
-	// for the no-tier fallback), subject to the session floor: the C2 replacement
-	// rule reads `max(relayDelayFloorTicks, rttTierInputDelays[tier])` since the
-	// 2026-08-03 amendment, applied inside `tierInputDelayTicks`. Worse tiers buy
-	// more delay, which hides more of
+	// the effective input delay once a tier is known, subject to the session
+	// floor: the C2 replacement rule reads `max(relayDelayFloorTicks,
+	// rttTierInputDelays[tier])` since the 2026-08-03 amendment, applied inside
+	// `tierInputDelayTicks`. Worse tiers buy more delay, which hides more of
 	// the network round-trip behind the local input latency.
+	//
+	// ALSO SERVES AS THE NO-TIER FALLBACK (item 62 / RN-12): the last entry,
+	// `rttTierInputDelays[kMaxConnectionTierIndex]`, is read by both
+	// `ServerInputDelayQueue::effectiveDelay` and
+	// `ReplicatedTierConsumer::effectiveInputDelayTicks` whenever no per-connection
+	// tier is available yet. That is exactly why "MUST be monotonically
+	// non-decreasing" below matters beyond the escalation argument: it is what
+	// guarantees the last entry IS the worst (pessimistic) delay rather than an
+	// arbitrary one.
 	// MUST be monotonically non-decreasing — a worse connection must never get a
 	// SHORTER delay, which would defeat the escalation entirely.
 	// Default: { 1, 2, 3, 4 }

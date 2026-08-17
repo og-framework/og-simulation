@@ -164,13 +164,13 @@ struct CorrectionInsertVerdict
 // AuthorityAgreedKeptPrediction / Replayed / ReplayedOverCorrection), 60 bytes
 // per cache. ⚠ It is NOT the retired `m_isResimulated` bit coming back — read
 // the three fences in SlotStateProvenance.h and the gravestone at the bottom of
-// this class BEFORE assuming otherwise. See `getDiagnosticStateProvenance`.
+// this class BEFORE assuming otherwise. See `getDiagnostics().stateProvenance`.
 //
 // [item 47] THE LANDING STAMP is the one column added since: "the value of this
 // cache's monotonic landing counter when a correction was last inserted here",
 // 0 for never. It exists to split item 47's replay-write PROTECTIONS into fresh
 // and stale populations for the probe — it decides nothing. The write rule reads
-// `m_containsCorrectTick` alone. See `getSlotLandingSeq` and
+// `m_containsCorrectTick` alone. See `m_slotLandingSeqNr` and
 // `resimGate::classifyResimSlotWrite`.
 //
 // [item 45] TWO BITS, NOT THREE: `m_isResimulated` retired with the
@@ -190,9 +190,9 @@ struct CorrectionInsertVerdict
 // ANY FUTURE CODE LOOKING FOR AN INPUT VALUE IN THE CORRECTION CACHE IS LOOKING
 // FOR SOMETHING THAT NO LONGER EXISTS BY DESIGN. The three live sources, by
 // question asked:
-//   * "what did the local player capture at tick t?"   -> ClientInputDelayLine
+//   * "what did the local player capture at tick t?"   -> LocalInputCache
 //     (capture-tick keyed; SimulationNetSync owns one per provider-present id).
-//   * "what did a REMOTE player send for capture t?"   -> RelayedInputStore, via
+//   * "what did a REMOTE player send for capture t?"   -> RemoteInputCache, via
 //     SimulationNetSync::getLastRelayedInput / resolveScheduledRelayedInput.
 //   * "which capture did the AUTHORITY apply at tick t?" -> the ref that lives in
 //     THIS slot, read through getAppliedCaptureTick / the classified
@@ -225,7 +225,7 @@ public:
 	{
 		m_tickBuffer.fill(0);
 		m_appliedCaptureTickBuffer.fill(kNoInputCaptureTick);
-		m_slotLandingSeq.fill(0u);
+		m_slotLandingSeqNr.fill(0u);
 		// [item 48] Nothing has written state anywhere yet, and `Empty` is the one
 		// place that fact is recorded in data — the tick buffer cannot carry it,
 		// because filling it with 0 makes every unwritten slot claim tick 0.
@@ -243,7 +243,7 @@ public:
 	{
 		m_tickBuffer.fill(0);
 		m_appliedCaptureTickBuffer.fill(kNoInputCaptureTick);
-		m_slotLandingSeq.fill(0u);
+		m_slotLandingSeqNr.fill(0u);
 		m_stateProvenance.fill(SlotStateProvenance::Empty);   // [item 48]
 	}
 
@@ -424,38 +424,10 @@ public:
 		m_anomalousMissDistanceTicks = distanceTicks;
 	}
 
-	// [og-netcode-v2-input-relay item 45] "Which is the newest tick an authoritative
-	// correction has LANDED in?" — a pure query over `m_containsCorrectTick`.
-	//
-	// ITS FORMER PRODUCTION READER IS GONE: `getLastResimulationTick` used this as
-	// the lower bound of its newest-first scan, and that scan is retired with the
-	// level-triggered gate (see the anchor block below). It is kept rather than
-	// retired with it, and the T16 rule is why that is not a contradiction: T16
-	// retires STORED values nothing reads, because a second copy of the truth goes
-	// stale silently. This stores nothing — it derives an answer from the live
-	// bitset on every call and cannot be stale. It remains the honest way to ask
-	// the question (the resim ANCHOR is now a decided trigger, not "the newest
-	// correction", and the two must not be conflated), and it is what the wipe
-	// cases assert against.
-	uint32 getLastCorrectTick() const
-	{
-		const uint32 predictionTick = getPredictionTick();
-		const uint32 predictionIndex = getCacheIndex(predictionTick);
-
-		//iterate backwards, from the prediction index, through the ring buffer to find the last correct tick
-		for (int32 offset = 0; offset < StateBufferSize; ++offset)
-		{
-			int32 checkIndex = static_cast<int32>(predictionIndex) - offset;
-			if (checkIndex < 0)
-				checkIndex += StateBufferSize;
-			if (m_containsCorrectTick.test(checkIndex))
-			{
-				return m_tickBuffer[checkIndex];
-			}
-		}
-
-		return 0;
-	}
+	// [og-netcode-v2-input-relay T52] The newest-landed-correction query MOVED to
+	// `getDiagnostics().lastCorrectTick()` — see the Diagnostics view near the end
+	// of this class's public section for the full "why it is kept" rationale
+	// (item 45) and the walk-backwards implementation.
 
 	// =======================================================================
 	// [og-netcode-v2-input-relay item 45] THE RESIM GATE — ONE WORD, EDGE-TRIGGERED.
@@ -465,7 +437,7 @@ public:
 	//
 	// ⛔ `getLastResimulationTick()` IS GONE, together with the `m_isResimulated`
 	// bitset it scanned and the `pushPredictionTick` inheritance that fed it. What
-	// it did: computed `getLastCorrectTick()`, then walked newest->oldest FROM THE
+	// it did: computed `getDiagnostics().lastCorrectTick()`, then walked newest->oldest FROM THE
 	// FRONTIER SLOT (offset 0) and returned the first slot flagged `m_isResimulated
 	// || m_containsCorrectTick`. Since `postResimulationAll` flagged every replayed
 	// slot INCLUDING the frontier and `pushPredictionTick` copied that bit into
@@ -549,7 +521,7 @@ public:
 	// read) while looking exactly like a server-sourced value — refreshed every
 	// tick, so with no staleness to notice. The correct remote source is
 	// `SimulationNetSync::getLastRelayedInput` / `resolveScheduledRelayedInput`;
-	// the correct local source is the client's own `ClientInputDelayLine`.
+	// the correct local source is the client's own `LocalInputCache`.
 
 	// R1 — THE GATE. Unchanged in shape from the level-triggered version
 	// (`anchor != 0 && anchor != predictionTick`) and deliberately so: the second
@@ -625,134 +597,25 @@ public:
 	//
 	// The sequence capture is PHYSICS-THREAD-PRIVATE in the same way the anchor
 	// capture is, and it READS a game-thread-written counter — see the threading
-	// note on `getSlotLandingSeq`. It feeds a COUNTER, never a decision.
+	// note on `m_slotLandingSeqNr` (private section, below). It feeds a COUNTER,
+	// never a decision.
 	void captureResimAnchorForConsume()
 	{
 		m_consumeExpectedAnchorTick = getPendingResimAnchorTick();
-		m_preparedLandingSeq        = m_landingSeq;
+		m_preparedLandingSeqNr        = m_landingSeqNr;
 	}
 
-	uint32 getCapturedResimAnchorTick() const { return m_consumeExpectedAnchorTick; }
-
-	// [item 47] The prepare-time landing-sequence capture. Diagnostics and tests
-	// only — production reads it exactly once, inside the classifier call in
-	// `tryInsertingResimulatedState`.
-	uint32 getCapturedLandingSeq() const { return m_preparedLandingSeq; }
-
-	// [item 47] THE PER-SLOT LANDING STAMP — "the value of this cache's monotonic
-	// landing counter when a correction was last inserted into this slot", 0 for a
-	// slot no correction has ever landed in.
-	//
-	// ⚠ THREADING, STATED HERE BECAUSE THIS IS THE ONE NEW CROSS-THREAD SURFACE
-	// ITEM 47 ADDS. The stamps are written on the GAME thread (`W1`'s hit path)
-	// and read on the PHYSICS thread (the classifier). They are PLAIN `uint32`s,
-	// deliberately, and this is NOT a second gate word:
-	//   * they RIDE THE PRE-EXISTING STATE-BUFFER RACE they exist to protect. The
-	//     authority STATE this stamp describes travels through `m_stateBuffer`,
-	//     whose unsynchronized GT/PT access is the cache's long-standing formal
-	//     race (design §7.4, its own future item). A stamp torn or stale relative
-	//     to the state beside it is the same race, not a new class of one.
-	//   * they are OBSERVATIONAL. `resimGate::classifyResimSlotWrite` returns
-	//     `Written` iff `!slotContainsCorrectTick` — REGARDLESS of the stamps —
-	//     and the write site acts on `outcome != Written`, so the decision rests
-	//     on exactly one input, itself a pre-existing GT-written / PT-read bit.
-	//     The stamps only split the protections into fresh/stale for the probe. A
-	//     torn stamp mis-labels a COUNTER; it can never mis-decide a write. (That
-	//     one-bit property is swept as its own section in `ResimGatePolicyTest`,
-	//     because it is what this whole paragraph rests on.)
-	//   * ⛔ THEY ARE NOT GATE STATE. `needsResimulation()` does not read them and
-	//     must never be made to. Item 45's one-atomic-word fence governs the GATE
-	//     (`m_pendingResimAnchorTick`), which is two-writer control state; growing
-	//     the GATE to a second shared word is what that fence forbids, and this is
-	//     not that.
-	//
-	// WRAPAROUND: `m_landingSeq` is monotonic and never reset except by
-	// `wipeCache`. At 2^32 landings — >2 years of continuous 60 Hz corrections on
-	// one character — the `>` comparison would invert for one window and
-	// mis-CLASSIFY (never mis-protect). Not defended against, recorded so it is a
-	// known bound rather than a surprise.
-	uint32 getSlotLandingSeq(uint32 cacheIndex) const
-	{
-		OG_CHECK(cacheIndex < StateBufferSize, "trying to access landing seq with bad cacheIndex");
-		return m_slotLandingSeq[cacheIndex];
-	}
-
-	// The monotonic counter itself — the value the NEXT landing will exceed.
-	uint32 getLandingSeq() const { return m_landingSeq; }
-
-	// =======================================================================
-	// [og-netcode-v2-input-relay item 48] THE PER-SLOT STATE PROVENANCE —
-	// "WHERE DID THE STATE IN THIS SLOT COME FROM?", DIAGNOSTIC-ONLY.
-	//
-	// ⛔ THE FULL CONTRACT, THE THREE FENCES AND THE ⚠ AGAINST MISTAKING THIS
-	// FOR THE RETIRED `m_isResimulated` BIT ARE IN `SlotStateProvenance.h`.
-	// Read that block before changing any of the five write sites, and read the
-	// gravestone at the bottom of this class before adding a sixth.
-	//
-	// The one-paragraph version, because a reader who lands HERE needs it:
-	// this column is written at five sites and read by NOTHING IN PRODUCTION.
-	// The accessor is named `getDiagnosticStateProvenance` rather than anything
-	// shorter for exactly that reason — the name is load-bearing. Its readers
-	// are the `[CorrectionCache][ResimGate][Provenance]` LLTs and the Verbose
-	// `[ResimProbe.SlotMap]` line (`SimulationReconciliation::
-	// dumpSlotProvenanceAll`), and that is the complete list.
-	//
-	// ⭐ THE INDEPENDENCE IS MACHINE-CHECKED, and the case is named so it can be
-	// found and so it cannot be quietly dropped:
-	//     CorrectionCache.ResimGate.TheProvenanceColumnCannotReachAnyProductionOutput
-	// It scribbles arbitrary garbage into this column at three points of a live
-	// gate lifecycle and asserts every production output — gate, anchor,
-	// captures, verdicts, replay write outcomes, adopted state and the
-	// determinism CHECKSUM — is byte-identical to the un-scribbled run. THAT
-	// CASE IS THE FENCE. The original resim-gate defect was production logic
-	// derived from per-slot bits; the case makes that regression fail a test
-	// rather than merely contradict a comment.
-	//
-	// ⚠ THREADING: GT-written (corrections) and PT-written (prediction, replay,
-	// wipe), plain bytes, riding the pre-existing `m_stateBuffer` GT/PT race
-	// exactly as item 47's landing stamps do. A diagnostic read TOLERATES a torn
-	// or ±1-stale value: one slot of one map line may be wrong, and because
-	// nothing decides on it there is no correctness consequence to be had.
-	//
-	// ⛔ IT NEVER ENTERS `compute_checksum` OR THE DETERMINISM COMPARISON — the
-	// anchor's prohibition, verbatim, for the same reason: two peers replaying
-	// identical inputs from identical state must agree on the STATE and may
-	// legitimately disagree on how each of them got there.
-	// =======================================================================
-	SlotStateProvenance getDiagnosticStateProvenance(uint32 cacheIndex) const
-	{
-		OG_CHECK(cacheIndex < StateBufferSize, "trying to access state provenance with bad cacheIndex");
-		return m_stateProvenance[cacheIndex];
-	}
-
-	// ⛔ THE FENCE'S OWN INSTRUMENT. IT HAS NO PRODUCTION CALLER AND MUST NEVER
-	// ACQUIRE ONE — the name says so at every call site on purpose.
-	//
-	// Fills the whole provenance column with a deterministic garbage cycle
-	// derived from `seed`, i.e. makes every slot's recorded lineage a LIE while
-	// leaving every other column untouched. Two cases use it:
-	//
-	//   1. `…TheProvenanceColumnCannotReachAnyProductionOutput` — fence 2. If
-	//      any production output moved, some production path is reading this
-	//      column and the fence is broken.
-	//   2. `…ReplayedOverCorrectionIsUnreachableButTheAlarmIsWired` — forges the
-	//      guard-failure precondition (authority-grade provenance over a CLEAR
-	//      `m_containsCorrectTick`) that protect-all makes unreachable, so the
-	//      alarm value can be proven live rather than merely asserted absent.
-	//
-	// The cycle walks all `kSlotStateProvenanceCount` enumerators and offsets by
-	// slot index, so no two adjacent slots agree and every value appears. It
-	// stays INSIDE the enumeration deliberately: a genuinely out-of-range byte
-	// would be undefined behaviour on the switch in `slotStateProvenanceChar`,
-	// and "every slot lies" is already the whole hypothesis under test.
-	void scribbleDiagnosticStateProvenanceForFenceTest(uint32 seed)
-	{
-		for (size_t i = 0; i < StateBufferSize; ++i)
-		{
-			m_stateProvenance[i] = static_cast<SlotStateProvenance>(
-				static_cast<std::uint8_t>((seed + static_cast<uint32>(i)) % kSlotStateProvenanceCount));
-		}
-	}
+	// [og-netcode-v2-input-relay T52] The six read-only diagnostic accessors that
+	// used to sit here — the anchor prepare-time capture, the landing-sequence
+	// prepare-time capture, the per-slot landing stamp, the landing counter, the
+	// per-slot state provenance and the trigger-policy read-back — MOVED into the
+	// `Diagnostics` / `MutableDiagnostics` views — see `getDiagnostics()` /
+	// `editDiagnostics()` near the end of this class's public section (RN-1 +
+	// RN-2 resolved design, ReviewNotes.md). The write side of this pair —
+	// `captureResimAnchorForConsume` above and `setResimTriggerPolicy` below —
+	// STAYS here: production calls both. The landing-stamp threading contract
+	// moved down to sit with `m_slotLandingSeqNr`'s declaration in the private
+	// section.
 
 	bool consumeCapturedResimAnchor() { return consumeResimAnchor(m_consumeExpectedAnchorTick); }
 
@@ -769,12 +632,14 @@ public:
 	// correction can land) and read at W1. It is not atomic for that reason, and
 	// making it a runtime-tunable cvar would break that argument — see the
 	// one-shot-at-composition ruling on the sibling knobs in SimulationManager.h.
+	//
+	// [T52] The READ side (the trigger-policy read-back) moved into
+	// `getDiagnostics()` — this setter is production-called
+	// (`SimulationReconciliation::setResimTriggerPolicy`) and stays on the cache.
 	void setResimTriggerPolicy(TimeConfig::ResimTriggerPolicy policy)
 	{
 		m_resimTriggerPolicy = policy;
 	}
-
-	TimeConfig::ResimTriggerPolicy getResimTriggerPolicy() const { return m_resimTriggerPolicy; }
 
 	void pushPredictionTick(uint32 tick)
 	{
@@ -816,7 +681,7 @@ public:
 		// but it would report a protection for a landing that never happened.
 		// The stamp's "0 == no correction has ever landed here" contract is worth
 		// more than the two instructions it costs to keep.
-		m_slotLandingSeq[newPredictionIndex] = 0u;
+		m_slotLandingSeqNr[newPredictionIndex] = 0u;
 		// [item 48] WRITE SITE 1 of 5 — RING RECYCLE. The slot now describes a
 		// different tick and holds no state for it yet, so its lineage retires
 		// with the rest of its bookkeeping.
@@ -911,8 +776,8 @@ public:
 			// the ACTION note on `resimGate::ResimSlotWriteOutcome`.
 			const resimGate::ResimSlotWriteOutcome outcome = resimGate::classifyResimSlotWrite(
 				m_containsCorrectTick[cacheIndex],
-				m_slotLandingSeq[cacheIndex],
-				m_preparedLandingSeq,
+				m_slotLandingSeqNr[cacheIndex],
+				m_preparedLandingSeqNr,
 				tick,
 				m_consumeExpectedAnchorTick);
 
@@ -1001,17 +866,25 @@ public:
 	// describes what the AUTHORITY did, which is equally true whether or not the
 	// local prediction happened to match, and T6 needs it in both cases.
 	//
-	// [T24] `outVerdict` is a DEFAULTED, PURELY OBSERVATIONAL out-parameter: it
+	// [T24] `outDiagnosticVerdict` is a DEFAULTED, PURELY OBSERVATIONAL out-parameter: it
 	// reports the `isSimilarTo` verdict this method has always computed, so a
 	// caller that knows the character id and its class can attribute it. Nothing
 	// on this method's behaviour depends on whether it is supplied. See
 	// CorrectionInsertVerdict at the top of this file.
+	//
+	// ⛔ THE MARKER NAMES THE CHANNEL, NOT THE FACT (docs/DiagnosticsConventions.md
+	// §4). `predictionWasCorrect` below, computed by `isSimilarTo`, feeds
+	// `resimGate::shouldSetPendingAnchor` directly — under the shipped
+	// ResimTriggerPolicy=OnDisagreement that boolean decides whether a resim runs
+	// at all. `outDiagnosticVerdict` only carries a COPY of that fact out for
+	// reporting; it is not the path the decision takes. Deleting `isSimilarTo`
+	// silently disables the resim gate.
 	void tryInsertingCorrectState(StateType&& state, uint32 tick,
 	                              uint32 appliedCaptureTick = kNoInputCaptureTick,
-	                              CorrectionInsertVerdict* outVerdict = nullptr)
+	                              CorrectionInsertVerdict* outDiagnosticVerdict = nullptr)
 	{
-		if (outVerdict != nullptr)
-			*outVerdict = CorrectionInsertVerdict{ false, false, tick };
+		if (outDiagnosticVerdict != nullptr)
+			*outDiagnosticVerdict = CorrectionInsertVerdict{ false, false, tick };
 
 		auto it = std::find(m_tickBuffer.begin(), m_tickBuffer.end(), tick);
 		if (it != m_tickBuffer.end())
@@ -1030,7 +903,7 @@ public:
 			// — an agreeing landing is authority information too (it certifies
 			// the prediction), and the protection rule makes no verdict
 			// distinction. See `resimGate::classifyResimSlotWrite`.
-			m_slotLandingSeq[cacheIndex] = ++m_landingSeq;
+			m_slotLandingSeqNr[cacheIndex] = ++m_landingSeqNr;
 
 			// [item 48] WRITE SITE 2 of 5 — AND THE ONE THAT CARRIES THE COLUMN'S
 			// FIRST PAYLOAD VALUE.
@@ -1085,8 +958,8 @@ public:
 			// [T24] Reported BEFORE the state move below, for no reason other than
 			// that the verdict is about the state as it was compared; the flag is a
 			// bool copy and the ordering is not load-bearing.
-			if (outVerdict != nullptr)
-				*outVerdict = CorrectionInsertVerdict{ true, predictionWasCorrect, tick };
+			if (outDiagnosticVerdict != nullptr)
+				*outDiagnosticVerdict = CorrectionInsertVerdict{ true, predictionWasCorrect, tick };
 
 			if (!predictionWasCorrect)
 				m_stateBuffer[cacheIndex] = std::move(state);
@@ -1160,9 +1033,9 @@ public:
 		// would compare an old landing's sequence against a new resim's capture
 		// and call an ancient slot fresh. The counter is re-armed from 0 with the
 		// slots, which keeps "stamp 0 == never landed" true after a wipe as well.
-		m_slotLandingSeq.fill(0u);
-		m_landingSeq         = 0u;
-		m_preparedLandingSeq = 0u;
+		m_slotLandingSeqNr.fill(0u);
+		m_landingSeqNr         = 0u;
+		m_preparedLandingSeqNr = 0u;
 		// [item 48] WRITE SITE 4 of 5 — THE WIPE, and the one place `Empty` is
 		// written after construction. A resync renumbers every tick, so no slot
 		// describes state for the tick it now claims: "predicted" and "corrected"
@@ -1223,9 +1096,9 @@ public:
 			// a freshly allocated slot has had no landing. NOTE the 4-method API
 			// still touches NO gate state and NO landing COUNTER — the stamp is
 			// per-slot bookkeeping that mirrors the bits beside it, whereas
-			// `m_landingSeq` / the anchor are session control state a determinism
+			// `m_landingSeqNr` / the anchor are session control state a determinism
 			// harness must not be able to perturb (design §3.1's non-site list).
-			m_slotLandingSeq[slot] = 0u;
+			m_slotLandingSeqNr[slot] = 0u;
 			// [item 48] WRITE SITE 5 of 5 — THE FRESHLY ALLOCATED HARNESS SLOT.
 			//
 			// ⭐ WHY THE 4-METHOD API WRITES PROVENANCE WHILE IT DELIBERATELY DOES
@@ -1323,6 +1196,224 @@ public:
 		return crc32(buffer.data(), written);
 	}
 
+	// =======================================================================
+	// [og-netcode-v2-input-relay T52] DIAGNOSTIC VIEWS — RN-1 + RN-2, RESOLVED
+	// DESIGN (ReviewNotes.md, user rulings 2026-08-13). Full triage and rationale
+	// there; the grouping rule these views follow is centralised in
+	// `docs/DiagnosticsConventions.md` (T53) — do not re-derive it here.
+	//
+	// WHAT THESE ARE. Eight accessors that share one property — deleting them and
+	// every caller changes no production behaviour and no shipped telemetry
+	// (RN-2's corrected triage: six read seams whose production reads the
+	// underlying member directly, one logging-only read, one test-only mutator) —
+	// grouped behind two nested views instead of a name-based marker on each:
+	//
+	//     cache.getDiagnostics().slotLandingSeqNr(i)
+	//     cache.editDiagnostics().scribbleStateProvenanceForFenceTest(seed)
+	//
+	// `get` / `edit` on the OUTER call is existing house style (`editStorage`,
+	// `editState`, `editResimGateProbe`, `editReconciliation`, `editClientClock`,
+	// …); the members INSIDE a view carry no `get` prefix and no `Diagnostic`
+	// infix of their own — the view's TYPE is the marker, so the name is not
+	// tripled the way `getDiagnostics().getDiagnosticSlotLandingSeqNr(i)` would.
+	// The const/non-const split lands exactly on the triage boundary: seven read
+	// seams on the const view, one test-only mutator on the non-const one.
+	//
+	// ⛔ THE WRITE SIDE STAYS ON THE CACHE — NEVER GROUP IT. Three of these have a
+	// production write partner that a "move everything related" pass would sweep
+	// in by mistake:
+	//     resimTriggerPolicy (read)      moved here | setResimTriggerPolicy        STAYS (SimulationReconciliation, config path)
+	//     capturedResimAnchorTick (read) moved here | captureResimAnchorForConsume STAYS (physics thread, production)
+	//     capturedLandingSeqNr (read)    moved here | (same capture call)          STAYS
+	// The asymmetry is the point: performing the act is production, observing
+	// the result is diagnostic. `isAnomalousMiss` and `getPendingResimAnchorTick`
+	// are NOT in this view for the same reason — both are production-read (the
+	// former picks a log severity, the latter is the live gate R1).
+	//
+	// Nested classes rather than free functions: a nested class is a member of
+	// the enclosing class template and, per the standard, has the same access to
+	// StateCorrectionCache's private members as any other member — no friend
+	// declaration needed, and the view can hold nothing but a reference.
+	// =======================================================================
+	class Diagnostics
+	{
+	public:
+		explicit Diagnostics(const StateCorrectionCache& cache) : m_cache(cache) {}
+
+		// [item 47] The per-slot landing stamp. THE FULL THREADING CONTRACT — the
+		// GT-write/PT-read argument, why this rides the pre-existing state-buffer
+		// race rather than opening a new one, why it is observational and can
+		// never mis-decide a write, and the wraparound bound — sits with
+		// `m_slotLandingSeqNr`'s declaration in the private section below this
+		// class. Read it there before relying on this accessor for anything but a
+		// diagnostic.
+		uint32 slotLandingSeqNr(uint32 cacheIndex) const
+		{
+			OG_CHECK(cacheIndex < StateBufferSize, "trying to access landing seq with bad cacheIndex");
+			return m_cache.m_slotLandingSeqNr[cacheIndex];
+		}
+
+		// The monotonic counter itself — the value the NEXT landing will exceed.
+		uint32 landingSeqNr() const { return m_cache.m_landingSeqNr; }
+
+		// [item 47] The prepare-time landing-sequence capture. Diagnostics and
+		// tests only — production reads it exactly once, inside the classifier
+		// call in `tryInsertingResimulatedState`. Write side (the capture itself):
+		// `captureResimAnchorForConsume`, which stays on the cache.
+		uint32 capturedLandingSeqNr() const { return m_cache.m_preparedLandingSeqNr; }
+
+		// [item 45] R2's diagnostic read of the prepare-time anchor capture. Write
+		// side: `captureResimAnchorForConsume` (physics thread, production; stays
+		// on the cache — see the fence above this class).
+		uint32 capturedResimAnchorTick() const { return m_cache.m_consumeExpectedAnchorTick; }
+
+		// [og-netcode-v2-input-relay item 45] "Which is the newest tick an
+		// authoritative correction has LANDED in?" — a pure query over
+		// `m_containsCorrectTick`.
+		//
+		// ITS FORMER PRODUCTION READER IS GONE: `getLastResimulationTick` used
+		// this as the lower bound of its newest-first scan, and that scan is
+		// retired with the level-triggered gate (see the anchor block above
+		// `getPendingResimAnchorTick`). It is kept rather than retired with it,
+		// and the T16 rule is why that is not a contradiction: T16 retires STORED
+		// values nothing reads, because a second copy of the truth goes stale
+		// silently. This stores nothing — it derives an answer from the live
+		// bitset on every call and cannot be stale. It remains the honest way to
+		// ask the question (the resim ANCHOR is now a decided trigger, not "the
+		// newest correction", and the two must not be conflated), and it is what
+		// the wipe cases assert against.
+		//
+		// [task 59 RULING] Still 0 production callers / 7 test callers, same
+		// shape as the resim-gate probe accessor task 59 wires a proof for —
+		// but the two are not analogous, and this one is deliberately left as
+		// a test-only seam rather than getting a wiring test of its own. The
+		// resim-gate probe needed one because it is a COUNTER FED BY SEPARATE
+		// WRITE SITES elsewhere, and an accessor alone cannot prove those
+		// sites are connected to it. This method has no such split: it is a
+		// pure derivation over `m_containsCorrectTick`, computed fresh on
+		// every call, with no probe object and no `note*` feeder in between.
+		// The 7 tests exercising it already run the exact same code a
+		// production caller would — there is nothing upstream left to wire.
+		uint32 lastCorrectTick() const
+		{
+			const uint32 predictionTick = m_cache.getPredictionTick();
+			const uint32 predictionIndex = m_cache.getCacheIndex(predictionTick);
+
+			//iterate backwards, from the prediction index, through the ring buffer to find the last correct tick
+			for (int32 offset = 0; offset < StateBufferSize; ++offset)
+			{
+				int32 checkIndex = static_cast<int32>(predictionIndex) - offset;
+				if (checkIndex < 0)
+					checkIndex += StateBufferSize;
+				if (m_cache.m_containsCorrectTick.test(checkIndex))
+				{
+					return m_cache.m_tickBuffer[checkIndex];
+				}
+			}
+
+			return 0;
+		}
+
+		// The trigger-policy read-back. Write side: `setResimTriggerPolicy`,
+		// which stays on the cache — see the fence above this class.
+		TimeConfig::ResimTriggerPolicy resimTriggerPolicy() const { return m_cache.m_resimTriggerPolicy; }
+
+		// =======================================================================
+		// [og-netcode-v2-input-relay item 48] THE PER-SLOT STATE PROVENANCE —
+		// "WHERE DID THE STATE IN THIS SLOT COME FROM?", DIAGNOSTIC-ONLY.
+		//
+		// ⛔ THE FULL CONTRACT, THE THREE FENCES AND THE ⚠ AGAINST MISTAKING THIS
+		// FOR THE RETIRED `m_isResimulated` BIT ARE IN `SlotStateProvenance.h`.
+		// Read that block before changing any of the five write sites, and read
+		// the gravestone at the bottom of this class before adding a sixth.
+		//
+		// The one-paragraph version, because a reader who lands HERE needs it:
+		// this column is written at five sites and read by NOTHING IN
+		// PRODUCTION. [T52] It was named `getDiagnosticStateProvenance` for
+		// exactly that reason before RN-1+RN-2 grouped it here; under
+		// `getDiagnostics()` the VIEW carries the marker instead of the name, so
+		// the member below is simply `stateProvenance`. Its readers are the
+		// `[CorrectionCache][ResimGate][Provenance]` LLTs and the Verbose
+		// `[ResimProbe.SlotMap]` line (`SimulationReconciliation::
+		// getDiagnostics().logSlotProvenanceAll`, RN-7/task 56), and that is the
+		// complete list.
+		//
+		// ⭐ THE INDEPENDENCE IS MACHINE-CHECKED, and the case is named so it can
+		// be found and so it cannot be quietly dropped:
+		//     CorrectionCache.ResimGate.TheProvenanceColumnCannotReachAnyProductionOutput
+		// It scribbles arbitrary garbage into this column at three points of a
+		// live gate lifecycle and asserts every production output — gate,
+		// anchor, captures, verdicts, replay write outcomes, adopted state and
+		// the determinism CHECKSUM — is byte-identical to the un-scribbled run.
+		// THAT CASE IS THE FENCE. The original resim-gate defect was production
+		// logic derived from per-slot bits; the case makes that regression fail
+		// a test rather than merely contradict a comment.
+		//
+		// ⚠ THREADING: GT-written (corrections) and PT-written (prediction,
+		// replay, wipe), plain bytes, riding the pre-existing `m_stateBuffer`
+		// GT/PT race exactly as item 47's landing stamps do. A diagnostic read
+		// TOLERATES a torn or ±1-stale value: one slot of one map line may be
+		// wrong, and because nothing decides on it there is no correctness
+		// consequence to be had.
+		//
+		// ⛔ IT NEVER ENTERS `compute_checksum` OR THE DETERMINISM COMPARISON —
+		// the anchor's prohibition, verbatim, for the same reason: two peers
+		// replaying identical inputs from identical state must agree on the
+		// STATE and may legitimately disagree on how each of them got there.
+		// =======================================================================
+		SlotStateProvenance stateProvenance(uint32 cacheIndex) const
+		{
+			OG_CHECK(cacheIndex < StateBufferSize, "trying to access state provenance with bad cacheIndex");
+			return m_cache.m_stateProvenance[cacheIndex];
+		}
+
+	private:
+		const StateCorrectionCache& m_cache;
+	};
+
+	class MutableDiagnostics
+	{
+	public:
+		explicit MutableDiagnostics(StateCorrectionCache& cache) : m_cache(cache) {}
+
+		// ⛔ THE FENCE'S OWN INSTRUMENT. IT HAS NO PRODUCTION CALLER AND MUST
+		// NEVER ACQUIRE ONE — the name says so at every call site on purpose.
+		//
+		// Fills the whole provenance column with a deterministic garbage cycle
+		// derived from `seed`, i.e. makes every slot's recorded lineage a LIE
+		// while leaving every other column untouched. Two cases use it:
+		//
+		//   1. `…TheProvenanceColumnCannotReachAnyProductionOutput` — fence 2. If
+		//      any production output moved, some production path is reading
+		//      this column and the fence is broken.
+		//   2. `…ReplayedOverCorrectionIsUnreachableButTheAlarmIsWired` — forges
+		//      the guard-failure precondition (authority-grade provenance over a
+		//      CLEAR `m_containsCorrectTick`) that protect-all makes
+		//      unreachable, so the alarm value can be proven live rather than
+		//      merely asserted absent.
+		//
+		// The cycle walks all `kSlotStateProvenanceCount` enumerators and
+		// offsets by slot index, so no two adjacent slots agree and every value
+		// appears. It stays INSIDE the enumeration deliberately: a genuinely
+		// out-of-range byte would be undefined behaviour on the switch in
+		// `slotStateProvenanceChar`, and "every slot lies" is already the whole
+		// hypothesis under test.
+		void scribbleStateProvenanceForFenceTest(uint32 seed)
+		{
+			for (size_t i = 0; i < StateBufferSize; ++i)
+			{
+				m_cache.m_stateProvenance[i] = static_cast<SlotStateProvenance>(
+					static_cast<std::uint8_t>((seed + static_cast<uint32>(i)) % kSlotStateProvenanceCount));
+			}
+		}
+
+	private:
+		StateCorrectionCache& m_cache;
+	};
+
+	Diagnostics getDiagnostics() const { return Diagnostics(*this); }
+	MutableDiagnostics editDiagnostics() { return MutableDiagnostics(*this); }
+
 private:
 	// [item 45] W1's CAS-MAX — "the anchor is the NEWEST tick anybody asked to
 	// resimulate from".
@@ -1390,14 +1481,54 @@ private:
 	// m_tickBuffer: index i answers "which capture tick did the authority apply at
 	// m_tickBuffer[i]". kNoInputCaptureTick everywhere it is unknown.
 	std::array<uint32, StateBufferSize> m_appliedCaptureTickBuffer;
-	// [item 47] Per-slot landing stamp — see getSlotLandingSeq for the contract,
-	// the threading argument and the wraparound bound. 60 * 4 B = 240 B per
-	// character, which is the whole memory cost of the fresh/stale split.
-	std::array<uint32, StateBufferSize> m_slotLandingSeq;
-	// [item 48] Per-slot STATE LINEAGE — see `getDiagnosticStateProvenance` for
-	// the contract and `SlotStateProvenance.h` for the three fences. 60 * 1 B =
-	// 60 B per character. ⛔ DIAGNOSTIC ONLY: no production reader, and the
-	// independence is machine-checked by a named LLT rather than asserted here.
+
+	// [item 47] THE PER-SLOT LANDING STAMP — "the value of this cache's monotonic
+	// landing counter when a correction was last inserted into this slot", 0 for a
+	// slot no correction has ever landed in.
+	//
+	// [og-netcode-v2-input-relay T52] RELOCATED FROM ABOVE the old read accessor
+	// (RN-1 + RN-2 resolved design, ReviewNotes.md): this is the MEMBER's
+	// contract, not the now-relocated accessor's, so it sits here instead of
+	// travelling into `Diagnostics::slotLandingSeqNr`'s definition. The view
+	// leaves a one-line pointer back to this block.
+	//
+	// ⚠ THREADING, STATED HERE BECAUSE THIS IS THE ONE NEW CROSS-THREAD SURFACE
+	// ITEM 47 ADDS. The stamps are written on the GAME thread (`W1`'s hit path)
+	// and read on the PHYSICS thread (the classifier). They are PLAIN `uint32`s,
+	// deliberately, and this is NOT a second gate word:
+	//   * they RIDE THE PRE-EXISTING STATE-BUFFER RACE they exist to protect. The
+	//     authority STATE this stamp describes travels through `m_stateBuffer`,
+	//     whose unsynchronized GT/PT access is the cache's long-standing formal
+	//     race (design §7.4, its own future item). A stamp torn or stale relative
+	//     to the state beside it is the same race, not a new class of one.
+	//   * they are OBSERVATIONAL. `resimGate::classifyResimSlotWrite` returns
+	//     `Written` iff `!slotContainsCorrectTick` — REGARDLESS of the stamps —
+	//     and the write site acts on `outcome != Written`, so the decision rests
+	//     on exactly one input, itself a pre-existing GT-written / PT-read bit.
+	//     The stamps only split the protections into fresh/stale for the probe. A
+	//     torn stamp mis-labels a COUNTER; it can never mis-decide a write. (That
+	//     one-bit property is swept as its own section in `ResimGatePolicyTest`,
+	//     because it is what this whole paragraph rests on.)
+	//   * ⛔ THEY ARE NOT GATE STATE. `needsResimulation()` does not read them and
+	//     must never be made to. Item 45's one-atomic-word fence governs the GATE
+	//     (`m_pendingResimAnchorTick`), which is two-writer control state; growing
+	//     the GATE to a second shared word is what that fence forbids, and this is
+	//     not that.
+	//
+	// WRAPAROUND: `m_landingSeqNr` is monotonic and never reset except by
+	// `wipeCache`. At 2^32 landings — >2 years of continuous 60 Hz corrections on
+	// one character — the `>` comparison would invert for one window and
+	// mis-CLASSIFY (never mis-protect). Not defended against, recorded so it is a
+	// known bound rather than a surprise.
+	//
+	// 60 * 4 B = 240 B per character, which is the whole memory cost of the
+	// fresh/stale split.
+	std::array<uint32, StateBufferSize> m_slotLandingSeqNr;
+	// [item 48] Per-slot STATE LINEAGE — see `Diagnostics::stateProvenance`
+	// (relocated here by RN-1+RN-2/T52) for the contract and
+	// `SlotStateProvenance.h` for the three fences. 60 * 1 B = 60 B per character.
+	// ⛔ DIAGNOSTIC ONLY: no production reader, and the independence is
+	// machine-checked by a named LLT rather than asserted here.
 	std::array<SlotStateProvenance, StateBufferSize> m_stateProvenance;
 	std::bitset<StateBufferSize> m_containsCorrectTick;
 	std::bitset<StateBufferSize> m_predictionWasCorrect;
@@ -1497,9 +1628,9 @@ private:
 	// writer) and the PREPARE-TIME CAPTURE of it (PHYSICS thread; written by
 	// `captureResimAnchorForConsume`, read by the classifier). Both plain, both
 	// observational — the write rule reads neither. Full argument, including why
-	// this is not a second gate word, at `getSlotLandingSeq`.
-	uint32 m_landingSeq         = 0u;
-	uint32 m_preparedLandingSeq = 0u;
+	// this is not a second gate word, at `m_slotLandingSeqNr`'s declaration above.
+	uint32 m_landingSeqNr         = 0u;
+	uint32 m_preparedLandingSeqNr = 0u;
 
 	// [item 45] The pushed copy of `TimeConfig::resimTriggerPolicy` — see
 	// `setResimTriggerPolicy`. Sourced from the TimeConfig default rather than a

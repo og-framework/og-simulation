@@ -9,8 +9,8 @@
 #include <type_traits>
 #include <unordered_map>
 
-#include "OGSimulation/Network/ClientInputDelayLine.h"
-#include "OGSimulation/Network/RelayedInputStore.h"
+#include "OGSimulation/Network/LocalInputCache.h"
+#include "OGSimulation/Network/RemoteInputCache.h"
 #include "OGSimulation/PCTimeManagement/TimeConfig.h"
 
 // ---------------------------------------------------------------------------
@@ -154,9 +154,18 @@ inline constexpr int32_t clampConnectionTierIndex(int32_t tierIndex)
 //
 // A MISSED SITE IS A DIVERGENCE BUG, not a cosmetic gap: the server parks the
 // input at its own effective delay while the client predicts at a different one,
-// so every tick mispredicts by the difference. Note that the completeness guard
-// is a grep on `forcedInputLatencyTicks` READS, not on `rttTierInputDelays[`:
-// the two fallback sites never touch the array.
+// so every tick mispredicts by the difference.
+//
+// [item 62 / RN-12] The dedicated no-tier baseline field sites 2 and 3 used to
+// read (its old identifier is on record in RN-12, ReviewNotes.md) is RETIRED.
+// Both fallback sites now read `rttTierInputDelays[kMaxConnectionTierIndex]`
+// (the WORST tier) directly, so the completeness guard that used to be "a grep
+// on the retired field's READS" no longer applies: there is no second field to
+// grep for. The guard is now structural instead — count the sites that route
+// through
+// `applyRelayDelayFloor` (still 4: sites 1-3 call it directly, site 4
+// transitively through site 3) — see `classifyRelayDelayFloor` below for the
+// companion startup-advisory this item also adds.
 // ---------------------------------------------------------------------------
 
 // The absolute ceiling for an effective floor, in ticks (review finding A5,
@@ -166,14 +175,14 @@ inline constexpr int32_t clampConnectionTierIndex(int32_t tierIndex)
 // the floor has to survive — because a configured floor delays the read on BOTH
 // ends of the relay and each end holds the value in a ring of its own:
 //
-//   SENDER SIDE (`ClientInputDelayLine`, capacity
-//   `kClientInputDelayLineCapacityTicks`): the local capture is pushed AT capture,
+//   SENDER SIDE (`LocalInputCache`, capacity
+//   `kLocalInputCacheCapacityTicks`): the local capture is pushed AT capture,
 //   read at `capture + floor`, and revisited by a resim up to
 //   `rollbackWindowHardCap` ticks further back. It must therefore survive
 //   `floor + rollbackWindowHardCap` ticks of pushes.
 //
-//   RECEIVER SIDE (`RelayedInputStore`, capacity
-//   `kRelayedInputStoreCapacityTicks`): the relayed entry for capture tick `c`
+//   RECEIVER SIDE (`RemoteInputCache`, capacity
+//   `kRemoteInputCacheCapacityTicks`): the relayed entry for capture tick `c`
 //   enters the store at arrival (~`c + wire`), is consumed by the scheduled read
 //   at `c + dA`, and must stay resident for T6's resim reads until the frontier
 //   passes `c + dA + rollbackWindowHardCap`. The store is fed at up to one entry
@@ -183,7 +192,7 @@ inline constexpr int32_t clampConnectionTierIndex(int32_t tierIndex)
 //   bound that merely happens not to bind while both capacities are 64 and the
 //   wire slack is non-negative.
 //
-// SO THE MIN IS THE POINT, NOT A FLOURISH. Lower `kRelayedInputStoreCapacityTicks`
+// SO THE MIN IS THE POINT, NOT A FLOURISH. Lower `kRemoteInputCacheCapacityTicks`
 // to 32 and a delay-line-only derivation would still admit a floor of 44 into a
 // store that evicts scheduled entries before their resim window closes — the
 // scheduled regime degenerating SILENTLY into permanent fallback reads, which is
@@ -209,8 +218,8 @@ constexpr int32_t relayDelayFloorHardCapForCapacities(std::size_t delayLineCapac
 
 inline int32_t relayDelayFloorHardCapTicks(const TimeConfig& cfg)
 {
-    return relayDelayFloorHardCapForCapacities(kClientInputDelayLineCapacityTicks,
-                                               kRelayedInputStoreCapacityTicks,
+    return relayDelayFloorHardCapForCapacities(kLocalInputCacheCapacityTicks,
+                                               kRemoteInputCacheCapacityTicks,
                                                cfg.rollbackWindowHardCap);
 }
 
@@ -235,14 +244,93 @@ inline int32_t clampRelayDelayFloorTicks(int32_t requestedFloorTicks, const Time
 
 // THE shared floor application: `max(relayDelayFloorTicks, base)`.
 //
-// `base` is whatever the caller's own rule produced (a tier delay, or the
-// no-tier `forcedInputLatencyTicks` baseline). At the shipped default floor of 0
-// this is the identity for every non-negative base, which is what makes the
-// whole feature ship degenerate — floor 0 behaves exactly as the pre-T11 build.
+// `base` is whatever the caller's own rule produced (a tier delay, or — since
+// item 62 / RN-12 retired the dedicated field — the no-tier fallback, which is
+// itself `rttTierInputDelays[kMaxConnectionTierIndex]`). At the shipped default
+// floor of 0 this is the identity for every non-negative base, which is what
+// makes the whole feature ship degenerate — floor 0 behaves exactly as the
+// pre-T11 build.
 inline int32_t applyRelayDelayFloor(int32_t baseDelayTicks, const TimeConfig& cfg)
 {
     const int32_t floorTicks = clampRelayDelayFloorTicks(cfg.relayDelayFloorTicks, cfg);
     return baseDelayTicks > floorTicks ? baseDelayTicks : floorTicks;
+}
+
+// ---------------------------------------------------------------------------
+// FLOOR VALIDATION (og-netcode-v2-input-relay item 62 / RN-12) — ADVISORY ONLY,
+// NEVER AN ASSERT. `relayDelayFloorTicks == 0` is the documented "scheduled
+// regime OFF" mode (see the field's own comment: "Default: 0 (degenerate —
+// today's behaviour, byte-for-byte)"), so a hard check on `floor < 2` would
+// forbid a mode this codebase deliberately supports. This classifies the
+// CONFIGURED floor for STARTUP LOGGING; callers (the composition-root ini
+// intake and the client's floor OnRep — the same two sites `clampRelayDelayFloorTicks`
+// is called from) decide how loudly to log each case. Never used to reject or
+// correct a value — that is `clampRelayDelayFloorTicks`'s job, and it always
+// runs first.
+//
+//   0                          -> None (documented off mode; silent)
+//   1                          -> BelowHiccupBaseline (below the hiccup-
+//                                 absorption baseline `relayDelayFloorTicks` now
+//                                 documents, above off — the one value that is
+//                                 neither; WARN)
+//   2 .. < max(rttTierInputDelays) -> None (an ordinary scheduled-regime floor;
+//                                 silent)
+//   >= max(rttTierInputDelays) -> UniformDFairnessActive (every derivation path
+//                                 — tier, LAN override, and the no-tier fallback
+//                                 — collapses to this one value; NOTE, not a
+//                                 warning: this is ACTIVE on the shipped config
+//                                 today — floor 6 vs max tier delay 4 — and was,
+//                                 until this item, invisible in the logs)
+// ---------------------------------------------------------------------------
+enum class RelayDelayFloorAdvisory
+{
+    None,
+    BelowHiccupBaseline,
+    UniformDFairnessActive,
+};
+
+// The worst-connection per-tier delay — the threshold at which a floor
+// dominates every tiered derivation path. Computed rather than assumed to be
+// the last array entry so this stays correct independent of the
+// monotonic-non-decreasing invariant `TimeConfigTierArrayOrderingTest` pins
+// (today it is exactly `rttTierInputDelays[kMaxConnectionTierIndex]`, and that
+// equivalence is itself asserted by a test rather than assumed here).
+inline int32_t maxRttTierInputDelay(const TimeConfig& cfg)
+{
+    int32_t maxDelay = cfg.rttTierInputDelays[0];
+    for (std::size_t i = 1; i < kConnectionTierCount; ++i)
+    {
+        if (cfg.rttTierInputDelays[i] > maxDelay)
+        {
+            maxDelay = cfg.rttTierInputDelays[i];
+        }
+    }
+    return maxDelay;
+}
+
+// Classify `cfg.relayDelayFloorTicks` per the table above. UniformDFairnessActive
+// is checked BEFORE BelowHiccupBaseline: the two conditions cannot both hold
+// under the shipped tier table (`rttTierInputDelays[0] == 1`, so
+// `maxRttTierInputDelay >= 1` always, which makes floor 1 read as
+// UniformDFairnessActive only in the degenerate case where every tier delay is
+// <= 1) — the ordering below simply decides that degenerate case in favour of
+// the stronger, more informative advisory rather than leaving it unspecified.
+inline RelayDelayFloorAdvisory classifyRelayDelayFloor(const TimeConfig& cfg)
+{
+    const int32_t floorTicks = cfg.relayDelayFloorTicks;
+    if (floorTicks <= 0)
+    {
+        return RelayDelayFloorAdvisory::None;   // documented off mode
+    }
+    if (floorTicks >= maxRttTierInputDelay(cfg))
+    {
+        return RelayDelayFloorAdvisory::UniformDFairnessActive;
+    }
+    if (floorTicks == 1)
+    {
+        return RelayDelayFloorAdvisory::BelowHiccupBaseline;
+    }
+    return RelayDelayFloorAdvisory::None;
 }
 
 // Effective Layer-1 input delay in ticks for `tierIndex`.
@@ -258,11 +346,14 @@ inline int32_t applyRelayDelayFloor(int32_t baseDelayTicks, const TimeConfig& cf
 // receivers. Documented at `lanZeroDelayOverride`'s definition too.
 //
 // NOTE this is the C2-locked REPLACES value: it IS the effective delay, and is
-// never added to `TimeConfig::forcedInputLatencyTicks`. The baseline applies
-// only when NO tier is available at all (see ReplicatedTierConsumer and
+// never added to the no-tier fallback. The fallback applies only when NO tier is
+// available at all (see ReplicatedTierConsumer and
 // ServerInputDelayQueue::effectiveDelay, which each own that fallback for their
-// own "no tier" condition). AMENDED 2026-08-03: the replacement value is
-// `max(relayDelayFloorTicks, tier-or-fallback)` at every one of those sites.
+// own "no tier" condition) and — since item 62 / RN-12 retired the dedicated
+// no-tier-baseline field this used to read — the fallback value itself is
+// `rttTierInputDelays[kMaxConnectionTierIndex]` (the WORST tier). AMENDED
+// 2026-08-03: the replacement value is `max(relayDelayFloorTicks,
+// tier-or-fallback)` at every one of those sites.
 inline int32_t tierInputDelayTicks(int32_t tierIndex, const TimeConfig& cfg)
 {
     const int32_t tier = clampConnectionTierIndex(tierIndex);
@@ -314,6 +405,52 @@ inline bool tierShouldMuteEcho(int32_t tierIndex, const TimeConfig& cfg)
 inline int32_t tierDelayDeltaTicks(int32_t fromTier, int32_t toTier, const TimeConfig& cfg)
 {
     return tierInputDelayTicks(toTier, cfg) - tierInputDelayTicks(fromTier, cfg);
+}
+
+// THE CLIENT PREDICTION-STALL DECISION for a wire tier transition (item 69 /
+// og-netcode-v2-input-relay, filed from item 62's review finding 1).
+//
+// `oldTier` in `ISimulationConnectionRelayListener::onConnectionTierReceived`
+// is the replicated property's value BEFORE this OnRep — but on a fresh
+// connection's FIRST real OnRep, that "before" value is the property's
+// compiled default (0), not a tier the client was ever actually running.
+// Before that first arrival the client runs the pre-arrival no-tier fallback
+// (`rttTierInputDelays[kMaxConnectionTierIndex]`, floored — see
+// ReplicatedTierConsumer's PRE-ARRIVAL FALLBACK note), never tier 0's delay.
+// Feeding `tierDelayDeltaTicks(0, newTier, cfg)` into that case therefore
+// stalls by the wrong quantity, in the wrong direction, for every newTier
+// except 0 (SimulationManagerUImpl.cpp's PRESERVED QUIRK note has the full
+// worked table). `hadAnyTier` is what makes the two cases distinguishable:
+// pass whether the caller had ALREADY received an authoritative tier before
+// THIS call — never infer it from `oldTier` itself, since 0 is both the
+// property default and a legal tier.
+//
+// FIRST-EVER RESOLUTION -> ALWAYS ZERO, regardless of newTier. This is
+// exactly `onConnectionTierReplayed`'s reasoning (no stall: nothing was
+// predicted against a previous TIER's delay, only against the fallback) —
+// a first real OnRep is the same situation, just arriving through the other
+// entry point.
+//
+// The `oldTier == newTier` early-out is preserved: an OnRep can fire for an
+// unchanged value, and nothing transitioned.
+//
+// Only a genuine (hadAnyTier == true) transition reaches `tierDelayDeltaTicks`,
+// and only a POSITIVE delta (an upward/degrading move) is ever returned — a
+// downward or delay-neutral transition needs no correction, matching
+// `applyTierTransitionStall`'s pre-existing "non-positive deltas are dropped"
+// contract (ClientPredictionClock::requestInputDelayIncreaseStall is also a
+// no-op below zero, so this is belt-and-braces, not the only guard).
+inline int32_t shouldStallForTierTransition(
+    int32_t oldTier, int32_t newTier, bool hadAnyTier, const TimeConfig& cfg)
+{
+    if (oldTier == newTier)
+        return 0;
+
+    if (!hadAnyTier)
+        return 0;
+
+    const int32_t deltaDelayTicks = tierDelayDeltaTicks(oldTier, newTier, cfg);
+    return deltaDelayTicks > 0 ? deltaDelayTicks : 0;
 }
 
 // Outcome of a single ConnectionTierTable::onRttSample call.

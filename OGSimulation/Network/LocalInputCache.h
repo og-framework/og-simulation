@@ -6,7 +6,7 @@
 #include <vector>
 
 // ---------------------------------------------------------------------------
-// ClientInputDelayLine<InputT> — the CLIENT-side counterpart of
+// LocalInputCache<InputT> — the CLIENT-side counterpart of
 // ServerInputDelayQueue. (Stage 5 / D5.2, T9 parts 3+4.)
 //
 // WHAT IT IS. A small ring of the client's OWN input CAPTURES, keyed by the tick
@@ -116,7 +116,7 @@
 // design corpus writes `ogsim::` but no such namespace exists in this tree.
 // ---------------------------------------------------------------------------
 
-// Slot count of a default-constructed ClientInputDelayLine.
+// Slot count of a default-constructed LocalInputCache.
 //
 // Declared as a FREE constant (the class member below aliases it) so that
 // config-layer code can derive bounds from it without naming an arbitrary
@@ -126,10 +126,27 @@
 // that would schedule reads at a tick whose capture has already been evicted,
 // silently degenerating the scheduled regime instead of failing loudly
 // (RelayDelaySpectrumDesign.md review finding A5).
-inline constexpr std::size_t kClientInputDelayLineCapacityTicks = 64u;
+inline constexpr std::size_t kLocalInputCacheCapacityTicks = 64u;
+
+// ---------------------------------------------------------------------------
+// Formerly ClientInputDelayLine (renamed 2026-08-16, RN-14).
+//
+// WIPE ASYMMETRY — THE SIGNAL THE OLD, ASYMMETRIC NAMES WERE CARRYING.
+// This cache is CLOCK-KEYED and IS wiped by SimulationNetSync::wipeAllForResync
+// (see clear() below, and the non-wipe comment at the wipeAllForResync call
+// site): its keys are the local PREDICTION clock's tick numbers, and a hard
+// resync jumps that clock, so a surviving capture would be read at the wrong
+// tick. Its counterpart, RemoteInputCache (Network/RemoteInputCache.h), is
+// SENDER-KEYED — a server-domain identity a local resync does not touch — and
+// is deliberately NOT wiped: a proxy would be blind for a window after every
+// resync (the 2026-08-04 failure). `LocalInputCache` / `RemoteInputCache` are
+// now symmetric names; this note pays back the asymmetry signal the old
+// `DelayLine` / `Store` names encoded by accident, so a reader does not
+// mistake the new symmetry for a symmetric contract.
+// ---------------------------------------------------------------------------
 
 template <typename InputT>
-class ClientInputDelayLine
+class LocalInputCache
 {
 public:
     // Capacity must comfortably exceed the largest configurable tier delay
@@ -139,10 +156,10 @@ public:
     // a tick modulus the caller has to reason about — `at()` validates the
     // stored tick, so an evicted tick reads as absent rather than as a stale
     // neighbour.
-    static constexpr std::size_t kDefaultCapacityTicks = kClientInputDelayLineCapacityTicks;
+    static constexpr std::size_t kDefaultCapacityTicks = kLocalInputCacheCapacityTicks;
 
-    explicit ClientInputDelayLine(InputT neutralInput = InputT{},
-                                  std::size_t capacity = kDefaultCapacityTicks)
+    explicit LocalInputCache(InputT neutralInput = InputT{},
+                             std::size_t capacity = kDefaultCapacityTicks)
         : m_neutral(std::move(neutralInput))
         , m_slots(capacity == 0u ? kDefaultCapacityTicks : capacity)
     {
@@ -276,7 +293,7 @@ private:
 // input. Zero delay must be indistinguishable from the pre-T9 behaviour.
 // ---------------------------------------------------------------------------
 template <typename InputT>
-const InputT& resolveDelayedInput(const ClientInputDelayLine<InputT>& line,
+const InputT& resolveDelayedInput(const LocalInputCache<InputT>& line,
                                   std::int32_t currentTick,
                                   std::int32_t effectiveDelay,
                                   const InputT& liveCapture)
