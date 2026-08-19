@@ -9,8 +9,10 @@
 #include <functional>
 #include "OGSimulation/SimulationTypes.h"
 
+#include "OGSimulation/CompilerControl.h"
+
 // pragma optimize off — debugger-friendliness; rationale in SimulationManager.h.
-#pragma optimize( "", off )
+OGSIM_OPTIMIZE_OFF
 
 // Replaces bool isStalling / bool isSkipping pair on SimulationTimeStep.
 // isResimulation stays a separate axis — resim is driven by Chaos, not the clock.
@@ -204,5 +206,5 @@ private:
 
 };
 
-#pragma optimize( "", on )
+OGSIM_OPTIMIZE_ON
 // pragma optimize on.

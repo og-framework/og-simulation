@@ -11,8 +11,10 @@
 #include "OGSimulation/SimulationTimeContext.h"
 #include "TimeConfig.h"
 
+#include "OGSimulation/CompilerControl.h"
+
 // pragma optimize off — debugger-friendliness; rationale in SimulationManager.h.
-#pragma optimize( "", off )
+OGSIM_OPTIMIZE_OFF
 
 // ClientPredictionClock — client-only tick counter with graduated drift correction
 // and resimulation cursor.
@@ -147,5 +149,5 @@ private:
     PCClockLoggerFn m_logger;
 };
 
-#pragma optimize( "", on )
+OGSIM_OPTIMIZE_ON
 // pragma optimize on.

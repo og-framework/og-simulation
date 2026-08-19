@@ -12,8 +12,10 @@
 #include "OGSimulation/SimulationObjectStorage.h"
 #include "OGSimulation/SimulationTimeContext.h"
 
+#include "OGSimulation/CompilerControl.h"
+
 // pragma optimize off — debugger-friendliness; rationale in SimulationManager.h.
-#pragma optimize("", off)
+OGSIM_OPTIMIZE_OFF
 
 // ---------------------------------------------------------------------------
 // [og-netcode-v2-input-relay T6 / design D3] AppliedCaptureRef — the answer to
@@ -897,5 +899,5 @@ concept SimulationReconciliationConcept = requires(
     // the class body.
 };
 
-#pragma optimize("", on)
+OGSIM_OPTIMIZE_ON
 // pragma optimize on.

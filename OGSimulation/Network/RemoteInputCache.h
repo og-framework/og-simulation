@@ -463,25 +463,17 @@ public:
         return count;
     }
 
-    // ONE-SHOT gate for the wire-version-mismatch log.
-    //
-    // Returns true exactly once per store, i.e. exactly once PER CHARACTER (=
-    // per replicated component) PER SESSION — which is the cadence the fence
-    // requires, because an incompatible peer re-replicates its ring forever and an
-    // ungated log would fire on every single replication. The latch lives on the
-    // store because the store is the only per-character object the ingest path
-    // has; `populateRemoteInputCache` itself is stateless and logger-free (core
-    // containers do not log — the caller owns the logger, exactly as
-    // RemoteMoveQueue's too-far-future drop is warned by SimulationNetSync).
-    bool shouldLogVersionMismatchOnce()
-    {
-        if (m_versionMismatchLogged)
-        {
-            return false;
-        }
-        m_versionMismatchLogged = true;
-        return true;
-    }
+    // [og-netcode-v2-input-relay task 79] `shouldLogVersionMismatchOnce()` USED
+    // TO LIVE HERE — one-shot gate for the wire-version-mismatch log, exactly
+    // once per store (= per character = per replicated component) per session.
+    // It moved to `NetSyncTelemetry::shouldLogVersionMismatchOnce(id)`
+    // (`NetSyncTelemetry.h`), id-keyed instead of store-resident: log-suppression
+    // state belongs with the logger, not with the data container being logged
+    // about, and handing the telemetry sibling a reference to THIS store so it
+    // could call the old method would have been exactly the production-container
+    // coupling that task's split exists to avoid. `RemoteInputCacheTest.cpp`'s
+    // four assertions against the old method moved to `NetSyncTelemetryTest.cpp`
+    // against the new one — see that task's impl notes for the before/after.
 
 private:
     struct Slot
@@ -532,9 +524,6 @@ private:
 
     InputT            m_neutral;
     std::vector<Slot> m_slots;
-
-    // See shouldLogVersionMismatchOnce().
-    bool m_versionMismatchLogged = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -564,7 +553,8 @@ private:
 //   version ==
 //   kWireFormat -> consume.
 //   anything else -> DROP THE WHOLE RING. Consume nothing. The caller logs, once
-//                 per component per session (see shouldLogVersionMismatchOnce).
+//                 per component per session (see
+//                 NetSyncTelemetry::shouldLogVersionMismatchOnce, task 79).
 //
 // DROP AT CONSUME — DO NOT `Ar.SetError()`, AND DO NOT "FIX" THIS TO MATCH THE
 // LENGTH CHECK. The two are asymmetric on purpose. A bad LENGTH prefix means the

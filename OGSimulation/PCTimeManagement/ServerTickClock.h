@@ -8,8 +8,10 @@
 #include "OGSimulation/OGAssert.h"
 #include "OGSimulation/SimulationTimeContext.h"
 
+#include "OGSimulation/CompilerControl.h"
+
 // pragma optimize off — debugger-friendliness; rationale in SimulationManager.h.
-#pragma optimize( "", off )
+OGSIM_OPTIMIZE_OFF
 
 // ServerTickClock — server-side monotonic tick counter with sync-buffer serialization.
 // Replaces AuthoritySimulationTimeManager (renamed for clarity).
@@ -76,5 +78,5 @@ private:
     LoggerFn m_logger;
 };
 
-#pragma optimize( "", on )
+OGSIM_OPTIMIZE_ON
 // pragma optimize on.

@@ -99,8 +99,10 @@ private:
 	}
 };
 
+#include "OGSimulation/CompilerControl.h"
+
 // pragma optimize off — debugger-friendliness; rationale in SimulationManager.h.
-#pragma optimize( "", off )
+OGSIM_OPTIMIZE_OFF
 
 // ---------------------------------------------------------------------------
 // [og-netcode-v2-input-relay T24] CorrectionInsertVerdict — what
@@ -737,14 +739,37 @@ public:
 	// [og-netcode-v2-input-relay item 47] ⛔ IT NO LONGER WRITES UNCONDITIONALLY —
 	// A REPLAY NEVER OVERWRITES A CORRECTED SLOT.
 	//
-	// The rule, its rationale, the provenance invariant it makes hold by
-	// construction, and the fresh/stale classifier are all in ONE block:
-	// `resimGate::classifyResimSlotWrite` in ResimGatePolicy.h. Read that before
-	// changing anything here. In one line: authority state (or a
-	// within-tolerance prediction the authority certified) is strictly better
-	// than a re-derivation of it, so the replay's own output is dropped for that
-	// slot and `m_containsCorrectTick` is left ALONE — never cleared, because
-	// nothing authority-marked is ever overwritten.
+	// The rule, its rationale, the provenance invariant it makes hold, and the
+	// fresh/stale classifier are all in ONE block: `resimGate::classifyResimSlotWrite`
+	// in ResimGatePolicy.h. Read that before changing anything here. In one line:
+	// authority state (or a within-tolerance prediction the authority certified)
+	// is strictly better than a re-derivation of it, so the replay's own output
+	// is dropped for that slot and `m_containsCorrectTick` is left ALONE — never
+	// cleared, because nothing authority-marked is ever overwritten.
+	//
+	// ⚠ [og-netcode-v2-input-relay item 81] THE INVARIANT'S HONEST BOUND — it
+	// holds UP TO AN ACKNOWLEDGED WORD RACE, not "by construction" unqualified.
+	// `m_containsCorrectTick` is a TWO-WRITER WORD: GT `set()` right here (below,
+	// ~:898) and the PT clear in the push path (`pushPredictionTick`, ~:660) are
+	// both read-modify-writes of the same `std::bitset` word, so a PT
+	// frontier-clear can lose-update a concurrent GT landing-set (or the
+	// reverse), erasing one slot's authority mark. The deliberately-redundant
+	// provenance check (`ReplayedOverCorrection`, WRITE SITE 3 below) catches
+	// exactly that lost-set case, but only on the `[ResimProbe.SlotMap]` Verbose
+	// surface — never on this decision path. The mechanism fix (moving this
+	// crossing onto the SPSC staging seam) is item 82's, deliberately gated;
+	// this note corrects the description only, and changes neither behaviour
+	// nor severity assessment.
+	//
+	// ⚠ [item 83 / 81 f2] CALIBRATION, FOR A READER WHO LANDS ONLY HERE: the
+	// architecture review that derived this correction sizes the PRACTICAL
+	// exposure as a few-instruction window per event at 60 Hz x ~20 Hz —
+	// self-healing at the next landing, hence rare. The ARCHITECTURAL point
+	// stands regardless (an accepted-tear price list priced torn *values*; a
+	// lost *decision bit* is a different line item), which is why the
+	// description above states the honest bound unqualified. This sentence adds
+	// no new severity judgement — it surfaces the one already reached — and does
+	// not reopen item 82's gated mechanism fix.
 	//
 	// ⚠ THE RETURN VALUE STILL MEANS "THE SLOT EXISTED", NOT "I WROTE". A
 	// PROTECTED slot returns TRUE: item 42's `replayOverruns` counts ticks that
@@ -1504,10 +1529,17 @@ private:
 	//   * they are OBSERVATIONAL. `resimGate::classifyResimSlotWrite` returns
 	//     `Written` iff `!slotContainsCorrectTick` — REGARDLESS of the stamps —
 	//     and the write site acts on `outcome != Written`, so the decision rests
-	//     on exactly one input, itself a pre-existing GT-written / PT-read bit.
-	//     The stamps only split the protections into fresh/stale for the probe. A
-	//     torn stamp mis-labels a COUNTER; it can never mis-decide a write. (That
-	//     one-bit property is swept as its own section in `ResimGatePolicyTest`,
+	//     on exactly one input: `m_containsCorrectTick`. [og-netcode-v2-input-relay
+	//     item 81] That bit is TWO WRITERS ON ONE WORD, not the milder
+	//     "GT-written / PT-read" shape this sentence used to claim — GT `set()`
+	//     in `tryInsertingCorrectState` (~:898) and the PT clear in the push
+	//     path (~:660) are both read-modify-writes of the same `std::bitset`
+	//     word, so the failure mode this decision is exposed to is a LOST
+	//     UPDATE, not a torn read. See the honest-bound note on item 47's header
+	//     block above for the full shape and what catches it. The stamps only
+	//     split the protections into fresh/stale for the probe. A torn stamp
+	//     mis-labels a COUNTER; it can never mis-decide a write. (That one-bit
+	//     property is swept as its own section in `ResimGatePolicyTest`,
 	//     because it is what this whole paragraph rests on.)
 	//   * ⛔ THEY ARE NOT GATE STATE. `needsResimulation()` does not read them and
 	//     must never be made to. Item 45's one-atomic-word fence governs the GATE
@@ -1685,7 +1717,7 @@ void sendCorrectionState(const SimulationTimeStep& timingInfo, const StateType& 
 	internalByteIterator += writeBufferFunction(state, buffer, internalByteIterator);
 }
 
-#pragma optimize( "", on )
+OGSIM_OPTIMIZE_ON
 // pragma optimize on.
 
 

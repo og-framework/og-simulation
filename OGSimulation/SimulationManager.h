@@ -13,16 +13,48 @@
 #include "OGSimulation/PCTimeManagement/ClientPredictionClock.h"
 #include "OGSimulation/ResimGatePolicy.h"                // resimGate:: (item 45)
 #include "OGSimulation/SimulationLog.h"
+// [item 80 / B6] The two peer concepts this file names directly, so the
+// `requires` clauses below can use them. Nothing else in this file needed the
+// concrete peer classes (NetSyncT / ReconciliationT / IntegrationExecT stay
+// duck-typed template parameters) — these two includes exist ONLY to bring
+// the concept declarations into scope. NetSyncT is constrained by two
+// sibling concepts DEFINED IN THIS FILE, not by including SimulationNetSync.h
+// — see the rationale beside SimulationNetSyncTickConcept below.
+#include "OGSimulation/SimulationIntegrationExecutor.h"
+#include "OGSimulation/SimulationReconciliation.h"
 #include "OGSimulation/SimulationTimeContext.h"
 // [og-netcode-v2-input-relay item 42] The resim-gate telemetry. Physics-thread
 // half only — the game-thread half (CorrectionLandingProbe) is owned by
 // SimulationNetSync, at the site that knows the character id and its class.
 #include "OGSimulation/ResimGateProbe.h"
+#include "OGSimulation/CompilerControl.h"
 
 // pragma optimize off — debugger-friendliness across all build configs (breakpoints hit,
 // locals visible, call-stack intact). OGSim-core convention; canonical statement — the
 // other OGSim-core pragma sites point here.
-#pragma optimize( "", off )
+//
+// [og-netcode-v2-input-relay item 77] As of this item the pair below is
+// OGSIM_OPTIMIZE_OFF/ON, not a raw pragma — every OGSim-core, OGBrawler-core,
+// and UE-adapter site (43 files) uses the same two macros, defined once in
+// OGSimulation/CompilerControl.h. That header is the mechanism; this comment
+// is the contract:
+//   - Default (Debug/Development, no switch defined): the macros expand to
+//     exactly this pragma pair — daily debugging is untouched by item 77.
+//   - Define OGSIM_FORCE_OPTIMIZED=1 (or build Test/Shipping) and both macros
+//     expand to nothing everywhere — the whole core compiles at full
+//     command-line optimization.
+//   - Non-MSVC compilers get a no-op pair unconditionally — CompilerControl.h
+//     is where the MSVC-only pragma is made portable, not just renamed.
+//
+// THE MEASUREMENT RULE: no gate-family cost number (items 43, 46, 78, ...) is
+// quotable unless the log or record that produced it NAMES the optimize
+// setting it was taken under. A number measured under the default (this
+// pragma active, as every archived resim number to date was) and one measured
+// with OGSIM_FORCE_OPTIMIZED=1 are not the same measurement — treating them as
+// interchangeable without saying so is this initiative's signature defect (an
+// instrument measuring the wrong quantity under the right name), applied to
+// build configuration. Full rationale in OGSimulation/CompilerControl.h.
+OGSIM_OPTIMIZE_OFF
 
 // SimulationUpdateInfo — passed from the Chaos async callback into onGameSimulation.
 class SimulationUpdateInfo
@@ -41,6 +73,99 @@ public:
 private:
     bool m_isResimulation = false;
     bool m_isFirstResimulationStep = false;
+};
+
+// ---------------------------------------------------------------------------
+// [og-netcode-v2-input-relay item 80 / B6] SimulationManager-facing splits of
+// SimulationNetSyncConcept (SimulationNetSync.h).
+//
+// SimulationManager's own six template parameters never carry SimulatableTs —
+// that pack lives inside NetSyncT's own instantiation
+// (SimulationNetSync<SimulatableTs...>), never as one of the manager's type
+// parameters — so SimulationNetSyncConcept's two SimulatableTs-typed return
+// checks (collectInputAll / collectResimInputAll ->
+// convertible_to<ResolvedInputs<SimulatableTs...>>) cannot be expressed at
+// the manager's generality: there is no pack for the manager to supply.
+// These two sibling concepts check the SAME method names and argument
+// shapes, presence-only (no return-type pin), split along the two groups
+// SimulationManager's own member functions actually call together: the
+// per-tick read side (onGameSimulationPrediction/Authority/Resimulation) and
+// the once-per-tick publish side (onPostSimulationGameThread).
+// SimulationNetSyncConcept itself is untouched by this task and stays the
+// precise, SimulatableTs-exact check used ad hoc adapter-side where the
+// concrete SimulatableTs are known (task 6, SimulationManagerUImplConceptTest.cpp).
+//
+// ⚠ [item 83 / 80 f2] PRESENCE-ONLY IS NOT THE STRONGEST CHECK REACHABLE HERE,
+// AND THAT IS WORTH SAYING PLAINLY RATHER THAN LEAVING IMPLIED. A concept could
+// still constrain the SHAPE of `collectInputAll`/`collectResimInputAll`'s return
+// (e.g. "convertible to some `std::tuple` of `std::unordered_map<unsigned int, X>`s")
+// without knowing `SimulatableTs` — strictly tighter than presence-only, and
+// expressible at this generality. That was not attempted here: the manager's own
+// proof namespace below demonstrates just how weak presence-only is
+// (`NetSyncShaped::collectInputAll` returns a bare `int` and still satisfies this
+// concept), and a wrong return type at the manager still fails loudly downstream —
+// at the real `ResolvedInputs` consumer (`SimulationIntegrationExecutor::integrateAll`) —
+// rather than silently. Left as a residual for a future revisit of this concept,
+// not attempted in this task.
+//
+// [item 83 / 80 f4] PLACEMENT, RECONSIDERED ON THE MERITS NOW THAT THE
+// SCHEDULING CONTENTION IS OVER. These two concepts were originally defined here
+// (rather than beside `SimulationNetSyncConcept` in `SimulationNetSync.h`, where
+// `SimulationReconciliationConcept` and `SimulationIntegrationExecutorConcept`
+// each live beside THEIR peer class) because item 79 owned `SimulationNetSync.h`
+// concurrently. That is a scheduling reason, not a design one, and the
+// "definition-at-call-site is better anyway" argument that accompanied it does
+// not hold as a general principle — this file's other two peer concepts are both
+// defined at their PEER's declaration site and pulled in by `#include`, not
+// defined at their one call site (here). Item 79 has since landed, so the
+// contention that forced this placement no longer exists.
+// RULING: left here rather than moved, because this task (item 83) owns
+// `SimulationManager.h`, `docs/ThreadingCrossings.md`, `CorrectionCache.h` and
+// `NetSyncTelemetry.h` — not `SimulationNetSync.h` — and moving these two
+// concepts is a `SimulationNetSync.h` edit with its own blast radius (a new
+// include cycle to check, since `SimulationManager.h` deliberately does not
+// include `SimulationNetSync.h` today). Recorded here as a decision, not an
+// oversight: a follow-up task that already owns `SimulationNetSync.h` should
+// relocate `SimulationNetSyncTickConcept` / `SimulationNetSyncPublishConcept`
+// beside `SimulationNetSyncConcept` for consistency with the other two peers.
+// ---------------------------------------------------------------------------
+
+template <typename T>
+concept SimulationNetSyncTickConcept = requires(
+    T& t, const SimulationTimeStep& step, uint32_t tick, int32_t rollbackWindow)
+{
+    { t.collectInputAll(step) };
+    { t.collectResimInputAll(tick) };
+    { t.setAuthorityGuardContext(tick, rollbackWindow) };
+    // [item 83 / Part A] `wipeAllForResync` was dropped from BOTH split concepts
+    // with no stated reason — the SimulatableTs-invisibility justification above
+    // covers only the two return-type pins, and this method is a plain
+    // `void(uint32)` with no pack involvement, so it was reachable and simply
+    // missed. The manager's ctor calls `m_netSync.wipeAllForResync(...)` from
+    // ClientPredictionClock's resync callback, which fires from INSIDE
+    // `advancePrediction()` — i.e. from THIS group: the callback is registered
+    // only when `shouldRunPrediction`, and it fires only as a side effect of the
+    // same physics-thread call chain `onGameSimulationPrediction` (below) drives.
+    // Added HERE, not to the Publish sibling, for that reason: it belongs to the
+    // group that is actually reachable when the resync path can fire.
+    //
+    // ⚠ CAVEAT, STATED AT THE SITE SO THIS ISN'T MISREAD AS MORE THAN IT IS:
+    // `wipeAllForResync` is the ONE method name shared verbatim by this concept's
+    // peer `SimulationReconciliationConcept` (see the ctor's own comment on why
+    // that sharing means a wipeAllForResync-only clause cannot distinguish a
+    // NetSync-shaped peer from a Reconciliation-shaped one). Adding it here is
+    // PRESENCE-CHECKING ONLY — it makes the resync call site covered by SOME
+    // concept instead of none, not transposition-safe. The ctor itself stays
+    // deliberately unconstrained for exactly this reason.
+    { t.wipeAllForResync(tick) };
+};
+
+template <typename T>
+concept SimulationNetSyncPublishConcept = requires(
+    T& t, const SimulationTimeStep& step, uint32_t tick, int32_t correctionRotationK)
+{
+    { t.sendCorrectionAll(step, correctionRotationK) };
+    { t.sendLocalInputToAuthorityAll(tick, tick) };
 };
 
 // ---------------------------------------------------------------------------
@@ -106,6 +231,14 @@ public:
     {
         m_timeConfig.tickFrequency = 1.0 / tickFrequency;
 
+        // [item 80 / B6] The ctor itself stays UNCONSTRAINED by any peer concept,
+        // deliberately: `wipeAllForResync(uint32)` is the one method name both
+        // SimulationNetSyncConcept and SimulationReconciliationConcept share
+        // verbatim, so a requires-clause built only from it could not
+        // distinguish a NetSync-shaped peer from a Reconciliation-shaped one —
+        // it would give the false impression of transposition protection while
+        // providing none. The methods that actually differ between the two
+        // peers are constrained below, at the member functions that call them.
         if (shouldRunPrediction)
         {
             m_networkEstimator.emplace(m_timeConfig, params.logger);
@@ -240,7 +373,9 @@ public:
     // to every allocated cache. A caller that wrote `TimeConfig` directly would leave
     // the caches on the compiled default and the proof line reporting a policy
     // nothing implements.
+    // [item 80 / B6] setResimTriggerPolicy (SimulationReconciliationConcept).
     void setResimTriggerPolicy(TimeConfig::ResimTriggerPolicy policy)
+        requires SimulationReconciliationConcept<ReconciliationT>
     {
         m_timeConfig.resimTriggerPolicy = policy;
         m_reconciliation.setResimTriggerPolicy(policy);
@@ -312,7 +447,13 @@ public:
     // Runs after Chaos has integrated and solved physics for this sub-step.
     // Captures post-solve state into the cache and detects the resim-batch
     // catch-up edge to apply resim results.
+    // [item 80 / B6] captureBodyStatesAll (SimulationIntegrationExecutorConcept)
+    // plus postPredictionAll / postResimulationAll / applyResimAll /
+    // consumeResimAnchorsAll (SimulationReconciliationConcept) — every one of
+    // this method's peer calls below.
     void onPostGameSimulation(const SimulationUpdateInfo& updateInfo)
+        requires SimulationIntegrationExecutorConcept<IntegrationExecT> &&
+                 SimulationReconciliationConcept<ReconciliationT>
     {
         if (!m_lastStep.has_value())
             return;
@@ -412,7 +553,9 @@ public:
         }
     }
 
+    // [item 80 / B6] checkDivergenceAll (SimulationReconciliationConcept).
     unsigned int onCheckIsSimilar()
+        requires SimulationReconciliationConcept<ReconciliationT>
     {
         // Caller (FSimulationManagerAsyncCallback::TriggerRewindIfNeeded_Internal)
         // short-circuits on !runsPrediction() so this is only reached on the
@@ -478,7 +621,11 @@ public:
     }
 
     // chaosStep is the raw Chaos physics step; simTick is the simulation tick to resim from.
+    // [item 80 / B6] prepareResimAll (SimulationReconciliationConcept) +
+    // firstResimStepAll (SimulationIntegrationExecutorConcept).
     void prepareResimulation(int32_t chaosStep, uint32_t simTick)
+        requires SimulationReconciliationConcept<ReconciliationT> &&
+                 SimulationIntegrationExecutorConcept<IntegrationExecT>
     {
         if (!m_runsPrediction)
         {
@@ -571,7 +718,11 @@ public:
         return m_lastStep.has_value() ? m_lastStep->getTick() : 0u;
     }
 
+    // [item 80 / B6] sendCorrectionAll + sendLocalInputToAuthorityAll — the
+    // NetSync "publish" surface (SimulationNetSyncPublishConcept), the other
+    // half of the NetSync method inventory the tick methods above don't call.
     void onPostSimulationGameThread()
+        requires SimulationNetSyncPublishConcept<NetSyncT>
     {
         const SimulationTimeStep step = currentStep();
         // [T39] The state-rotation width — how many characters' correction buffers
@@ -695,7 +846,11 @@ private:
             window.freshClobbersAvoided, window.staleClobbersAvoided);
     }
 
+    // [item 80 / B6] Constrained on the NetSync "tick" surface — the group
+    // this method, onGameSimulationAuthority and onGameSimulationResimulation
+    // all draw from (collectInputAll here).
     void onGameSimulationPrediction()
+        requires SimulationNetSyncTickConcept<NetSyncT>
     {
         // [item 42 / I5] THE STRANDED-CURSOR OBSERVATION, taken BEFORE
         // advancePrediction so it reports the state this frame INHERITED rather
@@ -762,7 +917,10 @@ private:
         m_systemsExec.firePostIntegrate(step, storage, staticData);
     }
 
+    // [item 80 / B6] setAuthorityGuardContext + collectInputAll — both members
+    // of the NetSync "tick" surface (SimulationNetSyncTickConcept).
     void onGameSimulationAuthority()
+        requires SimulationNetSyncTickConcept<NetSyncT>
     {
         m_serverClock->advanceTick();
         const SimulationTimeStep step = m_serverClock->getSimulationStep();
@@ -781,7 +939,10 @@ private:
         m_systemsExec.firePostIntegrate(step, storage, staticData);
     }
 
+    // [item 80 / B6] collectResimInputAll — the third member of the NetSync
+    // "tick" surface (SimulationNetSyncTickConcept).
     void onGameSimulationResimulation()
+        requires SimulationNetSyncTickConcept<NetSyncT>
     {
         m_clientClock->advanceResimulation();
         const SimulationTimeStep step = m_clientClock->getResimulationStep();
@@ -855,5 +1016,112 @@ private:
     ResimGateProbe                       m_resimGateProbe;
 };
 
-#pragma optimize( "", on )
+// ---------------------------------------------------------------------------
+// [og-netcode-v2-input-relay item 80 / B6] COMPILE-CHECKED PROOF that the
+// concept vocabulary applied above actually rejects a same-category
+// transposition — the exact scenario `Params`' own comment (top of this
+// class) says compiles today for a duck-typed, unconstrained peer reference:
+// "a transposition of two same-category refs COMPILES — they are duck-typed
+// — and misbehaves only at runtime."
+//
+// Two minimal local types, each shaped like exactly one of the two peers that
+// share a method name (`wipeAllForResync`) but are otherwise structurally
+// distinct: a NetSync-shaped type (satisfies the manager's NetSync tick/
+// publish surfaces) and a Reconciliation-shaped type (satisfies
+// SimulationReconciliationConcept). Swapping them into each other's concept
+// is the transposition itself, and it is now a hard compile-time rejection
+// rather than a silent duck-typed pass-through.
+// ---------------------------------------------------------------------------
+namespace simulationManagerConceptProof
+{
+    // Shaped like a NetSync peer. Satisfies every SimulationNetSyncConcept
+    // member EXCEPT the two SimulatableTs-typed returns — this proof does not
+    // need them; see the split concepts' rationale (SimulationNetSyncTickConcept,
+    // above) for why the manager cannot express those two generically either way.
+    struct NetSyncShaped
+    {
+        void sendCorrectionAll(const SimulationTimeStep&, int32 /*correctionRotationK*/) {}
+        void sendLocalInputToAuthorityAll(uint32 /*tick*/, uint32 /*redundancyDepth*/) {}
+        int  collectInputAll(const SimulationTimeStep&) { return 0; }
+        int  collectResimInputAll(uint32 /*tick*/) { return 0; }
+        void wipeAllForResync(uint32 /*tick*/) {}
+        void setAuthorityGuardContext(uint32 /*tick*/, int32 /*rollbackWindow*/) {}
+    };
+
+    // Shaped like a Reconciliation peer. Satisfies every
+    // SimulationReconciliationConcept member.
+    struct ReconciliationShaped
+    {
+        void postPredictionAll(const SimulationTimeStep&) {}
+        void postResimulationAll(const SimulationTimeStep&) {}
+        unsigned int checkDivergenceAll(uint32 /*tick*/) { return 0u; }
+        void wipeAllForResync(uint32 /*tick*/) {}
+        void prepareResimAll(uint32 /*tick*/) {}
+        void applyResimAll() {}
+        unsigned int consumeResimAnchorsAll() { return 0u; }
+        void setResimTriggerPolicy(TimeConfig::ResimTriggerPolicy) {}
+    };
+
+    // [item 83 / 80 f3] Shaped like an IntegrationExec peer. Satisfies every
+    // SimulationIntegrationExecutorConcept member. Added to LEVEL the proof
+    // coverage: unlike the NetSync/Reconciliation pair above,
+    // SimulationIntegrationExecutorConcept previously got no positive shaped
+    // control and no transposition negative in this block — only the Empty-type
+    // negative below — even though NetSyncShaped/ReconciliationShaped would both
+    // (correctly) fail it, a claim nothing here proved before this addition.
+    struct IntegrationExecShaped
+    {
+        void firstResimStepAll(int32 /*physicsStep*/) {}
+        void captureBodyStatesAll() {}
+    };
+
+    // --- POSITIVE CONTROLS — each shaped type satisfies its own concept. ---
+    static_assert(SimulationNetSyncTickConcept<NetSyncShaped>,
+        "NetSyncShaped must satisfy the manager's NetSync tick surface");
+    static_assert(SimulationNetSyncPublishConcept<NetSyncShaped>,
+        "NetSyncShaped must satisfy the manager's NetSync publish surface");
+    static_assert(SimulationReconciliationConcept<ReconciliationShaped>,
+        "ReconciliationShaped must satisfy SimulationReconciliationConcept");
+    static_assert(SimulationIntegrationExecutorConcept<IntegrationExecShaped>,
+        "IntegrationExecShaped must satisfy SimulationIntegrationExecutorConcept");
+
+    // --- NEGATIVE CONTROLS — THE TRANSPOSITION. A NetSync-shaped ref used
+    // where a Reconciliation-typed slot is expected, and the reverse. This is
+    // the failure the Params aggregate exists to guard against structurally;
+    // these two lines are the concept vocabulary catching it at compile time
+    // instead. ---
+    static_assert(!SimulationReconciliationConcept<NetSyncShaped>,
+        "a NetSync-shaped type must NOT satisfy SimulationReconciliationConcept"
+        " -- this is the same-category transposition Params exists to guard");
+    static_assert(!SimulationNetSyncTickConcept<ReconciliationShaped>,
+        "a Reconciliation-shaped type must NOT satisfy the manager's NetSync"
+        " tick surface -- the transposition's other direction");
+    static_assert(!SimulationNetSyncPublishConcept<ReconciliationShaped>,
+        "a Reconciliation-shaped type must NOT satisfy the manager's NetSync"
+        " publish surface either");
+
+    // [item 83 / 80 f3] THE COVERAGE GAP THE REVIEW NAMED, CLOSED: neither
+    // shaped peer above has `firstResimStepAll`/`captureBodyStatesAll`, so both
+    // would fail SimulationIntegrationExecutorConcept — asserted here instead of
+    // left as an unproven claim.
+    static_assert(!SimulationIntegrationExecutorConcept<NetSyncShaped>,
+        "a NetSync-shaped type must NOT satisfy"
+        " SimulationIntegrationExecutorConcept");
+    static_assert(!SimulationIntegrationExecutorConcept<ReconciliationShaped>,
+        "a Reconciliation-shaped type must NOT satisfy"
+        " SimulationIntegrationExecutorConcept");
+
+    // A plain nonconforming type (no members at all) satisfies none of the
+    // three constrained concepts, including the one with no SimulatableTs
+    // wrinkle to work around.
+    struct Empty {};
+    static_assert(!SimulationIntegrationExecutorConcept<Empty>,
+        "an empty type must NOT satisfy SimulationIntegrationExecutorConcept");
+    static_assert(!SimulationReconciliationConcept<Empty>,
+        "an empty type must NOT satisfy SimulationReconciliationConcept");
+    static_assert(!SimulationNetSyncTickConcept<Empty>,
+        "an empty type must NOT satisfy the manager's NetSync tick surface");
+} // namespace simulationManagerConceptProof
+
+OGSIM_OPTIMIZE_ON
 // pragma optimize on — restore command-line optimization settings.

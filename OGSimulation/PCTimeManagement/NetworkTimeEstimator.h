@@ -9,8 +9,10 @@
 
 #include "TimeConfig.h"
 
+#include "OGSimulation/CompilerControl.h"
+
 // pragma optimize off — debugger-friendliness; rationale in SimulationManager.h.
-#pragma optimize( "", off )
+OGSIM_OPTIMIZE_OFF
 
 // NetworkTimeEstimator — client-only network estimation component.
 // Tracks smoothed RTT and jitter via EMA, stores the last known authority tick,
@@ -164,5 +166,5 @@ private:
     LoggerFn m_logger;
 };
 
-#pragma optimize( "", on )
+OGSIM_OPTIMIZE_ON
 // pragma optimize on.

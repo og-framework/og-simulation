@@ -201,16 +201,17 @@ inline constexpr int32_t clampConnectionTierIndex(int32_t tierIndex)
 //
 // 64 - 20 = 44 at current defaults; lowering `rollbackWindowHardCap` raises it,
 // lowering EITHER capacity lowers it.
-constexpr int32_t relayDelayFloorHardCapForCapacities(std::size_t delayLineCapacityTicks,
-                                                      std::size_t storeCapacityTicks,
+constexpr int32_t relayDelayFloorHardCapForCapacities(std::size_t localInputCacheCapacityTicks,
+                                                      std::size_t remoteInputCacheCapacityTicks,
                                                       int32_t     rollbackWindowHardCap)
 {
     // Split out from `relayDelayFloorHardCapTicks` so the derivation is TESTABLE
     // against capacities other than the shipped ones: both capacities are
     // `constexpr` constants, so a test can only prove "the cap follows the store
     // capacity down" by feeding a different one in here.
-    const std::size_t smallerCapacity =
-        delayLineCapacityTicks < storeCapacityTicks ? delayLineCapacityTicks : storeCapacityTicks;
+    const std::size_t smallerCapacity = localInputCacheCapacityTicks < remoteInputCacheCapacityTicks
+        ? localInputCacheCapacityTicks
+        : remoteInputCacheCapacityTicks;
 
     const int32_t cap = static_cast<int32_t>(smallerCapacity) - rollbackWindowHardCap;
     return cap < 0 ? 0 : cap;   // a pathological hardCap must not produce a negative cap

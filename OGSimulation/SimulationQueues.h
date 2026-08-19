@@ -7,8 +7,10 @@
 #include <optional>
 #include <cstddef>
 
+#include "OGSimulation/CompilerControl.h"
+
 // pragma optimize off — debugger-friendliness; rationale in SimulationManager.h.
-#pragma optimize("", off)
+OGSIM_OPTIMIZE_OFF
 
 // Outcome of RemoteMoveQueue::queueMove — receive-side capture-tick
 // guard (proposal §3.3 step 10). Returned (rather than logged here) so the queue stays
@@ -200,5 +202,5 @@ private:
     std::array<Entry, RingSize> m_buffer{};
 };
 
-#pragma optimize("", on)
+OGSIM_OPTIMIZE_ON
 // pragma optimize on.

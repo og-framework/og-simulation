@@ -8,8 +8,10 @@
 #include "OGSimulation/PCTimeManagement/TimeConfig.h"
 #include "OGSimulation/SimulationLog.h"
 
+#include "OGSimulation/CompilerControl.h"
+
 // pragma optimize off — debugger-friendliness; rationale in SimulationManager.h.
-#pragma optimize("", off)
+OGSIM_OPTIMIZE_OFF
 
 // ---------------------------------------------------------------------------
 // Desync diagnostic sink boundary (proposal §2.4 / D3.8).
@@ -161,5 +163,5 @@ inline bool shouldEscalateToLayer2(int32_t consecutiveMismatchRun, const TimeCon
     return consecutiveMismatchRun >= cfg.hashMismatchTickThreshold;
 }
 
-#pragma optimize("", on)
+OGSIM_OPTIMIZE_ON
 // pragma optimize on.

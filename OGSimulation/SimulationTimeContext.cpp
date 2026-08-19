@@ -3,8 +3,10 @@
 #include <algorithm>
 #include "glm/geometric.hpp"
 
+#include "OGSimulation/CompilerControl.h"
+
 // pragma optimize off — debugger-friendliness; rationale in SimulationManager.h.
-#pragma optimize( "", off )
+OGSIM_OPTIMIZE_OFF
 
 
 AuthoritySimulationTimeManager::AuthoritySimulationTimeManager()
@@ -64,5 +66,5 @@ SimulationTimeStep PredictedAndCorrectionSimulationTimeManager::getReSimulationS
 	return SimulationTimeStep(m_resimulationTick, true);
 }
 
-#pragma optimize( "", on )
+OGSIM_OPTIMIZE_ON
 // pragma optimize on.

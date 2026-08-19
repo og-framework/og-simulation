@@ -10,8 +10,10 @@
 #include "OGSimulation/SimulatableList.h"  // SimulatableList, apply_t, IsSimulatableList, list_contains_v
 #include "OGSimulation/StorageView.h"      // StorageView, StorageViewThunk (projectTo<> return + thunks)
 
+#include "OGSimulation/CompilerControl.h"
+
 // pragma optimize off — debugger-friendliness; rationale in SimulationManager.h.
-#pragma optimize("", off)
+OGSIM_OPTIMIZE_OFF
 
 // ---------------------------------------------------------------------------
 // SimulatableState concept — adapter-agnostic side of a simulatable.
@@ -194,5 +196,5 @@ void updateVisualizationAll(SimulationObjectStorage<Ts...>& storage)
     });
 }
 
-#pragma optimize("", on)
+OGSIM_OPTIMIZE_ON
 // pragma optimize on.

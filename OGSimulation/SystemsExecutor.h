@@ -9,8 +9,10 @@
 #include "OGSimulation/SimulationObjectStorage.h"    // SimulationObjectStorage (StorageT + projectTo<>)
 #include "OGSimulation/SimulationTimeContext.h"      // SimulationTimeStep
 
+#include "OGSimulation/CompilerControl.h"
+
 // pragma optimize off — debugger-friendliness; rationale in SimulationManager.h.
-#pragma optimize("", off)
+OGSIM_OPTIMIZE_OFF
 
 // ---------------------------------------------------------------------------
 // SimulationSystem concept + SimulationSystemsExecutor + NullSystemsExecutor.
@@ -86,6 +88,21 @@ concept SimulationSystem = requires
 // Determinism: firing order == template-parameter order. Server and every
 // client compile the same type alias, so the order is byte-identical across
 // machines by construction.
+//
+// [og-netcode-v2-input-relay item 81] THE MISSING HALF — CHARACTER ORDER
+// WITHIN A SWEEP. The guarantee above covers SYSTEM order only. Within one
+// system's sweep, the CHARACTER order the projected StorageView walks is
+// unordered-map order — unspecified, and machine-varying with registration
+// history. This is a LIBRARY CONTRACT, not a survey of what happens to be
+// true today: a system whose per-character effects are non-commutative
+// (first-hit-wins, a capped resource claimed by two characters, any other
+// tie-break) MUST impose its own order over the view (e.g. sort by id)
+// before applying such effects, or it manufactures a permanent,
+// input-independent server/client divergence that no amount of gate or
+// verdict work downstream can repair. This header does not, and must not,
+// enforce that ordering itself or cite which game-repo system conforms to
+// it — this is engine- and game-agnostic core; the obligation is the
+// conforming system's alone.
 //
 // Ownership: systems are value-members of the tuple. No heap allocations, no
 // virtual dispatch.
@@ -216,5 +233,5 @@ public:
 template <typename SimulatablesList, typename StaticDataT>
 using NullSystemsExecutor = SimulationSystemsExecutor<SimulatablesList, StaticDataT>;
 
-#pragma optimize("", on)
+OGSIM_OPTIMIZE_ON
 // pragma optimize on.

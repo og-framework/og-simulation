@@ -4,8 +4,10 @@
 #include <algorithm>
 #include <cstdio>
 
+#include "OGSimulation/CompilerControl.h"
+
 // pragma optimize off — debugger-friendliness; rationale in SimulationManager.h.
-#pragma optimize( "", off )
+OGSIM_OPTIMIZE_OFF
 
 NetworkTimeEstimator::NetworkTimeEstimator(const TimeConfig& config, LoggerFn logger)
     : m_config(config)
@@ -417,5 +419,5 @@ unsigned int NetworkTimeEstimator::getOutlierEscapeCount() const
     return m_outlierEscapes;
 }
 
-#pragma optimize( "", on )
+OGSIM_OPTIMIZE_ON
 // pragma optimize on.

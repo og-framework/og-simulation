@@ -20,14 +20,17 @@
 #include "OGSimulation/ResimGateProbe.h"
 #include "OGSimulation/Network/RelayReadProbe.h"
 #include "OGSimulation/Network/RemoteInputCache.h"
+#include "OGSimulation/NetSyncTelemetry.h"
 #include "OGSimulation/SimulationLog.h"
 #include "OGSimulation/SimulationObjectStorage.h"
 #include "OGSimulation/SimulationQueues.h"
 #include "OGSimulation/SimulationReconciliation.h"
 #include "OGSimulation/SimulationTimeContext.h"
 
+#include "OGSimulation/CompilerControl.h"
+
 // pragma optimize off — debugger-friendliness; rationale in SimulationManager.h.
-#pragma optimize("", off)
+OGSIM_OPTIMIZE_OFF
 
 // ---------------------------------------------------------------------------
 // SimulatableOwnerTraits<SimulatableT>
@@ -644,6 +647,12 @@ public:
 
     void setLogger(std::function<void(const char*)> logger)
     {
+        // [task 79] The telemetry sibling logs its own `emit*` lines now, so it
+        // gets its own copy of the same logger. `m_logger` stays on this class
+        // too — the SIMLOG call sites that are NOT part of the sixteen `emit*`
+        // helpers (e.g. [ReceiveLocalInput], [SendCorrectionStateToClients])
+        // never moved and still use it directly.
+        m_telemetry.setLogger(logger);
         m_logger = std::move(logger);
     }
 
@@ -839,26 +848,30 @@ public:
     }
 
     // =======================================================================
-    // [og-netcode-v2-input-relay task 59] THE FOUR PROBE ACCESSORS' DIAGNOSTIC
-    // VIEW — RN-9 + amendment, grouped per `docs/DiagnosticsConventions.md`
-    // (the classification rule these views follow is centralised there, not
-    // re-derived here). A sibling ruling groups `SimulationManager`'s own
-    // resim-gate probe accessor the same way, in the same task.
+    // [og-netcode-v2-input-relay task 59, retargeted task 79] THE FOUR PROBE
+    // ACCESSORS' DIAGNOSTIC VIEW — RN-9 + amendment, grouped per
+    // `docs/DiagnosticsConventions.md` (the classification rule these views
+    // follow is centralised there, not re-derived here). A sibling ruling
+    // groups `SimulationManager`'s own resim-gate probe accessor the same
+    // way, in the same task.
     //
-    // ⛔ ONLY THESE FOUR READ-ONLY ACCESSORS MOVE. The probe MEMBERS
-    // (`m_relayReadProbe` etc., declared further down this class), the
-    // `note*` call sites that feed them every frame, and the private
-    // `emit*` helpers further down (RN-11) are production instrumentation and
-    // are UNTOUCHED — see the fence comment on each probe member's own
-    // declaration and `docs/DiagnosticsConventions.md` §2/§3 for the current
-    // roster and count.
+    // ⛔ ONLY THESE FOUR READ-ONLY ACCESSORS MOVE. The probe MEMBERS, the
+    // `note*` call sites that feed them every frame, and the `emit*` helpers
+    // are production instrumentation and are UNTOUCHED by this view — task 79
+    // relocated all three onto a sibling `NetSyncTelemetry` object
+    // (`m_telemetry` below), so these three accessors now delegate into ITS
+    // const accessors rather than reading a member of this class directly.
+    // See `NetSyncTelemetry.h` for the probe declarations and the fence
+    // comment on each, and `docs/DiagnosticsConventions.md` §2/§3 for the
+    // current roster and count.
     //
-    // CONST-ONLY AND DELIBERATELY SO: the only writers are the three call sites
-    // in this class, each on its own thread, and a mutable handle handed out
-    // here would be an invitation to increment a physics-thread counter from
-    // the game thread — the exact hazard the two-object split exists to
-    // prevent. There is therefore no `MutableDiagnostics` / `editDiagnostics()`
-    // on this class, unlike `StateCorrectionCache`'s pair.
+    // CONST-ONLY AND DELIBERATELY SO: the only writers are on `NetSyncTelemetry`,
+    // each reachable from exactly one thread (see that class's own two-thread
+    // banner), and a mutable handle handed out here would be an invitation to
+    // increment a physics-thread counter from the game thread — the exact
+    // hazard the two-object split exists to prevent. There is therefore no
+    // `MutableDiagnostics` / `editDiagnostics()` on this class, unlike
+    // `StateCorrectionCache`'s pair.
     //
     // Nested class, not a free function: it has the same access to
     // SimulationNetSync's private members as any other member function — no
@@ -876,8 +889,8 @@ public:
         // og-simulation-tests, but only a suite with SimulatableOwnerTraits
         // bound to concrete owners can show that the shipped branch actually
         // feeds them.
-        const RelayReadProbe&    relayReadProbe()    const { return m_netSync.m_relayReadProbe; }
-        const RelayArrivalProbe& relayArrivalProbe() const { return m_netSync.m_relayArrivalProbe; }
+        const RelayReadProbe&    relayReadProbe()    const { return m_netSync.m_telemetry.relayReadProbe(); }
+        const RelayArrivalProbe& relayArrivalProbe() const { return m_netSync.m_telemetry.relayArrivalProbe(); }
 
         // [T24] Same contract, same reason. Its consumer is the og-brawler-tests
         // wiring block: the probe's arithmetic is unit-tested in og-simulation-tests,
@@ -885,7 +898,7 @@ public:
         // show that the shipped correction callback actually feeds it AND classifies
         // by the same provider-presence test the rest of this class uses.
         const CorrectionVerdictProbe& correctionVerdictProbe() const
-        { return m_netSync.m_correctionVerdictProbe; }
+        { return m_netSync.m_telemetry.correctionVerdictProbe(); }
 
         // [og-netcode-v2-input-relay item 42 / I2] Same contract, same consumer, same
         // reason as the verdict probe's accessor directly above: the three-way
@@ -895,7 +908,7 @@ public:
         // the right class, and puts a DISCARD in the discarded bucket rather than
         // dropping it on the verdict probe's early return.
         const CorrectionLandingProbe& correctionLandingProbe() const
-        { return m_netSync.m_correctionLandingProbe; }
+        { return m_netSync.m_telemetry.correctionLandingProbe(); }
 
     private:
         const SimulationNetSync& m_netSync;
@@ -1132,19 +1145,14 @@ public:
         // m_lastUsedInputs used to be erased on the line above; retired.)
         std::get<LastUsedCaptureTickMapFor<T>>(m_lastUsedCaptureTicks).value.erase(id);
 
-        // [T19] Step 4: drop the probes' per-id telemetry state. Neither probe holds
-        // anything the simulation reads, but both keep an id-keyed map (the stale
-        // run and the capture-tick watermark), and without this they would grow with
-        // every character that has ever existed in the session — the unbounded-memo
-        // shape this codebase has already had to fix once in the log throttles.
-        m_relayReadProbe.forgetOwner(id);
-        m_relayArrivalProbe.forgetOwner(id);
-        // [T24] m_correctionVerdictProbe is deliberately NOT forgotten here, and the
-        // asymmetry is by design rather than an omission: it keeps no id-keyed map
-        // at all. Its counters are per-CLASS aggregates across characters, so an
-        // unregistered character leaves nothing to erase and the class totals for
-        // the window it was part of stay correct. Adding a forgetOwner here would
-        // need per-id state to exist first, which would be a different metric.
+        // [T19, relocated task 79] Step 4: drop the telemetry sibling's per-id
+        // state (the two relay probes' id-keyed maps plus the version-mismatch
+        // log-once latch). This is LIFECYCLE CLEANUP, not diagnostics — the same
+        // call, in the same fixed step of the same ordering, that lived here
+        // before task 79 moved the probes onto `NetSyncTelemetry`. See
+        // `NetSyncTelemetry::forgetOwner` for the full rationale (including why
+        // the two correction probes are deliberately NOT forgotten there).
+        m_telemetry.forgetOwner(id);
     }
 
     // -----------------------------------------------------------------------
@@ -1200,8 +1208,10 @@ public:
         //
         // PHYSICS-THREAD WINDOW. The game-thread arrival probe has its own, separate
         // window object; see the two-thread statement at the top of
-        // Network/RelayReadProbe.h for why they must not be merged.
-        emitRelayReadWindowIfDue(step.getTick());
+        // Network/RelayReadProbe.h for why they must not be merged, and
+        // NetSyncTelemetry.h's own two-thread banner (task 79) for which of ITS
+        // methods this call site may reach.
+        m_telemetry.emitRelayReadWindowIfDue(step.getTick());
 
         return inputs;
     }
@@ -1645,7 +1655,7 @@ private:
             typename T::InputType applied = resolveDelayedInput(
                 delayLine, static_cast<int32>(step.getTick()), effectiveDelay, capture);
 
-            emitLocalInputRead(id, step.getTick(), step.getStepKind(), effectiveDelay);
+            m_telemetry.emitLocalInputRead(id, step.getTick(), step.getStepKind(), effectiveDelay);
 
             if (step.getStepKind() == StepKind::Skip)
                 m_reconciliation.template backfillSkippedTick<T>(
@@ -1678,7 +1688,7 @@ private:
             // taken first and the returned tick is never used to infer it.
             const bool underrun = qit->second.empty();
             auto move = qit->second.dequeueMove();
-            emitRemoteQueueRead(id, step.getTick(), move.tick);
+            m_telemetry.emitRemoteQueueRead(id, step.getTick(), move.tick);
             // [T2] The relay's join key: the ORIGINAL capture tick of the input
             // just applied. move.tick is that original capture tick: the drain
             // (ServerReceptionCoordinator::releaseDelayedInputs) delivers the
@@ -1814,7 +1824,12 @@ private:
             // on whether the fold happened: the Skip/Stall handling and the
             // final `map.emplace` below run unconditionally either way,
             // exactly as they did with the diagnostics inline.
-            emitPredictionInputRead(id, step.getTick(), store, readReport);
+            //
+            // [task 79] `store != nullptr` rather than `store` itself: the
+            // helper never dereferenced the pointer, only null-checked it, so
+            // the telemetry sibling gets the one bit it needs instead of a
+            // reference into this class's own RemoteInputCache map.
+            m_telemetry.emitPredictionInputRead(id, step.getTick(), store != nullptr, readReport);
 
             if (step.getStepKind() == StepKind::Skip)
                 m_reconciliation.template backfillSkippedTick<T>(
@@ -1834,80 +1849,16 @@ private:
         }
     }
 
-    // [item 61] Local-provider branch's classification line — a plain,
-    // unconditional single-statement fold (Pattern 1); nothing gates it.
-    void emitLocalInputRead(unsigned int id, uint32 tick, StepKind stepKind, int32 effectiveDelay)
-    {
-        SIMLOG(m_logger,
-            "[CollectInput] id=%u tick=%u source=Provider kind=%s delay=%d",
-            id, tick, stepKindName(stepKind), effectiveDelay);
-    }
-
-    // [item 61] Remote-queue branch's classification line — same shape as
-    // `emitLocalInputRead` above.
-    void emitRemoteQueueRead(unsigned int id, uint32 tick, uint32 queuedTick)
-    {
-        SIMLOG(m_logger, "[CollectInput] id=%u tick=%u source=RemoteQueue queuedTick=%u",
-            id, tick, queuedTick);
-    }
-
-    // [item 61] Simulated-proxy branch's WHOLE probing tail: the T19/T20 probe
-    // write (only when a store exists), its two rare-event Verbose lines, and
-    // the unconditional per-tick [CollectInput] classification line. Templated
-    // on the store's InputT (deduced from `store`, nullable) exactly like
-    // `emitRelayArrival` — the store can be null (not-yet-registered proxy),
-    // in which case only the final unconditional line fires, matching the
-    // original inline `if (store != nullptr)` gate byte-for-byte.
-    template <typename InputT>
-    void emitPredictionInputRead(unsigned int id, uint32 tick,
-                                 const RemoteInputCache<InputT>* store,
-                                 const ScheduledRelayedReadReport& readReport)
-    {
-        if (store != nullptr)
-        {
-            // [T20] The WHOLE report, not just the outcome: the miss class
-            // and the signed probe-to-newest delta are tallied here too.
-            m_relayReadProbe.notePredictionRead(id, readReport);
-
-            // PER-EVENT DETAIL AT VERBOSE, AND ONLY FOR THE OUTCOME THAT IS
-            // SILENT IN THE STEADY STATE — the [RelaySkip] precedent exactly.
-            // A verify-fail means the delay regime moved under this reader,
-            // which does not happen while the schedule is stable, so this
-            // costs nothing per tick in the ordinary case. Hits and misses
-            // are RATES and are reported by the per-window summary; emitting
-            // them per event would be another per-tick line, which is the
-            // thing this task exists to stop adding.
-            if (readReport.outcome == ScheduledRelayedReadOutcome::VerifyFail)
-            {
-                SIMLOG(m_logger,
-                    "[Verbose][RelayProbe.Read] id=%u tick=%u VERIFY-FAIL probeTick=%u "
-                    "candidateDA=%u dLatest=%u src=Prediction",
-                    id, tick, readReport.probeTick,
-                    static_cast<unsigned int>(readReport.candidateDA),
-                    static_cast<unsigned int>(readReport.dLatest));
-            }
-
-            // [T20] THE OTHER OUTCOME THAT IS SILENT IN THE STEADY STATE.
-            // missInSpan and missAboveNewest are the two expected classes and
-            // are RATES — the per-window summary reports them. A read landing
-            // BELOW the oldest resident entry is different in kind: it means
-            // the receiver's clock has drifted out of the store's 64-tick
-            // reach, which should not happen at all, so it gets the same
-            // rare-event treatment the verify-fail line gets.
-            if (readReport.missClass == ScheduledRelayedReadMissClass::BelowOldest)
-            {
-                SIMLOG(m_logger,
-                    "[Verbose][RelayProbe.Read] id=%u tick=%u BELOW-OLDEST probeTick=%u "
-                    "oldest=%u newest=%u resident=%u src=Prediction",
-                    id, tick, readReport.probeTick,
-                    readReport.oldestResident, readReport.newestResident,
-                    readReport.residentCount);
-            }
-        }
-
-        SIMLOG(m_logger, "[CollectInput] id=%u tick=%u source=RemoteInputCache hasStore=%d",
-            id, tick, store != nullptr ? 1 : 0);
-    }
+    // [item 61, relocated task 79] The local-provider branch's classification
+    // line, the remote-queue branch's, and the simulated-proxy branch's whole
+    // probing tail now live on the telemetry sibling as
+    // `NetSyncTelemetry::emitLocalInputRead` / `emitRemoteQueueRead` /
+    // `emitPredictionInputRead`. The last of the three takes `bool hasStore`
+    // rather than the `RemoteInputCache<InputT>*` this class used to pass —
+    // the helper only ever null-checked the pointer, so the one bit crosses
+    // instead of a reference into this class's own map (see the call site
+    // above and `NetSyncTelemetry.h` for the ruling). See that header for the
+    // full bodies and comments, unchanged otherwise from the pre-task-79 shape.
 
     // [item 61 / RN-11] `collectResimInputAll`'s per-character body, lifted out
     // verbatim. This is the TWO-LEVEL RESOLUTION TABLE described in the banner
@@ -1934,7 +1885,7 @@ private:
 
         if (ref.kind == AppliedCaptureRefKind::NoSlot)
         {
-            emitResimNoSlot(id, simTick);
+            m_telemetry.emitResimNoSlot(id, simTick);
             return;
         }
 
@@ -1948,7 +1899,7 @@ private:
             // decision means applying what the authority applied — never a
             // value-initialised InputType{}, which is the exact poison T17
             // removed from that path.
-            emitResimSentinel(id, simTick);
+            m_telemetry.emitResimSentinel(id, simTick);
             map.emplace(id, neutral);
             return;
         }
@@ -1976,7 +1927,7 @@ private:
             // capture at delay 0, and a resim has no live capture. Reading
             // at(simTick) at delay 0 is right precisely because the original
             // prediction pass pushed that tick's capture into the line.
-            emitResimLocalRead(id, simTick, ref.kind, captureTick);
+            m_telemetry.emitResimLocalRead(id, simTick, ref.kind, captureTick);
             map.emplace(id, delayLine.at(captureTick));
             return;
         }
@@ -1988,7 +1939,7 @@ private:
         const auto* store = findRemoteInputCache<T>(id);
         if (store == nullptr)
         {
-            emitResimNoStore(id, simTick);
+            m_telemetry.emitResimNoStore(id, simTick);
             map.emplace(id, neutral);
             return;
         }
@@ -2002,7 +1953,7 @@ private:
             std::uint8_t   ignoredScheduleStamp = 0u;
             typename T::InputType relayed{};
             const bool hit = store->find(ref.captureTick, ignoredScheduleStamp, relayed);
-            emitResimRefRead(id, simTick, ref.captureTick, hit);
+            m_telemetry.emitResimRefRead(id, simTick, ref.captureTick, hit);
             // THE SELF-HEAL: a miss degrades THIS TICK's replay input to
             // last-known, never the injected state. The state is a complete
             // anchor, so the next every-frame correction supersedes the error.
@@ -2028,65 +1979,17 @@ private:
         ScheduledRelayedReadReport readReport;
         typename T::InputType scheduled =
             resolveScheduledRelayedInput(*store, simTick, &readReport);
-        emitResimScheduledRead(id, simTick, readReport);
+        m_telemetry.emitResimScheduledRead(id, simTick, readReport);
         map.emplace(id, std::move(scheduled));
     }
 
-    // [item 61] NoSlot rung — single unconditional line, straight fold.
-    void emitResimNoSlot(unsigned int id, uint32 tick)
-    {
-        SIMLOG(m_logger, "[Verbose][Resim.Input] id=%u tick=%u class=NoSlot", id, tick);
-    }
-
-    // [item 61] Sentinel rung — same shape as `emitResimNoSlot` above.
-    void emitResimSentinel(unsigned int id, uint32 tick)
-    {
-        SIMLOG(m_logger, "[Verbose][Resim.Input] id=%u tick=%u class=Sentinel", id, tick);
-    }
-
-    // [item 61] Local/delay-line rung.
-    void emitResimLocalRead(unsigned int id, uint32 tick, AppliedCaptureRefKind refKind, int32 captureTick)
-    {
-        SIMLOG(m_logger, "[Verbose][Resim.Input] id=%u tick=%u class=%s src=LocalInputCache capture=%d",
-            id, tick, refKind == AppliedCaptureRefKind::Ref ? "Ref" : "NoRef", captureTick);
-    }
-
-    // [item 61] Remote/no-store rung.
-    void emitResimNoStore(unsigned int id, uint32 tick)
-    {
-        SIMLOG(m_logger, "[Verbose][Resim.Input] id=%u tick=%u class=Remote src=NoStore", id, tick);
-    }
-
-    // [item 61] Remote/Ref rung.
-    void emitResimRefRead(unsigned int id, uint32 tick, uint32 captureTick, bool hit)
-    {
-        SIMLOG(m_logger, "[Verbose][Resim.Input] id=%u tick=%u class=Ref src=RemoteInputCache ref=%u hit=%d",
-            id, tick, captureTick, hit ? 1 : 0);
-    }
-
-    // [item 61] Remote/NoRef rung — the ONE rung with a probe write
-    // (`noteResimRead`) plus two SIMLOGs (one gated on VerifyFail, one
-    // unconditional). Folds cleanly: nothing after this call in
-    // `collectResimInputForCharacter` branches on whether the probe fired —
-    // the `map.emplace`/`return` below run unconditionally either way, same as
-    // they did with the diagnostics inline.
-    void emitResimScheduledRead(unsigned int id, uint32 tick, const ScheduledRelayedReadReport& readReport)
-    {
-        // [T20] The whole report — same reason as the prediction site.
-        m_relayReadProbe.noteResimRead(readReport);
-
-        if (readReport.outcome == ScheduledRelayedReadOutcome::VerifyFail)
-        {
-            SIMLOG(m_logger,
-                "[Verbose][RelayProbe.Read] id=%u tick=%u VERIFY-FAIL probeTick=%u "
-                "candidateDA=%u dLatest=%u src=Resim",
-                id, tick, readReport.probeTick,
-                static_cast<unsigned int>(readReport.candidateDA),
-                static_cast<unsigned int>(readReport.dLatest));
-        }
-
-        SIMLOG(m_logger, "[Verbose][Resim.Input] id=%u tick=%u class=NoRef src=ScheduledRead", id, tick);
-    }
+    // [item 61, relocated task 79] The five resim rungs' classification lines
+    // (NoSlot, Sentinel, Local, NoStore, Ref) plus the NoRef/scheduled rung's
+    // probe write + two SIMLOGs now live on the telemetry sibling as
+    // `NetSyncTelemetry::emitResimNoSlot` / `emitResimSentinel` /
+    // `emitResimLocalRead` / `emitResimNoStore` / `emitResimRefRead` /
+    // `emitResimScheduledRead`. See that header for the full bodies and
+    // comments, unchanged from the pre-task-79 shape.
 
     // Variadic helper: expands over each per-type tuple slot using index_sequence.
     // Calls fn<SimulatableT>(perTypeMap) for each SimulatableT in the pack.
@@ -2132,126 +2035,18 @@ private:
     {
         const RelayedInputIngestReport report =
             populateRemoteInputCache<typename SimulatableT::InputType>(store, ring);
-        emitRelayArrival(id, report, store);
+        m_telemetry.emitRelayArrival(id, report);
     }
 
-    // [RN-10 part B] ALL of CALL SITE 1's probing + logging, moved here
-    // verbatim from the old inline lambda — REUSING the existing `emit*` verb
-    // rather than coining a new one. See `docs/DiagnosticsConventions.md` §3
-    // for the current private `emit*` roster; this and
-    // `emitCorrectionArrival` extend that convention rather than inventing a
-    // second one. Templated on the store's InputT (deduced from `store` at
-    // the call site) purely so it can take the store by reference; nothing in
-    // the body depends on SimulatableT beyond that.
-    template <typename InputT>
-    void emitRelayArrival(unsigned int id, const RelayedInputIngestReport& report,
-                          RemoteInputCache<InputT>& store)
-    {
-        // [T19] PROBE 2 — replication cadence, measured in CAPTURE
-        // TICKS. GAME-THREAD window, a different object from the
-        // physics-side read probe; see the two-thread statement at the
-        // top of Network/RelayReadProbe.h.
-        //
-        // `report.newestCaptureTick` is the newest tick THIS RING
-        // carried, not the newest the store holds — the distinction is
-        // load-bearing and the report field's own comment explains it.
-        if (report.newestCaptureTickValid)
-        {
-            RelayArrivalWindowSummary arrival;
-            std::uint32_t gapCaptureTicks = 0u;
-            // ⛔ [T34 loss-counter fix] `newCaptureTicksIngested`, NOT
-            // `entriesIngested` and NOT a hard-coded 1. It is the count
-            // of capture ticks this arrival made newly resident, and it
-            // is what turns `lostCaptureTicksX1000` from a measure of
-            // the BURST RATE into a measure of loss. `entriesIngested`
-            // would count re-delivered ticks as new coverage and hide
-            // real loss; a hard-coded 1 is the retired replace-latest
-            // premise and is exactly what reported ~120 per mille on a
-            // working flush.
-            const bool windowClosed = m_relayArrivalProbe.noteArrival(
-                id,
-                report.newestCaptureTick,
-                static_cast<std::uint32_t>(report.newCaptureTicksIngested),
-                arrival,
-                &gapCaptureTicks);
-
-            // Per-event Verbose, and only when the cadence actually
-            // hiccuped. A gap of exactly 1 is the healthy depth-1
-            // steady state and would be a per-tick line; the interesting
-            // events are the stalls, which are what set the depth rule.
-            if (gapCaptureTicks > 1u)
-            {
-                SIMLOG(m_logger,
-                    "[Verbose][RelayProbe.Arrival] id=%u newestCapture=%u "
-                    "gapCaptureTicks=%u",
-                    id, report.newestCaptureTick, gapCaptureTicks);
-            }
-
-            if (windowClosed)
-            {
-                // PER-WINDOW SUMMARY AT WARNING — the cadence
-                // [InputStats] already uses. p99 is what the
-                // `depth >= gap_p99 + margin` rule reads; the mean is
-                // deliberately absent because it hides the tail that
-                // sets depth.
-                //
-                // ⭐ [T34] `lostCaptureTicksX1000` IS THE R = 0 LOSS
-                // INSTRUMENT, and it is on this line rather than its
-                // own because it is derived from these same samples.
-                // WARNING, not Log, is load-bearing:
-                // `Config/DefaultEngine.ini` sets `LogOGNet=Warning`, so
-                // a Log line does not exist on a dedicated server —
-                // items 35 and 36 each cost this initiative a proof line
-                // for exactly that. Steady-state expectation ~ 11 per
-                // mille (the measured 1.122 % wire loss); the raw
-                // numerator and denominator ride along so a window can
-                // be re-derived rather than trusted.
-                //
-                // ⭐ [T34 rework] `discont=` IS PART OF THE GATE, not
-                // garnish. A window reporting `discont=` > 0 was
-                // interrupted (see kRelayArrivalDiscontinuityTicks) and
-                // must be DISCARDED rather than averaged in — the same
-                // rule `[RelayProbe.Write] discont=` already carries.
-                // `discontMax=` is the largest excluded gap, exact, so
-                // discarding a window never hides how bad it was.
-                //
-                // ⭐ [T34 loss-counter fix] `delivered=` IS THE FIELD
-                // THAT MAKES THIS LINE SELF-CHECKING. `lost + delivered
-                // == expected` must hold on every window; a reader who
-                // sees it fail knows the delivered count is not being
-                // plumbed and that `lostCaptureTicksX1000` is measuring
-                // the burst rate again. Before this field existed, that
-                // failure mode was indistinguishable from a lossy wire.
-                SIMLOG(m_logger,
-                    "[Warning][RelayProbe.Arrival] samples=%u gapCaptureTicks "
-                    "p50=%u p99=%u%s max=%u noAdvance=%u saturated=%u "
-                    "lostCaptureTicksX1000=%u lost=%u delivered=%u expected=%u "
-                    "discont=%u discontMax=%u",
-                    arrival.samples, arrival.p50, arrival.p99,
-                    arrival.p99Saturated ? "+" : "",
-                    arrival.maxGap, arrival.noAdvance,
-                    arrival.saturatedSamples,
-                    arrival.lostCaptureTicksX1000,
-                    arrival.lostCaptureTicks,
-                    arrival.deliveredCaptureTicks,
-                    arrival.expectedCaptureTicks,
-                    arrival.discontinuities,
-                    arrival.maxDiscontinuityGap);
-            }
-        }
-
-        if (report.outcome == RelayedInputIngestOutcome::VersionMismatch
-            && store.shouldLogVersionMismatchOnce())
-        {
-            // ONCE per component per session — an incompatible peer
-            // re-replicates its ring forever.
-            SIMLOG(m_logger,
-                "[Warning][RelayedInput] DROP wire-version mismatch id=%u onWire=%u expected=%u",
-                id,
-                static_cast<unsigned int>(report.versionOnWire),
-                static_cast<unsigned int>(relayedInputRing::kWireFormatVersion));
-        }
-    }
+    // [RN-10 part B, relocated task 79] CALL SITE 1's probing + logging now
+    // lives on the telemetry sibling — `NetSyncTelemetry::emitRelayArrival` —
+    // reusing the existing `emit*` verb rather than coining a new one. See
+    // `docs/DiagnosticsConventions.md` §3 for the current `emit*` roster.
+    // No `store` argument crosses this call: the helper's only use of it was
+    // the one-shot version-mismatch latch, which moved INTO the telemetry
+    // object, id-keyed, rather than being handed a reference to this class's
+    // own `RemoteInputCache` map — see `NetSyncTelemetry.h`'s file banner and
+    // `emitRelayArrival`'s own comment for the full ruling.
 
     // [RN-10 part A] CALL SITE 2's callback (registerPredictionOwner), lifted
     // out verbatim — a pure lift; the production call and the two helpers it
@@ -2275,7 +2070,7 @@ private:
 
         const CorrectionArrivalDecision decision =
             decideCorrectionArrival<SimulatableT>(id, verdict);
-        emitCorrectionArrival(id, decision);
+        m_telemetry.emitCorrectionArrival(id, decision);
     }
 
     // [task 60 / RN-10 part C] THE CORRECTION-ARRIVAL DECISION.
@@ -2290,33 +2085,16 @@ private:
     // `CorrectionLandingProbe` counts). `landed` is therefore a FIELD of the
     // decision, not a mid-block `return`, exactly as
     // `ScheduledRelayedReadDecision::isUnderflowMiss` is a field rather than
-    // a re-derivable fact (see the banner above that struct). `characterClass`
-    // / `landingSite` are meaningful even when `!landed` — the landing probe
-    // needs them unconditionally, see the "hoisted above the gate" note in
-    // `decideCorrectionArrival` below.
-    struct CorrectionArrivalDecision
-    {
-        PredictedCharacterClass characterClass = PredictedCharacterClass::LocallyPredicted;
-        CorrectionLandingSite   landingSite    = CorrectionLandingSite::Discarded;
-
-        // Mirrors CorrectionInsertVerdict::landed. Kept as its own field —
-        // rather than re-derived from `landingSite == Discarded` — so the two
-        // notions can never silently diverge in the projection below.
-        bool landed = false;
-
-        // The correction's tick, echoed back so the caller's log line needs no
-        // second decode of the wire buffer. Set on BOTH paths — mirrors
-        // CorrectionInsertVerdict::tick's own rule. `emitCorrectionArrival`'s
-        // `[Verbose][ResimProbe.Landing]` SIMLOG relies on this: it prints
-        // `decision.tick` unconditionally, BEFORE the `!landed` gate below, so a
-        // discarded correction's landing-probe line still carries the wire tick.
-        uint32 tick = 0u;
-
-        // Meaningless when `!landed` (CorrectionInsertVerdict's own rule) — unlike
-        // `tick` above, this one really is discard-invalid: no comparison happened,
-        // so it must never be read as either an agreement or a disagreement.
-        bool predictionWasCorrect = false;
-    };
+    // a re-derivable fact. `characterClass` / `landingSite` are meaningful
+    // even when `!landed` — the landing probe needs them unconditionally,
+    // see the "hoisted above the gate" note below.
+    //
+    // [relocated task 79] `CorrectionArrivalDecision` itself now lives in
+    // `NetSyncTelemetry.h` as a free struct, not nested here — it needs a
+    // name both this peer (which constructs it, below) and the telemetry
+    // sibling (whose `emitCorrectionArrival` is its one consumer) can see
+    // without one class owning the other. See that struct's own comment in
+    // `NetSyncTelemetry.h` for the full rationale.
 
     // [RN-10 part C] THE PURE HALF — computes the decision, touches no probe
     // and calls no `note*`/`emit*`/`log*`. `characterClass` and `landingSite`
@@ -2412,259 +2190,19 @@ private:
         return decision;
     }
 
-    // [RN-10 part C] THE PROJECTION — the landing probe fires
-    // UNCONDITIONALLY (a discard IS an observation, item 41's `aboveNewest`
-    // population); the verdict probe only if `decision.landed`. THIS
-    // `return` IS THE SAME CONTROL-FLOW FACT the old inline lambda encoded
-    // with its mid-block `if (!verdict.landed) return;` — moved here, not
-    // removed, and reading `decision.landed` rather than re-deriving it from
-    // `landingSite`, per the struct's own comment above.
-    void emitCorrectionArrival(unsigned int id, const CorrectionArrivalDecision& decision)
-    {
-        SIMLOG(m_logger,
-            "[Verbose][ResimProbe.Landing] id=%u tick=%u class=%s site=%s",
-            id, decision.tick,
-            predictedCharacterClassName(decision.characterClass),
-            correctionLandingSiteName(decision.landingSite));
+    // [RN-10 part C, relocated task 79] THE PROJECTION now lives on the
+    // telemetry sibling — `NetSyncTelemetry::emitCorrectionArrival` — which
+    // is also the sole caller of `emitCorrectionVerdictClassLine` and
+    // `emitCorrectionLandingClassLine` (both relocated with it; neither had
+    // any other caller). See `NetSyncTelemetry.h` for the full body and its
+    // comments, unchanged from the pre-task-79 shape.
 
-        CorrectionLandingWindowSummary landingWindow;
-        if (m_correctionLandingProbe.noteLanding(
-                decision.characterClass, decision.landingSite, landingWindow))
-        {
-            emitCorrectionLandingClassLine(
-                PredictedCharacterClass::LocallyPredicted,
-                landingWindow.local, landingWindow.samples);
-            emitCorrectionLandingClassLine(
-                PredictedCharacterClass::RemoteProxy,
-                landingWindow.remote, landingWindow.samples);
-        }
-
-        // A correction whose tick had no slot was DISCARDED — no comparison
-        // happened. Counting it would put a denominator under a verdict that
-        // was never reached, and the discard path already logs itself
-        // (isAnomalousMiss-gated, in the cache).
-        //
-        // [item 42] THE LANDING PROBE ABOVE DELIBERATELY SITS ON THE OTHER
-        // SIDE OF THIS RETURN. Its `discarded` bucket is the one place the
-        // two probes' sample sets are required to differ, and moving this
-        // gate up would silently empty it. [RN-10 part C] `decision.landed`
-        // carries the exact same fact `verdict.landed` did before the split
-        // — see `decideCorrectionArrival`'s comment above for why it is a
-        // field rather than re-derived here.
-        if (!decision.landed)
-            return;
-
-        // PER-EVENT DETAIL AT VERBOSE — off under the shipped
-        // LogOGDivergenceProbe=Warning. Emitted on EVERY landed correction
-        // rather than on disagreements only, because "per-correction verdict
-        // observable with id and class" is the acceptance criterion and a
-        // disagreement-only line cannot distinguish "predicted correctly"
-        // from "no correction arrived". The cost is one snprintf at a site
-        // that already performs two per correction ([InjectCorrectionState]
-        // and the cache's own line), so this adds no new volume CLASS — the
-        // thing T19 was filed to stop.
-        SIMLOG(m_logger,
-            "[Verbose][DivergenceProbe.Correction] id=%u tick=%u class=%s correct=%u",
-            id, decision.tick,
-            predictedCharacterClassName(decision.characterClass),
-            decision.predictionWasCorrect ? 1u : 0u);
-
-        CorrectionVerdictWindowSummary window;
-        if (!m_correctionVerdictProbe.noteCorrection(
-                decision.characterClass, decision.predictionWasCorrect, window))
-            return;
-
-        // PER-WINDOW SUMMARY AT WARNING, ONE LINE PER CLASS. Never one
-        // pooled line: only the remote half can move with the relay delay
-        // floor, and summing it with a locally-predicted population that
-        // cannot move would dilute exactly the signal T23 scenario 4 reads.
-        //
-        // A class with no corrections in the window is SKIPPED rather than
-        // printed as `rate=0`, which would read as a perfect record instead
-        // of as no observation. That is also the steady state on a client
-        // with no remote proxies.
-        emitCorrectionVerdictClassLine(
-            PredictedCharacterClass::LocallyPredicted, window.local, window.samples);
-        emitCorrectionVerdictClassLine(
-            PredictedCharacterClass::RemoteProxy, window.remote, window.samples);
-    }
-
-    // [T24] ONE per-window class block of the correction-verdict summary.
-    // Called twice — once per class — from `emitCorrectionArrival` (RN-10
-    // part C), itself called from the correction callback
-    // (`onCorrectionReceived`) bound in registerPredictionOwner, and ONLY
-    // when a window closed.
-    //
-    // SILENT ON AN EMPTY CLASS. `corrections == 0` means this window observed
-    // nothing about that class; printing `disagreed=0 ratePerMille=0` would assert
-    // a perfect record where there is no record at all, and that misreading is
-    // precisely the one a benefit claim would be built on. It is also the steady
-    // state for the remote block on a client that has no proxies and for the local
-    // block on a spectator, so gating it keeps those sessions quiet as well.
-    //
-    // ONE LINE PER CLASS, NEVER ONE POOLED LINE — the reason is at the top of
-    // Network/CorrectionVerdictProbe.h and is the whole point of the split.
-    void emitCorrectionVerdictClassLine(PredictedCharacterClass characterClass,
-                                        const CorrectionVerdictClassSummary& classSummary,
-                                        std::uint32_t windowSamples)
-    {
-        if (classSummary.corrections == 0u)
-        {
-            return;
-        }
-
-        SIMLOG(m_logger,
-            "[Warning][DivergenceProbe.Window] class=%s corrections=%u disagreed=%u "
-            "ratePerMille=%u windowSamples=%u",
-            predictedCharacterClassName(characterClass),
-            classSummary.corrections, classSummary.disagreements,
-            classSummary.disagreementRatePerMille, windowSamples);
-    }
-
-    // [og-netcode-v2-input-relay item 42 / I2] ONE per-window class block of the
-    // frontier-landing split. Called twice — once per class — from
-    // `emitCorrectionArrival` (RN-10 part C), and ONLY when a window closed.
-    //
-    // SILENT ON AN EMPTY CLASS, same rule and same reason as the verdict line
-    // above: printing `behind=0 atFrontier=0 discarded=0` would assert a perfect
-    // record where there is no record at all, and that is the misreading this whole
-    // instrument exists to prevent. It is also the steady state for the remote
-    // block on a client with no proxies.
-    //
-    // ⭐ HOW TO READ THE PAIR THIS LINE FORMS WITH `[ResimProbe.Gate]`. Under the
-    // mechanism, resim triggers track `atFrontier` and are blind to `behind`. So:
-    //   * `atFrontierPerMille` here ~= `requestedPerMille` on the Gate line  ⇒ the
-    //     finding's central claim reproducing live;
-    //   * `behind` large with the Gate line's `requested` small  ⇒ the suppressed-
-    //     correction population, i.e. the under-resimulation statement itself;
-    //   * `discarded` large  ⇒ item 41's `aboveNewest` anomaly, whose fix will MOVE
-    //     this mix (it is referenced here, not solved here).
-    // The two lines cannot be merged into one: they are fed by different threads
-    // and item 42 requires one probe per thread with no sharing. See the cost note
-    // at the top of ResimGateProbe.h.
-    void emitCorrectionLandingClassLine(PredictedCharacterClass characterClass,
-                                        const CorrectionLandingClassSummary& classSummary,
-                                        std::uint32_t windowSamples)
-    {
-        if (classSummary.total() == 0u)
-        {
-            return;
-        }
-
-        SIMLOG(m_logger,
-            "[Warning][ResimProbe.Landing] class=%s behind=%u atFrontier=%u discarded=%u "
-            "atFrontierPerMille=%u windowSamples=%u",
-            predictedCharacterClassName(characterClass),
-            classSummary.landedBehind, classSummary.landedAtFrontier,
-            classSummary.discarded, classSummary.atFrontierRatePerMille, windowSamples);
-    }
-
-    // [T19] PROBES 1 + 3 — the per-window summary. Called once per prediction tick
-    // from collectInputAll; silent unless a window both CLOSED and carried at least
-    // one scheduled read, so the authority (no relay stores, so neither call site is
-    // ever reached) and an idle client never heartbeat a Warning line.
-    //
-    // TWO LINES, ONE PER CALL SITE, plus a third only when a stale run occurred.
-    // Split rather than concatenated because a single line carrying both blocks runs
-    // close to SIMLOG's 256-byte buffer once the counts reach five digits, and a
-    // silently truncated telemetry line is worse than no line.
-    void emitRelayReadWindowIfDue(uint32 predictionTick)
-    {
-        RelayReadWindowSummary summary;
-        if (!m_relayReadProbe.maybeCloseWindow(predictionTick, summary))
-        {
-            return;
-        }
-
-        SIMLOG(m_logger,
-            "[Warning][RelayProbe.Read] window=[%u,%u] src=Prediction hit=%u miss=%u "
-            "verifyFail=%u rung0=%u total=%u",
-            summary.windowStartTick, summary.windowEndTick,
-            summary.prediction.hit, summary.prediction.miss,
-            summary.prediction.verifyFail, summary.prediction.noProbe,
-            summary.prediction.total());
-
-        SIMLOG(m_logger,
-            "[Warning][RelayProbe.Read] window=[%u,%u] src=Resim hit=%u miss=%u "
-            "verifyFail=%u rung0=%u total=%u",
-            summary.windowStartTick, summary.windowEndTick,
-            summary.resim.hit, summary.resim.miss,
-            summary.resim.verifyFail, summary.resim.noProbe,
-            summary.resim.total());
-
-        // [T20] PROBE B — the miss PARTITION and the signed-delta distribution, per
-        // call site. SEPARATE LINES rather than more fields on the two above: the
-        // existing lines already run to ~130 characters and SIMLOG's buffer is 256,
-        // so folding ten more five-digit counters in would silently truncate exactly
-        // when the counts get interesting. Each is gated so a call site that carried
-        // nothing (the resim block on a client that never resimmed) stays silent.
-        emitMissClassLine(summary, summary.prediction, "Prediction");
-        emitMissClassLine(summary, summary.resim,      "Resim");
-        emitDeltaLine(summary, summary.prediction, "Prediction");
-        emitDeltaLine(summary, summary.resim,      "Resim");
-
-        // PROBE 3 — the D4 stale window, which is what sets `K` for the deferred
-        // stale-hold rule. Silent when nothing went stale, which is the healthy
-        // state; rung-0 serves are excluded from the run (review F5), so a join
-        // window does not produce one.
-        if (summary.maxConsecutiveFallbackRun > 0u)
-        {
-            SIMLOG(m_logger,
-                "[Warning][RelayProbe.Stale] window=[%u,%u] maxConsecutiveFallbackRun=%u id=%u",
-                summary.windowStartTick, summary.windowEndTick,
-                summary.maxConsecutiveFallbackRun, summary.maxConsecutiveFallbackId);
-        }
-    }
-
-    // [T20] PROBE B — the miss partition for ONE call site. Silent when that call
-    // site missed nothing, so a healthy window costs no line.
-    //
-    // THE THREE COUNTERS ARE THE WHOLE POINT OF T20 and they answer three different
-    // questions: `inSpan` is the coverage hole raising the relay depth would close;
-    // `aboveNewest` is the delay deficit, which depth cannot touch; `belowOldest` is
-    // a clock or capacity fault. `noProbeTick` is the early-session underflow guard,
-    // reported alongside so the four always visibly sum to `miss`.
-    void emitMissClassLine(const RelayReadWindowSummary& summary,
-                           const RelayReadCounters& counters, const char* site)
-    {
-        if (counters.miss == 0u)
-        {
-            return;
-        }
-
-        SIMLOG(m_logger,
-            "[Warning][RelayProbe.Miss] window=[%u,%u] src=%s inSpan=%u aboveNewest=%u "
-            "belowOldest=%u noProbeTick=%u miss=%u",
-            summary.windowStartTick, summary.windowEndTick, site,
-            counters.missInSpan, counters.missAboveNewest,
-            counters.missBelowOldest, counters.missNoProbeTick,
-            counters.miss);
-    }
-
-    // [T20] PROBE B — the signed `probeTick - newestResident` distribution for ONE
-    // call site. At depth 1 this is the richer signal: it says WHERE the receiver is
-    // asking relative to what it holds, continuously, rather than in three buckets.
-    // A window whose p50 sits above 0 is a receiver reading ahead of its data (no
-    // depth helps); one whose p50 sits below 0 while missing is reading inside a
-    // span full of holes (depth does).
-    void emitDeltaLine(const RelayReadWindowSummary& summary,
-                       const RelayReadCounters& counters, const char* site)
-    {
-        RelayDeltaSummary delta;
-        counters.delta.fillSummary(delta);
-        if (delta.samples == 0u)
-        {
-            return;
-        }
-
-        SIMLOG(m_logger,
-            "[Warning][RelayProbe.Delta] window=[%u,%u] src=%s n=%u p10=%d p50=%d "
-            "p90=%d min=%d max=%d satLow=%u satHigh=%u",
-            summary.windowStartTick, summary.windowEndTick, site,
-            delta.samples, delta.p10, delta.p50, delta.p90,
-            delta.minDelta, delta.maxDelta,
-            delta.saturatedLow, delta.saturatedHigh);
-    }
+    // [T19, relocated task 79] PROBES 1 + 3 — the per-window summary now
+    // lives on the telemetry sibling as `NetSyncTelemetry::emitRelayReadWindowIfDue`,
+    // called once per prediction tick from `collectInputAll` above. It is also
+    // the sole caller of `emitMissClassLine` / `emitDeltaLine` (both relocated
+    // with it). See `NetSyncTelemetry.h` for the full bodies and comments,
+    // unchanged from the pre-task-79 shape.
 
     // m_inputProviders uses std::function intentionally — converting to a pointer struct
     // would require extending PredictionSyncedBufferOwnerConcept with a typed
@@ -2718,52 +2256,20 @@ private:
     // Network/RemoteInputCache.h. Do not restate it here; do not weaken it there.
     std::tuple<RemoteInputCacheMapFor<SimulatableTs>...> m_remoteInputCaches;
 
-    // [T19] THE TWO CLIENT-SIDE RELAY PROBES. Pure telemetry: nothing in the
-    // resolution path reads them, and every consumer is a SIMLOG.
-    //
-    // TWO OBJECTS BECAUSE THERE ARE TWO THREADS, and they must never be merged into
-    // one window — the full statement is at the top of Network/RelayReadProbe.h.
-    //
-    //   m_relayReadProbe     PHYSICS thread only: collectInputAll's proxy branch
-    //                        and collectResimInputAll's NoRef/remote row.
-    //   m_relayArrivalProbe  GAME thread only: the relay-ring arrival callback bound
-    //                        in registerPredictionOwner.
-    //
-    // NOT ATOMIC, AND CORRECTLY SO — unlike m_clientEffectiveInputDelayTicks below,
-    // neither object is ever touched from the other's thread, so there is no
-    // crossing to guard. This is the ONE piece of relay state in this class that
-    // does NOT inherit the game-write/physics-read pattern, precisely because it was
-    // split to avoid it.
-    //
-    // THE SERVER'S maybeEmitInputStats WAS THE OBVIOUS TEMPLATE AND DOES NOT FIT:
-    // ServerReceptionCoordinator is server-side and both of these probes are
-    // client-side, so they need their own window rather than a counter bolted onto
-    // the server's.
-    RelayReadProbe    m_relayReadProbe;
-    RelayArrivalProbe m_relayArrivalProbe;
-
-    // [T24] THE CORRECTION-VERDICT PROBE. Also pure telemetry, also client-side,
-    // and — unlike the pair above — a SINGLE object, because it has a single
-    // feeder: the OnRep-dispatched correction-state callback bound in
-    // registerPredictionOwner, on the GAME thread. There is no physics-thread
-    // correction arrival, so there is no second window to keep apart. It also
-    // carries no per-id state, which is why unregisterSimulatable forgets the two
-    // relay probes and not this one. Full statement at the top of
-    // Network/CorrectionVerdictProbe.h.
-    CorrectionVerdictProbe m_correctionVerdictProbe;
-
-    // [og-netcode-v2-input-relay item 42 / I2] THE FRONTIER-LANDING SPLIT. Same
-    // feeder, same thread and same no-per-id-state rule as the verdict probe above
-    // — it is deliberately a second object on the same site rather than three more
-    // fields on the first, because the two answer different questions on different
-    // denominators (a DISCARDED correction is a non-event for the verdict and a
-    // first-class observation for the landing site) and merging them would have
-    // forced one of the two to adopt the other's sample set.
-    //
-    // ITS PHYSICS-THREAD SIBLING IS ON SimulationManager (ResimGateProbe). The two
-    // are never shared and never atomic — see the two-object rule at the top of
-    // OGSimulation/ResimGateProbe.h.
-    CorrectionLandingProbe m_correctionLandingProbe;
+    // [T19/T24/item 42, relocated task 79] THE FOUR PROBES — `RelayReadProbe`,
+    // `RelayArrivalProbe`, `CorrectionVerdictProbe`, `CorrectionLandingProbe` —
+    // and the sixteen `emit*` helpers that feed shipped log lines from them no
+    // longer live on this class. They are owned by the `NetSyncTelemetry`
+    // sibling below, which finishes the decide/project split this file already
+    // used for `ScheduledRelayedReadDecision` / `CorrectionArrivalDecision`:
+    // this class computes and returns those structs; `m_telemetry` turns them
+    // into a probe count or a log line. See `NetSyncTelemetry.h` for the probe
+    // declarations, the fence on each, and the two-thread rule now stated once
+    // there instead of as prose scattered across this class. Diagnostics access
+    // is unchanged in shape: `SimulationNetSync::Diagnostics` still exposes
+    // exactly these four probes, const-only, by delegating into
+    // `m_telemetry`'s own const accessors.
+    NetSyncTelemetry m_telemetry;
 
     SimulationObjectStorage<SimulatableTs...>&   m_storage;
     SimulationReconciliation<SimulatableTs...>&  m_reconciliation;
@@ -2902,5 +2408,5 @@ void unregisterSimulatable(
     reconciliation.template removeCacheFor<SimulatableT>(id);
 }
 
-#pragma optimize("", on)
+OGSIM_OPTIMIZE_ON
 // pragma optimize on.

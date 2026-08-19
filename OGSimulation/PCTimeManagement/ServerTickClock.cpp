@@ -3,8 +3,10 @@
 
 #include <cstdio>
 
+#include "OGSimulation/CompilerControl.h"
+
 // pragma optimize off — debugger-friendliness; rationale in SimulationManager.h.
-#pragma optimize( "", off )
+OGSIM_OPTIMIZE_OFF
 
 ServerTickClock::ServerTickClock(float deltaSeconds, LoggerFn logger)
     : m_tick(0)
@@ -29,5 +31,5 @@ SimulationTimeStep ServerTickClock::getSimulationStep() const
     return SimulationTimeStep(m_tick, /*isResimulating=*/false, StepKind::Normal, m_deltaSeconds);
 }
 
-#pragma optimize( "", on )
+OGSIM_OPTIMIZE_ON
 // pragma optimize on.

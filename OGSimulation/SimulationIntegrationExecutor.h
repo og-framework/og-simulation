@@ -8,8 +8,10 @@
 #include "OGSimulation/SimulationObjectStorage.h"
 #include "OGSimulation/SimulationTimeContext.h"
 
+#include "OGSimulation/CompilerControl.h"
+
 // pragma optimize off — debugger-friendliness; rationale in SimulationManager.h.
-#pragma optimize("", off)
+OGSIM_OPTIMIZE_OFF
 
 // Adapter-dependent side of a simulatable: integrate() and firstResimStep().
 // Required by SimulationIntegrationExecutor.
@@ -114,5 +116,5 @@ concept SimulationIntegrationExecutorConcept = requires(
     { t.captureBodyStatesAll() };
 };
 
-#pragma optimize("", on)
+OGSIM_OPTIMIZE_ON
 // pragma optimize on.
