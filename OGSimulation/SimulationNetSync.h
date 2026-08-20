@@ -20,6 +20,8 @@
 #include "OGSimulation/ResimGateProbe.h"
 #include "OGSimulation/Network/RelayReadProbe.h"
 #include "OGSimulation/Network/RemoteInputCache.h"
+#include "OGSimulation/OGAssert.h"
+#include "OGSimulation/SimulationInputResolution.h"
 #include "OGSimulation/NetSyncTelemetry.h"
 #include "OGSimulation/SimulationLog.h"
 #include "OGSimulation/SimulationObjectStorage.h"
@@ -69,427 +71,15 @@ struct LocalInputSender
 };
 
 // ---------------------------------------------------------------------------
-// Per-type map aliases for SimulationNetSync members
+// [item 86] The per-type map aliases for the FIVE input container families,
+// the provider map, the join-key map and the ladder free functions all moved
+// to `SimulationInputResolution.h` (verbatim — design §F). What stays here is
+// exactly the two owner-BINDING maps below: `SimulationNetSync` keeps the
+// owner concepts, `SimulatableOwnerTraits`, and the registration bindings;
+// the container LIFECYCLE these two maps used to be populated alongside now
+// lives on the resolution peer (see `registerPredictionOwner` /
+// `registerAuthorityOwner` / `unregisterSimulatable` below).
 // ---------------------------------------------------------------------------
-
-// [T15 / input relay] THE PROVIDER TAKES THE DELAY LINE AS A PARAMETER.
-//
-// The second argument is the character's own LocalInputCache — its raw
-// capture history, keyed by capture tick. It is here because the motion-sequence
-// matcher (the game's Hadouken detector, which runs INSIDE the provider) needs
-// contiguous raw captures up to `tick - 1`, and passing them in is what makes
-// the read ordering statable in one place rather than as a cross-file contract.
-//
-// THE ORDERING CONTRACT, AND WHY IT IS NOW VISIBLE. collectInputAll looks the
-// line up and calls the provider BEFORE it pushes this tick's capture. So the
-// line a provider receives holds ticks <= `step.getTick() - 1`, never the
-// current tick, and the current tick's sample is the value the provider is in
-// the middle of producing. Both halves of that statement are now in ONE
-// function; before, the provider reached back for the history itself and nothing
-// at either site said it must not observe the current tick — it held only
-// because one line happened to precede another.
-//
-// The reference is const: a provider reads history, it never writes it.
-template <typename T>
-using InputProviderMapFor = std::unordered_map<
-    unsigned int,
-    std::function<typename T::InputType(const SimulationTimeStep&,
-                                        const LocalInputCache<typename T::InputType>&)>>;
-
-template <typename T>
-using RemoteMoveQueueMapFor = std::unordered_map<
-    unsigned int,
-    RemoteMoveQueue<typename T::InputType>>;
-
-template <typename T>
-using PendingInputQueueMapFor = std::unordered_map<
-    unsigned int,
-    PendingInputQueue<typename T::InputType>>;
-
-// [og-netcode-v2-input-relay T8] `LastUsedInputMapFor` / `m_lastUsedInputs` — the
-// authority's per-id record of "the input I applied on my most recent tick" — ARE
-// GONE. That record existed for exactly one purpose: sendCorrectionAll replicated
-// it on the correction-INPUT channel. With that write removed it had zero readers
-// and was pure write-only bookkeeping on the server's hot path (a hash lookup and
-// a composite copy per character per authority tick, feeding nothing).
-//
-// DO NOT CONFUSE IT WITH `LastUsedCaptureTickMapFor` / `m_lastUsedCaptureTicks`
-// BELOW, WHICH STAYS. That one shares the retired map's key set and its
-// population/erase sites, but it serves T2's applied-capture-tick REF — the join
-// key the relay is built on, published in the correction STATE payload and
-// consumed by T6's resim resolution. It is load-bearing.
-
-// ---------------------------------------------------------------------------
-// [T2 / input relay] kNoInputCaptureTick — the "no real input was applied"
-// sentinel for the applied-capture-tick track below — now lives in
-// OGSimulation/CorrectionStateBufferCodec.h (included above), because T4 made it
-// a WIRE value shared by three layers that must not depend on this header: the
-// correction-state payload, the correction cache's per-slot ref, and the UE sync
-// buffer. Same name, same value, same meaning; the rationale moved with it.
-// ---------------------------------------------------------------------------
-
-// [T2 / input relay] Per-authority-id record of the capture tick behind the
-// input the authority APPLIED this tick — the join key the relay is built on.
-// It used to mirror LastUsedInputMapFor (same key set, same population/erase
-// sites, same threading); **[T8] that twin is retired and this is now the only
-// per-id authority track**, populated at registerAuthorityOwner and written in
-// collectInputAll's remote branch. See the member declaration for threading.
-//
-// WHY A STRUCT AND NOT A BARE ALIAS. The mapped type (uint32) does not depend on
-// T, so a plain `using ... = std::unordered_map<unsigned int, uint32>` would give
-// EVERY member of the pack the identical tuple slot type and make the
-// `std::get<LastUsedCaptureTickMapFor<T>>` lookups used below ill-formed the
-// moment a second simulatable type is registered. Wrapping keyed on T gives
-// distinct slots — the same reason NeutralInputFor is a struct, except that here
-// the collision is guaranteed rather than merely possible.
-template <typename T>
-struct LastUsedCaptureTickMapFor
-{
-    std::unordered_map<unsigned int, uint32> value;
-};
-
-// [T9 parts 3+4] Per-locally-controlled-simulatable ring of the client's own raw
-// input captures. Populated ONLY for ids that have an input provider, i.e. the
-// exact set for which m_pendingInputQueues is populated. See
-// Network/LocalInputCache.h for why this is a separate structure from the
-// correction cache — the short version is that the cache's slot T already means
-// "input APPLIED at tick T" and resim reads it with no offset.
-template <typename T>
-using LocalInputCacheMapFor = std::unordered_map<
-    unsigned int,
-    LocalInputCache<typename T::InputType>>;
-
-// [T5 / input relay] Per-REMOTE-simulatable store of the inputs the server
-// relayed for that character, keyed by the SENDER's capture tick.
-//
-// THE EXACT COMPLEMENT of LocalInputCacheMapFor above: that map is populated
-// for the ids that HAVE an input provider (locally controlled), this one for the
-// ids that do NOT (remote proxies). Provider-presence is the local-vs-remote test
-// throughout this file, and it is the one that stays correct under COUCH CO-OP,
-// where a single client legitimately owns several locally-controlled characters —
-// any test based on "the client's character" would pick exactly one of them and
-// hand the others a relay store they must not have.
-//
-// NOT wiped by wipeAllForResync — see the deliberate non-wipe note there, and the
-// naming ruling in Network/RemoteInputCache.h for why this is its own type rather
-// than a second LocalInputCache.
-template <typename T>
-using RemoteInputCacheMapFor = std::unordered_map<
-    unsigned int,
-    RemoteInputCache<typename T::InputType>>;
-
-// ---------------------------------------------------------------------------
-// [T6] resolveScheduledRelayedInput — THE UNIFIED SCHEDULED READ, in one place.
-//
-// The remote-proxy answer to "which relayed input does tick N run on, when no
-// authoritative ref is available for N". Spelled out as a three-step ladder in
-// Backlog T7 and RelayDelaySpectrumDesign.md §4/§5.2:
-//
-//   0. nothing has ever arrived (`!findLatest().valid`) -> TERMINAL FALLBACK, and
-//      specifically NO PROBE AT ALL. `find(N)` can genuinely hit for a LAN peer,
-//      so probing with a default dA of 0 would be accidentally-safe-because-a-
-//      later-check-catches-it rather than correct (RemoteInputCache.h's
-//      initial-state contract states and requires this skip).
-//   1. probe `find(N - dLatest)`;
-//   2. VERIFY the candidate's own stamp equals `dLatest`. This means "the delay
-//      REGIME has not shifted under me", NOT "this entry is individually
-//      scheduled at N": the authority applies ONE current delay to every parked
-//      entry (its drain reads `effectiveDelay` at drain time), so the freshest
-//      stamp is the best estimate of that delay, and a per-entry-stamp scan would
-//      faithfully reproduce a schedule the server does not use. On mismatch the
-//      schedule is in transition — fall back, never guess.
-//   3. hit -> the candidate's input; miss or verify-fail -> `fallback()`, the
-//      newest arrived input or the INJECTED game zero if nothing ever arrived.
-//
-// EMERGENT REGIME, no flag: at floor 0 the probe nearly always misses and this
-// degenerates to last-known (the pre-relay behaviour); at a high floor it nearly
-// always hits and the proxy consumes the server's actual schedule. Same code.
-//
-// WHY IT LIVES HERE, as a free function, rather than inline in its callers: T6's
-// resim frontier row and T7's prediction proxy branch must run the IDENTICAL
-// ladder — a resim that resolved a frontier tick differently from the prediction
-// that produced it would manufacture divergence out of nothing. T7 calls this
-// from collectInputAll's proxy branch; it is deliberately not a private member so
-// the ladder can also be unit-tested on its own.
-//
-// CLASSIFICATION NOTE — the `tick < dA` guard reports Miss, not NoProbe. Rung 0 is
-// specifically `!findLatest().valid`, "nothing has EVER arrived": the join window.
-// The underflow guard is a different situation — data HAS arrived, we simply cannot
-// form a probe tick for a session younger than the delay. Since the D4 stale-run
-// rule (review F5) is stated exactly as "count fallback serves where
-// `findLatest().valid` is true", this case belongs in the run and NoProbe does not.
-// ---------------------------------------------------------------------------
-// [RN-8 / task 58] DECIDE, THEN PROJECT — the ladder above is 14 load-bearing
-// lines; T19/T20 grew ~50 lines of diagnostic scaffolding (three lambdas) in front
-// of the first one of them. This is option B from ReviewNotes.md RN-8: the ladder
-// is factored into a PURE decision (`decideScheduledRelayedRead`, below) and a
-// thin projection (`resolveScheduledRelayedInput`, further below) that turns the
-// decision into candidate-or-fallback and, only if asked, into the diagnostic
-// report. THIS IS THE SHAPE TASKS 60 (part C) and 61 COPY — keep it clean.
-//
-// THREE PROPERTIES THIS SPLIT MUST PRESERVE, none obvious from either half alone:
-//
-//   1. THE NO-REPORT PATH STAYS BYTE-FOR-BYTE AS CHEAP. `decideScheduledRelayedRead`
-//      never touches the reporting out-param at all — it cannot, it is not passed
-//      one — and returns a small POD-ish struct by value: the same integer/enum
-//      scalars the old lambdas captured, plus the one `InputT` copy `find` already
-//      produced on the ladder's own stack. No new scan, no new allocation.
-//   2. THE `residentSpan()` SECOND SCAN IS PAID ONLY ON A MISS AND ONLY WHEN A
-//      REPORT WAS ASKED FOR. `decideScheduledRelayedRead` NEVER calls
-//      `residentSpan()` — it cannot classify InSpan/AboveNewest/BelowOldest at all,
-//      only whether a probe tick was formed. That classification is the
-//      PROJECTION's job, inside `resolveScheduledRelayedInput`'s
-//      `outDiagnosticReport != nullptr` guard, exactly where T20 already paid it.
-//   3. `NoProbeTick` STAYS DISTINCT FROM `BelowOldest`. The decision struct carries
-//      `isUnderflowMiss` as its OWN field rather than folding the tick<dA guard into
-//      the ordinary Miss arm — this is precisely where the two would get merged by
-//      someone reaching for the smallest struct. One IS an early-session artefact,
-//      the other a clock/capacity fault, and telling them apart is the whole point
-//      (see the classification note above `decideScheduledRelayedRead`'s underflow
-//      arm, and `RelayMissClass: the tick < dA underflow guard is its OWN class,
-//      not belowOldest` in RelayReadProbeTest.cpp).
-// ---------------------------------------------------------------------------
-
-// What the ladder decided, before any of it is turned into a report. Returned BY
-// VALUE for the same reason `resolveScheduledRelayedInput` always has: `find`
-// copies into an out-param, so the Hit arm has a local to hand back, and a decision
-// struct is just that local plus the classification scalars the old lambdas used to
-// capture. Every field is meaningless on the outcomes the comment beside it excludes
-// — same convention `ScheduledRelayedReadReport` (RelayReadProbe.h) already uses.
-template <typename InputT>
-struct ScheduledRelayedReadDecision
-{
-    ScheduledRelayedReadOutcome outcome = ScheduledRelayedReadOutcome::NoProbe;
-
-    // The probed capture tick. 0u — and meaningless — on NoProbe and on the
-    // tick<dA underflow guard, matching what the pre-split ladder reported on
-    // those two rungs (neither ever formed a real probe tick).
-    uint32       probeTick   = 0u;
-    std::uint8_t dLatest     = 0u;   // meaningless on NoProbe
-    std::uint8_t candidateDA = 0u;   // meaningful on Hit / VerifyFail only
-
-    // The candidate PROJECT should serve when `useCandidate` is true (Hit only);
-    // every other outcome projects to `store.fallback()`. Filled unconditionally by
-    // `find`'s out-param, same as the pre-split ladder's `candidate` local — no
-    // extra cost on the no-report path.
-    InputT candidateInput{};
-    bool   useCandidate = false;
-
-    // Whether a probe tick was actually FORMED — false on rung 0 (NoProbe) and on
-    // the tick<dA underflow guard, true on Hit/VerifyFail/every other Miss. Gates
-    // both the delta projection and the `isUnderflowMiss` short-circuit below.
-    bool probeTickFormed = false;
-
-    // FREE when set — `latest.captureTick`, which `decide` already has in hand from
-    // its first line (T20's comment on the old `reportDelta`). Meaningless unless
-    // `probeTickFormed`.
-    uint32 newestResident = 0u;
-
-    // Set ONLY on the tick<dA underflow guard. `decide` already knows the miss
-    // class there without a scan; PROJECT must not re-derive it and must not pay
-    // `residentSpan()` for this rung (property 3 above).
-    bool isUnderflowMiss = false;
-};
-
-// THE PURE LADDER — property 1's whole reason for existing. Side-effect-free,
-// `const` over the store, callable with no reporting out-param because it has none
-// to take. Byte-for-byte the same arms, conditions, order and returned values T6/T7
-// shipped and T19/T20 left alone; only the SHAPE of what leaves the function changed.
-template <typename InputT>
-ScheduledRelayedReadDecision<InputT> decideScheduledRelayedRead(
-    const RemoteInputCache<InputT>& store, uint32 tick)
-{
-    ScheduledRelayedReadDecision<InputT> decision;
-
-    const auto latest = store.findLatest();
-    if (!latest.valid)
-    {
-        return decision;                             // rung 0 — no probe at all
-    }
-
-    // Guard the subtraction rather than wrapping into a ~4-billion capture tick:
-    // a session fewer than dA ticks old has no scheduled entry yet, which is the
-    // same "nothing to read" situation as rung 0 — but see the classification note
-    // above for why it is reported as Miss, not NoProbe.
-    if (tick < static_cast<uint32>(latest.dA))
-    {
-        decision.outcome         = ScheduledRelayedReadOutcome::Miss;
-        decision.dLatest         = latest.dA;
-        decision.isUnderflowMiss = true;
-        return decision;
-    }
-
-    const uint32 probeTick   = tick - static_cast<uint32>(latest.dA);
-    decision.probeTick       = probeTick;
-    decision.dLatest         = latest.dA;
-    decision.probeTickFormed = true;
-    decision.newestResident  = latest.captureTick;
-
-    std::uint8_t candidateDA = 0u;
-    InputT       candidate{};
-    if (store.find(probeTick, candidateDA, candidate))
-    {
-        decision.candidateDA = candidateDA;
-        if (candidateDA == latest.dA)
-        {
-            decision.outcome        = ScheduledRelayedReadOutcome::Hit;
-            decision.candidateInput = candidate;
-            decision.useCandidate   = true;
-            return decision;
-        }
-
-        // A candidate WAS resident, but stamped against a delay that is no longer
-        // the current one. The delay REGIME shifted under us — a transition, not
-        // starvation. Same fallback, completely different diagnosis.
-        decision.outcome = ScheduledRelayedReadOutcome::VerifyFail;
-        return decision;
-    }
-
-    decision.outcome = ScheduledRelayedReadOutcome::Miss;
-    return decision;
-}
-
-// ---------------------------------------------------------------------------
-// [T19, updated RN-8] `outDiagnosticReport` (renamed from the old, undifferentiated
-// out-param name, matching DiagnosticsConventions.md's `outDiagnostic…` prefix) —
-// THE OUTCOME, REPORTED TO THE CALLER RATHER THAN COUNTED HERE.
-//
-// The relay hit-rate probe needs to know WHICH rung answered. The counters for it
-// deliberately do NOT live in this function, and that is a design constraint rather
-// than a style choice:
-//
-//   * `decideScheduledRelayedRead` is side-effect-free so that it can be reasoned
-//     about (and unit-tested) as a pure classification;
-//   * it is SHARED by T6's resim frontier row and T7's prediction branch precisely
-//     so the two can never disagree — a resim that resolved a frontier tick
-//     differently from the prediction that produced it would manufacture divergence
-//     out of nothing. State living here would be state shared across two threads'
-//     worth of call sites through a function whose whole value is that it has none.
-//
-// Reporting to the caller also means THE TWO CALL SITES ARE COUNTED SEPARATELY,
-// which is worth having on its own: prediction and resim hitting at different rates
-// is a real signal about the frontier, and summing them would erase it.
-//
-// The parameter is a defaulted OUT-POINTER rather than a widened return type so
-// that every existing call site — and every existing test — compiles and behaves
-// unchanged. Writing through a pointer the CALLER owns is not a side effect on the
-// store, and mirrors `RemoteInputCache::find`, which already answers through
-// out-params for the same reason.
-//
-// [RN-8] THIS FUNCTION IS NOW A PROJECTION: it calls `decideScheduledRelayedRead`
-// once, turns the decision into candidate-or-fallback, and — only when
-// `outDiagnosticReport != nullptr` — projects the SAME decision into the report.
-// The `residentSpan()` second scan (T20 PROBE B, half two — WHY the miss happened)
-// lives here, inside that guard, and ONLY on the Miss/non-underflow arm: this is
-// property 2 from the banner above `decideScheduledRelayedRead`.
-// ---------------------------------------------------------------------------
-template <typename InputT>
-InputT resolveScheduledRelayedInput(const RemoteInputCache<InputT>& store, uint32 tick,
-                                    ScheduledRelayedReadReport* outDiagnosticReport = nullptr)
-{
-    const auto decision = decideScheduledRelayedRead(store, tick);
-
-    if (outDiagnosticReport != nullptr)
-    {
-        outDiagnosticReport->outcome     = decision.outcome;
-        outDiagnosticReport->probeTick   = decision.probeTick;
-        outDiagnosticReport->dLatest     = decision.dLatest;
-        outDiagnosticReport->candidateDA = decision.candidateDA;
-
-        // [T20] PROBE B, half one — the SIGNED DISTANCE from the probe tick to the
-        // newest thing the store holds. Set on every rung that formed a probe tick,
-        // Hit included: the hit deltas are the calibration the miss deltas are read
-        // against. FREE — `decision.newestResident` is `latest.captureTick`, which
-        // `decide` computed on its first line, so this is an integer subtraction and
-        // no scan.
-        if (decision.probeTickFormed)
-        {
-            outDiagnosticReport->newestResident     = decision.newestResident;
-            outDiagnosticReport->deltaToNewestValid = true;
-            outDiagnosticReport->deltaToNewest      = static_cast<std::int32_t>(
-                static_cast<std::int64_t>(decision.probeTick)
-                - static_cast<std::int64_t>(decision.newestResident));
-        }
-
-        // [T20] PROBE B, half two — WHY the miss happened, from the store's
-        // RESIDENT SPAN. This is the one addition that costs anything: a second
-        // scan of the store's slots. Paid ONLY on a miss and ONLY when a report was
-        // asked for (this whole block sits behind `outDiagnosticReport != nullptr`),
-        // so a caller that passes no report is byte-for-byte as cheap as before T20.
-        //
-        // THE SPAN IS THE STORE'S, NOT THE RING'S. The ring carries `depth` entries
-        // per replication; the store accumulates up to 64 arrivals. That is exactly
-        // why an in-span hole is meaningful at depth 1 — it IS the hole the
-        // replace-latest ring punched between two replications. Reading the ring's
-        // span here instead would make every miss trivially "out of span" and the
-        // classification worthless.
-        if (decision.outcome == ScheduledRelayedReadOutcome::Miss)
-        {
-            if (decision.isUnderflowMiss)
-            {
-                // NO PROBE TICK EXISTS, so there is no delta and no span comparison
-                // to make. Kept as its own miss class rather than folded into
-                // BelowOldest, which it superficially resembles: this is an
-                // early-session artefact and that one is a clock/capacity fault, and
-                // the whole point of the split is to tell causes apart.
-                outDiagnosticReport->missClass = ScheduledRelayedReadMissClass::NoProbeTick;
-            }
-            else
-            {
-                const auto span = store.residentSpan();
-                outDiagnosticReport->spanValid      = span.valid;
-                outDiagnosticReport->oldestResident = span.oldest;
-                outDiagnosticReport->newestResident = span.newest;
-                outDiagnosticReport->residentCount  = static_cast<std::uint32_t>(span.count);
-
-                if (!span.valid)
-                {
-                    // Unreachable: this arm only runs on a Miss below the rung-0
-                    // gate, so at least one slot is occupied. Classified rather than
-                    // asserted because a probe must never be the thing that brings a
-                    // session down.
-                    outDiagnosticReport->missClass = ScheduledRelayedReadMissClass::NoProbeTick;
-                }
-                else
-                {
-                    outDiagnosticReport->missClass =
-                          (decision.probeTick > span.newest) ? ScheduledRelayedReadMissClass::AboveNewest
-                        : (decision.probeTick < span.oldest) ? ScheduledRelayedReadMissClass::BelowOldest
-                                                              : ScheduledRelayedReadMissClass::InSpan;
-                }
-            }
-        }
-    }
-
-    return decision.useCandidate ? decision.candidateInput : store.fallback();
-}
-
-// Per-SIMULATABLE-TYPE (not per-id) neutral input. Wrapped in a struct keyed on
-// the simulatable rather than stored as a bare `InputType` so that a pack whose
-// members happen to share one InputType still gets distinct tuple slots —
-// `std::get<InputType>` would be ill-formed there, and silently so at the
-// template level until such a pack first appeared.
-//
-// [og-netcode-v2-input-relay T17] `injected` records whether the composition root
-// ever called setNeutralInput for this type. It exists because the AUTHORITY is
-// now a first-class consumer of this value — collectInputAll's remote branch
-// substitutes it on a queue underrun, i.e. on every tick of every join window.
-// ([T8] T17 also seeded `m_lastUsedInputs` with it at registerAuthorityOwner;
-// that map is retired, so the underrun substitute is the surviving authority
-// consumer. The warning at the registration site is unchanged and is still the
-// right place for it — registration is where an un-injected neutral first
-// becomes reachable by the branch below.) A composition root that injects on the
-// client role only
-// would silently reintroduce the value-initialised `InputType{}` — whose (0,0,0)
-// forward vectors are exactly the value LocalInputCache.h documents as
-// normalisation-breaking. Before T17 the miss was invisible; the flag turns it
-// into a warning at the registration site where it bites.
-template <typename T>
-struct NeutralInputFor
-{
-    typename T::InputType value{};
-    bool                  injected{ false };
-};
 
 template <typename T>
 using AuthorityWriterMapFor = std::unordered_map<unsigned int, AuthorityWriter<T>>;
@@ -626,10 +216,17 @@ concept AuthoritySyncedBufferOwnerConcept =
 // ---------------------------------------------------------------------------
 // SimulationNetSync<SimulatableTs...>
 //
-// Owns all per-type transport state: input providers, remote-move queues,
-// pending-input queues, last-used inputs. Owns per-type owner-binding maps
-// (AuthorityWriter, LocalInputSender) as concrete pointer structs (no std::function
-// on the hot path). Holds refs to SimulationObjectStorage and SimulationReconciliation.
+// Owns per-type owner-binding maps (AuthorityWriter, LocalInputSender) as
+// concrete pointer structs (no std::function on the hot path), the owner
+// registration bindings and callbacks, transport (correction-state send,
+// local-input RPC send, relay-ring arrival, remote-move RPC arrival,
+// correction-arrival landing), and the receive-side guard context. Holds
+// refs to SimulationObjectStorage, SimulationReconciliation and — as of
+// item 87's promotion — SimulationInputResolution, a real
+// composition-root-constructed sibling peer (design §A.3) reached through
+// the by-id doors its own registration and transport methods call. NetSync
+// no longer owns or forwards the resolution peer's surface; callers reach it
+// directly.
 //
 // Layer: OGSimulation. Adapter-agnostic, UE/Chaos-free.
 // ---------------------------------------------------------------------------
@@ -640,18 +237,24 @@ class SimulationNetSync
 public:
     SimulationNetSync(
         SimulationObjectStorage<SimulatableTs...>& storage,
-        SimulationReconciliation<SimulatableTs...>& reconciliation)
+        SimulationReconciliation<SimulatableTs...>& reconciliation,
+        SimulationInputResolution<SimulatableTs...>& inputResolution)
         : m_storage(storage)
         , m_reconciliation(reconciliation)
+        , m_inputResolution(inputResolution)
     {}
 
     void setLogger(std::function<void(const char*)> logger)
     {
-        // [task 79] The telemetry sibling logs its own `emit*` lines now, so it
-        // gets its own copy of the same logger. `m_logger` stays on this class
-        // too — the SIMLOG call sites that are NOT part of the sixteen `emit*`
-        // helpers (e.g. [ReceiveLocalInput], [SendCorrectionStateToClients])
-        // never moved and still use it directly.
+        // [task 79, split at item 85; item 87] `m_telemetry` is this class's
+        // OWN telemetry sibling — the resolution peer's `InputResolutionTelemetry`
+        // is seeded by the composition root calling
+        // `SimulationInputResolution::setLogger` directly now that the peer is
+        // no longer a scaffold sub-object (see that method's own comment).
+        // `m_logger` stays on this class too — the SIMLOG call sites that are
+        // NOT part of the sixteen `emit*` helpers (e.g. [ReceiveLocalInput],
+        // [SendCorrectionStateToClients]) never moved and still use it
+        // directly.
         m_telemetry.setLogger(logger);
         m_logger = std::move(logger);
     }
@@ -668,210 +271,37 @@ public:
         m_rollbackWindowTicks  = rollbackWindowTicks;
     }
 
-    // -----------------------------------------------------------------------
-    // [T9 part 3] Client-side Layer-1 input delay
-    // -----------------------------------------------------------------------
-    //
-    // The number of ticks the LOCAL client's own captured input is held before
-    // the integrator sees it. One scalar, not a per-id map, because a delay is a
-    // property of the local CONNECTION and a client has exactly one — the same
-    // reason the server keys its queue by Address rather than by simulatable.
-    //
-    // THE GAME->PHYSICS THREAD CROSSING, and why an atomic is sufficient here.
-    // The writer is USimmableUpdateComponent::OnRep_ConnectionTier on the GAME
-    // thread; the reader is collectInputAll on the PHYSICS thread, which loads it
-    // ONCE per tick and uses that one value for the whole tick. This is safe
-    // precisely because it is a lone independent scalar with no internal
-    // structure: the worst a relaxed, one-tick-stale read can do is apply a tier
-    // change one tick later than it landed. It is emphatically NOT the same
-    // situation as T10's ServerInputDelayQueue, where the shared thing was an
-    // unordered_map whose concurrent rehash is undefined behaviour rather than a
-    // stale value — which is why that one needed the R2 restructuring and this
-    // one does not.
-    //
-    // Relaxed ordering is deliberate: there is no other datum whose visibility
-    // this value has to order, so acquire/release would buy nothing.
-    //
-    // Defaults to 0 = "no delay", i.e. exact pre-T9 behaviour, so an instance
-    // nobody configures (isolated unit tests, the authority-role manager) is
-    // unaffected.
-    void setClientEffectiveInputDelayTicks(int32 delayTicks)
-    {
-        m_clientEffectiveInputDelayTicks.store(delayTicks < 0 ? 0 : delayTicks,
-                                               std::memory_order_relaxed);
-    }
-
-    int32 getClientEffectiveInputDelayTicks() const
-    {
-        return m_clientEffectiveInputDelayTicks.load(std::memory_order_relaxed);
-    }
-
-    // [T9 part 4] Inject the game's zero input, used to fill the
-    // [0, effectiveDelay) window at session start and after a resync wipe.
-    //
-    // MUST be called by the composition root ON BOTH ROLES: the default
-    // `InputType{}` is NOT the brawler's zero input (`getZeroPlayerInput` builds
-    // (0,0,1) forward vectors, a value-initialised one would carry (0,0,0) into
-    // normalisation). Applies to delay lines created later AND to any already
-    // created, so it is order-independent with respect to registration.
-    //
-    // [T5] The SAME injected zero also seeds every relay store — it is that
-    // store's `fallback()` value before anything has ever arrived for a remote
-    // character (T7's rung 0, the pre-registration / idle window). One injection
-    // point, two consumers, so the two can never disagree about what "zero" is.
-    //
-    // [T17] ...and a THIRD consumer, on the AUTHORITY: the substitute integrated
-    // on a remote-move queue underrun. "Client" is no longer part of this value's
-    // name for that reason. ([T8] T17 named a second authority consumer here, the
-    // `m_lastUsedInputs` seed at registerAuthorityOwner; that map is retired with
-    // the correction-input channel, so the underrun substitute is the whole of
-    // the authority's use.) The authority path is still the one that is NOT
-    // order-independent (see registerAuthorityOwner), which is why the injection
-    // being missed there is warned about rather than merely commented.
-    template <typename SimulatableT>
-    void setNeutralInput(const typename SimulatableT::InputType& neutralInput)
-    {
-        auto& neutral = std::get<NeutralInputFor<SimulatableT>>(m_neutralInputs);
-        neutral.value    = neutralInput;
-        neutral.injected = true;
-        for (auto& [id, line] :
-             std::get<LocalInputCacheMapFor<SimulatableT>>(m_localInputCaches))
-        {
-            line.setNeutralInput(neutralInput);
-        }
-        for (auto& [id, store] :
-             std::get<RemoteInputCacheMapFor<SimulatableT>>(m_remoteInputCaches))
-        {
-            store.setNeutralInput(neutralInput);
-        }
-    }
-
-    // [T17] Has the composition root injected the game's zero input for this
-    // simulatable type? Public so the ROLE that consumes it can be pinned by a
-    // test rather than by a comment: the authority's seed and its underrun
-    // substitute are both silently degraded — never wrong-looking — when the
-    // injection is missed, which is exactly the class of regression a comment
-    // does not catch. Also the read side of registerAuthorityOwner's warning.
-    template <typename SimulatableT>
-    bool hasNeutralInput() const
-    {
-        return std::get<NeutralInputFor<SimulatableT>>(m_neutralInputs).injected;
-    }
-
-    // [T17] The injected neutral itself, for the same reason: a test that asserts
-    // "the authority applied the GAME's zero" must be able to name the value the
-    // composition root injected without re-deriving it.
-    template <typename SimulatableT>
-    const typename SimulatableT::InputType& getNeutralInput() const
-    {
-        return std::get<NeutralInputFor<SimulatableT>>(m_neutralInputs).value;
-    }
-
-    // -----------------------------------------------------------------------
-    // [T5 / input relay] Relay-store access — NULLABLE BY DESIGN
-    // -----------------------------------------------------------------------
-    //
-    // Returns nullptr for an id that has no store, which is every LOCAL character
-    // (provider-present) and every id the authority owns. Nullable rather than
-    // throwing because both eventual callers are on paths that legitimately see
-    // both classes of id: T7's proxy branch iterates all simulatables, and the
-    // game-thread visualization readers run on the listen-server host too, where
-    // no store exists at all. A throwing accessor on those paths is a known trap
-    // in this codebase — the retired `getLastCorrectionInput` routed through the
-    // THROWING `getCacheFor`, so calling it on the authority (which keeps no
-    // caches) threw rather than answering "nothing here".
-    template <typename SimulatableT>
-    RemoteInputCache<typename SimulatableT::InputType>* findRemoteInputCache(unsigned int id)
-    {
-        auto& map = std::get<RemoteInputCacheMapFor<SimulatableT>>(m_remoteInputCaches);
-        const auto it = map.find(id);
-        return it == map.end() ? nullptr : &it->second;
-    }
-
-    template <typename SimulatableT>
-    const RemoteInputCache<typename SimulatableT::InputType>* findRemoteInputCache(unsigned int id) const
-    {
-        const auto& map = std::get<RemoteInputCacheMapFor<SimulatableT>>(m_remoteInputCaches);
-        const auto it = map.find(id);
-        return it == map.end() ? nullptr : &it->second;
-    }
-
-    // -----------------------------------------------------------------------
-    // [T7] getLastRelayedInput — LAST-KNOWN, for the GAME-THREAD viz readers
-    // -----------------------------------------------------------------------
-    //
-    // `lastKnown` as the design doc's §4 vocabulary defines it: the newest relayed
-    // input for a REMOTE character, or nothing if none has ever arrived. It is the
-    // replacement source for the two remote-proxy visualization consumers that
-    // used to read the correction cache's input column
-    // (SimulationReconciliation::getLatestInput -> the SimmableUpdateComponent viz
-    // site, and through it BrawlerVisualizationInputSource's remote branch).
-    // [T8] That re-point is now IRREVERSIBLE, not merely preferred: with the
-    // correction-input channel retired, a remote character's cache input column
-    // held only this client's own prediction. [T16] The column does not exist at
-    // all any more. This accessor is THE source of a remote character's actual
-    // input on the client — there is no second one to fall back to.
-    //
-    // WHY `findLatest().input` RATHER THAN `fallback()`, which is what the
-    // per-tick ladder terminates on. The viz caller must be able to tell "nothing
-    // has ever arrived" from "an input arrived and it happened to be neutral":
-    // the pre-existing behaviour is that a remote proxy with no data yet has its
-    // input-carrying viz SKIPPED for that frame, and `fallback()` — which invents
-    // the injected game zero on an empty store — would silently start drawing an
-    // aim indicator at the neutral pose instead. std::optional keeps the two
-    // distinguishable, exactly as the (since-retired, T16) getLatestInput it
-    // replaced did with its own nullopt. (T5's notes name both spellings and this
-    // condition for choosing.)
-    //
-    // NULLABLE FOR TWO SEPARATE REASONS, both of which the callers really see:
-    // no store exists for a LOCAL character or on the AUTHORITY at all (a listen
-    // server's own pawn), and a store that exists may still be cold.
-    //
-    // THREADING. This is the ONE reader of the store on the GAME thread, which is
-    // the store's WRITER thread (OnRep_RelayedInputRing -> populate). It therefore
-    // does not participate in the accepted GT-write/PT-read tear documented in
-    // RemoteInputCache.h — it is same-thread with the writer, and strictly safer
-    // than the physics-thread readers. It returns a COPY, so no reference into the
-    // slots outlives the call.
-    template <typename SimulatableT>
-    std::optional<typename SimulatableT::InputType> getLastRelayedInput(unsigned int id) const
-    {
-        const auto* store = this->template findRemoteInputCache<SimulatableT>(id);
-        if (store == nullptr)
-            return std::nullopt;
-
-        const auto latest = store->findLatest();
-        if (!latest.valid)
-            return std::nullopt;
-
-        return std::optional<typename SimulatableT::InputType>(latest.input);
-    }
-
     // =======================================================================
-    // [og-netcode-v2-input-relay task 59, retargeted task 79] THE FOUR PROBE
+    // [og-netcode-v2-input-relay task 59, retargeted task 79] THE THREE PROBE
     // ACCESSORS' DIAGNOSTIC VIEW — RN-9 + amendment, grouped per
     // `docs/DiagnosticsConventions.md` (the classification rule these views
     // follow is centralised there, not re-derived here). A sibling ruling
     // groups `SimulationManager`'s own resim-gate probe accessor the same
     // way, in the same task.
     //
-    // ⛔ ONLY THESE FOUR READ-ONLY ACCESSORS MOVE. The probe MEMBERS, the
+    // ⛔ ONLY THESE THREE READ-ONLY ACCESSORS MOVE. The probe MEMBERS, the
     // `note*` call sites that feed them every frame, and the `emit*` helpers
     // are production instrumentation and are UNTOUCHED by this view — task 79
-    // relocated all three onto a sibling `NetSyncTelemetry` object
-    // (`m_telemetry` below), so these three accessors now delegate into ITS
-    // const accessors rather than reading a member of this class directly.
-    // See `NetSyncTelemetry.h` for the probe declarations and the fence
-    // comment on each, and `docs/DiagnosticsConventions.md` §2/§3 for the
-    // current roster and count.
+    // relocated all four onto sibling telemetry objects; item 85 split the PT
+    // group onto `InputResolutionTelemetry`; item 87 dropped this class's own
+    // two-hop `relayReadProbe()` delegation entirely (design §C.6: "the
+    // resolution peer's `getDiagnostics()` exposes `relayReadProbe()`;
+    // NetSync's keeps the other three") — callers reach it directly at
+    // `inputResolution.getDiagnostics().relayReadProbe()` now that the peer
+    // is no longer a scaffold sub-object. Each remaining accessor's NAME,
+    // COUNT and const-only shape is unchanged. See `NetSyncTelemetry.h` and
+    // `SimulationInputResolution.h` / `InputResolutionTelemetry.h` for the
+    // probe declarations and the fence comment on each, and
+    // `docs/DiagnosticsConventions.md` §2/§3 for the current roster and
+    // count.
     //
-    // CONST-ONLY AND DELIBERATELY SO: the only writers are on `NetSyncTelemetry`,
-    // each reachable from exactly one thread (see that class's own two-thread
-    // banner), and a mutable handle handed out here would be an invitation to
-    // increment a physics-thread counter from the game thread — the exact
-    // hazard the two-object split exists to prevent. There is therefore no
-    // `MutableDiagnostics` / `editDiagnostics()` on this class, unlike
-    // `StateCorrectionCache`'s pair.
+    // CONST-ONLY AND DELIBERATELY SO: the only writers are on the telemetry
+    // siblings, each reachable from exactly one thread (see each class's own
+    // two-thread banner), and a mutable handle handed out here would be an
+    // invitation to increment a physics-thread counter from the game thread —
+    // the exact hazard the two-object split exists to prevent. There is
+    // therefore no `MutableDiagnostics` / `editDiagnostics()` on this class,
+    // unlike `StateCorrectionCache`'s pair.
     //
     // Nested class, not a free function: it has the same access to
     // SimulationNetSync's private members as any other member function — no
@@ -882,14 +312,6 @@ public:
     public:
         explicit Diagnostics(const SimulationNetSync& netSync) : m_netSync(netSync) {}
 
-        // [T19] The two relay probes. Its consumer is the og-brawler-tests
-        // wiring block, which drives the REAL collectInputAll and asserts the
-        // counters the log lines are built from. That proof cannot be written
-        // against the probe types alone: they are unit-tested in
-        // og-simulation-tests, but only a suite with SimulatableOwnerTraits
-        // bound to concrete owners can show that the shipped branch actually
-        // feeds them.
-        const RelayReadProbe&    relayReadProbe()    const { return m_netSync.m_telemetry.relayReadProbe(); }
         const RelayArrivalProbe& relayArrivalProbe() const { return m_netSync.m_telemetry.relayArrivalProbe(); }
 
         // [T24] Same contract, same reason. Its consumer is the og-brawler-tests
@@ -921,6 +343,18 @@ public:
     // -----------------------------------------------------------------------
 
     // Client overload registration helpers — called from registerSimulatable free function.
+    //
+    // [item 86 / design §C.4's closing paragraph] THE CROSS-PEER SET
+    // INVARIANT. Before this item, "m_inputProviders / m_pendingInputQueues /
+    // m_localInputSenders populated as a set" was an INTRA-class invariant —
+    // all three lived here. Post-cut, providers+queues live on
+    // `m_inputResolution`, senders stay here: the invariant is now
+    // *sender-map keys ⊆ provider-set*, maintained SOLELY by this method (and
+    // `registerAuthorityOwner` below) calling the resolution peer's
+    // container-lifecycle methods and this class's own map insert in the SAME
+    // fixed sequence, every time. `sendLocalInputToAuthorityAll` is the one
+    // consumption point, and it enforces the invariant loudly
+    // (`findPendingInputQueue` + `OG_CHECK`) rather than assuming it.
     template <typename SimulatableT>
         requires PredictionSyncedBufferOwnerConcept<
             PredictionOwnerFor<SimulatableT>,
@@ -931,55 +365,36 @@ public:
         PredictionOwnerFor<SimulatableT>& predictionOwner,
         std::function<typename SimulatableT::InputType(
             const SimulationTimeStep&,
-            const LocalInputCache<typename SimulatableT::InputType>&)> inputProvider)
+            const LocalInputCache<typename SimulatableT::InputType>&)> inputProvider,
+        SimulationInputResolution<SimulatableTs...>& inputResolution)
     {
         // Input provider is present iff this owner drives a locally-controlled
-        // simulatable. Keep m_inputProviders / m_pendingInputQueues / m_localInputSenders
-        // populated as a set: sendLocalInputToAuthorityAll iterates m_localInputSenders
-        // and looks up m_pendingInputQueues by id, so the three maps must agree.
+        // simulatable.
         if (inputProvider)
         {
-            std::get<InputProviderMapFor<SimulatableT>>(m_inputProviders)
-                .emplace(id, std::move(inputProvider));
-
-            // try_emplace default-constructs in place — PendingInputQueue
-            // holds std::atomic members and is neither copyable nor movable.
-            std::get<PendingInputQueueMapFor<SimulatableT>>(m_pendingInputQueues)
-                .try_emplace(id);
-
-            // [T9 part 3] The delay line is populated for exactly the ids that
-            // have a provider — the locally-controlled ones. A remote proxy has
-            // no capture of its own to delay, so it must not get a line —
-            // collectInputAll's proxy branch reads no delay line at all (post-T7
-            // it reads that character's relay store instead).
-            std::get<LocalInputCacheMapFor<SimulatableT>>(m_localInputCaches)
-                .try_emplace(id,
-                    std::get<NeutralInputFor<SimulatableT>>(m_neutralInputs).value);
+            inputResolution.template registerLocalCharacter<SimulatableT>(id, std::move(inputProvider));
 
             std::get<LocalInputSenderMapFor<SimulatableT>>(m_localInputSenders)
                 .emplace(id, LocalInputSender<SimulatableT>{ &predictionOwner });
         }
         else
         {
-            // [T5] REMOTE character (no provider) — the exact complement of the
-            // delay line above. A locally-controlled character must NOT get a relay
-            // store: its inputs come from its own provider, and the server does not
-            // relay a character's input back to the client that produced it.
-            auto& store =
-                std::get<RemoteInputCacheMapFor<SimulatableT>>(m_remoteInputCaches)
-                    .try_emplace(id,
-                        std::get<NeutralInputFor<SimulatableT>>(m_neutralInputs).value)
-                    .first->second;
+            // [T5] REMOTE character (no provider) — the resolution peer's
+            // registerRemoteCharacter creates the neutral-seeded relay store;
+            // this class binds the two callbacks that feed it, by id only
+            // (design §C.3 — no captured container reference).
+            inputResolution.template registerRemoteCharacter<SimulatableT>(id);
 
             // CALL SITE 1 — arrival. Fires on the GAME thread (see the THREADING
             // section in Network/RemoteInputCache.h); the store is read on the
             // physics thread.
             predictionOwner.setOnRelayedInputReceivedCallback(
-                [this, id, &store](const typename PredictionOwnerFor<SimulatableT>::RelayedInputRingType& ring) {
-                    onRelayedInputReceived<SimulatableT>(id, store, ring);
+                [this, id](const typename PredictionOwnerFor<SimulatableT>::RelayedInputRingType& ring) {
+                    onRelayedInputReceived<SimulatableT>(id, ring);
                 });
 
-            // CALL SITE 2 — POPULATE ONCE AT BIND. Closes the hole where the ring
+            // CALL SITE 2 — POPULATE ONCE AT BIND, through the same by-id door
+            // the OnRep callback uses. Closes the hole where the ring
             // replicated (and its OnRep fired into a null callback) before this
             // registration ran, and the sender then went quiet: without this the
             // store would stay empty until the next relay write.
@@ -1003,9 +418,10 @@ public:
             // sample in the histogram on the one role that has no relay traffic.
             // The cost is that the first real OnRep seeds the watermark instead of
             // producing a gap, which is exactly one lost sample per component per
-            // session.
-            populateRemoteInputCache<typename SimulatableT::InputType>(
-                store, predictionOwner.getRelayedInputRing());
+            // session. The report is discarded here, unread — `ingestRelayRing`'s
+            // own comment states the same rule from the peer side.
+            inputResolution.template ingestRelayRing<SimulatableT>(
+                id, predictionOwner.getRelayedInputRing());
         }
 
         predictionOwner.setOnCorrectionStateReceivedCallback(
@@ -1027,10 +443,18 @@ public:
             AuthorityOwnerFor<SimulatableT>,
             typename SimulatableT::StateType,
             typename SimulatableT::InputType>
-    void registerAuthorityOwner(unsigned int id, AuthorityOwnerFor<SimulatableT>& authorityOwner)
+    void registerAuthorityOwner(
+        unsigned int id,
+        AuthorityOwnerFor<SimulatableT>& authorityOwner,
+        SimulationInputResolution<SimulatableTs...>& inputResolution)
     {
-        std::get<RemoteMoveQueueMapFor<SimulatableT>>(m_remoteMoveQueues)
-            .emplace(id, RemoteMoveQueue<typename SimulatableT::InputType>{});
+        // [item 86 / design §C.4's closing paragraph] THE CROSS-PEER SET
+        // INVARIANT'S OTHER HALF — see the full statement at
+        // registerPredictionOwner above. This call seeds the resolution
+        // peer's remote-move queue + join-key entry; this method's own
+        // `m_authorityWriters` insert below is this class's matching half of
+        // the same fixed sequence.
+        inputResolution.template registerAuthorityCharacter<SimulatableT>(id);
 
         // [T17] THE NEUTRAL-INJECTION ROLE GUARD.
         //
@@ -1058,8 +482,7 @@ public:
         //     "not injected yet, and this character is already live" signal rather
         //     than a permanent-damage one. It is kept because that window is still
         //     real and still silent otherwise.
-        const auto& neutral = std::get<NeutralInputFor<SimulatableT>>(m_neutralInputs);
-        if (!neutral.injected)
+        if (!inputResolution.template hasNeutralInput<SimulatableT>())
         {
             SIMLOG(m_logger,
                 "[Warning][NeutralInput] registerAuthorityOwner id=%u ran BEFORE setNeutralInput"
@@ -1067,31 +490,22 @@ public:
                 " value-initialised input", id);
         }
 
-        // [T2] Populated here and erased in unregisterSimulatable —
-        // collectInputAll's remote branch writes it with .at(id), so the key must
-        // exist for the whole lifetime of the authority registration.
-        // The initial value is the SENTINEL, not 0: before the first authority tick
-        // this id has applied no input at all, which is exactly what the sentinel
-        // means. Seeding 0 would claim capture tick 0 was applied.
-        std::get<LastUsedCaptureTickMapFor<SimulatableT>>(m_lastUsedCaptureTicks)
-            .value.emplace(id, kNoInputCaptureTick);
-
-        // RPC inbound — lambda captures ref into m_remoteMoveQueues.
-        // Cleared in unregisterSimulatable before data-map erasure (see ordering comment there).
-        auto& remoteQueue = std::get<RemoteMoveQueueMapFor<SimulatableT>>(m_remoteMoveQueues).at(id);
-        // Per-slot inbound callback: the owner walks the inbound
-        // FInputRedundancyBundle and invokes this once per (capture_tick, input).
-        // The queue dedups by capture_tick (first-writer-wins)
-        // and rejects too-far-future capture ticks against the guard context published by
+        // RPC inbound — [item 86] now routes through the resolution peer's
+        // by-id `queueRemoteMove` door instead of a captured `&remoteQueue`
+        // reference (design §C.3): a late-firing callback after
+        // unregisterCharacter's erase becomes a benign lookup miss instead of
+        // a dangling reference. Guard context crosses in BY VALUE from this
+        // class's own members — the guard stays NetSync's (design §C.4). The
+        // queue dedups by capture_tick (first-writer-wins) and rejects
+        // too-far-future capture ticks against the guard context published by
         // SimulationManager via setAuthorityGuardContext (current authority tick +
         // TimeConfig::rollbackWindowTicks). A too-far-future drop is warned here so the
         // queue stays logger-free.
         authorityOwner.setOnRemoteMoveReceivedCallback(
-            [this, id, &remoteQueue](uint32 tick, const typename SimulatableT::InputType& input) {
+            [this, id](uint32 tick, const typename SimulatableT::InputType& input) {
                 SIMLOG(m_logger, "[ReceiveLocalInput] id=%u tick=%u", id, tick);
-                typename SimulatableT::InputType copy = input;
-                const QueueMoveResult result = remoteQueue.queueMove(
-                    std::move(copy), tick, m_currentAuthorityTick, m_rollbackWindowTicks);
+                const QueueMoveResult result = m_inputResolution.template queueRemoteMove<SimulatableT>(
+                    id, tick, input, m_currentAuthorityTick, m_rollbackWindowTicks);
                 if (result == QueueMoveResult::TooFarFutureDiscarded)
                 {
                     SIMLOG(m_logger,
@@ -1105,13 +519,17 @@ public:
     }
 
     // Centralized unregister — fixed order; ordering is load-bearing.
-    // Step 1 MUST precede step 3: onRemoteMoveReceived captures &remoteQueue from
-    // m_remoteMoveQueues. Clear RPC-inbound callbacks before erasing data maps,
-    // or the cleared lambda may fire against a dangling queue reference.
+    // Step 1 MUST precede step 3: the pre-item-86 onRemoteMoveReceived captured
+    // &remoteQueue from m_remoteMoveQueues; [item 86] the callbacks now route by
+    // id through the resolution peer, so a late fire is a benign lookup miss
+    // rather than UB — but clearing callbacks first, before any lifecycle erase,
+    // remains the contract every registered owner is bound under, and is kept
+    // unchanged rather than loosened now that its failure mode is cheaper.
     template <typename T>
     void unregisterSimulatable(
         unsigned int id,
         PredictionOwnerFor<T>* predictionOwner,
+        SimulationInputResolution<SimulatableTs...>& inputResolution,
         AuthorityOwnerFor<T>* authorityOwner = nullptr)
     {
         // Step 1: clear RPC-inbound callbacks on the owner(s) — before any data-map erase.
@@ -1120,9 +538,6 @@ public:
             predictionOwner->clearOnCorrectionStateReceivedCallback();
             // [T8] `clearOnCorrectionInputReceivedCallback` was here; the channel it
             // unbound is retired, so there is nothing to clear.
-            // [T5] Same ordering requirement as the authority's remote-move
-            // callback below: the relay lambda captures `&store` into
-            // m_remoteInputCaches, so it must be cleared before step 3 erases it.
             predictionOwner->clearOnRelayedInputReceivedCallback();
         }
         if (authorityOwner)
@@ -1134,181 +549,24 @@ public:
         std::get<AuthorityWriterMapFor<T>>(m_authorityWriters).erase(id);
         std::get<LocalInputSenderMapFor<T>>(m_localInputSenders).erase(id);
 
-        // Step 3: erase data maps.
-        std::get<InputProviderMapFor<T>>(m_inputProviders).erase(id);
-        std::get<RemoteMoveQueueMapFor<T>>(m_remoteMoveQueues).erase(id);
-        std::get<PendingInputQueueMapFor<T>>(m_pendingInputQueues).erase(id);
-        std::get<LocalInputCacheMapFor<T>>(m_localInputCaches).erase(id);
-        // [T5] Erased on UNREGISTRATION only — never on resync (see wipeAllForResync).
-        std::get<RemoteInputCacheMapFor<T>>(m_remoteInputCaches).erase(id);
-        // [T2] Erased here, populated in registerAuthorityOwner. ([T8] its twin
-        // m_lastUsedInputs used to be erased on the line above; retired.)
-        std::get<LastUsedCaptureTickMapFor<T>>(m_lastUsedCaptureTicks).value.erase(id);
+        // Step 3: [item 86] the container-lifecycle erase — five container
+        // families' entries plus the join key — now lives on the resolution
+        // peer; see SimulationInputResolution::unregisterCharacter.
+        inputResolution.template unregisterCharacter<T>(id);
 
-        // [T19, relocated task 79] Step 4: drop the telemetry sibling's per-id
-        // state (the two relay probes' id-keyed maps plus the version-mismatch
-        // log-once latch). This is LIFECYCLE CLEANUP, not diagnostics — the same
-        // call, in the same fixed step of the same ordering, that lived here
-        // before task 79 moved the probes onto `NetSyncTelemetry`. See
-        // `NetSyncTelemetry::forgetOwner` for the full rationale (including why
-        // the two correction probes are deliberately NOT forgotten there).
+        // [T19, relocated task 79, split at item 85, resolution peer owns the
+        // PT sibling at item 86] Step 4: drop BOTH telemetry siblings' per-id
+        // state (the two relay probes' id-keyed maps plus the
+        // version-mismatch log-once latch) — one call each, same fixed step
+        // of the same ordering that lived here before task 79 moved the
+        // probes off this class. `inputResolution.forgetOwner` forwards to
+        // its own `InputResolutionTelemetry` sibling. See
+        // `NetSyncTelemetry::forgetOwner` and
+        // `InputResolutionTelemetry::forgetOwner` for the full rationale
+        // (including why the two correction probes are deliberately NOT
+        // forgotten by either).
         m_telemetry.forgetOwner(id);
-    }
-
-    // -----------------------------------------------------------------------
-    // [T2 / input relay] Applied-capture-tick accessor
-    // -----------------------------------------------------------------------
-    //
-    // The capture tick behind the input the authority applied for `id` on its most
-    // recent tick, or kNoInputCaptureTick if that input was a substitute (queue
-    // underrun) or the authority has not ticked this id yet. T4 attaches this to
-    // the correction state; the tests observe it here.
-    //
-    // Returns the sentinel rather than throwing for an unknown id: a caller asking
-    // about an id the authority does not own is in exactly the "no real input
-    // applied" situation the sentinel describes.
-    template <typename SimulatableT>
-    uint32 getLastUsedCaptureTick(unsigned int id) const
-    {
-        const auto& map =
-            std::get<LastUsedCaptureTickMapFor<SimulatableT>>(m_lastUsedCaptureTicks).value;
-        const auto it = map.find(id);
-        return it == map.end() ? kNoInputCaptureTick : it->second;
-    }
-
-    // -----------------------------------------------------------------------
-    // Per-tick input resolution (physics thread)
-    // -----------------------------------------------------------------------
-
-    // [item 61 / RN-11] SKELETON — the per-character dispatch lives in
-    // `collectInputForCharacter`, extracted below (straight fold, Pattern 1: no
-    // branch in the old lambda body contained a `return`, so nothing here needed
-    // the RN-8/task-58 decide/project split — see the banner on
-    // `collectInputForCharacter` for the full argument).
-    ResolvedInputs<SimulatableTs...> collectInputAll(const SimulationTimeStep& step)
-    {
-        ResolvedInputs<SimulatableTs...> inputs;
-
-        // [T9 part 3] ONE load per tick, used for every locally-controlled
-        // simulatable below. Reading it once (rather than per id) is what makes
-        // a concurrent OnRep_ConnectionTier write unable to split a single tick
-        // across two different delays.
-        const int32 effectiveDelay = getClientEffectiveInputDelayTicks();
-
-        m_storage.forEachSimulatable([&](unsigned int id, auto& simulatable) {
-            using T = std::remove_reference_t<decltype(simulatable)>;
-            collectInputForCharacter<T>(id, simulatable, step, effectiveDelay, inputs);
-        });
-
-        // [T19] PROBES 1 + 3, per-window summary. Driven from here — once per
-        // prediction tick, after every character has been resolved — for the same
-        // reason ServerReceptionCoordinator drives [InputStats] from its
-        // once-per-tick reapConnections hook: it is the only place with a
-        // monotonic tick AND a guarantee of running exactly once per tick.
-        //
-        // PHYSICS-THREAD WINDOW. The game-thread arrival probe has its own, separate
-        // window object; see the two-thread statement at the top of
-        // Network/RelayReadProbe.h for why they must not be merged, and
-        // NetSyncTelemetry.h's own two-thread banner (task 79) for which of ITS
-        // methods this call site may reach.
-        m_telemetry.emitRelayReadWindowIfDue(step.getTick());
-
-        return inputs;
-    }
-
-    // -----------------------------------------------------------------------
-    // [T6] Resim replay input (physics thread) — THE RESOLUTION TABLE
-    // -----------------------------------------------------------------------
-    //
-    // RELOCATED HERE from SimulationReconciliation (T6 placement ruling, Option
-    // C). It used to read one thing — the correction cache's input column — and
-    // its old home was justified on exactly that. It now reads the client's own
-    // delay lines, the relayed-input stores and the injected neutrals, all owned
-    // by this class; only the JOIN KEY still comes from reconciliation, through
-    // the single narrow getAppliedCaptureTickRef query. Nothing was added to
-    // either class's dependencies: this class already held m_reconciliation, and
-    // reconciliation still knows nothing about netsync.
-    //
-    // TWO-LEVEL DISPATCH: TICK CLASS x CHARACTER CLASS.
-    //
-    //                    | LOCAL (provider present)   | REMOTE (proxy)
-    //   -----------------+----------------------------+---------------------------
-    //   Ref (corrected)  | delayLine.at(ref)          | store.find(ref) -> input
-    //   Sentinel         | injected game zero         | injected game zero
-    //   ...store miss    | line miss -> its neutral   | store.fallback() (SELF-HEAL)
-    //   NoRef (frontier) | delayLine.at(t - d)        | the scheduled read
-    //   NoSlot           | no entry at all — the character is not in this resim
-    //
-    // CHARACTER CLASS IS PROVIDER PRESENCE, NEVER A ROLE CHECK (T5's mechanism).
-    // It is the only test that stays correct under COUCH CO-OP, where one client
-    // legitimately owns several locally-controlled characters and any
-    // "the client's character" test would pick exactly one of them.
-    //
-    // ---------------------------------------------------------------------
-    // THE PRECEDENCE RULE (RelayDelaySpectrumDesign.md §5.3): WHEREVER A REF
-    // EXISTS, THE REF WINS — and the relay entry's `dA` stamp is IGNORED on a
-    // corrected tick. The stamp is the INTENDED schedule; the ref is what the
-    // authority ACTUALLY did, and resim exists to reproduce the authority. The
-    // case that makes this concrete: T26 can release a capture LATE (up to
-    // rollbackWindowHardCap), so capture 6 stamped for tick 7 may be applied at
-    // tick 7+d — the ref on 7+d then says 6, and resim must replay 6 there.
-    // An implementation that consulted the stamp would replay whatever capture
-    // the schedule pointed at instead, and be confidently wrong.
-    //
-    // ---------------------------------------------------------------------
-    // NoSlot EMITS NOTHING, AND THAT IS LOAD-BEARING. The pre-T6 body only
-    // emplaced on a cache hit, and SimulationIntegrationExecutor::integrateAll
-    // skips any id absent from the map. prepareResimAll likewise only restores
-    // state for a character whose slot exists — so emitting an input for a
-    // slotless character would integrate it from an UN-RESTORED state. Freshly
-    // registered proxies sit in exactly that window for a few ticks.
-    //
-    // ---------------------------------------------------------------------
-    // THE D2 FRONTIER EDGE — DOCUMENTED, DELIBERATELY NOT SOLVED (Backlog T6).
-    // The NoRef/local row re-derives with the CURRENT effective delay. If the
-    // delay changed between the original prediction of tick `t` and this resim,
-    // `t - currentEffectiveDelay` can name a DIFFERENT capture than the one
-    // originally integrated there, so a resim that crosses a delay change replays
-    // a mixture of offsets. That is the accepted offset-mixture edge: exposure is
-    // about one tick at every-frame correction cadence, the every-frame state
-    // anchor supersedes it immediately, and T14's stall paydown narrows the window
-    // further. Do not "fix" this by stashing the per-tick delay without re-opening
-    // the design decision — the cache slot would have to carry a third column.
-    //
-    // ---------------------------------------------------------------------
-    // RESYNC INTERPLAY, stated so it is not rediscovered as a regression. A hard
-    // resync wipes the correction cache AND the local delay lines, but NOT the
-    // relay stores (T5's ruling — a relayed entry is keyed by the SENDER's capture
-    // tick, which our clock jumping does not invalidate). So through the wipe
-    // window local ticks resolve to the neutral, exactly as they did pre-T6, while
-    // remote proxies keep resolving from surviving entries. Strictly better than
-    // the pre-T6 behaviour, in which the wiped cache blinded both.
-    // [item 61 / RN-11] SKELETON — see `collectResimInputForCharacter`'s banner
-    // for why this is also a straight fold (Pattern 1), same reasoning as
-    // `collectInputAll`, applied per rung of the resolution table below rather
-    // than per branch.
-    ResolvedInputs<SimulatableTs...> collectResimInputAll(uint32 simTick)
-    {
-        ResolvedInputs<SimulatableTs...> inputs;
-
-        // ONE load per resim tick, mirroring collectInputAll's one-load-per-tick
-        // rule so a concurrent OnRep cannot split a single tick across two
-        // different delays. See the D2 note above for what it does NOT promise.
-        const int32 effectiveDelay = getClientEffectiveInputDelayTicks();
-
-        // LOG VOLUME, deliberately bounded. The branches below are mutually
-        // exclusive, so this emits EXACTLY ONE line per character per resim tick
-        // — and it is [Verbose]-prefixed while its `[Resim.*]` neighbours are not,
-        // so an operator can silence this table trace alone (LogOGSim=Log) and
-        // keep [Resim.Pre]/[Resim.Post]. The pre-T6 body logged nothing at all;
-        // a resolution table nobody can trace in PIE is not worth that saving.
-
-        m_storage.forEachSimulatable([&](unsigned int id, auto& simulatable) {
-            using T = std::remove_reference_t<decltype(simulatable)>;
-            collectResimInputForCharacter<T>(id, simTick, effectiveDelay, inputs);
-        });
-
-        return inputs;
+        inputResolution.forgetOwner(id);
     }
 
     // -----------------------------------------------------------------------
@@ -1467,7 +725,7 @@ public:
                 // an id present in m_authorityWriters but not yet in the track
                 // answers the sentinel instead of throwing on the send path.
                 const uint32 appliedCaptureTick =
-                    this->template getLastUsedCaptureTick<T>(id);
+                    m_inputResolution.template getLastUsedCaptureTick<T>(id);
                 SIMLOG(m_logger, "[SendCorrectionStateToClients] id=%u tick=%u appliedCaptureTick=%u",
                     id, tick, appliedCaptureTick);
                 w.owner->getSyncedCorrectionStateBuffer().write(
@@ -1496,501 +754,31 @@ public:
         // type stays UE-side (opaque to this layer); we only hand the owner the queue
         // + scalar params. After the send we retain only the redundancy window for the
         // next frame's overlap and release older entries so the queue stays bounded.
+        //
+        // [item 86 / design §C.4] `findPendingInputQueue` + `OG_CHECK` replaces
+        // the pre-cut `.at(id)` into `m_pendingInputQueues` (now owned by the
+        // resolution peer): the cross-peer set invariant (sender-map keys ⊆
+        // provider-set, see registerPredictionOwner's comment) means a queue
+        // MUST exist for every id enumerated here, so the check is loud
+        // rather than silent — an id present in m_localInputSenders without a
+        // matching pending queue is exactly the invariant violation the two
+        // registration sites exist to prevent.
         forEachTypeMap(m_localInputSenders, [&]<typename T>(auto& perTypeMap) {
-            auto& pendingQueueMap = std::get<PendingInputQueueMapFor<T>>(m_pendingInputQueues);
             for (auto& [id, s] : perTypeMap)
             {
-                auto& pendingQueue = pendingQueueMap.at(id);
+                auto* pendingQueue = m_inputResolution.template findPendingInputQueue<T>(id);
+                OG_CHECK(pendingQueue != nullptr,
+                    "sendLocalInputToAuthorityAll: no pending queue for a registered local sender id "
+                    "- the cross-peer sender/provider set invariant is broken");
                 SIMLOG(m_logger, "[SendLocalInputToServer] id=%u tick=%u depth=%u",
                     id, currentTick, redundancyDepth);
-                s.owner->sendLocalInputToAuthority(pendingQueue, currentTick, redundancyDepth);
-                pendingQueue.releaseAllButRecent(static_cast<size_t>(redundancyDepth));
+                s.owner->sendLocalInputToAuthority(*pendingQueue, currentTick, redundancyDepth);
+                pendingQueue->releaseAllButRecent(static_cast<size_t>(redundancyDepth));
             }
         });
-    }
-
-    // Drops any queued local inputs that were produced against the pre-resync
-    // prediction clock. Invoked from the ClientPredictionClock resync callback
-    // alongside the reconciliation cache wipe.
-    void wipeAllForResync(uint32 newPredictionTick)
-    {
-        forEachTypeMap(m_pendingInputQueues, [&]<typename T>(auto& perTypeMap) {
-            for (auto& [id, queue] : perTypeMap)
-            {
-                SIMLOG(m_logger,
-                    "[TimeResync.WipeInputQueue] id=%u newPredictionTick=%u",
-                    id, newPredictionTick);
-                queue.clear();
-            }
-        });
-
-        // [T9 part 3] The delay line is keyed by CAPTURE TICK against the
-        // pre-resync prediction clock. After a hard resync that clock has jumped,
-        // so those keys describe ticks that no longer mean what they meant, and a
-        // surviving capture would be read at the wrong tick for `effectiveDelay`
-        // ticks. Dropping them re-enters the neutral-filled window — the same
-        // well-defined state as session start (part 4), which is exactly why part
-        // 4 is not special-cased to tick 0.
-        //
-        // [T15] SECOND CONSUMER, SECOND CONSEQUENCE — stated so it is not
-        // rediscovered as a bug. The line is now also the motion matcher's
-        // history source, so this wipe blanks the matcher for up to
-        // `inputSequence::kHistoryWindowFrames` (30) ticks after a hard resync,
-        // where the correction cache it used to read would still have served
-        // data. That is CORRECT, not a regression: the cache's data was keyed to
-        // the pre-resync clock, so a motion "matched" out of it would have been
-        // assembled from ticks that no longer mean what they meant. Going cold is
-        // the honest answer, and it costs at most half a second of matcher
-        // availability on an event that already visibly jumps the simulation.
-        forEachTypeMap(m_localInputCaches, [&]<typename T>(auto& perTypeMap) {
-            for (auto& [id, line] : perTypeMap)
-            {
-                SIMLOG(m_logger,
-                    "[TimeResync.WipeLocalInputCache] id=%u newPredictionTick=%u",
-                    id, newPredictionTick);
-                line.clear();
-            }
-        });
-
-        // [T5 / input relay] m_remoteInputCaches is DELIBERATELY NOT WIPED HERE,
-        // and this comment exists because the loop above is the obvious thing to
-        // mirror.
-        //
-        // The delay line's keys are the LOCAL prediction clock's tick numbers, and
-        // a hard resync jumps that clock — so those keys stop describing the ticks
-        // they were written for, and keeping them would read a capture at the wrong
-        // tick for `effectiveDelay` ticks. A relay entry's key is the SENDER's
-        // capture tick: a server-domain identity produced by another machine's
-        // clock, which a resync of OUR clock does not touch. Wiping it would blind
-        // every remote proxy for a window after every resync, for no reason.
-        //
-        // (This wipe divergence is also the decisive reason the store is its own
-        // type rather than a reused LocalInputCache — see the naming ruling in
-        // Network/RemoteInputCache.h. A reused type would have been swept by
-        // whoever next mirrored these per-id map loops.)
     }
 
 private:
-    // [item 61 / RN-11] `collectInputAll`'s per-character body, lifted out
-    // verbatim (RN-10 part A precedent) — three mutually exclusive branches
-    // (local provider / remote queue / simulated proxy), each ending in a
-    // `map.emplace`, none containing a `return`. PATTERN 1 — STRAIGHT FOLD
-    // applies to every branch's diagnostics: the dispatch's fence is "no branch
-    // is a return affecting the caller", and there is exactly one `return`
-    // anywhere in this function (the implicit one at the end of each branch,
-    // same as before the split) — never one interleaved BETWEEN two probe/log
-    // calls the way `decideCorrectionArrival` had to guard against. Each
-    // branch's SIMLOG/probe tail folds into its own `emit*` call below.
-    template <typename T>
-    void collectInputForCharacter(unsigned int id, T& simulatable, const SimulationTimeStep& step,
-                                  int32 effectiveDelay, ResolvedInputs<SimulatableTs...>& inputs)
-    {
-        auto& providerMap = std::get<InputProviderMapFor<T>>(m_inputProviders);
-        auto& queueMap    = std::get<RemoteMoveQueueMapFor<T>>(m_remoteMoveQueues);
-        auto& map         = std::get<std::unordered_map<unsigned int, typename T::InputType>>(inputs);
-
-        if (auto it = providerMap.find(id); it != providerMap.end())
-        {
-            // [T15] HOISTED ABOVE THE PROVIDER CALL — this used to be looked
-            // up further down, right before the delayed read.
-            //
-            // The line is passed INTO the provider because the provider runs
-            // the game's motion-sequence matcher, which needs raw capture
-            // history. Reading it here and handing it over puts two facts
-            // side by side that used to live in different files:
-            //
-            //   * the provider sees history up to `tick - 1` ONLY — the push
-            //     below is the next statement it does not get to observe;
-            //   * the current tick's sample is the provider's own return
-            //     value, so it never needs to look for it.
-            //
-            // `.at(id)` rather than a nullable lookup on purpose: the line is
-            // created iff a provider is registered (see
-            // registerPredictionOwner), so provider-present and line-present
-            // are the same condition by construction. A throw here would mean
-            // that invariant had been broken, which is exactly when a silent
-            // fallback would be wrong.
-            auto& delayLine =
-                std::get<LocalInputCacheMapFor<T>>(m_localInputCaches).at(id);
-
-            // The RAW capture, as the local player produced it THIS tick.
-            const auto capture = it->second(step, delayLine);
-
-            // [T9 parts 3+4] Layer-1 client input delay.
-            //
-            // Two different values leave this branch and the distinction is
-            // the whole point of the task:
-            //
-            //   `capture` — the ORIGINAL, undelayed input, stamped at the
-            //     CURRENT tick. This is what goes on the wire. The server
-            //     parks it in its own ServerInputDelayQueue and applies the
-            //     same delay itself; sending an already-delayed input would
-            //     have the server delay it a SECOND time and the two ends
-            //     would diverge by exactly `effectiveDelay` ticks.
-            //
-            //   `applied`  — the capture from `tick - effectiveDelay`. This
-            //     is what the integrator predicts with.
-            //
-            //     [T16] It used to ALSO be pushed into the correction cache's
-            //     input column, because that column's slot T meant "the input
-            //     APPLIED at tick T" — matching both the server's replicated
-            //     correction-input write and the no-offset read the pre-T6
-            //     collectResimInputAll did. All three of those are retired:
-            //     the channel at T8, the resim read at T6 (it resolves by the
-            //     T4 capture-tick REF now), and the column itself at T16. The
-            //     `applied` value is consumed by the integrator and by nothing
-            //     else on this line; the RAW capture is what persists, in the
-            //     delay line, which is where the resim and the motion matcher
-            //     both read it from.
-            //
-            // With `effectiveDelay == 0` this is exactly the pre-T9 path:
-            // resolveDelayedInput returns the live capture untouched.
-            //
-            // [T15] `delayLine` is bound ABOVE, before the provider call.
-            if (step.getStepKind() != StepKind::Stall)
-            {
-                delayLine.push(static_cast<int32>(step.getTick()), capture);
-            }
-
-            typename T::InputType applied = resolveDelayedInput(
-                delayLine, static_cast<int32>(step.getTick()), effectiveDelay, capture);
-
-            m_telemetry.emitLocalInputRead(id, step.getTick(), step.getStepKind(), effectiveDelay);
-
-            if (step.getStepKind() == StepKind::Skip)
-                m_reconciliation.template backfillSkippedTick<T>(
-                    id, step.getTick() - 1, simulatable.getAllState().getState());
-
-            if (step.getStepKind() != StepKind::Stall)
-            {
-                m_reconciliation.template pushPredictionTick<T>(id, step.getTick());
-                // [T16] The `pushPredictionInput<T>(id, applied)` that stood
-                // here is gone with the cache's input column. The tick push
-                // above is what allocates the slot; only the input write went.
-                // ORIGINAL capture, current tick — see above. Do not pass
-                // `applied` here.
-                std::get<PendingInputQueueMapFor<T>>(m_pendingInputQueues)
-                    .at(id).enqueue(step.getTick(), capture);
-            }
-
-            map.emplace(id, std::move(applied));
-        }
-        else if (auto qit = queueMap.find(id); qit != queueMap.end())
-        {
-            // [T2] UNDERRUN MUST BE DETECTED HERE, BEFORE THE DEQUEUE.
-            //
-            // dequeueMove() on an empty queue returns a value-initialised
-            // Move{} whose `tick` is 0 (SimulationQueues.h) — and 0 is a
-            // perfectly ordinary real capture tick at session start. So the
-            // RETURNED tick cannot distinguish "the authority substituted an
-            // input" from "the authority applied the client's tick-0 capture".
-            // Only the pre-dequeue empty() gate can, which is why the flag is
-            // taken first and the returned tick is never used to infer it.
-            const bool underrun = qit->second.empty();
-            auto move = qit->second.dequeueMove();
-            m_telemetry.emitRemoteQueueRead(id, step.getTick(), move.tick);
-            // [T2] The relay's join key: the ORIGINAL capture tick of the input
-            // just applied. move.tick is that original capture tick: the drain
-            // (ServerReceptionCoordinator::releaseDelayedInputs) delivers the
-            // entry's STORED captureTick rather than a reconstructed
-            // `simTick - delay`, so it survives an overdue release intact.
-            // The sentinel replaces it when the input was a substitute and no
-            // client capture stands behind it.
-            //
-            // [T17] UNCHANGED by the substitution below — the ref stays the
-            // sentinel on an underrun, which remains exactly true: no client
-            // capture stands behind the game's zero input either. T17 fixes
-            // WHICH input is substituted, not how it is classified.
-            std::get<LastUsedCaptureTickMapFor<T>>(m_lastUsedCaptureTicks).value.at(id) =
-                underrun ? kNoInputCaptureTick : move.tick;
-
-            if (underrun)
-            {
-                // [T17] THE SUBSTITUTE IS THE GAME'S ZERO INPUT.
-                //
-                // dequeueMove() on an empty queue hands back a value-initialised
-                // Move (SimulationQueues.h), so `move.input` here is an
-                // `InputType{}` — for the brawler that is (0,0,0) forward
-                // vectors, the value LocalInputCache.h names as the one
-                // that "would be carried into normalisation and break". The
-                // injected neutral is the game's real zero ((0,0,1) forwards),
-                // it is already present on both roles, and it was simply unused
-                // on this path.
-                //
-                // This is NOT a loss-only path: the remote branch runs from
-                // registerAuthorityOwner onward, so every tick between
-                // registration and the client's first input arriving underruns
-                // — i.e. every join window, in ordinary play.
-                //
-                // [T8] T17 also wrote this value into `m_lastUsedInputs` here,
-                // because that map was replicated as "the input applied" on the
-                // correction-input channel. Both the map and the channel are
-                // retired; what the substitution feeds now is the integration
-                // (and, through it, the correction STATE peers actually consume).
-                // The T17 fix is undiminished — this is still the only value the
-                // authority simulates on an underrun tick — it simply has one
-                // consumer instead of two.
-                const auto& neutral = std::get<NeutralInputFor<T>>(m_neutralInputs).value;
-                map.emplace(id, neutral);
-            }
-            else
-            {
-                // The dequeued input passes through UNTOUCHED — this arm is
-                // byte-for-byte the pre-T17 behaviour.
-                map.emplace(id, std::move(move.input));
-            }
-        }
-        else
-        {
-            // -----------------------------------------------------------
-            // [T7] SIMULATED-PROXY BRANCH — THE UNIFIED SCHEDULED READ.
-            // -----------------------------------------------------------
-            //
-            // The client is predicting a character it does not control. Until
-            // T7 this read the CORRECTION CACHE's last server-reported input
-            // — "hold whatever the server last told us this player did",
-            // about one RTT stale and with no notion of WHEN the authority
-            // would apply it. It now asks the relay store the same question
-            // the resim asks: which relayed input does tick N run on.
-            //
-            // ONE CODE PATH, NO REGIME FLAG — the emergent-regime property
-            // (RelayDelaySpectrumDesign.md §4). resolveScheduledRelayedInput
-            // probes `N - dLatest` and verifies the stamp:
-            //
-            //   * at relay delay floor 0 the probe nearly always MISSES (the
-            //     sender's capture for tick N has not reached us yet, because
-            //     nothing was scheduled to make it) and the ladder degenerates
-            //     to last-known — byte-for-byte the pre-relay behaviour;
-            //   * at a high floor it nearly always HITS and the proxy consumes
-            //     the server's actual schedule, tick for tick.
-            //
-            // Nothing here selects between those. The regime is decided per
-            // input, per receiver, by whether the data is there — which is why
-            // raising the floor needs no second implementation and no switch.
-            //
-            // And "nearly always" is deliberate on BOTH ends: a hit at floor 0
-            // is legitimate, not a bug. A mixed pair — a WAN sender stamped
-            // dA=4 against a LAN receiver whose lead wobbles down inside the
-            // dead band — can satisfy the schedule, and the answer is then the
-            // server's REAL scheduled input rather than a stale hold. That is
-            // a non-regression, and it is why the degenerate-equivalence test
-            // pins byte-equivalence to empty/behind-store conditions only
-            // rather than asserting it absolutely at floor 0 (review A4).
-            //
-            // THE SAME FUNCTION T6'S RESIM CALLS, on purpose: a resim that
-            // resolved a frontier tick differently from the prediction that
-            // produced it would manufacture divergence out of nothing. Do not
-            // inline a second copy of the ladder here.
-            //
-            // THE TERMINAL VALUE IS THE INJECTED GAME ZERO. This branch used
-            // to read `cached.value_or(typename T::InputType{})` — the same
-            // (0,0,0)-forward poison T17 removed from the authority path, and
-            // reached on EVERY tick of the D4 pre-registration / idle window
-            // rather than only on loss. Rung 0 of the ladder answers
-            // `store.fallback()`, which is the injected neutral until anything
-            // arrives; a missing store answers the same neutral directly.
-            // Sentinel-aware for free: `kNoInputCaptureTick` is never a store
-            // key (push rejects it), so a sentinel can only ever resolve
-            // through the same neutral, never through an InputType{}.
-            //
-            // Nullable store lookup for the reason T5 documents on the
-            // accessor: this branch iterates every simulatable, and a
-            // character can be seen here before its registration completes.
-            //
-            // The prediction tick is still advanced in lockstep with the
-            // provider branch below — otherwise postPredictionAll keeps
-            // overwriting a stale tick slot and every correction lands outside
-            // the cache window. That part is unchanged by T7, and by T16:
-            // the tick push is the slot allocation and it stays; only the
-            // paired input write went with the column.
-            //
-            // [T19] The read is CLASSIFIED here (probe 1 + probe 3). The ladder
-            // itself stays stateless — it reports which rung answered through
-            // `readReport` and this call site does the counting, which is also
-            // what keeps prediction and resim counted separately. A missing
-            // store is not a read at all and is deliberately not counted: there
-            // was no probe to hit or miss, and folding it in would make a
-            // not-yet-registered proxy look like starvation.
-            const auto* store = this->template findRemoteInputCache<T>(id);
-            ScheduledRelayedReadReport readReport;
-            typename T::InputType input =
-                store != nullptr
-                    ? resolveScheduledRelayedInput(*store, step.getTick(), &readReport)
-                    : std::get<NeutralInputFor<T>>(m_neutralInputs).value;
-
-            // [item 61] The `if (store != nullptr)` probe/log block plus the
-            // unconditional `[CollectInput]` line below are ALL folded into
-            // ONE emit* call — safe because nothing after this point branches
-            // on whether the fold happened: the Skip/Stall handling and the
-            // final `map.emplace` below run unconditionally either way,
-            // exactly as they did with the diagnostics inline.
-            //
-            // [task 79] `store != nullptr` rather than `store` itself: the
-            // helper never dereferenced the pointer, only null-checked it, so
-            // the telemetry sibling gets the one bit it needs instead of a
-            // reference into this class's own RemoteInputCache map.
-            m_telemetry.emitPredictionInputRead(id, step.getTick(), store != nullptr, readReport);
-
-            if (step.getStepKind() == StepKind::Skip)
-                m_reconciliation.template backfillSkippedTick<T>(
-                    id, step.getTick() - 1, simulatable.getAllState().getState());
-
-            if (step.getStepKind() != StepKind::Stall)
-            {
-                m_reconciliation.template pushPredictionTick<T>(id, step.getTick());
-                // [T16] The remote `pushPredictionInput<T>(id, input)` that
-                // stood here is gone. It was the write that made a REMOTE
-                // column look alive while holding only this client's guess —
-                // spectrum doc §14.2 amendment 2. Nothing stores that guess
-                // now; the relay store holds what the proxy actually sent.
-            }
-
-            map.emplace(id, std::move(input));
-        }
-    }
-
-    // [item 61, relocated task 79] The local-provider branch's classification
-    // line, the remote-queue branch's, and the simulated-proxy branch's whole
-    // probing tail now live on the telemetry sibling as
-    // `NetSyncTelemetry::emitLocalInputRead` / `emitRemoteQueueRead` /
-    // `emitPredictionInputRead`. The last of the three takes `bool hasStore`
-    // rather than the `RemoteInputCache<InputT>*` this class used to pass —
-    // the helper only ever null-checked the pointer, so the one bit crosses
-    // instead of a reference into this class's own map (see the call site
-    // above and `NetSyncTelemetry.h` for the ruling). See that header for the
-    // full bodies and comments, unchanged otherwise from the pre-task-79 shape.
-
-    // [item 61 / RN-11] `collectResimInputAll`'s per-character body, lifted out
-    // verbatim. This is the TWO-LEVEL RESOLUTION TABLE described in the banner
-    // above `collectResimInputAll` — a ladder of mutually exclusive rungs, each
-    // a guard clause ending in its own `return`. PATTERN 1 — STRAIGHT FOLD
-    // applies at the PER-RUNG granularity: within any single rung, the
-    // diagnostics (one SIMLOG, or — the last rung — one probe write plus two
-    // SIMLOGs) are never split by a `return`; the `return` always comes AFTER
-    // the diagnostics and the `map.emplace`, exactly like the guard clauses in
-    // `decideCorrectionArrival`'s CALLER (`onCorrectionReceived`), never like
-    // `decideCorrectionArrival` itself. There is also only ONE probe write in
-    // this whole function (`noteResimRead`, last rung) — none of it shares a
-    // counter with a sibling probe the way the correction callback's two probes
-    // did, so there is no discard-population hazard to guard against here.
-    // Each rung's tail folds into its own `emit*` call below.
-    template <typename T>
-    void collectResimInputForCharacter(unsigned int id, uint32 simTick, int32 effectiveDelay,
-                                       ResolvedInputs<SimulatableTs...>& inputs)
-    {
-        auto& map = std::get<std::unordered_map<unsigned int, typename T::InputType>>(inputs);
-
-        const AppliedCaptureRef ref =
-            m_reconciliation.template getAppliedCaptureTickRef<T>(id, simTick);
-
-        if (ref.kind == AppliedCaptureRefKind::NoSlot)
-        {
-            m_telemetry.emitResimNoSlot(id, simTick);
-            return;
-        }
-
-        const auto& neutral = std::get<NeutralInputFor<T>>(m_neutralInputs).value;
-
-        if (ref.kind == AppliedCaptureRefKind::Sentinel)
-        {
-            // BOTH character classes, one answer: the authority told us it
-            // applied no client capture at this tick, and T17 made the value
-            // it substituted the INJECTED GAME ZERO. Reproducing an authority
-            // decision means applying what the authority applied — never a
-            // value-initialised InputType{}, which is the exact poison T17
-            // removed from that path.
-            m_telemetry.emitResimSentinel(id, simTick);
-            map.emplace(id, neutral);
-            return;
-        }
-
-        auto& providerMap  = std::get<InputProviderMapFor<T>>(m_inputProviders);
-        const bool isLocal = providerMap.find(id) != providerMap.end();
-
-        if (isLocal)
-        {
-            // `.at(id)` for the same reason collectInputAll uses it: the line
-            // is created iff a provider is registered, so provider-present and
-            // line-present are the same condition by construction.
-            const auto& delayLine =
-                std::get<LocalInputCacheMapFor<T>>(m_localInputCaches).at(id);
-
-            const int32 captureTick = (ref.kind == AppliedCaptureRefKind::Ref)
-                ? static_cast<int32>(ref.captureTick)
-                : static_cast<int32>(simTick) - effectiveDelay;
-
-            // A line miss answers with the line's own INJECTED neutral (never
-            // InputT{}) — the store-miss/local cell. Post-resync that is the
-            // only reachable way to get here, and it is today's behaviour.
-            //
-            // NOT resolveDelayedInput: that helper exists to protect the LIVE
-            // capture at delay 0, and a resim has no live capture. Reading
-            // at(simTick) at delay 0 is right precisely because the original
-            // prediction pass pushed that tick's capture into the line.
-            m_telemetry.emitResimLocalRead(id, simTick, ref.kind, captureTick);
-            map.emplace(id, delayLine.at(captureTick));
-            return;
-        }
-
-        // REMOTE. Nullable by design (T5): the authority allocates no stores
-        // for ids it owns, and a character can be iterated before its
-        // registration completes. Neutral rather than a throw, matching every
-        // other reader of this accessor.
-        const auto* store = findRemoteInputCache<T>(id);
-        if (store == nullptr)
-        {
-            m_telemetry.emitResimNoStore(id, simTick);
-            map.emplace(id, neutral);
-            return;
-        }
-
-        if (ref.kind == AppliedCaptureRefKind::Ref)
-        {
-            // THE REF WINS — see the precedence block above. `outDA` is bound
-            // only because `find` requires an out-param; its value is
-            // deliberately never read. The stamp is the intended schedule and
-            // has no authority over a tick the server has already ruled on.
-            std::uint8_t   ignoredScheduleStamp = 0u;
-            typename T::InputType relayed{};
-            const bool hit = store->find(ref.captureTick, ignoredScheduleStamp, relayed);
-            m_telemetry.emitResimRefRead(id, simTick, ref.captureTick, hit);
-            // THE SELF-HEAL: a miss degrades THIS TICK's replay input to
-            // last-known, never the injected state. The state is a complete
-            // anchor, so the next every-frame correction supersedes the error.
-            map.emplace(id, hit ? relayed : store->fallback());
-            return;
-        }
-
-        // NoRef / REMOTE — no authoritative answer for this tick, so run the
-        // same scheduled read the prediction pass runs (T7). Sharing the ladder
-        // is what stops a resim from disagreeing with the prediction it replays.
-        //
-        // [T19] SECOND CALL SITE OF PROBE 1 — counted into its OWN counter block,
-        // never summed with the prediction one. Resim resolves ticks the
-        // prediction already ran, and entries missing then may have landed since,
-        // so a resim hit rate materially above the prediction's is real
-        // information about the frontier rather than noise.
-        //
-        // It does NOT feed the stale run (probe 3): a run is "consecutive ticks
-        // this character was served a fallback", and resim revisits ticks out of
-        // order and repeatedly. It also does not advance the window — the window
-        // is keyed to the monotonic prediction tick, and a resim's `simTick`
-        // walks backwards.
-        ScheduledRelayedReadReport readReport;
-        typename T::InputType scheduled =
-            resolveScheduledRelayedInput(*store, simTick, &readReport);
-        m_telemetry.emitResimScheduledRead(id, simTick, readReport);
-        map.emplace(id, std::move(scheduled));
-    }
-
-    // [item 61, relocated task 79] The five resim rungs' classification lines
-    // (NoSlot, Sentinel, Local, NoStore, Ref) plus the NoRef/scheduled rung's
-    // probe write + two SIMLOGs now live on the telemetry sibling as
-    // `NetSyncTelemetry::emitResimNoSlot` / `emitResimSentinel` /
-    // `emitResimLocalRead` / `emitResimNoStore` / `emitResimRefRead` /
-    // `emitResimScheduledRead`. See that header for the full bodies and
-    // comments, unchanged from the pre-task-79 shape.
-
     // Variadic helper: expands over each per-type tuple slot using index_sequence.
     // Calls fn<SimulatableT>(perTypeMap) for each SimulatableT in the pack.
     template <typename TupleT, typename Fn, std::size_t... Is>
@@ -2022,19 +810,25 @@ private:
     // apply the RN-8/task-58 decide-then-project shape instead.
     // -----------------------------------------------------------------------
 
-    // [RN-10 part A+B] CALL SITE 1's callback (registerPredictionOwner),
-    // lifted out verbatim and its probing tail folded behind ONE `emit*`
-    // call. Safe as a straight fold — unlike the correction callback below —
-    // because nothing past the ingest line alters control flow: every branch
-    // in the old lambda was a logging gate, never a `return`.
+    // [RN-10 part A+B; re-bound at item 86] CALL SITE 1's callback
+    // (registerPredictionOwner), its probing tail folded behind ONE `emit*`
+    // call. [item 86] No longer takes a `store` reference — the ingest itself
+    // now routes through the resolution peer's by-id `ingestRelayRing` door
+    // (design §C.3); this method's own job is unchanged: project the
+    // returned report through `emitRelayArrival`.
+    //
+    // [item 89 / design §C.3, corrected] Cost of the by-id lookup this callback
+    // makes on every arrival: worst case ~180 lookups/s per character
+    // (redundancy depth 3 × the 60 Hz relay rate) — off the hot per-tick path,
+    // which stays at 60 Hz regardless of how many redundant entries one
+    // replicated bundle carries.
     template <typename SimulatableT>
     void onRelayedInputReceived(
         unsigned int id,
-        RemoteInputCache<typename SimulatableT::InputType>& store,
         const typename PredictionOwnerFor<SimulatableT>::RelayedInputRingType& ring)
     {
         const RelayedInputIngestReport report =
-            populateRemoteInputCache<typename SimulatableT::InputType>(store, ring);
+            m_inputResolution.template ingestRelayRing<SimulatableT>(id, ring);
         m_telemetry.emitRelayArrival(id, report);
     }
 
@@ -2106,13 +900,14 @@ private:
     CorrectionArrivalDecision decideCorrectionArrival(
         unsigned int id, const CorrectionInsertVerdict& verdict)
     {
-        // THE CLASS TEST IS PROVIDER-PRESENCE — the SAME lookup
-        // registerPredictionOwner forks on above and collectInputAll forks
-        // on every tick, not a second notion of "remote". Read live rather
-        // than captured at bind time so it cannot drift from the map that
-        // actually decides behaviour.
+        // THE CLASS TEST IS PROVIDER-PRESENCE — [item 86] routed through the
+        // resolution peer's `isLocallyControlled` query, THE identity test
+        // (design §C.1/§A.2) — the SAME lookup registerPredictionOwner forks
+        // on above and collectInputAll forks on every tick, not a second
+        // notion of "remote". Read live rather than captured at bind time so
+        // it cannot drift from the map that actually decides behaviour.
         const bool hasProvider =
-            std::get<InputProviderMapFor<SimulatableT>>(m_inputProviders).count(id) != 0u;
+            m_inputResolution.template isLocallyControlled<SimulatableT>(id);
         const PredictedCharacterClass characterClass = hasProvider
             ? PredictedCharacterClass::LocallyPredicted
             : PredictedCharacterClass::RemoteProxy;
@@ -2197,82 +992,53 @@ private:
     // any other caller). See `NetSyncTelemetry.h` for the full body and its
     // comments, unchanged from the pre-task-79 shape.
 
-    // [T19, relocated task 79] PROBES 1 + 3 — the per-window summary now
-    // lives on the telemetry sibling as `NetSyncTelemetry::emitRelayReadWindowIfDue`,
-    // called once per prediction tick from `collectInputAll` above. It is also
-    // the sole caller of `emitMissClassLine` / `emitDeltaLine` (both relocated
-    // with it). See `NetSyncTelemetry.h` for the full bodies and comments,
-    // unchanged from the pre-task-79 shape.
+    // [T19, relocated task 79, split at item 85, resolution peer owns the PT
+    // sibling at item 86] PROBES 1 + 3 — the per-window summary now lives on
+    // `SimulationInputResolution`'s `InputResolutionTelemetry` sibling as
+    // `emitRelayReadWindowIfDue`, called once per prediction tick from
+    // `SimulationInputResolution::collectInputAll`. See
+    // `InputResolutionTelemetry.h` for the full bodies and comments,
+    // unchanged otherwise from the pre-task-79 shape.
 
-    // m_inputProviders uses std::function intentionally — converting to a pointer struct
-    // would require extending PredictionSyncedBufferOwnerConcept with a typed
-    // getLocalInputFor<T>(step) method; tracked as a post-cutover follow-up.
-    std::tuple<InputProviderMapFor<SimulatableTs>...>    m_inputProviders;
-    std::tuple<RemoteMoveQueueMapFor<SimulatableTs>...>  m_remoteMoveQueues;
-    std::tuple<PendingInputQueueMapFor<SimulatableTs>...> m_pendingInputQueues;
-
-    // [T2 / input relay] The capture tick behind each applied remote input, or
-    // kNoInputCaptureTick on an underrun substitution. Written in collectInputAll
-    // (PHYSICS thread), read in sendCorrectionAll (GAME thread) where T4 attaches
-    // it to the correction state.
-    //
-    // [T8] It used to be the strict parallel of `m_lastUsedInputs` and INHERITED
-    // that member's pre-existing physics-write / game-read pattern rather than
-    // introducing one. `m_lastUsedInputs` is now retired, so this member carries
-    // that pattern alone — it is the same pattern, not a new one, and the argument
-    // for why it is tolerable is unchanged: it is a plain scalar per id, so the
-    // worst a torn schedule can do is carry the previous tick's value for one
-    // tick, which the every-frame correction that transports it then supersedes.
-    std::tuple<LastUsedCaptureTickMapFor<SimulatableTs>...> m_lastUsedCaptureTicks;
-
+    // [item 86] Owner-BINDING maps only — see the type aliases' own comment
+    // above for why the container-lifecycle maps moved off this class.
     std::tuple<AuthorityWriterMapFor<SimulatableTs>...>  m_authorityWriters;
     std::tuple<LocalInputSenderMapFor<SimulatableTs>...> m_localInputSenders;
 
-    // [T9 parts 3+4] Client Layer-1 input delay. Populated for provider-owning
-    // ids only; touched exclusively from collectInputAll (physics thread) and
-    // wipeAllForResync.
-    std::tuple<LocalInputCacheMapFor<SimulatableTs>...> m_localInputCaches;
-
-    // [T9 part 4, RENAMED by T17] The game's zero input, per simulatable type.
-    // NOT "client" neutral inputs any more: the AUTHORITY reads this too (the
-    // underrun substitute in collectInputAll's remote branch; [T8] T17 also named
-    // the `m_lastUsedInputs` seed in registerAuthorityOwner, since retired), so the
-    // old name described one of several consumers and invited exactly the reasoning
-    // that left the authority path integrating `InputType{}`. Written once by the
-    // composition root
-    // (setNeutralInput, game thread, before/around registration), read on the
-    // physics thread thereafter.
-    std::tuple<NeutralInputFor<SimulatableTs>...>            m_neutralInputs;
-
-    // [T5 / input relay] The client's relayed-input stores, one per REMOTE
-    // character (provider-ABSENT ids — the complement of m_localInputCaches).
-    //
-    // WRITTEN ON THE GAME THREAD (the OnRep_RelayedInputRing callback bound in
-    // registerPredictionOwner), READ ON THE PHYSICS THREAD (T7's proxy branch of
-    // collectInputAll, T6's collectResimInputAll). That crossing is INHERITED from
-    // the correction path, which already does exactly this, and its full rationale
-    // — the torn-slot-not-container-UB argument, the correction heal, and the
-    // named deferred SPSC-seam cleanup — is in the THREADING section of
-    // Network/RemoteInputCache.h. Do not restate it here; do not weaken it there.
-    std::tuple<RemoteInputCacheMapFor<SimulatableTs>...> m_remoteInputCaches;
-
-    // [T19/T24/item 42, relocated task 79] THE FOUR PROBES — `RelayReadProbe`,
-    // `RelayArrivalProbe`, `CorrectionVerdictProbe`, `CorrectionLandingProbe` —
-    // and the sixteen `emit*` helpers that feed shipped log lines from them no
-    // longer live on this class. They are owned by the `NetSyncTelemetry`
-    // sibling below, which finishes the decide/project split this file already
-    // used for `ScheduledRelayedReadDecision` / `CorrectionArrivalDecision`:
-    // this class computes and returns those structs; `m_telemetry` turns them
-    // into a probe count or a log line. See `NetSyncTelemetry.h` for the probe
-    // declarations, the fence on each, and the two-thread rule now stated once
-    // there instead of as prose scattered across this class. Diagnostics access
-    // is unchanged in shape: `SimulationNetSync::Diagnostics` still exposes
-    // exactly these four probes, const-only, by delegating into
-    // `m_telemetry`'s own const accessors.
+    // [T19/T24/item 42, relocated task 79, SPLIT AT ITEM 85] THE GAME-THREAD
+    // telemetry sibling — `RelayArrivalProbe`, `CorrectionVerdictProbe`,
+    // `CorrectionLandingProbe` and their six `emit*` helpers. The
+    // PHYSICS-THREAD sibling (`RelayReadProbe` + ten `emit*` helpers) is
+    // owned by the resolution peer (`m_inputResolution` below) — see
+    // `NetSyncTelemetry.h` and `InputResolutionTelemetry.h` for the probe
+    // declarations, the fence on each, and each class's own two-thread rule.
+    // [item 87] Diagnostics access shrinks with the split: `Diagnostics`
+    // above now exposes exactly the three GAME-THREAD probes this sibling
+    // owns; `relayReadProbe()` is reached directly at
+    // `inputResolution.getDiagnostics().relayReadProbe()` (design §C.6).
     NetSyncTelemetry m_telemetry;
 
     SimulationObjectStorage<SimulatableTs...>&   m_storage;
     SimulationReconciliation<SimulatableTs...>&  m_reconciliation;
+
+    // [item 86 / step 2, PROMOTED item 87 / step 3 of the input-resolution
+    // migration, design §A.3] A real reference to the composition-root-
+    // constructed resolution peer — no longer an owned scaffold sub-object.
+    // NetSync knows both this peer and Reconciliation (design §A.3's
+    // dependency spine); this peer and Reconciliation do not know NetSync
+    // exists. Used by the per-tick/per-event methods whose signatures are
+    // fixed by the manager-facing concepts (`sendCorrectionAll`,
+    // `sendLocalInputToAuthorityAll`) and by the two async-callback helpers
+    // (`onRelayedInputReceived`, `decideCorrectionArrival`) whose bound
+    // lambdas capture only `(this, id)` and so must reach this peer through
+    // a member rather than a call-time parameter. The three
+    // registration/unregistration methods (`registerPredictionOwner`,
+    // `registerAuthorityOwner`, `unregisterSimulatable`) instead take the
+    // resolution peer as an EXPLICIT parameter (design §C.5's facade
+    // signature change) — they run synchronously from the registration
+    // facade, which already has the same reference in hand.
+    SimulationInputResolution<SimulatableTs...>& m_inputResolution;
+
     std::function<void(const char*)>             m_logger;
 
     // Receive-side dedup guard context, pushed by SimulationManager
@@ -2283,11 +1049,6 @@ private:
     // the future guard until SimulationManager injects TimeConfig::rollbackWindowTicks.
     uint32 m_currentAuthorityTick = 0;
     int32  m_rollbackWindowTicks  = -1;
-
-    // [T9 part 3] Written on the GAME thread (OnRep_ConnectionTier), read once
-    // per tick on the PHYSICS thread. Atomic — and ONLY atomic — for the reasons
-    // spelled out on setClientEffectiveInputDelayTicks. 0 = pre-T9 behaviour.
-    std::atomic<int32> m_clientEffectiveInputDelayTicks{ 0 };
 
     // [T39] THE STATE-ROTATION CURSOR. Monotonic, advanced by K once per
     // sendCorrectionAll, wrapped per type map at the point of use — see the
@@ -2306,6 +1067,15 @@ private:
 // SimulationNetSyncConcept
 // ---------------------------------------------------------------------------
 
+// [item 87 / design §C.7] `collectInputAll` / `collectResimInputAll` /
+// `wipeAllForResync` LEFT this concept for `SimulationInputResolutionConcept`
+// (SimulationInputResolution.h, item 83's recorded placement preference) —
+// the three methods moved off this class onto the resolution peer at the
+// same item. What remains is exactly NetSync's own surface: the two publish
+// methods (state send, local-input RPC send) and the receive-side guard.
+// `SimulatableTs` stays a template parameter for signature symmetry with the
+// peer concepts even though no member below returns a SimulatableTs-typed
+// value any more.
 template <typename T, typename... SimulatableTs>
 concept SimulationNetSyncConcept = requires(
     T& t, const SimulationTimeStep& step, uint32 tick, int32 rollbackWindow,
@@ -2315,12 +1085,6 @@ concept SimulationNetSyncConcept = requires(
     // argument rather than a defaulted one — see the note at the definition.
     { t.sendCorrectionAll(step, correctionRotationK) };
     { t.sendLocalInputToAuthorityAll(tick, tick) };
-    { t.collectInputAll(step) } -> std::convertible_to<ResolvedInputs<SimulatableTs...>>;
-    // [T6] MOVED here from SimulationReconciliationConcept along with the method:
-    // resim input resolution reads this class's delay lines, relay stores and
-    // neutrals, and only borrows the join key from reconciliation.
-    { t.collectResimInputAll(tick) } -> std::convertible_to<ResolvedInputs<SimulatableTs...>>;
-    { t.wipeAllForResync(tick) };
     { t.setAuthorityGuardContext(tick, rollbackWindow) };
 };
 
@@ -2344,6 +1108,7 @@ template <typename SimulatableT, typename... Ts>
 void registerSimulatable(
     SimulationObjectStorage<Ts...>&        storage,
     SimulationReconciliation<Ts...>&       reconciliation,
+    SimulationInputResolution<Ts...>&      inputResolution,
     SimulationNetSync<Ts...>&              netSync,
     unsigned int                           id,
     SimulatableT&&                         simulatable,
@@ -2357,9 +1122,22 @@ void registerSimulatable(
     // (postPredictionAll etc.). If storage gets the id first, a concurrent physics
     // tick sees storage-has-id and calls getCacheFor(id), which throws.
     // Inverted-order invariant: if storage has id, cache has id.
+    // [item 92] THE SAME SHAPE OF INVARIANT IS ENFORCED BELOW, IN THE SERVER
+    // OVERLOAD — that overload has no cache to create, so it orders
+    // registerAuthorityOwner (the call that lets sweep 2 skip an authority id)
+    // before storage.add instead. State both so a future edit to either overload
+    // cannot break its ordering without seeing the sibling invariant it mirrors.
+    // [item 93] THE SAME INVARIANT, READ BACKWARDS, GOVERNS unregisterSimulatable
+    // below (publish-last on the way in ⇒ unpublish-first on the way out).
     reconciliation.template createCacheFor<SimulatableT>(id);
     storage.template add<SimulatableT>(id, std::forward<SimulatableT>(simulatable));
-    netSync.template registerPredictionOwner<SimulatableT>(id, owner, std::move(inputProvider));
+    // [item 87 / design §C.5] `inputResolution` gained by this facade's own
+    // signature — the resolution peer's containers must exist before
+    // `registerPredictionOwner` can bind callbacks against them, same order,
+    // same reason as the cache-before-storage invariant above, now spanning
+    // this extra call.
+    netSync.template registerPredictionOwner<SimulatableT>(
+        id, owner, std::move(inputProvider), inputResolution);
 }
 
 // Server overload — no correction cache is allocated: the authority does not
@@ -2378,33 +1156,84 @@ template <typename SimulatableT, typename... Ts>
 void registerSimulatable(
     SimulationObjectStorage<Ts...>&        storage,
     SimulationReconciliation<Ts...>&       /*reconciliation*/,
+    SimulationInputResolution<Ts...>&      inputResolution,
     SimulationNetSync<Ts...>&              netSync,
     unsigned int                           id,
     SimulatableT&&                         simulatable,
     PredictionOwnerFor<SimulatableT>&      predictionOwner,
     AuthorityOwnerFor<SimulatableT>&       authorityOwner)
 {
+    // [item 92] Order matters, mirroring the client overload's cache-before-
+    // storage invariant above: this overload has no cache to create, but
+    // registerAuthorityOwner still MUST run before storage.add, because it is
+    // the only call that populates queueMap — the map sweep 2
+    // (allocateFrontierSlotForCharacter) checks to skip authority ids. Neither
+    // registerPredictionOwner (provider is null here, so it takes the
+    // provider-absent/remote branch) nor registerAuthorityOwner touches
+    // `storage` or the stored `simulatable`, so both are safe to run first.
+    // If storage.add ran first, a concurrent physics tick's sweep 2 could
+    // observe the id in storage but in neither queueMap nor providerMap, fall
+    // through the guard, and call pushPredictionTick for an id that (by this
+    // overload's own design, above) will NEVER have a correction cache —
+    // SimulationReconciliation::getCacheFor's bare .at(id) then throws. This
+    // was the exact defect behind the item-92 crash.
+    // Inverted-order invariant: if storage has id, queueMap has id.
+    // [item 93] THE SAME INVARIANT, READ BACKWARDS, GOVERNS unregisterSimulatable
+    // below (publish-last on the way in ⇒ unpublish-first on the way out).
+    netSync.template registerPredictionOwner<SimulatableT>(
+        id, predictionOwner, nullptr, inputResolution);
+    netSync.template registerAuthorityOwner<SimulatableT>(id, authorityOwner, inputResolution);
     storage.template add<SimulatableT>(id, std::forward<SimulatableT>(simulatable));
-    netSync.template registerPredictionOwner<SimulatableT>(id, predictionOwner, nullptr);
-    netSync.template registerAuthorityOwner<SimulatableT>(id, authorityOwner);
 }
 
-// Unregister facade — mirrors registration; clears callbacks before data-map erasure.
+// Unregister facade — mirrors registration.
+//
+// [item 93] REGISTRATION PUBLISHES LAST, SO UNREGISTRATION MUST UNPUBLISH
+// FIRST — the two register overloads above establish "if storage has id,
+// queueMap/cache has id" by making storage.add the LAST call (queueMap/cache
+// is already populated the instant the id becomes visible to
+// storage.forEachSimulatable). Unregistration is the same invariant read
+// backwards: the id must stop being visible to forEachSimulatable — i.e.
+// leave storage — BEFORE anything erases the queueMap/cache entries that
+// gate what a concurrent physics-thread sweep does with it. So
+// storage.remove<SimulatableT> runs FIRST here, ahead of
+// netSync.unregisterSimulatable (whose step 3 erases queueMap via
+// SimulationInputResolution::unregisterCharacter) and reconciliation's
+// removeCacheFor. This was previously reversed — storage.remove ran AFTER
+// netSync.unregisterSimulatable — which left the id visible in storage
+// with an already-erased queueMap entry for the width of that call: exactly
+// the item-92 crash shape (sweep 2's queueMap guard passes, then
+// allocateFrontierSlotForCharacter's OG_CHECK aborts / getCacheFor's
+// bare .at(id) throws), reachable on the authority path on player-leave.
+// ⚠ The comment previously on this facade already CLAIMED "remove from
+// storage before cache" — but the code below it did the opposite (netSync's
+// queueMap-erasing call ran first). The claim was aspirational, never
+// implemented; corrected here rather than just centered on the code.
+//
+// [item 93] CLIENT-PATH SYMMETRY, CONFIRMED NOT ASSUMED: the client register
+// overload creates the correction cache BEFORE storage.add, so by the same
+// rule the cache must be removed AFTER storage.remove on the way out.
+// Placing reconciliation.removeCacheFor LAST (after both storage.remove and
+// netSync.unregisterSimulatable) satisfies that — read
+// SimulationReconciliation::removeCacheFor and NetSync::unregisterSimulatable's
+// own body: neither touches `storage`, so nothing here depends on the cache
+// or the queueMap/telemetry maps outliving storage.remove. This ordering was
+// already correct before this fix (removeCacheFor was already the last of
+// the three calls) and remains correct now; only the storage/netSync
+// relative order changes.
 template <typename SimulatableT, typename... Ts>
 void unregisterSimulatable(
     SimulationObjectStorage<Ts...>&   storage,
     SimulationReconciliation<Ts...>&  reconciliation,
+    SimulationInputResolution<Ts...>& inputResolution,
     SimulationNetSync<Ts...>&         netSync,
     unsigned int                      id,
     PredictionOwnerFor<SimulatableT>* predictionOwner,
     AuthorityOwnerFor<SimulatableT>*  authorityOwner = nullptr)
 {
-    // Symmetric to register ordering: remove from storage before cache, so a
-    // physics tick racing this teardown never sees storage-has-id without a
-    // corresponding cache entry. Preserves the invariant "if storage has id,
-    // cache has id" across both lifecycle directions.
-    netSync.template unregisterSimulatable<SimulatableT>(id, predictionOwner, authorityOwner);
     storage.template remove<SimulatableT>(id);
+    netSync.template unregisterSimulatable<SimulatableT>(
+        id, predictionOwner, inputResolution, authorityOwner);
     reconciliation.template removeCacheFor<SimulatableT>(id);
 }
 

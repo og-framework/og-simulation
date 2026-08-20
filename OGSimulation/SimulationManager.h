@@ -83,7 +83,7 @@ private:
 // that pack lives inside NetSyncT's own instantiation
 // (SimulationNetSync<SimulatableTs...>), never as one of the manager's type
 // parameters — so SimulationNetSyncConcept's two SimulatableTs-typed return
-// checks (collectInputAll / collectResimInputAll ->
+// checks (prepareSimulationStep / collectResimInputAll ->
 // convertible_to<ResolvedInputs<SimulatableTs...>>) cannot be expressed at
 // the manager's generality: there is no pack for the manager to supply.
 // These two sibling concepts check the SAME method names and argument
@@ -97,12 +97,12 @@ private:
 //
 // ⚠ [item 83 / 80 f2] PRESENCE-ONLY IS NOT THE STRONGEST CHECK REACHABLE HERE,
 // AND THAT IS WORTH SAYING PLAINLY RATHER THAN LEAVING IMPLIED. A concept could
-// still constrain the SHAPE of `collectInputAll`/`collectResimInputAll`'s return
+// still constrain the SHAPE of `prepareSimulationStep`/`collectResimInputAll`'s return
 // (e.g. "convertible to some `std::tuple` of `std::unordered_map<unsigned int, X>`s")
 // without knowing `SimulatableTs` — strictly tighter than presence-only, and
 // expressible at this generality. That was not attempted here: the manager's own
 // proof namespace below demonstrates just how weak presence-only is
-// (`NetSyncShaped::collectInputAll` returns a bare `int` and still satisfies this
+// (`InputResolutionShaped::prepareSimulationStep` returns a bare `int` and still satisfies this
 // concept), and a wrong return type at the manager still fails loudly downstream —
 // at the real `ResolvedInputs` consumer (`SimulationIntegrationExecutor::integrateAll`) —
 // rather than silently. Left as a residual for a future revisit of this concept,
@@ -130,34 +130,20 @@ private:
 // beside `SimulationNetSyncConcept` for consistency with the other two peers.
 // ---------------------------------------------------------------------------
 
+// [item 87 / design §C.7] `collectInputAll` (RENAMED `prepareSimulationStep`
+// at item 90) / `collectResimInputAll` / `wipeAllForResync` LEFT this concept
+// — they moved off `SimulationNetSync` onto the resolution peer at item 87,
+// and with them the manager no longer calls any of the three ON `m_netSync`.
+// This concept shrinks to the one member the manager still reaches on
+// NetSyncT from a tick-group method: the receive-side guard, published once
+// per authority tick immediately before `onGameSimulationAuthority`'s own
+// `prepareSimulationStep` call (now on `InputResolutionT` — see
+// `SimulationInputResolutionTickConcept` below).
 template <typename T>
 concept SimulationNetSyncTickConcept = requires(
-    T& t, const SimulationTimeStep& step, uint32_t tick, int32_t rollbackWindow)
+    T& t, uint32_t tick, int32_t rollbackWindow)
 {
-    { t.collectInputAll(step) };
-    { t.collectResimInputAll(tick) };
     { t.setAuthorityGuardContext(tick, rollbackWindow) };
-    // [item 83 / Part A] `wipeAllForResync` was dropped from BOTH split concepts
-    // with no stated reason — the SimulatableTs-invisibility justification above
-    // covers only the two return-type pins, and this method is a plain
-    // `void(uint32)` with no pack involvement, so it was reachable and simply
-    // missed. The manager's ctor calls `m_netSync.wipeAllForResync(...)` from
-    // ClientPredictionClock's resync callback, which fires from INSIDE
-    // `advancePrediction()` — i.e. from THIS group: the callback is registered
-    // only when `shouldRunPrediction`, and it fires only as a side effect of the
-    // same physics-thread call chain `onGameSimulationPrediction` (below) drives.
-    // Added HERE, not to the Publish sibling, for that reason: it belongs to the
-    // group that is actually reachable when the resync path can fire.
-    //
-    // ⚠ CAVEAT, STATED AT THE SITE SO THIS ISN'T MISREAD AS MORE THAN IT IS:
-    // `wipeAllForResync` is the ONE method name shared verbatim by this concept's
-    // peer `SimulationReconciliationConcept` (see the ctor's own comment on why
-    // that sharing means a wipeAllForResync-only clause cannot distinguish a
-    // NetSync-shaped peer from a Reconciliation-shaped one). Adding it here is
-    // PRESENCE-CHECKING ONLY — it makes the resync call site covered by SOME
-    // concept instead of none, not transposition-safe. The ctor itself stays
-    // deliberately unconstrained for exactly this reason.
-    { t.wipeAllForResync(tick) };
 };
 
 template <typename T>
@@ -169,15 +155,60 @@ concept SimulationNetSyncPublishConcept = requires(
 };
 
 // ---------------------------------------------------------------------------
-// SimulationManager<IntegrationExecT, NetSyncT, ReconciliationT, SystemsExecT,
-//                   StorageT, StaticDataT>
+// [item 87 / design §C.7] SimulationManager-facing split of
+// SimulationInputResolutionConcept (SimulationInputResolution.h) — same
+// SimulatableTs-invisibility reasoning as `SimulationNetSyncTickConcept`
+// above (item 80/83's residual, inherited here): the manager's own template
+// parameters never carry `SimulatableTs`, so the peer concept's two
+// SimulatableTs-typed return checks cannot be expressed at the manager's
+// generality. Presence-only, checking the group all three prediction/
+// authority/resim step methods call: `prepareSimulationStep` (prediction,
+// authority; named `collectInputAll` before item 90's rename),
+// `collectResimInputAll` (resim) and `wipeAllForResync` (the
+// resync-callback path, reachable from the same physics-thread call chain
+// `onGameSimulationPrediction` drives — see that concept's own history on
+// `SimulationNetSyncTickConcept` above for why a resync-reachable member
+// belongs on a tick-group concept rather than a publish one).
 //
-// Orchestrates the simulation loop. Holds references to the four peers
-// (integration executor, net sync, reconciliation, systems executor), plus
-// references to the externally-owned object storage and static data, and owns
-// the clocks. Storage + static data live at the engine adapter's composition
-// root (shared by all peers); the manager reaches them directly rather than
-// bridging through the integration executor.
+// ⚠ `wipeAllForResync` IS NOW SHARED VERBATIM BY THREE PEER CONCEPTS —
+// `SimulationReconciliationConcept`, this one, and (until item 87) formerly
+// `SimulationNetSyncConcept` too, before it left NetSync entirely — so a
+// wipe-only clause distinguishes NOTHING between a resolution-shaped peer and
+// a reconciliation-shaped one. The DISTINGUISHING members are `collect*`
+// (resolution, checked below), `postPredictionAll` /
+// `consumeResimAnchorsAll` (reconciliation) and `sendCorrectionAll`
+// (netsync). The manager's ctor stays deliberately unconstrained by any peer
+// concept for exactly this reason (see the ctor's own comment) — a proof
+// that leaned on `wipeAllForResync` alone would look like transposition
+// protection while providing none, the same trap item 80's unconstrained
+// ctor documented.
+// ---------------------------------------------------------------------------
+template <typename T>
+concept SimulationInputResolutionTickConcept = requires(
+    T& t, const SimulationTimeStep& step, uint32_t tick)
+{
+    { t.prepareSimulationStep(step) };
+    { t.collectResimInputAll(tick) };
+    { t.wipeAllForResync(tick) };
+};
+
+// ---------------------------------------------------------------------------
+// SimulationManager<IntegrationExecT, NetSyncT, InputResolutionT,
+//                   ReconciliationT, SystemsExecT, StorageT, StaticDataT>
+//
+// Orchestrates the simulation loop. Holds references to the five peers
+// (integration executor, net sync, input resolution, reconciliation, systems
+// executor), plus references to the externally-owned object storage and
+// static data, and owns the clocks. Storage + static data live at the engine
+// adapter's composition root (shared by all peers); the manager reaches them
+// directly rather than bridging through the integration executor.
+//
+// [item 87 / design §A.3] InputResolutionT is the seventh template parameter,
+// added when the resolution peer was promoted off `SimulationNetSync`'s
+// scaffold to a real, composition-root-constructed peer of its own. The
+// manager reads prediction/authority/resim input straight from it
+// (`prepareSimulationStep` / `collectResimInputAll`) and drives its resync wipe —
+// NetSyncT's own tick-group surface shrank to the receive-side guard alone.
 //
 // The SystemsExecT peer (the SimulationSystemsExecutor — the ogsim-system-api
 // "fourth peer") fires cross-simulatable system hooks around integrateAll:
@@ -190,30 +221,32 @@ concept SimulationNetSyncPublishConcept = requires(
 // Layer: OGSimulation. Adapter-agnostic, UE/Chaos-free.
 // ---------------------------------------------------------------------------
 
-template <typename IntegrationExecT, typename NetSyncT, typename ReconciliationT, typename SystemsExecT,
+template <typename IntegrationExecT, typename NetSyncT, typename InputResolutionT,
+          typename ReconciliationT, typename SystemsExecT,
           typename StorageT, typename StaticDataT>
 class SimulationManager
 {
 public:
     using LoggerFn = std::function<void(const char*)>;
 
-    // Grouped dependency refs for the ctor. Bundles the four
+    // Grouped dependency refs for the ctor. Bundles the five
     // peer refs + storage + staticData + logger into one named aggregate so the
     // two composition-root emplace() sites cannot silently transpose the adjacent
     // duck-typed peer refs (a transposition of two same-category refs COMPILES —
     // they are duck-typed — and misbehaves only at runtime). Nested so it inherits
     // the enclosing template params: call sites write ManagerType::Params{ ... }
-    // without re-naming the six type arguments. Only the scalar loop config
+    // without re-naming the seven type arguments. Only the scalar loop config
     // (shouldRunPrediction / tickFrequency) stays positional.
     struct Params
     {
-        IntegrationExecT&  integrationLayer;
-        NetSyncT&          netSync;
-        ReconciliationT&   reconciliation;
-        SystemsExecT&      systemsExec;
-        StorageT&          storage;
-        const StaticDataT& staticData;
-        LoggerFn           logger = nullptr;
+        IntegrationExecT&    integrationLayer;
+        NetSyncT&            netSync;
+        InputResolutionT&    inputResolution;
+        ReconciliationT&     reconciliation;
+        SystemsExecT&        systemsExec;
+        StorageT&            storage;
+        const StaticDataT&   staticData;
+        LoggerFn             logger = nullptr;
     };
 
     SimulationManager(
@@ -223,6 +256,7 @@ public:
         : m_runsPrediction(shouldRunPrediction)
         , m_integrationLayer(params.integrationLayer)
         , m_netSync(params.netSync)
+        , m_inputResolution(params.inputResolution)
         , m_reconciliation(params.reconciliation)
         , m_systemsExec(params.systemsExec)
         , m_storage(params.storage)
@@ -231,14 +265,16 @@ public:
     {
         m_timeConfig.tickFrequency = 1.0 / tickFrequency;
 
-        // [item 80 / B6] The ctor itself stays UNCONSTRAINED by any peer concept,
-        // deliberately: `wipeAllForResync(uint32)` is the one method name both
-        // SimulationNetSyncConcept and SimulationReconciliationConcept share
-        // verbatim, so a requires-clause built only from it could not
-        // distinguish a NetSync-shaped peer from a Reconciliation-shaped one —
-        // it would give the false impression of transposition protection while
-        // providing none. The methods that actually differ between the two
-        // peers are constrained below, at the member functions that call them.
+        // [item 80 / B6, updated item 87] The ctor itself stays UNCONSTRAINED
+        // by any peer concept, deliberately: `wipeAllForResync(uint32)` is now
+        // shared verbatim by THREE peer concepts —
+        // SimulationInputResolutionTickConcept, SimulationReconciliationConcept,
+        // and (until item 87) formerly SimulationNetSyncConcept too — so a
+        // requires-clause built only from it could not distinguish a
+        // resolution-shaped peer from a reconciliation-shaped one — it would
+        // give the false impression of transposition protection while
+        // providing none. The methods that actually differ between the peers
+        // are constrained below, at the member functions that call them.
         if (shouldRunPrediction)
         {
             m_networkEstimator.emplace(m_timeConfig, params.logger);
@@ -256,7 +292,10 @@ public:
                     // the same caches in the same pass. See
                     // `SimulationReconciliation::logSlotProvenanceFor`.
                     m_reconciliation.wipeAllForResync(newPredictionTick);
-                    m_netSync.wipeAllForResync(newPredictionTick);
+                    // [item 87] Re-targeted off `m_netSync` — the resolution
+                    // peer now owns this call, matching its own container
+                    // lifecycle (design §C.4/§C.7).
+                    m_inputResolution.wipeAllForResync(newPredictionTick);
                 });
         }
         else
@@ -480,8 +519,9 @@ public:
                 // [item 55] The sweep returns one `ResimSweepDiagnostics` by value
                 // (RN-3, option B) instead of a return value plus two out-pointers
                 // — `auto` here keeps this call site duck-typed on the
-                // reconciliation peer, exactly as `m_netSync.collectInputAll`'s
-                // return is captured a few lines up.
+                // reconciliation peer, exactly as
+                // `m_inputResolution.prepareSimulationStep`'s return is
+                // captured a few lines up.
                 const auto resimDiagnostics = m_reconciliation.postResimulationAll(*m_lastStep);
                 m_resimGateProbe.noteReplayOverruns(resimDiagnostics.discards);
                 m_resimGateProbe.noteCorrectionProtections(
@@ -846,11 +886,13 @@ private:
             window.freshClobbersAvoided, window.staleClobbersAvoided);
     }
 
-    // [item 80 / B6] Constrained on the NetSync "tick" surface — the group
-    // this method, onGameSimulationAuthority and onGameSimulationResimulation
-    // all draw from (collectInputAll here).
+    // [item 80 / B6, re-targeted item 87] Constrained on the resolution
+    // peer's tick surface — the group this method, onGameSimulationAuthority
+    // and onGameSimulationResimulation all draw from (prepareSimulationStep
+    // here, named collectInputAll before item 90's rename; NetSyncT no
+    // longer has one).
     void onGameSimulationPrediction()
-        requires SimulationNetSyncTickConcept<NetSyncT>
+        requires SimulationInputResolutionTickConcept<InputResolutionT>
     {
         // [item 42 / I5] THE STRANDED-CURSOR OBSERVATION, taken BEFORE
         // advancePrediction so it reports the state this frame INHERITED rather
@@ -905,7 +947,15 @@ private:
         SIMLOG(m_logger, "[PredictionSimulation] tick=%u kind=%s advance=%s",
             step.getTick(), stepKindName(step.getStepKind()), advanceName);
 
-        auto inputs = m_netSync.collectInputAll(step);
+        // [og-netcode-v2-input-relay item 84] Capture completes the frontier
+        // pair opened by collect — see the frontier-pair contract
+        // (Reconciliation::pushPredictionTick's header; CorrectionCache.h's
+        // m_frontierSlotAwaitingState). Capture itself runs later, from
+        // onPostGameSimulation's non-resim branch.
+        // [item 87] Re-targeted off `m_netSync` onto the resolution peer,
+        // which now owns prepareSimulationStep (named collectInputAll before
+        // item 90's rename).
+        auto inputs = m_inputResolution.prepareSimulationStep(step);
         // Sequencing: fire preIntegrate BEFORE integrateAll; save m_lastStep
         // (so currentIntegratedTick() == step.getTick() for postIntegrate hooks)
         // BEFORE firing postIntegrate. See §7 "Sequencing consideration".
@@ -917,10 +967,15 @@ private:
         m_systemsExec.firePostIntegrate(step, storage, staticData);
     }
 
-    // [item 80 / B6] setAuthorityGuardContext + collectInputAll — both members
-    // of the NetSync "tick" surface (SimulationNetSyncTickConcept).
+    // [item 80 / B6, re-targeted item 87] setAuthorityGuardContext is now the
+    // sole member of NetSyncT's shrunk tick surface
+    // (SimulationNetSyncTickConcept); prepareSimulationStep (named
+    // collectInputAll before item 90's rename) moved to the resolution
+    // peer's tick surface (SimulationInputResolutionTickConcept) — this
+    // method is the one step function that needs BOTH.
     void onGameSimulationAuthority()
-        requires SimulationNetSyncTickConcept<NetSyncT>
+        requires SimulationNetSyncTickConcept<NetSyncT> &&
+                 SimulationInputResolutionTickConcept<InputResolutionT>
     {
         m_serverClock->advanceTick();
         const SimulationTimeStep step = m_serverClock->getSimulationStep();
@@ -929,7 +984,36 @@ private:
         // RPC-arrival queueMove path can reject too-far-future capture ticks. The window
         // is TimeConfig::rollbackWindowTicks (no hardcoded literal).
         m_netSync.setAuthorityGuardContext(step.getTick(), m_timeConfig.rollbackWindowTicks);
-        auto inputs = m_netSync.collectInputAll(step);
+        // [og-netcode-v2-input-relay item 84, re-scoped item 90] Unlike
+        // onGameSimulationPrediction, this collect call does NOT open the
+        // frontier-pair contract (see Reconciliation::pushPredictionTick's
+        // header): the server `registerSimulatable` overload allocates no
+        // correction cache at all (registerPredictionOwner is called with a
+        // null provider, so collectInputForCharacter's provider-present
+        // branch never matches here; every FULLY-REGISTERED authority id
+        // lands in the remote-queue branch instead). [item 90] Sweep 2
+        // (`allocateFrontierSlotForCharacter`) makes the same fact explicit
+        // from the other side: it looks every id up in the remote-move-queue
+        // map first and returns immediately on a hit.
+        // [item 92] ⚠ THIS IS NOT AN UNCONDITIONAL "the whole sweep is a
+        // no-op" CLAIM — item 90's original wording overstated it as one, and
+        // a crash proved the overstatement false. It holds only once
+        // registration has completed for a given id: between
+        // `storage.add` exposing the id to `forEachSimulatable` and
+        // `registerAuthorityOwner` populating `queueMap` (the server
+        // overload's ordering invariant, SimulationNetSync.h), that id has
+        // NEITHER a queueMap entry NOR a correction cache, sweep 2's guard
+        // does not skip it, and it would fall through to a cache lookup that
+        // throws. The ordering fix closes the window; the loud-failure guard
+        // in `allocateFrontierSlotForCharacter` is the independent backstop
+        // if it ever reopens. Capture (onPostGameSimulation's postPredictionAll
+        // call) is correspondingly never reached on this role
+        // (`m_runsPrediction == false`) for any id whose registration HAS
+        // completed — collect and capture agree on authority by both being
+        // absent, not by one completing the other.
+        // [item 87] Re-targeted off `m_netSync` onto the resolution peer.
+        // [item 90] `collectInputAll` -> `prepareSimulationStep`.
+        auto inputs = m_inputResolution.prepareSimulationStep(step);
         // Sequencing (see onGameSimulationPrediction).
         auto&       storage    = m_storage;
         const auto& staticData = m_staticData;
@@ -939,10 +1023,12 @@ private:
         m_systemsExec.firePostIntegrate(step, storage, staticData);
     }
 
-    // [item 80 / B6] collectResimInputAll — the third member of the NetSync
-    // "tick" surface (SimulationNetSyncTickConcept).
+    // [item 80 / B6, re-targeted item 87] collectResimInputAll — the third
+    // member of the resolution peer's tick surface
+    // (SimulationInputResolutionTickConcept); NetSyncT contributes nothing to
+    // this step.
     void onGameSimulationResimulation()
-        requires SimulationNetSyncTickConcept<NetSyncT>
+        requires SimulationInputResolutionTickConcept<InputResolutionT>
     {
         m_clientClock->advanceResimulation();
         const SimulationTimeStep step = m_clientClock->getResimulationStep();
@@ -953,11 +1039,21 @@ private:
         // permanent. `replayTicks / finishes` is the mean span; a value in the
         // 12-20 range would put rollback-window coalescing back on the table.
         m_resimGateProbe.noteReplayTick();
-        // [og-netcode-v2-input-relay T6] NetSync, not reconciliation. The resim
-        // input is resolved from the delay lines / relay stores / neutrals NetSync
-        // owns; reconciliation now contributes only the per-tick applied-capture
-        // reference, which NetSync asks it for internally.
-        auto inputs = m_netSync.collectResimInputAll(step.getTick());
+        // [og-netcode-v2-input-relay T6, re-targeted item 87] The resolution
+        // peer, not reconciliation. The resim input is resolved from the
+        // delay lines / relay stores / neutrals the resolution peer owns;
+        // reconciliation now contributes only the per-tick applied-capture
+        // reference, which the resolution peer asks it for internally.
+        // [og-netcode-v2-input-relay item 84] This collect call does NOT open
+        // the frontier-pair contract either — collectResimInputAll resolves
+        // input against slots that already exist (getAppliedCaptureTickRef)
+        // and never calls pushPredictionTick. A resim tick's state write
+        // (postResimulationAll -> tryInsertingResimulatedState, called from
+        // onPostGameSimulation's resim branch) is a REPLAY over an already-
+        // allocated slot, not the pair's completing half — see the frontier-
+        // pair contract at Reconciliation::pushPredictionTick's header for
+        // what that half actually is.
+        auto inputs = m_inputResolution.collectResimInputAll(step.getTick());
         // Sequencing (see onGameSimulationPrediction). Systems fire on every
         // resim replay tick too — routing stays deterministic across rollback (D4).
         auto&       storage    = m_storage;
@@ -981,10 +1077,15 @@ private:
 
     const bool m_runsPrediction;
 
-    IntegrationExecT& m_integrationLayer;
-    NetSyncT&         m_netSync;
-    ReconciliationT&  m_reconciliation;
-    SystemsExecT&     m_systemsExec;
+    IntegrationExecT&  m_integrationLayer;
+    NetSyncT&          m_netSync;
+    // [item 87 / design §A.3] The resolution peer — a real
+    // composition-root-constructed sibling, not owned by NetSyncT. See
+    // SimulationInputResolutionTickConcept above for what the manager reads
+    // from it and why.
+    InputResolutionT&  m_inputResolution;
+    ReconciliationT&   m_reconciliation;
+    SystemsExecT&      m_systemsExec;
 
     // Externally-owned object storage + static data (owned at the engine adapter's
     // composition root, shared by all peers). Held by reference here so the
@@ -1017,35 +1118,48 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// [og-netcode-v2-input-relay item 80 / B6] COMPILE-CHECKED PROOF that the
-// concept vocabulary applied above actually rejects a same-category
-// transposition — the exact scenario `Params`' own comment (top of this
-// class) says compiles today for a duck-typed, unconstrained peer reference:
-// "a transposition of two same-category refs COMPILES — they are duck-typed
-// — and misbehaves only at runtime."
+// [og-netcode-v2-input-relay item 80 / B6, extended item 87] COMPILE-CHECKED
+// PROOF that the concept vocabulary applied above actually rejects a
+// same-category transposition — the exact scenario `Params`' own comment
+// (top of this class) says compiles today for a duck-typed, unconstrained
+// peer reference: "a transposition of two same-category refs COMPILES —
+// they are duck-typed — and misbehaves only at runtime."
 //
-// Two minimal local types, each shaped like exactly one of the two peers that
-// share a method name (`wipeAllForResync`) but are otherwise structurally
-// distinct: a NetSync-shaped type (satisfies the manager's NetSync tick/
-// publish surfaces) and a Reconciliation-shaped type (satisfies
-// SimulationReconciliationConcept). Swapping them into each other's concept
-// is the transposition itself, and it is now a hard compile-time rejection
-// rather than a silent duck-typed pass-through.
+// Minimal local types, each shaped like exactly one peer. Three of them —
+// NetSync, InputResolution, Reconciliation — now share `wipeAllForResync`
+// verbatim (item 87 added the resolution peer as a third sharer; NetSync's
+// own copy of the method left with the other two collect* members it moved
+// off — see `SimulationNetSyncTickConcept`'s own history comment). A
+// wipe-only clause could not distinguish any of the three from another; the
+// DISTINGUISHING members are `collect*` (resolution), `postPredictionAll` /
+// `consumeResimAnchorsAll` (reconciliation) and `sendCorrectionAll`
+// (netsync) — exactly what the positive/negative controls below check.
+// Swapping a shaped type into another concept's slot is the transposition
+// itself, and it is now a hard compile-time rejection rather than a silent
+// duck-typed pass-through.
 // ---------------------------------------------------------------------------
 namespace simulationManagerConceptProof
 {
     // Shaped like a NetSync peer. Satisfies every SimulationNetSyncConcept
-    // member EXCEPT the two SimulatableTs-typed returns — this proof does not
-    // need them; see the split concepts' rationale (SimulationNetSyncTickConcept,
-    // above) for why the manager cannot express those two generically either way.
+    // member — [item 87] `collectInputAll` (RENAMED `prepareSimulationStep`
+    // at item 90) / `collectResimInputAll` / `wipeAllForResync` left this
+    // shape along with the concept; what remains is transport + the
+    // receive-side guard.
     struct NetSyncShaped
     {
         void sendCorrectionAll(const SimulationTimeStep&, int32 /*correctionRotationK*/) {}
         void sendLocalInputToAuthorityAll(uint32 /*tick*/, uint32 /*redundancyDepth*/) {}
-        int  collectInputAll(const SimulationTimeStep&) { return 0; }
+        void setAuthorityGuardContext(uint32 /*tick*/, int32 /*rollbackWindow*/) {}
+    };
+
+    // [item 87] Shaped like the resolution peer. Satisfies every
+    // SimulationInputResolutionTickConcept member — exactly the three
+    // methods that LEFT NetSyncShaped above for this shape.
+    struct InputResolutionShaped
+    {
+        int  prepareSimulationStep(const SimulationTimeStep&) { return 0; }
         int  collectResimInputAll(uint32 /*tick*/) { return 0; }
         void wipeAllForResync(uint32 /*tick*/) {}
-        void setAuthorityGuardContext(uint32 /*tick*/, int32 /*rollbackWindow*/) {}
     };
 
     // Shaped like a Reconciliation peer. Satisfies every
@@ -1080,16 +1194,17 @@ namespace simulationManagerConceptProof
         "NetSyncShaped must satisfy the manager's NetSync tick surface");
     static_assert(SimulationNetSyncPublishConcept<NetSyncShaped>,
         "NetSyncShaped must satisfy the manager's NetSync publish surface");
+    static_assert(SimulationInputResolutionTickConcept<InputResolutionShaped>,
+        "InputResolutionShaped must satisfy the manager's resolution tick surface");
     static_assert(SimulationReconciliationConcept<ReconciliationShaped>,
         "ReconciliationShaped must satisfy SimulationReconciliationConcept");
     static_assert(SimulationIntegrationExecutorConcept<IntegrationExecShaped>,
         "IntegrationExecShaped must satisfy SimulationIntegrationExecutorConcept");
 
-    // --- NEGATIVE CONTROLS — THE TRANSPOSITION. A NetSync-shaped ref used
-    // where a Reconciliation-typed slot is expected, and the reverse. This is
-    // the failure the Params aggregate exists to guard against structurally;
-    // these two lines are the concept vocabulary catching it at compile time
-    // instead. ---
+    // --- NEGATIVE CONTROLS — THE TRANSPOSITION. A shaped ref used where a
+    // different peer's typed slot is expected. This is the failure the
+    // Params aggregate exists to guard against structurally; these lines are
+    // the concept vocabulary catching it at compile time instead. ---
     static_assert(!SimulationReconciliationConcept<NetSyncShaped>,
         "a NetSync-shaped type must NOT satisfy SimulationReconciliationConcept"
         " -- this is the same-category transposition Params exists to guard");
@@ -1100,19 +1215,46 @@ namespace simulationManagerConceptProof
         "a Reconciliation-shaped type must NOT satisfy the manager's NetSync"
         " publish surface either");
 
-    // [item 83 / 80 f3] THE COVERAGE GAP THE REVIEW NAMED, CLOSED: neither
-    // shaped peer above has `firstResimStepAll`/`captureBodyStatesAll`, so both
-    // would fail SimulationIntegrationExecutorConcept — asserted here instead of
-    // left as an unproven claim.
+    // [item 87] THE RESOLUTION PEER'S TRANSPOSITION NEGATIVES, BOTH
+    // DIRECTIONS — against BOTH the NetSync- and Reconciliation-shaped
+    // types, exactly the two the shared `wipeAllForResync` name could be
+    // mistaken for distinguishing.
+    static_assert(!SimulationInputResolutionTickConcept<NetSyncShaped>,
+        "a NetSync-shaped type must NOT satisfy the manager's resolution"
+        " tick surface -- it no longer has prepareSimulationStep/collectResimInputAll");
+    static_assert(!SimulationInputResolutionTickConcept<ReconciliationShaped>,
+        "a Reconciliation-shaped type must NOT satisfy the manager's"
+        " resolution tick surface -- sharing wipeAllForResync distinguishes"
+        " nothing; it still lacks prepareSimulationStep/collectResimInputAll");
+    static_assert(!SimulationNetSyncTickConcept<InputResolutionShaped>,
+        "a resolution-shaped type must NOT satisfy the manager's NetSync"
+        " tick surface -- the transposition's other direction (it has no"
+        " setAuthorityGuardContext)");
+    static_assert(!SimulationNetSyncPublishConcept<InputResolutionShaped>,
+        "a resolution-shaped type must NOT satisfy the manager's NetSync"
+        " publish surface either");
+    static_assert(!SimulationReconciliationConcept<InputResolutionShaped>,
+        "a resolution-shaped type must NOT satisfy"
+        " SimulationReconciliationConcept -- sharing wipeAllForResync"
+        " distinguishes nothing; it still lacks postPredictionAll etc.");
+
+    // [item 83 / 80 f3, extended item 87] THE COVERAGE GAP THE REVIEW NAMED,
+    // CLOSED: none of the three peer shapes above has
+    // `firstResimStepAll`/`captureBodyStatesAll`, so all three would fail
+    // SimulationIntegrationExecutorConcept — asserted here instead of left
+    // as an unproven claim.
     static_assert(!SimulationIntegrationExecutorConcept<NetSyncShaped>,
         "a NetSync-shaped type must NOT satisfy"
+        " SimulationIntegrationExecutorConcept");
+    static_assert(!SimulationIntegrationExecutorConcept<InputResolutionShaped>,
+        "a resolution-shaped type must NOT satisfy"
         " SimulationIntegrationExecutorConcept");
     static_assert(!SimulationIntegrationExecutorConcept<ReconciliationShaped>,
         "a Reconciliation-shaped type must NOT satisfy"
         " SimulationIntegrationExecutorConcept");
 
     // A plain nonconforming type (no members at all) satisfies none of the
-    // three constrained concepts, including the one with no SimulatableTs
+    // four constrained concepts, including the ones with no SimulatableTs
     // wrinkle to work around.
     struct Empty {};
     static_assert(!SimulationIntegrationExecutorConcept<Empty>,
@@ -1121,6 +1263,8 @@ namespace simulationManagerConceptProof
         "an empty type must NOT satisfy SimulationReconciliationConcept");
     static_assert(!SimulationNetSyncTickConcept<Empty>,
         "an empty type must NOT satisfy the manager's NetSync tick surface");
+    static_assert(!SimulationInputResolutionTickConcept<Empty>,
+        "an empty type must NOT satisfy the manager's resolution tick surface");
 } // namespace simulationManagerConceptProof
 
 OGSIM_OPTIMIZE_ON

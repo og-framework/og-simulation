@@ -86,6 +86,19 @@ namespace resimGate
     // remains blocked on item 30; that only governs what a build with no ini
     // override runs, not whether this trigger runs today. Full argument:
     // `docs/ResimGatePolicy-rationale.md` §3 point 3, §5.
+    //
+    // [og-netcode-v2-input-relay item 84 / design §F.2] WHY `landedAtFrontier`
+    // CAN BE COMPUTED AT ALL: the frontier slot is allocated BEFORE the
+    // physics update runs (`StateCorrectionCache::pushPredictionTick`, called
+    // from collect), not after it at capture time, precisely so this word is
+    // fresh for the whole update while a landing can arrive on the game
+    // thread. `m_tickBuffer` is both the slot directory and the frontier
+    // (`getPredictionTick()` is `max_element` over it), so allocation timing
+    // IS trigger timing — it cannot slide to capture time without re-timing
+    // this exact predicate for the full width of a physics step. Full
+    // argument, including the four-read enumeration and the correction-
+    // arrival race walked both ways: `CorrectionCache.h`'s write-site-1 block
+    // (`m_frontierSlotAwaitingState`) and `DesignInputResolutionPeer.md` §F.
     // -----------------------------------------------------------------------
     constexpr bool shouldSetPendingAnchor(TimeConfig::ResimTriggerPolicy policy,
                                          bool landedAtFrontier,

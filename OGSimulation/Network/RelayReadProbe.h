@@ -1038,6 +1038,14 @@ public:
     // assert a distribution without having to fill an exact window.
     void peekSummary(RelayArrivalWindowSummary& out) const { fillSummary(out); }
 
+    // [og-netcode-v2-input-relay item 91 part C] Mirrors `RelayReadProbe::
+    // trackedOwnerCount()` above (this file, this class's PT sibling) — same
+    // reason: a direct, no-window-required proof that `forgetOwner` actually
+    // shrinks the id-keyed map, for a leak-freedom test that does not want to
+    // depend on `noteArrival`'s first-vs-subsequent-arrival semantics as an
+    // indirect signal.
+    std::size_t trackedOwnerCount() const { return m_lastNewestCaptureTick.size(); }
+
 private:
     // NEAREST-RANK. p_q is the smallest gap value whose cumulative count reaches
     // ceil(q * n) — the standard definition, chosen over interpolation because the

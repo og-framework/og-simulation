@@ -21,10 +21,9 @@ OGSIM_OPTIMIZE_OFF
 // [og-netcode-v2-input-relay T6 / design D3] AppliedCaptureRef — the answer to
 // "which capture tick did the authority apply at tick T for this character".
 //
-// This is the ONE piece of reconciliation-owned data the relocated
-// SimulationNetSync::collectResimInputAll consumes (T6 placement ruling, Option
-// C). It deliberately exposes NO cache and NO store: reconciliation answers the
-// D3 question and knows nothing about how netsync then resolves an input from it.
+// Consumed by SimulationInputResolution::collectResimInputAll; this class
+// deliberately exposes NO cache and NO store, only this one answer — it
+// knows nothing about how resolution then resolves an input from it.
 //
 // FOUR KINDS, THREE OUTCOMES. The ruling names three — ref / sentinel / absent —
 // and `Absent` is split in two here because the two halves must produce different
@@ -146,7 +145,14 @@ public:
     }
 
     // -----------------------------------------------------------------------
-    // Prediction push — called by SimulationNetSync::collectInputAll per tick
+    // Prediction push — the ALLOCATING half of THE FRONTIER-PAIR CONTRACT.
+    // -----------------------------------------------------------------------
+    // [og-netcode-v2-input-relay item 86] The frontier-pair contract's full
+    // text now lives at its FINAL HOME — SimulationInputResolution.h, above
+    // `collectInputAll` (design §B.4.3(1)) — the allocating call this method
+    // serves. See that banner for the predicate, the cache check, the three
+    // named blind spots, and why the push must not move to capture time. It
+    // was parked here (item 84) only until that peer existed.
     // -----------------------------------------------------------------------
 
     template <typename T>
@@ -157,7 +163,8 @@ public:
 
     // [og-netcode-v2-input-relay T16] `pushPredictionInput` — the wrapper around
     // StateCorrectionCache's input-column writer — IS GONE with the column. Its
-    // two production callers were both arms of SimulationNetSync::collectInputAll;
+    // two production callers were both arms of SimulationNetSync::collectInputAll
+    // (now SimulationInputResolution::prepareSimulationStep, item 90's rename);
     // both now push only the prediction TICK, which is what allocates the slot.
     // A cache slot is state + the applied-capture-tick ref; it holds no input
     // value, and nothing in this class can put one there.
@@ -188,7 +195,12 @@ public:
 
     void postPredictionAll(const SimulationTimeStep& step)
     {
-        if (step.getStepKind() == StepKind::Stall)
+        // [og-netcode-v2-input-relay item 84] THE COMPLETING half of the
+        // frontier-pair contract — see pushPredictionTick's header above.
+        // Was a literal `== StepKind::Stall` early return; now shares the one
+        // predicate both halves of the pair gate on, so a new StepKind can no
+        // longer make the two independently-written gates diverge.
+        if (!stepAllocatesFrontierSlot(step.getStepKind()))
             return;
 
         m_storage.forEachSimulatable([&](unsigned int id, auto& simulatable) {
@@ -292,10 +304,9 @@ public:
     //
     // THIS CLASS IS NOT THE PLACE THE VERDICT IS INTERPRETED, and deliberately so.
     // It knows the `id` but not whether that id is locally controlled or a remote
-    // proxy: provider-presence lives in SimulationNetSync's `m_inputProviders`, and
-    // reconciliation owning a second answer to "is this character remote" is
-    // exactly the duplicate-truth shape the T6/T16 retirements exist to avoid. So
-    // this method only relays.
+    // proxy — that is SimulationInputResolution::isLocallyControlled's job, and
+    // reconciliation owning a second answer to it is exactly the duplicate-truth
+    // shape the T6/T16 retirements exist to avoid. So this method only relays.
     template <typename T, typename BufferT>
     void injectCorrectionState(unsigned int id, const BufferT& buffer,
                                CorrectionInsertVerdict* outDiagnosticVerdict = nullptr)
@@ -644,16 +655,9 @@ public:
     }
 
     // -----------------------------------------------------------------------
-    // Resim replay input — RELOCATED to SimulationNetSync by T6.
+    // Resim replay input — moved out by T6, home finished by item 87. See
+    // SimulationInputResolution.h.
     // -----------------------------------------------------------------------
-    //
-    // `collectResimInputAll` used to live here, and its own comment said why:
-    // "resim inputs come purely from the cache". T6 falsified that premise. The
-    // resim input is now resolved from the client's own delay lines, the relayed-
-    // input stores and the injected neutrals — all NetSync-owned — and only the
-    // JOIN KEY comes from the cache. So the method moved to the class that owns
-    // the sources, and this class kept exactly one narrow query
-    // (getAppliedCaptureTickRef, below) that hands over that key and nothing else.
     //
     // Do not re-add a resim collector here. If a future task needs one, it needs
     // the stores, and the stores are not this class's business.
@@ -683,7 +687,7 @@ public:
     // applied-capture-tick queries. A slot answers "WHICH capture the authority
     // applied at tick T", never "what that capture WAS". The value comes from
     // LocalInputCache (local) or RemoteInputCache (remote), both owned by
-    // SimulationNetSync.
+    // SimulationInputResolution.
 
     // [T4 / D3] The join key stored for `tick` — "which capture tick did the
     // authority apply when it produced the state it corrected us to at `tick`".
@@ -710,10 +714,10 @@ public:
         return cache->getAppliedCaptureTick(idx);
     }
 
-    // [T6] THE ONE QUERY SimulationNetSync::collectResimInputAll consumes — the
-    // classified form of the raw accessor above. See the AppliedCaptureRef block
-    // at the top of this header for what each kind means and why `Absent` is two
-    // kinds rather than one.
+    // THE ONE QUERY SimulationInputResolution::collectResimInputAll consumes —
+    // the classified form of the raw accessor above. See the AppliedCaptureRef
+    // block at the top of this header for what each kind means and why `Absent`
+    // is two kinds rather than one.
     //
     // WHY BOTH EXIST. getAppliedCaptureTick (T4) reports the SLOT VALUE and is the
     // accessor T4's own wire/stash tests assert against; it cannot tell a
@@ -894,9 +898,7 @@ concept SimulationReconciliationConcept = requires(
     // concept — which is the whole reason this concept exists.
     { t.consumeResimAnchorsAll() } -> std::convertible_to<unsigned int>;
     { t.setResimTriggerPolicy(TimeConfig{}.resimTriggerPolicy) };
-    // [T6] collectResimInputAll MOVED to SimulationNetSyncConcept — resim input
-    // resolution is no longer a cache-only operation. See the relocation note in
-    // the class body.
+    // collectResimInputAll moved again, to SimulationInputResolutionConcept.
 };
 
 OGSIM_OPTIMIZE_ON

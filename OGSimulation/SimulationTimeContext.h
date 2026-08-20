@@ -36,6 +36,44 @@ inline const char* stepKindName(StepKind k)
     return "?";
 }
 
+// [og-netcode-v2-input-relay item 84, renumbered item 90] THE FRONTIER-PAIR
+// PREDICATE. True iff a step of this kind allocates a frontier slot
+// (StateCorrectionCache's ring slot, via pushPredictionTick) AND must
+// therefore be completed by pushPredictionState in the same manager tick
+// sequence. ONE predicate, not two — and, review B-3 corrected the design's
+// original undercount, not three either; item 90 then MERGED the two
+// branch-level push gates into one, dropping the count from four to three.
+// THREE production call sites + this definition (grep criterion):
+//   1. SimulationInputResolution::collectInputForCharacter, local-provider
+//      branch — the delay-line CAPTURE-HISTORY push (a third,
+//      independently-written `!= Stall` gate the design missed; B-3's ruling
+//      is that it shares this predicate rather than re-derive a literal —
+//      see the site). [item 90] Also gates that branch's send-enqueue now,
+//      via the SAME captured result rather than a second call — the enqueue
+//      used to share the tick-push gate below, and sweep 2 taking the tick
+//      push left the enqueue with nowhere else to ask the same question.
+//   2. SimulationInputResolution::allocateFrontierSlotForCharacter — sweep 2
+//      of `prepareSimulationStep` (item 90). THE tick-push gate that OPENS
+//      the pair, evaluated ONCE per tick and shared by every registered
+//      prediction-owned id, local and proxy alike. This is the MERGE of the
+//      former two branch-level gates (ex-1: local-provider branch's own
+//      tick-push gate; ex-2: simulated-proxy branch's tick-push gate,
+//      B.2's "other branch") — both former sites are GONE from
+//      `collectInputForCharacter`; this is their one replacement.
+//   3. SimulationReconciliation::postPredictionAll's early return — the
+//      state push that COMPLETES whatever 2 opened.
+// A new StepKind now forces one decision in one place, and every call site
+// above follows it by construction — they can no longer diverge. See the
+// pairing contract in CorrectionCache.h (write site 1,
+// m_frontierSlotAwaitingState) and DesignInputResolutionPeer.md §B/§F.
+// (The `Skip` backfill gate, `kind == Skip`, is a DIFFERENT predicate and
+// stays where it is — backfillSkippedTick pairs tick+state internally and is
+// not at risk.)
+inline constexpr bool stepAllocatesFrontierSlot(StepKind kind)
+{
+    return kind != StepKind::Stall;
+}
+
 class SimulationTimeStep
 {
 public:

@@ -652,6 +652,17 @@ public:
 		if (tick == predictionTick)
 			return; // already at this tick (e.g. clock stall); no new slot needed
 
+		// [og-netcode-v2-input-relay item 84] THE FRONTIER-PAIR DETECTOR — see
+		// m_frontierSlotAwaitingState's declaration (private section below)
+		// for the full contract, its declared non-properties and its honest
+		// coverage statement. Fires iff the PREVIOUS allocation never
+		// received its pushPredictionState — exactly the failure mode B.2
+		// names ("tick pushed, state never pushed"), caught one allocation
+		// late.
+		OG_CHECK(!m_frontierSlotAwaitingState,
+			"frontier pairing broken: the previous frontier slot was allocated and never received pushPredictionState");
+		m_frontierSlotAwaitingState = true;
+
 		const uint32 predictionIndex = getCacheIndex(predictionTick);
 
 		uint32 newPredictionIndex = (predictionIndex + 1) % StateBufferSize;
@@ -688,6 +699,29 @@ public:
 		// different tick and holds no state for it yet, so its lineage retires
 		// with the rest of its bookkeeping.
 		//
+		// [og-netcode-v2-input-relay item 84 / design §F.2] AND THIS IS WHY THE
+		// ALLOCATION HAPPENS HERE, BEFORE THE UPDATE, RATHER THAN AT CAPTURE
+		// TIME WITH THE STATE IT PAIRS WITH — the fact that forbids what would
+		// otherwise be the obvious structural fix (§B.3):
+		// The frontier slot must be allocated before the update because
+		// `m_tickBuffer` is both the slot directory and the frontier —
+		// `getPredictionTick()` is max over it, so one write serves both —
+		// and the game thread lands corrections against that word
+		// concurrently throughout the update (`tryInsertingCorrectState`'s
+		// lookup, W1's `landedAtFrontier`, the landing classifier).
+		// Allocating after the update would make every mid-update arrival
+		// look up, compare, classify and trigger against the PREVIOUS tick's
+		// frontier for the full width of the physics step — re-timing the
+		// anchor-set predicate the `FrontierExact` baselines are defined
+		// against, and turning mid-update frontier-tick landings into
+		// discards. Allocation timing IS trigger timing; it cannot slide to
+		// capture time, and it cannot be split from the frontier without
+		// creating a second frontier (design §F.4). Four concurrent
+		// game-thread reads decide against this exact word while the window
+		// is open: the slot lookup, the verdict compare, `landedAtFrontier`
+		// feeding `resimGate::shouldSetPendingAnchor` (W1), and
+		// `isAnomalousMiss`'s distance-from-frontier gate on the miss branch.
+		//
 		// ⚠ `Predicted`, NOT `Empty`, and the reason is the ordering of the two
 		// calls production always makes: `pushPredictionTick` is immediately
 		// followed by `pushPredictionState` (postPredictionAll, backfillSkippedTick,
@@ -708,10 +742,13 @@ public:
 
 	// [og-netcode-v2-input-relay T16] `pushPredictionInput` — the client-local
 	// writer of the input column, and by T8 its ONLY writer — IS GONE. Its two
-	// production call sites were both arms of
+	// production call sites were both arms of what was then
 	// `SimulationNetSync::collectInputAll` (the provider branch, writing the
 	// already-delayed applied capture; and the simulated-proxy branch, writing
-	// this client's guess at the remote input), plus
+	// this client's guess at the remote input) — since item 87 that class is
+	// `SimulationInputResolution`, and since item 90 the tick push itself lives
+	// in `prepareSimulationStep`'s sweep 2 (`allocateFrontierSlotForCharacter`),
+	// not inline in either branch — plus
 	// `SimulationReconciliation::backfillSkippedTick` and `advance_frame` below.
 	// The prediction TICK is still pushed at every one of those sites — only the
 	// input write went, so the ring's slot allocation is bit-for-bit unchanged.
@@ -720,6 +757,14 @@ public:
 	{
 		const uint32 predictionIndex = getCacheIndex(getPredictionTick());
 		m_stateBuffer[predictionIndex] = state;
+		// [og-netcode-v2-input-relay item 84] COMPLETES the frontier pair —
+		// see m_frontierSlotAwaitingState's declaration. NO CHECK on this
+		// side, deliberately: bare state pushes are legal (first-frame
+		// tick-equality re-entry, wipe renumber, stall re-entry), so clearing
+		// unconditionally is correct here even when no allocation opened this
+		// particular push. The one-sided check lives on pushPredictionTick's
+		// allocation path instead.
+		m_frontierSlotAwaitingState = false;
 	}
 
 	// [og-netcode-v2-input-relay item 42] RETURNS TRUE WHEN THE SLOT WAS FOUND —
@@ -1075,6 +1120,14 @@ public:
 		m_appliedCaptureTickBuffer.fill(kNoInputCaptureTick);
 
 		m_tickBuffer[predictionIndex] = newPredictionTick;
+
+		// [og-netcode-v2-input-relay item 84] THE FRONTIER-PAIR DETECTOR DIES
+		// WITH THE TICK NUMBERING TOO — same discipline as the resim anchor's
+		// W3. This is coverage blind spot (iii) at the member declaration: an
+		// allocation abandoned before this wipe is SWALLOWED, not reported —
+		// deliberate, because a surviving flag would describe a tick this
+		// resync just renumbered away.
+		m_frontierSlotAwaitingState = false;
 	}
 
 	// StateCorrectionCache 4-method external API (proposal §2.2).
@@ -1142,6 +1195,39 @@ public:
 			// because it WOULD, and provenance is admitted because it CANNOT (fence
 			// 2, and the checksum prohibition on both).
 			m_stateProvenance[slot] = SlotStateProvenance::Predicted;
+		}
+		else if (tick == getPredictionTick())
+		{
+			// [og-netcode-v2-input-relay item 91 part A] COMPLETES THE FRONTIER
+			// PAIR ON THIS PATH TOO — see m_frontierSlotAwaitingState's
+			// declaration (private section, below) for the full contract.
+			//
+			// FIXES THE FOURTH, OVER-DETECTION BLIND SPOT. Before this fix,
+			// this existing-slot path fell straight to `m_stateBuffer[slot] =
+			// state;` below without ever touching the bit — functionally
+			// identical to `pushPredictionState` on that path, but a
+			// separately-written one that skipped the clear. A `save_snapshot`
+			// call completing a `pushPredictionTick`-opened pairing therefore
+			// left the bit falsely `true`, arming a spurious `OG_CHECK` crash
+			// at the NEXT legitimate `pushPredictionTick` allocation — on a
+			// cache whose state is entirely correct.
+			//
+			// GUARDED on `tick == getPredictionTick()`, deliberately NOT an
+			// unconditional clear like `pushPredictionState`'s own.
+			// `pushPredictionState` always targets the frontier slot by
+			// construction (`getCacheIndex(getPredictionTick())`); this
+			// method's `tick` is caller-supplied, and `getCacheIndex` scans
+			// the WHOLE ring for a value match, so an existing-slot hit can
+			// legitimately name an OLDER resident tick that is NOT the
+			// frontier (see the class's own "at any index" slot-collision
+			// note above). Clearing unconditionally there would swallow a
+			// still-genuinely-open frontier pairing for an unrelated tick —
+			// the same swallowing failure mode blind spot (iii) describes for
+			// `wipeCache`, reintroduced here in a new disguise. Restricting
+			// the clear to the exact frontier tick keeps this a completion of
+			// THE open pairing, never an unrelated one; a no-op when the bit
+			// is already false, same as `pushPredictionState`'s own clear.
+			m_frontierSlotAwaitingState = false;
 		}
 
 		// ⚠ [item 48] AN **EXISTING** SLOT KEEPS ITS OLD PROVENANCE WHILE ITS
@@ -1391,6 +1477,14 @@ public:
 			OG_CHECK(cacheIndex < StateBufferSize, "trying to access state provenance with bad cacheIndex");
 			return m_cache.m_stateProvenance[cacheIndex];
 		}
+
+		// [og-netcode-v2-input-relay item 84] Read seam for the frontier-pair
+		// detector — see `m_frontierSlotAwaitingState`'s declaration (private
+		// section above) for the full contract, its declared non-properties
+		// and its honest coverage statement. A pure read; the write side
+		// (`pushPredictionTick` / `pushPredictionState` / `wipeCache`) stays
+		// on the cache — see the fence above this class.
+		bool frontierSlotAwaitingState() const { return m_cache.m_frontierSlotAwaitingState; }
 
 	private:
 		const StateCorrectionCache& m_cache;
@@ -1668,6 +1762,91 @@ private:
 	// `setResimTriggerPolicy`. Sourced from the TimeConfig default rather than a
 	// literal so R-P1 holds.
 	TimeConfig::ResimTriggerPolicy m_resimTriggerPolicy = TimeConfig{}.resimTriggerPolicy;
+
+	// =======================================================================
+	// [og-netcode-v2-input-relay item 84] THE FRONTIER-PAIR DETECTOR —
+	// PHYSICS-THREAD-PRIVATE. Catches "tick pushed, state never pushed", one
+	// allocation late. Full derivation: DesignInputResolutionPeer.md §B.4.2,
+	// review B-2/B-3, Backlog item 84.
+	//
+	// Set `true` by `pushPredictionTick` on its SLOT-ALLOCATION path only
+	// (after the tick==frontier early-return), guarded there by
+	// `OG_CHECK(!m_frontierSlotAwaitingState, ...)` — a second allocation
+	// while the previous one is still awaiting its state push is exactly the
+	// defect this bit exists to catch. Cleared by `pushPredictionState` WITH
+	// NO CHECK — bare state pushes are legal at the first-frame
+	// tick-equality re-entry, the wipe renumber, and stall re-entry, so
+	// clearing unconditionally is correct even when no allocation opened
+	// this particular push. Reset by `wipeCache` (dies with the tick
+	// numbering, same discipline as the resim anchor's W3).
+	//
+	// DECLARED NON-PROPERTIES — load-bearing, read before touching this bit:
+	//   * NOT GATE STATE. `needsResimulation()` must never read it — item
+	//     45's one-atomic-word fence governs the GATE
+	//     (`m_pendingResimAnchorTick`); this is a different word entirely,
+	//     and growing the gate to a second shared word is what that fence
+	//     forbids.
+	//   * NEVER ENTERS `compute_checksum`. Transient control bookkeeping,
+	//     the anchor's prohibition verbatim: two peers replaying identical
+	//     inputs from identical state must agree on STATE and may
+	//     legitimately disagree on this bit's transient value.
+	//   * PT-ONLY. `pushPredictionTick` / `pushPredictionState` /
+	//     `wipeCache` / `advance_frame` are all physics-thread (or
+	//     harness-thread), so this adds NO GT/PT crossing — no
+	//     `docs/ThreadingCrossings.md` row.
+	//   * A SEPARATE WORD FROM THE PROVENANCE COLUMN, deliberately. An
+	//     `OG_CHECK` against `m_stateProvenance` instead would be a
+	//     production read of that column and would fire under fence 2's
+	//     `…TheProvenanceColumnCannotReachAnyProductionOutput` scribble
+	//     (that test garbage-fills the provenance column mid-lifecycle and
+	//     asserts every production output byte-identical). This bit is a
+	//     dedicated word precisely so that fence stays green.
+	//
+	// BUILD REACH — development-time detector only, and it cannot be
+	// otherwise: standalone `OG_CHECK` is a bare `assert` (gone under
+	// `NDEBUG`); UE-side it is `checkf` (gone in Shipping). It never fires
+	// in a shipping build.
+	//
+	// COVERAGE — honestly bounded, not "cannot fail silently" (review B-2
+	// corrects the design's original honesty line; item 91 part A corrects it
+	// a SECOND time — the line below used to say "THREE blind spots", all
+	// UNDER-detection, and that was itself an overstatement of what the
+	// detector catches). This catches exactly ONE failure mode, one
+	// allocation late, and has FOUR known limits across its history, split by
+	// DIRECTION — three are live UNDER-detection blind spots (a violation
+	// exists and is never reported); the fourth WAS a live OVER-detection
+	// false positive (a crash fires on a cache whose state is entirely
+	// correct) and is now FIXED, kept here as history so nobody "simplifies"
+	// the fix back out:
+	//   UNDER-DETECTION, still live:
+	//   (i) a violation on the FINAL TICK before teardown — no later
+	//       allocation exists to catch it;
+	//   (ii) the ENTIRE REVERSE DIRECTION — state pushed without a paired
+	//        allocation is legal at the cache (see the no-check note
+	//        above) and is covered ONLY by the shared predicate
+	//        (`stepAllocatesFrontierSlot`), never by this bit;
+	//   (iii) a WIPE interposed between an abandoned allocation and the
+	//         next allocation SWALLOWS the violation — `wipeCache` resets
+	//         the bit by design (it dies with the tick numbering), so the
+	//         abandoned allocation is never reported.
+	//   OVER-DETECTION, fixed [item 91 part A]:
+	//   (iv) `save_snapshot`'s existing-slot path used to never touch this
+	//        bit at all — functionally identical to `pushPredictionState` on
+	//        that path, but a separately-written one that skipped the clear.
+	//        A `save_snapshot` call completing a `pushPredictionTick`-opened
+	//        pairing left the bit falsely `true`, arming a spurious
+	//        `OG_CHECK` crash at the NEXT legitimate allocation, on a cache
+	//        whose state was entirely correct — the more damaging direction,
+	//        since it fires on CORRECT state rather than staying silent on
+	//        BROKEN state. Closed by the guarded clear in `save_snapshot`
+	//        (see that method); pinned RED-then-GREEN by
+	//        `FrontierPairContractTest.cpp`'s
+	//        `SaveSnapshotOnAnExistingSlotClearsTheAwaitingBit` case.
+	//
+	// Read seam for tests: `getDiagnostics().frontierSlotAwaitingState()` —
+	// a pure read on the existing const view.
+	// =======================================================================
+	bool m_frontierSlotAwaitingState = false;
 
 public:
 	// [item 45] NON-COPYABLE AND NON-MOVABLE, stated rather than inherited.

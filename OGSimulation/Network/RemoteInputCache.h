@@ -44,7 +44,8 @@
 //      store has no neutral on the lookup path at all.
 //   3. THE WIPE DIVERGES — and this is the one that makes reuse unsafe rather
 //      than merely awkward. `LocalInputCache::clear()` is CONTRACTUALLY swept
-//      by SimulationNetSync::wipeAllForResync, because a local capture is keyed
+//      by SimulationInputResolution::wipeAllForResync (re-pointed off
+//      SimulationNetSync, item 87; item 91 part J1), because a local capture is keyed
 //      to the pre-resync PREDICTION clock and stops meaning anything when that
 //      clock jumps. A relayed entry is keyed to the SENDER's capture tick — a
 //      server-domain identity that a LOCAL hard resync does not invalidate. A
@@ -121,7 +122,8 @@
 // builds forward vectors of (0,0,1), while a value-initialised PlayerInput would
 // carry a (0,0,0) forward vector into normalisation. The default `InputT{}` here
 // exists purely so an engine-free unit test can construct a store without a game
-// type. SimulationNetSync::setNeutralInput injects the real one into every store.
+// type. SimulationInputResolution::setNeutralInput (re-pointed off SimulationNetSync,
+// item 87; item 91 part J1) injects the real one into every store.
 //
 // ---------------------------------------------------------------------------
 // SENTINEL + INITIAL-STATE CONTRACTS.
@@ -145,15 +147,19 @@
 //
 // WRITER: `USimmableUpdateComponent::OnRep_RelayedInputRing` fires on the GAME
 // thread and calls straight through to `populateRemoteInputCache` below.
-// READER: `SimulationNetSync::collectInputAll` (T7) and
-// `SimulationNetSync::collectResimInputAll` (T6, which relocated it off
+// READER: `SimulationInputResolution::prepareSimulationStep` (T7; named
+// `collectInputAll` before item 90's rename) and
+// `SimulationInputResolution::collectResimInputAll` (T6, which relocated it off
 // SimulationReconciliation) read on the PHYSICS
-// thread under `bTickPhysicsAsync`.
+// thread under `bTickPhysicsAsync`. [item 91 part J1: both re-pointed off
+// SimulationNetSync onto SimulationInputResolution, item 87's promotion —
+// this block is the one `docs/ThreadingCrossings.md` row 1 cites as
+// authoritative, so it must name the current owner.]
 //
 // DO NOT COPY LocalInputCache's "NOT thread-safe; single-threaded by
 // construction... both on the PHYSICS thread" claim along with the ring mechanics.
 // That sentence is TRUE for the delay line (its push and its read are two
-// statements inside one `collectInputAll` call) and FALSE for this type. A false
+// statements inside one `prepareSimulationStep` call) and FALSE for this type. A false
 // threading contract is worse than none, and a reviewer should reject a copied one
 // outright.
 //
@@ -226,7 +232,8 @@ inline constexpr std::size_t kRemoteInputCacheCapacityTicks = 64u;
 //
 // WIPE ASYMMETRY — THE SIGNAL THE OLD, ASYMMETRIC NAMES WERE CARRYING.
 // This cache is SENDER-KEYED and is deliberately NOT wiped by
-// SimulationNetSync::wipeAllForResync — see "THE WIPE DIVERGES" above and the
+// SimulationInputResolution::wipeAllForResync (re-pointed off SimulationNetSync,
+// item 87; item 91 part J1) — see "THE WIPE DIVERGES" above and the
 // non-wipe comment at the wipeAllForResync call site. Its counterpart,
 // LocalInputCache (Network/LocalInputCache.h), is CLOCK-KEYED and IS wiped:
 // its keys are the local prediction clock's tick numbers, which a hard resync

@@ -21,6 +21,12 @@ enum class QueueMoveResult
     Enqueued,               // accepted and stored
     DuplicateDiscarded,     // capture_tick already pending — R-T5 first-writer-wins
     TooFarFutureDiscarded,  // capture_tick > serverAuthorityTick + rollbackWindowTicks
+    // [og-netcode-v2-input-relay item 86] Added for SimulationInputResolution's
+    // by-id queueRemoteMove door (design §C.3): a lookup miss on the id — the
+    // benign downgrade of what used to be a captured-reference dangling-UB
+    // hazard before the callback rebind. Never produced by RemoteMoveQueue
+    // itself; the caller returns this without calling queueMove at all.
+    IdNotRegistered,
 };
 
 // Generic circular move queue — physics thread writes on RPC arrival (game thread),
