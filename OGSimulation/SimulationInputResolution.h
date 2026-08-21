@@ -43,10 +43,14 @@ OGSIM_OPTIMIZE_OFF
 // frontier-pair contract banner above `collectInputAll` (relocated from its
 // parked home at `Reconciliation::pushPredictionTick`'s header, design
 // §B.4.3(1); item 90 re-relocated it again, to `prepareSimulationStep`, its
-// current name), and the registration/lifecycle methods below, which are NEW —
-// they did not exist as such on `SimulationNetSync` (see design §C.5); the
-// container-lifecycle HALF of what those methods used to do moved here
-// verbatim as the body of each.
+// then-name — and item 94 moved the banner a THIRD time, off this class
+// entirely, to Reconciliation's own frontier-allocating sweep, once
+// frontier allocation itself moved there; the method's name reverts to
+// `collectInputAll`, item 90's rename reversed on the record — see the
+// method's own banner for why), and the registration/lifecycle methods
+// below, which are NEW — they did not exist as such on `SimulationNetSync`
+// (see design §C.5); the container-lifecycle HALF of what those methods
+// used to do moved here verbatim as the body of each.
 //
 // ⭐ [item 87] PROMOTED — NO LONGER SCAFFOLDING. This peer is now constructed
 // directly at the composition root (design §A.3's intended final wiring:
@@ -63,6 +67,15 @@ OGSIM_OPTIMIZE_OFF
 // knows both this peer and Reconciliation; this peer and Reconciliation do
 // not know NetSync exists. "No peer owns another" (design §A.3) is now a
 // true statement rather than the one-step exception step 2 accepted.
+//
+// [item 94] THE RECONCILIATION EDGE JUST SHRANK TO ONE READ. Frontier
+// allocation (`pushPredictionTick` / `backfillSkippedTick`) moved to
+// Reconciliation's own frontier-allocating sweep — this class calls
+// neither any more (grep-checked: zero `pushPredictionTick` /
+// `backfillSkippedTick` call sites remain below). The sole surviving reason
+// this class still holds `m_reconciliation` is `collectResimInputAll`'s
+// `getAppliedCaptureTickRef` — the resim join-key read (T6/D3) — the one
+// query this peer cannot answer from its own containers.
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
@@ -77,8 +90,8 @@ OGSIM_OPTIMIZE_OFF
 // contiguous raw captures up to `tick - 1`, and passing them in is what makes
 // the read ordering statable in one place rather than as a cross-file contract.
 //
-// THE ORDERING CONTRACT, AND WHY IT IS NOW VISIBLE. prepareSimulationStep's
-// sweep 1 looks the line up and calls the provider BEFORE it pushes this
+// THE ORDERING CONTRACT, AND WHY IT IS NOW VISIBLE. collectInputAll
+// looks the line up and calls the provider BEFORE it pushes this
 // tick's capture. So the
 // line a provider receives holds ticks <= `step.getTick() - 1`, never the
 // current tick, and the current tick's sample is the value the provider is in
@@ -131,7 +144,7 @@ using PendingInputQueueMapFor = std::unordered_map<
 // It used to mirror LastUsedInputMapFor (same key set, same population/erase
 // sites, same threading); **[T8] that twin is retired and this is now the only
 // per-id authority track**, populated at registerAuthorityOwner and written in
-// prepareSimulationStep's remote branch (sweep 1). See the member declaration
+// collectInputAll's remote branch. See the member declaration
 // for threading.
 //
 // WHY A STRUCT AND NOT A BARE ALIAS. The mapped type (uint32) does not depend on
@@ -208,7 +221,7 @@ using RemoteInputCacheMapFor = std::unordered_map<
 // resim frontier row and T7's prediction proxy branch must run the IDENTICAL
 // ladder — a resim that resolved a frontier tick differently from the prediction
 // that produced it would manufacture divergence out of nothing. T7 calls this
-// from prepareSimulationStep's proxy branch (sweep 1); it is deliberately not a
+// from collectInputAll's proxy branch; it is deliberately not a
 // private member so the ladder can also be unit-tested on its own.
 //
 // CLASSIFICATION NOTE — the `tick < dA` guard reports Miss, not NoProbe. Rung 0 is
@@ -471,8 +484,8 @@ InputT resolveScheduledRelayedInput(const RemoteInputCache<InputT>& store, uint3
 //
 // [og-netcode-v2-input-relay T17] `injected` records whether the composition root
 // ever called setNeutralInput for this type. It exists because the AUTHORITY is
-// now a first-class consumer of this value — prepareSimulationStep's remote
-// branch (sweep 1) substitutes it on a queue underrun, i.e. on every tick of
+// now a first-class consumer of this value — collectInputAll's remote
+// branch substitutes it on a queue underrun, i.e. on every tick of
 // every join window.
 // ([T8] T17 also seeded `m_lastUsedInputs` with it at registerAuthorityOwner;
 // that map is retired, so the underrun substitute is the surviving authority
@@ -541,7 +554,7 @@ public:
     //
     // THE GAME->PHYSICS THREAD CROSSING, and why an atomic is sufficient here.
     // The writer is USimmableUpdateComponent::OnRep_ConnectionTier on the GAME
-    // thread; the reader is prepareSimulationStep on the PHYSICS thread, which
+    // thread; the reader is collectInputAll on the PHYSICS thread, which
     // loads it ONCE per tick and uses that one value for the whole tick. This is safe
     // precisely because it is a lone independent scalar with no internal
     // structure: the worst a relaxed, one-tick-stale read can do is apply a tier
@@ -775,7 +788,7 @@ public:
         // [T9 part 3] The delay line is populated for exactly the ids that
         // have a provider — the locally-controlled ones. A remote proxy has
         // no capture of its own to delay, so it must not get a line —
-        // prepareSimulationStep's proxy branch (sweep 1) reads no delay line
+        // collectInputAll's proxy branch reads no delay line
         // at all (post-T7 it reads that character's relay store instead).
         std::get<LocalInputCacheMapFor<SimulatableT>>(m_localInputCaches)
             .try_emplace(id,
@@ -952,121 +965,73 @@ public:
     // -----------------------------------------------------------------------
 
     // -----------------------------------------------------------------------
-    // THE FRONTIER-PAIR CONTRACT — this method's ALLOCATING half of the pair.
+    // collectInputAll — resolves every registered id's input for this tick.
+    // ALLOCATES NOTHING. See `SimulationReconciliation`'s own frontier-
+    // allocating sweep for the frontier-pair contract's full text (item 94
+    // moved both the allocating sweep and its contract banner there).
     // -----------------------------------------------------------------------
-    // [og-netcode-v2-input-relay item 84, relocated to its final home at item
-    // 86 — design §B.4.3(1); item 90 split the method internally into two
-    // sweeps and moved this banner from above `collectInputAll` to above its
-    // replacement, `prepareSimulationStep`, without changing what it says:
-    // the ALLOCATING half of the pair is now sweep 2 specifically, not the
-    // whole method, but the method is still what a caller sees and still
-    // opens the pair every tick it runs] Every tick this method pushes via
-    // `Reconciliation::pushPredictionTick` is completed by
-    // `Reconciliation::postPredictionAll`'s `pushPredictionState` later in
-    // the SAME manager tick sequence (collect -> pre -> integrate -> post ->
-    // capture). Both halves gate on ONE predicate,
-    // `stepAllocatesFrontierSlot(StepKind)` (SimulationTimeContext.h) — never
-    // re-derive it. The pairing is why the cache may stamp `Predicted` at
-    // allocation; a violation is caught by the cache's
-    // `m_frontierSlotAwaitingState` check at the NEXT allocation
-    // (CorrectionCache.h, write site 1). Frontier advance touches no gate
-    // state (item 45); do not add gate writes here, and do not move this
-    // push to capture time — frontier timing is what `FrontierExact`'s
-    // anchor-set predicate is defined against (DesignInputResolutionPeer.md
-    // §B, §F).
+    // ⚠ THE SUCCESSOR OBLIGATION (part of the frontier-pair contract, stated
+    // here because this is the OPENING call a future author sees first): this
+    // call MUST be followed by reconciliation's frontier-allocating sweep
+    // in the SAME phase, before anything else runs. Collecting without
+    // allocating leaves capture (`postPredictionAll`) free to push state into
+    // the PREVIOUS frontier slot — the frontier-pair detector's uncovered
+    // direction (blind spot #2, `CorrectionCache.h`'s
+    // `m_frontierSlotAwaitingState`). This class can no longer prevent that
+    // by construction (item 90 through item 93's shape fused
+    // resolve-then-allocate inside one call; item 94 un-fuses them so both
+    // live where the slots do) — the obligation is now a caller discipline,
+    // not a compiler-enforced one, and this sentence is the record of that
+    // trade.
     //
-    // This banner was PARKED at `Reconciliation::pushPredictionTick`'s
-    // header until this class existed (item 84); this is its final home.
-    // `pushPredictionTick`'s header now carries a pointer here instead of
-    // the named-caller prose it used to carry.
+    // [item 96] THE DOCUMENTED DOOR: `preparePredictionSimulationStep`
+    // (`SimulationStepSequencing.h` — NOT this header; it names neither peer
+    // type, so hosting it here would have been arbitrary) performs this call
+    // followed by
+    // `reconciliation.allocateFrontierSlotsAll(step)` under one name, on the
+    // `registerSimulatable`/`unregisterSimulatable` precedent
+    // (`SimulationNetSync.h`). It is default-correctness and discoverability,
+    // NOT enforcement — this method stays public and independently callable,
+    // and blind spot #2 above is unchanged by its existence. The
+    // PREDICTION-only manager path (`SimulationManager::
+    // onGameSimulationPrediction`) routes through it; the authority path
+    // (`onGameSimulationAuthority`) calls this method directly, alone, on
+    // purpose — see both call sites.
     //
-    // [item 90] THREE PRODUCTION CALL SITES OF `stepAllocatesFrontierSlot`
-    // NOW, NOT FOUR (grep criterion) — see SimulationTimeContext.h's own
-    // banner for the full renumbering. The two former branch-level gates
-    // inside `collectInputForCharacter` (local-provider tick push,
-    // simulated-proxy tick push) MERGE into sweep 2's single generic gate
-    // below; the delay-line capture-history gate stays exactly where it was,
-    // in sweep 1; `postPredictionAll`'s early return is untouched.
-    // -----------------------------------------------------------------------
-
+    // [item 94] THE NAME REVERSAL, ON THE RECORD. This method is named
+    // `collectInputAll` again, reversing item 90's `prepareSimulationStep`
+    // ruling deliberately (RN-3 precedent: an overturned ruling is recorded,
+    // not silently undone). Item 90's own words for the rename: *"the twins'
+    // asymmetry is now meaningful and named, not merely historical: PREPARE
+    // allocates, RESIM COLLECT reads."* That argument no longer holds: this
+    // method does not allocate any more — allocation is exactly what item 94
+    // removes from it — so keeping "prepare" would describe a responsibility
+    // the method no longer has, the RN-14 defect (a name that outlives the
+    // fact that justified it), reintroduced by the very item that once fixed
+    // it. With allocation gone, `collectInputAll` and `collectResimInputAll`
+    // are symmetric pure readers again, and item 90's own naming argument now
+    // argues FOR the revert rather than against it.
+    //
     // [item 61 / RN-11] SKELETON — the per-character dispatch lives in
-    // `collectInputForCharacter`, extracted below (straight fold, Pattern 1: no
-    // branch in the old lambda body contained a `return`, so nothing here needed
-    // the RN-8/task-58 decide/project split — see the banner on
+    // `collectInputForCharacter`, extracted below (straight fold, Pattern 1:
+    // no branch in the old lambda body contained a `return`, so nothing here
+    // needed the RN-8/task-58 decide/project split — see the banner on
     // `collectInputForCharacter` for the full argument).
     //
-    // [og-netcode-v2-input-relay item 90] `collectInputAll` -> `prepareSimulationStep`,
-    // TWO SWEEPS INTERNALLY (design dispatch; item 84's §B.3 amendment records why
-    // this peer-internal split is safe where the caller-hoist family was rejected —
-    // no cross-peer surgery, no re-timing, runs under 84's armed detector):
-    //
-    //   SWEEP 1 — pure resolution. Today's per-character logic MINUS frontier
-    //   allocation: the destructive consumption (remote dequeue, the delay-line
-    //   push still gated on the predicate at its own capture site, the send
-    //   enqueue) and every `emit*` call, all exactly where they sat before —
-    //   the emits are interleaved with control flow deliberately (RN-10-C);
-    //   relocating one is how probe populations silently corrupt.
-    //
-    //   SWEEP 2 — frontier allocation (`allocateFrontierSlotsAll`, below).
-    //   Per registered prediction-owned id: `backfillSkippedTick` on `Skip`,
-    //   then ONE `pushPredictionTick` gated on `stepAllocatesFrontierSlot` —
-    //   the merge of the two former branch-level push gates.
-    //
-    //   ⛔ THE SWEEP BOUNDARY IS A TRADE, NOT AN ACCIDENT — STATED HERE SO IT
-    //   IS NEVER "TIDIED". Between the two sweeps every character's input has
-    //   been consumed (dequeued, delay-pushed, enqueued for send) and NO
-    //   frontier slot has been allocated for this tick yet. That window is
-    //   legal ONLY because CONTROL FLOW never runs inside it — today's
-    //   single-pass shape got prefix-consistency (each character fully
-    //   finished before the next started) for free; this shape trades that
-    //   for gate concentration (one production call site instead of two). DO
-    //   NOT add an early return or a `continue` between the two
-    //   `forEachSimulatable` sweeps below, and do not interleave a third pass
-    //   between them — either would leave some ids with inputs consumed and
-    //   no slot allocated, which the frontier-pair contract above assumes
-    //   cannot happen.
-    //
-    //   ⚠ [og-netcode-v2-input-relay item 91 part I] "NOTHING RUNS INSIDE IT"
-    //   IS CONTROL-FLOW-ONLY, NOT EXCEPTION-SAFE — an honest narrowing this
-    //   banner did not previously acknowledge. Sweep 1's local-provider
-    //   branch does three `.at(id)` lookups (`collectInputForCharacter`: the
-    //   delay-line fetch, the pending-input-queue enqueue, the
-    //   last-used-capture-tick write) that throw a real, unwinding C++
-    //   exception under this module's `/EHsc` build if the invariant they
-    //   assume — provider-present implies line/queue-entry-present — is
-    //   already broken elsewhere. PRE-item-90, resolve-and-allocate were
-    //   paired per character inline, so a mid-loop throw left every
-    //   already-processed character FULLY PAIRED (both halves done) and
-    //   every later character untouched (neither half done) — a clean
-    //   boundary either way. POST-item-90, sweep 2 only runs after sweep 1's
-    //   entire `forEachSimulatable` returns without throwing, so a throw
-    //   partway through sweep 1 leaves every character already resolved
-    //   before the throw point DESTRUCTIVELY CONSUMED WITH NO FRONTIER SLOT
-    //   EVER ALLOCATED for that tick — a state the pre-90 code could not
-    //   produce.
-    //
-    //   DECISION, RECORDED: accepted as documented debt, sweep 1 left NOT
-    //   exception-safe. Reasons: (1) this path is reachable only via an
-    //   ALREADY-BROKEN registration invariant (a second bug required —
-    //   provider/queue-entry presence is supposed to be established at
-    //   `registerPredictionOwner`/`registerAuthorityOwner` and never violated
-    //   after), so it is not a standalone defect surface; (2) making sweep 1
-    //   exception-safe would mean either a transactional rollback of
-    //   partial consumption (queue/delay-line pops are not easily undoable)
-    //   or reverting the two-sweep split's whole architectural point (one
-    //   gate-concentration call site); neither is a five-minute fix, and the
-    //   two-sweep split's own value (item 90) does not justify that cost
-    //   against a second-bug-required path. If a future author finds this
-    //   path reachable WITHOUT a prior invariant break, that changes the
-    //   calculus and this decision should be revisited.
-    //
-    //   `collectResimInputAll` (below) is UNTOUCHED and keeps its name and
-    //   shape — it allocates nothing, ever (design review §F.6: every one of
-    //   its four call sites either reads an already-allocated slot or is
-    //   indifferent to when within the tick it was allocated). The twins'
-    //   asymmetry is now meaningful and named, not merely historical: PREPARE
-    //   allocates, RESIM COLLECT reads.
-    ResolvedInputs<SimulatableTs...> prepareSimulationStep(const SimulationTimeStep& step)
+    // [item 94] ONLY ONE PASS NOW, NOT TWO. Item 90's internal sweep-1/sweep-2
+    // split, its sweep-boundary "nothing may run between them" fence, and its
+    // sweep-boundary exception-safety debt paragraph (item 91 part I) are all
+    // GONE from this method — there is only one `forEachSimulatable` pass
+    // left below, and the debt paragraph's DECISION (accepted as documented
+    // debt; a mid-sweep throw skips the whole tick's allocation, reachable
+    // only via an already-broken registration invariant) carries forward
+    // UNCHANGED, but its MECHANICS are now about two separate statements in
+    // `SimulationManager::onGameSimulationPrediction` rather than an internal
+    // boundary in this function — see that method for the relocated text.
+    // `collectInputForCharacter`'s own three `.at(id)` lookups (the ones that
+    // can throw) are unchanged by this move; see that method's own comment
+    // for their corrected attribution (91-I's fix, folded in by this task).
+    ResolvedInputs<SimulatableTs...> collectInputAll(const SimulationTimeStep& step)
     {
         ResolvedInputs<SimulatableTs...> inputs;
 
@@ -1076,7 +1041,6 @@ public:
         // across two different delays.
         const int32 effectiveDelay = getClientEffectiveInputDelayTicks();
 
-        // --- SWEEP 1: pure resolution — see the banner above. ---
         m_storage.forEachSimulatable([&](unsigned int id, auto& simulatable) {
             using T = std::remove_reference_t<decltype(simulatable)>;
             collectInputForCharacter<T>(id, step, effectiveDelay, inputs);
@@ -1096,18 +1060,13 @@ public:
         // which of ITS methods this call site may reach.
         m_inputResolutionTelemetry.emitRelayReadWindowIfDue(step.getTick());
 
-        // --- SWEEP BOUNDARY — see the ⛔ / ⚠ paragraphs above. No CONTROL
-        // FLOW may run between this point and sweep 2: every id is fully
-        // resolved and consumed, and no frontier slot exists for this tick
-        // yet. [item 91 part I] This is control-flow-only, not exception-safe
-        // — an uncaught throw inside sweep 1 (three `.at(id)` lookups, real
-        // exceptions under `/EHsc`) skips sweep 2 for characters already
-        // resolved this tick; see the ⚠ paragraph above for the reachability
-        // argument and the recorded accept-as-debt decision. ---
-
-        // --- SWEEP 2: frontier allocation — see `allocateFrontierSlotsAll`. ---
-        allocateFrontierSlotsAll(step);
-
+        // [item 94] THIS METHOD ALLOCATES NOTHING AND RETURNS HERE. The
+        // former sweep-boundary fence and the sweep-2 call (Reconciliation's
+        // frontier-allocating sweep) that used to sit at this exact point
+        // are GONE from this class — see the method's own banner above for
+        // where the fence and the debt-acceptance decision it protected
+        // relocated to (`SimulationManager::onGameSimulationPrediction`,
+        // between this call and reconciliation's own sweep).
         return inputs;
     }
 
@@ -1115,18 +1074,23 @@ public:
     // [T6] Resim replay input (physics thread) — THE RESOLUTION TABLE
     // -----------------------------------------------------------------------
     //
-    // [item 90 / design review §F.6] THIS METHOD ALLOCATES NOTHING, EVER — the
-    // one-line asymmetry with its twin above, now named rather than merely
-    // true: `prepareSimulationStep` PREPARES (resolves AND allocates this
-    // tick's frontier slot), `collectResimInputAll` COLLECTS (reads slots a
-    // past prediction pass already allocated). Verified at every one of this
-    // method's call sites in §F.6: `prepareResimAll` restores existing slots,
-    // this method's join key is a read of a slot allocated by a PAST
-    // prediction pass, `postResimulationAll` finds-or-discards and never
-    // allocates, and `applyResimAll` reads a frontier slot the original
-    // prediction pass allocated (replay itself pushes no ticks). The twins
-    // have been confusingly symmetric in name since T6; they are not
-    // symmetric in what they do to the frontier, and the names now say so.
+    // [item 90 / design review §F.6, re-scoped item 94] THIS METHOD ALLOCATES
+    // NOTHING, EVER — true since T6 and unchanged by item 94. What item 94
+    // DOES change: `collectInputAll` above ALSO allocates nothing any more
+    // (item 90's "PREPARE allocates, RESIM COLLECT reads" asymmetry named a
+    // real difference at the time; item 94 removes the allocating half from
+    // `collectInputAll` entirely, so that specific asymmetry is gone — both
+    // twins are pure readers now, matching their names again). The asymmetry
+    // that survives is about the CALLER, not either method: only the
+    // prediction path's caller (`SimulationManager::onGameSimulationPrediction`)
+    // follows its collect with reconciliation's own frontier-allocating sweep;
+    // nothing follows a resim collect with one, because resim never opens a
+    // frontier pair (verified at every one of this method's call sites in
+    // §F.6: `prepareResimAll` restores existing slots, this method's join key
+    // is a read of a slot allocated by a PAST prediction pass,
+    // `postResimulationAll` finds-or-discards and never allocates, and
+    // `applyResimAll` reads a frontier slot the original prediction pass
+    // allocated — replay itself pushes no ticks).
     //
     // RELOCATED HERE from SimulationReconciliation (T6 placement ruling, Option
     // C), and home finished by item 87. It used to read one thing — the
@@ -1194,13 +1158,13 @@ public:
     // the pre-T6 behaviour, in which the wiped cache blinded both.
     // [item 61 / RN-11] SKELETON — see `collectResimInputForCharacter`'s banner
     // for why this is also a straight fold (Pattern 1), same reasoning as
-    // `prepareSimulationStep`'s sweep 1, applied per rung of the resolution
+    // `collectInputAll`, applied per rung of the resolution
     // table below rather than per branch.
     ResolvedInputs<SimulatableTs...> collectResimInputAll(uint32 simTick)
     {
         ResolvedInputs<SimulatableTs...> inputs;
 
-        // ONE load per resim tick, mirroring prepareSimulationStep's
+        // ONE load per resim tick, mirroring collectInputAll's
         // one-load-per-tick rule so a concurrent OnRep cannot split a single
         // tick across two different delays. See the D2 note above for what it
         // does NOT promise.
@@ -1283,34 +1247,58 @@ public:
     }
 
 private:
-    // [item 61 / RN-11] `prepareSimulationStep`'s SWEEP-1 per-character body
-    // (named `collectInputAll` before item 90's rename), lifted out verbatim
-    // (RN-10 part A precedent) — three mutually exclusive branches (local
-    // provider / remote queue / simulated proxy), each ending in a
-    // `map.emplace`, none containing a `return`. PATTERN 1 — STRAIGHT FOLD
-    // applies to every branch's diagnostics: the dispatch's fence is "no branch
-    // is a return affecting the caller", and there is exactly one `return`
-    // anywhere in this function (the implicit one at the end of each branch,
-    // same as before the split) — never one interleaved BETWEEN two probe/log
-    // calls the way `decideCorrectionArrival` had to guard against. Each
-    // branch's SIMLOG/probe tail folds into its own `emit*` call below.
+    // [item 61 / RN-11] `collectInputAll`'s per-character body (named
+    // `collectInputAll` before item 90's rename to `prepareSimulationStep`;
+    // item 94 reverted that rename once allocation left the method — see
+    // `collectInputAll`'s own banner), lifted out verbatim (RN-10 part A
+    // precedent) — three mutually exclusive branches (local provider / remote
+    // queue / simulated proxy), each ending in a `map.emplace`, none
+    // containing a `return`. PATTERN 1 — STRAIGHT FOLD applies to every
+    // branch's diagnostics: the dispatch's fence is "no branch is a return
+    // affecting the caller", and there is exactly one `return` anywhere in
+    // this function (the implicit one at the end of each branch, same as
+    // before the split) — never one interleaved BETWEEN two probe/log calls
+    // the way `decideCorrectionArrival` had to guard against. Each branch's
+    // SIMLOG/probe tail folds into its own `emit*` call below.
     //
-    // [item 90] FRONTIER ALLOCATION NO LONGER HAPPENS HERE. Every branch used
-    // to end with its own `if (Skip) backfillSkippedTick(...)` and its own
-    // `if (stepAllocatesFrontierSlot(...)) pushPredictionTick(...)` — both are
-    // gone, relocated to sweep 2 (`allocateFrontierSlotForCharacter`, below).
-    // What stays here, per the local-provider branch's own comment at its
-    // site, is the delay-line capture gate (unchanged) and the send enqueue,
-    // now re-gated on the SAME captured predicate result as the capture gate
-    // rather than a second call to `stepAllocatesFrontierSlot` — see that
-    // site for why one call, not two.
+    // [item 90, unchanged by item 94] FRONTIER ALLOCATION DOES NOT HAPPEN
+    // HERE. Every branch used to end with its own `if (Skip)
+    // backfillSkippedTick(...)` and its own `if
+    // (stepAllocatesFrontierSlot(...)) pushPredictionTick(...)` — both are
+    // gone, relocated at item 90 to a dedicated sweep-2 method on THIS class
+    // and relocated AGAIN at item 94 to Reconciliation's own
+    // frontier-allocating sweep — this class no
+    // longer has an allocating sweep of its own at all. What stays here, per
+    // the local-provider branch's own comment at its site, is the delay-line
+    // capture gate (unchanged) and the send enqueue, now re-gated on the SAME
+    // captured predicate result as the capture gate rather than a second call
+    // to `stepAllocatesFrontierSlot` — see that site for why one call, not
+    // two.
     // [item 90] `T& simulatable` DROPPED FROM THE SIGNATURE — it was read
     // exactly twice, both times as `simulatable.getAllState().getState()` for
-    // a `backfillSkippedTick` call, and both calls moved to sweep 2
-    // (`allocateFrontierSlotForCharacter`, which takes its own `simulatable`
-    // from its own `forEachSimulatable` pass). Nothing else in this function
-    // ever touched the character object; keeping an unused reference parameter
-    // here would be dead weight this task's own restructuring created.
+    // a `backfillSkippedTick` call, and both calls moved to what was then
+    // sweep 2 (now Reconciliation's own frontier-allocating sweep,
+    // which takes its own `simulatable` from its own `forEachSimulatable`
+    // pass). Nothing else in this function ever touched the character object;
+    // keeping an unused reference parameter here would be dead weight that
+    // restructuring created.
+    //
+    // ⚠ [og-netcode-v2-input-relay item 91 part I, MISATTRIBUTION FIXED AT
+    // ITEM 94 — 91-I / review 92, folded in per task 94's part F] This
+    // function's local-provider branch does TWO `.at(id)` lookups that can
+    // throw a real, unwinding C++ exception under this module's `/EHsc`
+    // build if the invariant they assume — provider-present implies
+    // line/queue-entry-present — has already been broken elsewhere: the
+    // delay-line fetch (below) and the pending-input-queue enqueue (below).
+    // The THIRD such lookup this function makes — the last-used-capture-tick
+    // write — is NOT in the local-provider branch; it is in the
+    // AUTHORITY/QUEUE branch (`queueMap.find` succeeds), guarding
+    // `registerAuthorityCharacter`'s pairing. A prior version of this note
+    // misattributed all three to the local-provider branch (review 91 finding
+    // 1, confirmed still unfixed by review 92, corrected here). See
+    // `collectInputAll`'s own banner for what happens at the CALLER when any
+    // of the three throws (the debt-acceptance decision, now stated at
+    // `SimulationManager::onGameSimulationPrediction`).
     template <typename T>
     void collectInputForCharacter(unsigned int id, const SimulationTimeStep& step,
                                   int32 effectiveDelay, ResolvedInputs<SimulatableTs...>& inputs)
@@ -1388,11 +1376,13 @@ private:
             // silently fork this one. Do not "simplify" this back to a
             // literal `!= StepKind::Stall`.
             //
-            // [item 90] CAPTURED ONCE, USED TWICE — this is now sweep 1's
-            // ONLY call to `stepAllocatesFrontierSlot` (the grep-counted
-            // "sweep-1 capture gate"; see the frontier-pair banner above
-            // `prepareSimulationStep` and SimulationTimeContext.h's own
-            // banner). It gates the delay-line push immediately below AND
+            // [item 90] CAPTURED ONCE, USED TWICE — this is this class's
+            // ONLY remaining call to `stepAllocatesFrontierSlot` (the
+            // grep-counted "sweep-1 capture gate"; see `collectInputAll`'s
+            // banner and SimulationTimeContext.h's own banner — item 94's two
+            // allocation-side call sites both moved to
+            // `SimulationReconciliation.h`). It gates the delay-line push
+            // immediately below AND
             // this branch's send enqueue, further down, which used to be
             // gated by a SEPARATE call sharing the tick-push gate that sweep
             // 2 now owns. The enqueue and the tick push were never the same
@@ -1410,11 +1400,13 @@ private:
 
             m_inputResolutionTelemetry.emitLocalInputRead(id, step.getTick(), step.getStepKind(), effectiveDelay);
 
-            // [item 90] `backfillSkippedTick` and `pushPredictionTick`
-            // RELOCATED to sweep 2 (`allocateFrontierSlotForCharacter`) — this
-            // branch no longer allocates. The `[T16] pushPredictionInput`
-            // removal note that used to sit here moved with the tick push;
-            // see that method for the frontier half of this branch's story.
+            // [item 90, relocated again item 94] `backfillSkippedTick` and
+            // `pushPredictionTick` do not run in this class at all any more —
+            // this branch never allocated (item 90), and the dedicated
+            // sweep-2 method that used to is deleted; its
+            // replacement lives on `SimulationReconciliation`. The `[T16]
+            // pushPredictionInput` removal note that used to sit here moved
+            // with the tick push, all the way to `CorrectionCache.h`.
             if (allocatesFrontierSlotThisStep)
             {
                 // ORIGINAL capture, current tick — the send channel carries
@@ -1582,120 +1574,39 @@ private:
             // reference into this class's own RemoteInputCache map.
             m_inputResolutionTelemetry.emitPredictionInputRead(id, step.getTick(), store != nullptr, readReport);
 
-            // [item 90] `backfillSkippedTick` and `pushPredictionTick`
-            // RELOCATED to sweep 2 (`allocateFrontierSlotForCharacter`) — this
-            // branch no longer allocates; it never wrote an input column
-            // ([T16], the `pushPredictionInput<T>(id, input)` removal noted
-            // below the old gate) and now writes nothing frontier-related
-            // either. The relay store holds what the proxy actually sent;
-            // nothing here stores this client's guess.
+            // [item 90, relocated item 94] `backfillSkippedTick` and
+            // `pushPredictionTick` do not run in this class at all — this
+            // branch never allocated (item 90); it never wrote an input
+            // column either ([T16], the `pushPredictionInput<T>(id, input)`
+            // removal noted below the old gate). The relay store holds what
+            // the proxy actually sent; nothing here stores this client's
+            // guess.
 
             map.emplace(id, std::move(input));
         }
     }
 
     // -----------------------------------------------------------------------
-    // [og-netcode-v2-input-relay item 90] SWEEP 2 — FRONTIER ALLOCATION.
+    // [og-netcode-v2-input-relay item 90] SWEEP 2 — FRONTIER ALLOCATION — IS
+    // GONE FROM THIS CLASS. RETIRED AT ITEM 94.
     // -----------------------------------------------------------------------
-    // The other half of the frontier-pair contract banner above
-    // `prepareSimulationStep`: this is where the pair actually opens now.
-    // Per registered PREDICTION-OWNED id (every id sweep 1 did NOT hand to the
-    // remote-move-queue branch above — i.e. every local-provider id and every
-    // simulated-proxy id, the exact set that used to allocate inline in its
-    // own branch) — `backfillSkippedTick` on `Skip`, then ONE
-    // `pushPredictionTick` gated on `stepAllocatesFrontierSlot`. This merges
-    // what were two textually separate branch-level gates (former local-
-    // provider "Gate 1" and simulated-proxy "Gate 2") into the single call
-    // below — the predicate is evaluated ONCE per tick, not once per
-    // character, because `StepKind` is a property of the shared `step`
-    // argument, identical for every character resolved this tick.
+    // The whole-tick sweep method and its per-character helper used to
+    // live here, gated on a `queueMap` lookup (this class's own
+    // `m_remoteMoveQueues`) plus item 92's loud-failure `OG_CHECK` against
+    // `m_reconciliation.findInputCache`. Both are DELETED, not moved
+    // verbatim: the replacement, Reconciliation's own frontier-allocating
+    // sweep, filters on reconciliation's OWN cache population
+    // (`findInputCache` alone, no `queueMap` reference — see that method's
+    // banner for why this class's `m_remoteMoveQueues` was never
+    // load-bearing for the exclusion, only a second, redundant way of
+    // saying "has a cache") and silently skips rather than aborting loudly
+    // (item 92's guard is traded away — priced, not hidden, at the new
+    // site's banner). Grep proof this file no longer defines or calls the
+    // relocated sweep by name — its acceptance criterion is a case-
+    // insensitive zero-hit grep for the retired names across this whole
+    // TU, which is why this note is deliberately written without spelling
+    // them literally.
     //
-    // [item 45] RESTATED HERE, AT THE ALLOCATION SITE ITSELF, not only in the
-    // banner above `prepareSimulationStep`: frontier advance touches no gate
-    // state. `pushPredictionTick` and `backfillSkippedTick` write the ring's
-    // slot directory and its state buffer; neither reads nor writes
-    // `needsResimulation` or any other gate-decision input. Do not add a gate
-    // write to this method.
-    //
-    // WHY A SECOND `queueMap` LOOKUP RATHER THAN A FLAG CARRIED FROM SWEEP 1:
-    // sweep 1 no longer records which branch an id took (the pre-90 code
-    // didn't need to; each branch acted for itself). Re-deriving "is this id
-    // authority-owned" from the same map sweep 1 already consulted costs one
-    // more hash lookup per id per tick and buys the two sweeps genuine
-    // independence — sweep 2 does not depend on sweep 1's control flow, only
-    // on the container state sweep 1 left behind, which is exactly the trade
-    // the sweep-boundary comment above documents.
-    void allocateFrontierSlotsAll(const SimulationTimeStep& step)
-    {
-        // ONE evaluation for the whole tick — the sweep-2 call site the
-        // frontier-pair banners point at (SimulationTimeContext.h,
-        // `prepareSimulationStep`'s own banner above).
-        const bool allocatesSlot = stepAllocatesFrontierSlot(step.getStepKind());
-
-        m_storage.forEachSimulatable([&](unsigned int id, auto& simulatable) {
-            using T = std::remove_reference_t<decltype(simulatable)>;
-            allocateFrontierSlotForCharacter<T>(id, simulatable, step, allocatesSlot);
-        });
-    }
-
-    // Per-character body of sweep 2. `allocatesSlot` is computed once by the
-    // caller — see `allocateFrontierSlotsAll` for why passing it in, rather
-    // than re-evaluating the predicate per character, is what keeps this the
-    // grep-counted ONE production call site rather than N.
-    template <typename T>
-    void allocateFrontierSlotForCharacter(unsigned int id, T& simulatable,
-                                          const SimulationTimeStep& step, bool allocatesSlot)
-    {
-        // Authority-owned ids (the remote-move-queue branch of
-        // `collectInputForCharacter`) allocate no frontier slot — unchanged
-        // from before this task: that branch never called `backfillSkippedTick`
-        // or `pushPredictionTick` either. `onGameSimulationAuthority`'s own
-        // comment states the consequence: on that role every FULLY-REGISTERED
-        // id lands here and returns immediately, so the sweep allocates
-        // nothing for it, matching collect-and-capture's shared absence on
-        // authority. [item 92] That is conditional on registration having
-        // completed, not unconditional — see the loud-failure guard below for
-        // what happens, and why, when it has not.
-        auto& queueMap = std::get<RemoteMoveQueueMapFor<T>>(m_remoteMoveQueues);
-        if (queueMap.find(id) != queueMap.end())
-            return;
-
-        // [item 92] LOUD-FAILURE GUARD, independent of the registration-
-        // ordering invariant enforced in SimulationNetSync.h's registerSimulatable
-        // server overload (queueMap populated before storage.add). Every id
-        // that reaches this point is expected to carry a correction cache:
-        // `backfillSkippedTick` and `pushPredictionTick` below both resolve one
-        // through SimulationReconciliation::getCacheFor's bare `.at(id)`, which
-        // THROWS — an opaque MSVC exception three frames up in
-        // onGameSimulationAuthority — if the cache is missing. The only way to
-        // reach here with no cache is that ordering invariant having regressed
-        // (storage exposed this id to forEachSimulatable before
-        // registerAuthorityOwner populated queueMap). Fail loudly and name the
-        // invariant here, at the call site, instead of relying on the ordering
-        // fix alone or an unexplained exception downstream.
-        OG_CHECK(m_reconciliation.template findInputCache<T>(id) != nullptr,
-            "allocateFrontierSlotForCharacter: id is not in the remote-move queue but has no "
-            "correction cache either - registerAuthorityOwner must populate queueMap before "
-            "storage exposes this id to forEachSimulatable (see the ordering invariant on "
-            "SimulationNetSync.h's registerSimulatable server overload)");
-
-        if (step.getStepKind() == StepKind::Skip)
-            m_reconciliation.template backfillSkippedTick<T>(
-                id, step.getTick() - 1, simulatable.getAllState().getState());
-
-        // [og-netcode-v2-input-relay item 84, merged at item 90] THE sweep-2
-        // gate — the frontier-pair predicate's ONE remaining OPENING site
-        // (SimulationTimeContext.h::stepAllocatesFrontierSlot; the contract at
-        // `Reconciliation::pushPredictionTick`'s header). Former "Gate 1"
-        // (local-provider) and "Gate 2" (simulated-proxy) are this one call,
-        // now shared by both former branches because sweep 2 no longer knows
-        // or cares which branch resolved this id's input.
-        if (allocatesSlot)
-        {
-            m_reconciliation.template pushPredictionTick<T>(id, step.getTick());
-        }
-    }
-
     // [item 61, relocated task 79, split at item 85] The local-provider
     // branch's classification line, the remote-queue branch's, and the
     // simulated-proxy branch's whole probing tail now live on the PT telemetry
@@ -1757,7 +1668,7 @@ private:
 
         if (isLocal)
         {
-            // `.at(id)` for the same reason `prepareSimulationStep`'s
+            // `.at(id)` for the same reason `collectInputAll`'s
             // local-provider branch uses it: the line is created iff a
             // provider is registered, so provider-present and line-present
             // are the same condition by construction.
@@ -1864,7 +1775,7 @@ private:
 
     // [T2 / input relay] The capture tick behind each applied remote input, or
     // kNoInputCaptureTick on an underrun substitution. Written in
-    // prepareSimulationStep (PHYSICS thread), read in sendCorrectionAll (GAME
+    // collectInputAll (PHYSICS thread), read in sendCorrectionAll (GAME
     // thread, on SimulationNetSync, via its m_inputResolution peer reference —
     // no forwarder, since item 87 promoted this class to a real peer and
     // deleted NetSync's scaffold-era forwarders) where T4 attaches it to the
@@ -1880,13 +1791,13 @@ private:
     std::tuple<LastUsedCaptureTickMapFor<SimulatableTs>...> m_lastUsedCaptureTicks;
 
     // [T9 parts 3+4] Client Layer-1 input delay. Populated for provider-owning
-    // ids only; touched exclusively from prepareSimulationStep (physics thread) and
+    // ids only; touched exclusively from collectInputAll (physics thread) and
     // wipeAllForResync.
     std::tuple<LocalInputCacheMapFor<SimulatableTs>...> m_localInputCaches;
 
     // [T9 part 4, RENAMED by T17] The game's zero input, per simulatable type.
     // NOT "client" neutral inputs any more: the AUTHORITY reads this too (the
-    // underrun substitute in prepareSimulationStep's remote branch; [T8] T17 also named
+    // underrun substitute in collectInputAll's remote branch; [T8] T17 also named
     // the `m_lastUsedInputs` seed in registerAuthorityOwner, since retired), so the
     // old name described one of several consumers and invited exactly the reasoning
     // that left the authority path integrating `InputType{}`. Written once by the
@@ -1900,7 +1811,7 @@ private:
     //
     // WRITTEN ON THE GAME THREAD (the OnRep_RelayedInputRing callback bound in
     // registerPredictionOwner), READ ON THE PHYSICS THREAD (T7's proxy branch of
-    // prepareSimulationStep, T6's collectResimInputAll). That crossing is INHERITED from
+    // collectInputAll, T6's collectResimInputAll). That crossing is INHERITED from
     // the correction path, which already does exactly this, and its full rationale
     // — the torn-slot-not-container-UB argument, the correction heal, and the
     // named deferred SPSC-seam cleanup — is in the THREADING section of
@@ -1936,10 +1847,13 @@ private:
 // preference). Checks exactly the three members design §C.7 names as having
 // LEFT `SimulationNetSyncConcept` for this new concept: `collectInputAll`
 // (RENAMED `prepareSimulationStep` at item 90 — same slot, same signature,
-// same return-type pin), `collectResimInputAll` (the SimulatableTs-typed
-// return pins, unchanged from their pre-move form) and `wipeAllForResync`.
-// This is the ad-hoc, concrete-SimulatableTs check used adapter-side (task
-// 6's precedent, SimulationManagerUImplConceptTest.cpp) — the manager-facing,
+// same return-type pin — and RENAMED BACK to `collectInputAll` at item 94,
+// once allocation left the method entirely; see that method's own banner for
+// why item 90's naming argument now argues for the reversal rather than
+// against it), `collectResimInputAll` (the SimulatableTs-typed return pins,
+// unchanged from their pre-move form) and `wipeAllForResync`. This is the
+// ad-hoc, concrete-SimulatableTs check used adapter-side (task 6's
+// precedent, SimulationManagerUImplConceptTest.cpp) — the manager-facing,
 // pack-invisible split lives in SimulationManager.h as
 // `SimulationInputResolutionTickConcept` (item 80/83's SimulatableTs-invisibility
 // reasoning, inherited here).
@@ -1948,7 +1862,7 @@ private:
 template <typename T, typename... SimulatableTs>
 concept SimulationInputResolutionConcept = requires(T& t, const SimulationTimeStep& step, uint32 tick)
 {
-    { t.prepareSimulationStep(step) } -> std::convertible_to<ResolvedInputs<SimulatableTs...>>;
+    { t.collectInputAll(step) } -> std::convertible_to<ResolvedInputs<SimulatableTs...>>;
     { t.collectResimInputAll(tick) } -> std::convertible_to<ResolvedInputs<SimulatableTs...>>;
     { t.wipeAllForResync(tick) };
 };

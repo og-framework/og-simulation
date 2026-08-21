@@ -746,12 +746,14 @@ public:
 	// `SimulationNetSync::collectInputAll` (the provider branch, writing the
 	// already-delayed applied capture; and the simulated-proxy branch, writing
 	// this client's guess at the remote input) — since item 87 that class is
-	// `SimulationInputResolution`, and since item 90 the tick push itself lives
-	// in `prepareSimulationStep`'s sweep 2 (`allocateFrontierSlotForCharacter`),
-	// not inline in either branch — plus
-	// `SimulationReconciliation::backfillSkippedTick` and `advance_frame` below.
-	// The prediction TICK is still pushed at every one of those sites — only the
-	// input write went, so the ring's slot allocation is bit-for-bit unchanged.
+	// `SimulationInputResolution`, since item 90 the tick push moved to a
+	// dedicated sweep, and since item 94 that sweep itself moved to
+	// `SimulationReconciliation::allocateFrontierSlotsAll` — this class's own
+	// `pushPredictionTick`, called from there, not inline in either branch —
+	// plus `SimulationReconciliation::backfillSkippedTick` and `advance_frame`
+	// below. The prediction TICK is still pushed at every one of those sites —
+	// only the input write went, so the ring's slot allocation is bit-for-bit
+	// unchanged.
 
 	void pushPredictionState(const StateType& state)
 	{

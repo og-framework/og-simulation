@@ -1163,20 +1163,29 @@ void registerSimulatable(
     PredictionOwnerFor<SimulatableT>&      predictionOwner,
     AuthorityOwnerFor<SimulatableT>&       authorityOwner)
 {
-    // [item 92] Order matters, mirroring the client overload's cache-before-
-    // storage invariant above: this overload has no cache to create, but
-    // registerAuthorityOwner still MUST run before storage.add, because it is
-    // the only call that populates queueMap — the map sweep 2
-    // (allocateFrontierSlotForCharacter) checks to skip authority ids. Neither
-    // registerPredictionOwner (provider is null here, so it takes the
-    // provider-absent/remote branch) nor registerAuthorityOwner touches
-    // `storage` or the stored `simulatable`, so both are safe to run first.
-    // If storage.add ran first, a concurrent physics tick's sweep 2 could
-    // observe the id in storage but in neither queueMap nor providerMap, fall
-    // through the guard, and call pushPredictionTick for an id that (by this
-    // overload's own design, above) will NEVER have a correction cache —
-    // SimulationReconciliation::getCacheFor's bare .at(id) then throws. This
-    // was the exact defect behind the item-92 crash.
+    // [item 92, RE-CHECKED AT ITEM 94] Order matters, mirroring the client
+    // overload's cache-before-storage invariant above: this overload has no
+    // cache to create, but registerAuthorityOwner still SHOULD run before
+    // storage.add. [item 94] ⚠ WHAT THIS ORDERING NOW PROTECTS HAS CHANGED —
+    // priced explicitly rather than left stale. `queueMap` is no longer read
+    // by the frontier-allocation sweep at all: `SimulationReconciliation::
+    // allocateFrontierSlotsAll` filters on ITS OWN cache population
+    // (`findInputCache != nullptr`), not on this class's `queueMap`, so a
+    // storage-exposed id with no cache is now SILENTLY SKIPPED there rather
+    // than falling through to a throwing `.at(id)` — item 92's loud
+    // `OG_CHECK` guard was deleted along with the resolution-side sweep that
+    // carried it (`allocateFrontierSlotForCharacter`, item 94). What THIS
+    // ordering still protects is sweep 1's `queueMap`-based branch dispatch
+    // in `SimulationInputResolution::collectInputForCharacter`: an id exposed
+    // to storage before `queueMap` is populated would misclassify as a
+    // simulated-proxy id instead of an authority id for the width of the
+    // window, reading a relay store that will never exist for it rather than
+    // its remote-move queue — a real, lower-severity defect than the retired
+    // crash, and the reason this reorder is BELT-AND-BRACES now, not
+    // unnecessary. Neither registerPredictionOwner (provider is null here, so
+    // it takes the provider-absent/remote branch) nor registerAuthorityOwner
+    // touches `storage` or the stored `simulatable`, so both are safe to run
+    // first regardless.
     // Inverted-order invariant: if storage has id, queueMap has id.
     // [item 93] THE SAME INVARIANT, READ BACKWARDS, GOVERNS unregisterSimulatable
     // below (publish-last on the way in ⇒ unpublish-first on the way out).
@@ -1221,6 +1230,37 @@ void registerSimulatable(
 // already correct before this fix (removeCacheFor was already the last of
 // the three calls) and remains correct now; only the storage/netSync
 // relative order changes.
+//
+// [item 94, Part F] ⚠ THIS REORDER IS LANDED AND MUST NOT BE "SIMPLIFIED"
+// BACK — stated explicitly because task 94 removes the reorder's ORIGINAL
+// motivation. Frontier allocation is now storage-driven and filtered on
+// reconciliation's own cache population (`SimulationReconciliation::
+// allocateFrontierSlotsAll`), so it no longer falls through to the item-92
+// `OG_CHECK` / bare `.at(id)` throw this reorder was built to avoid — that
+// specific crash shape is retired by task 94's own existence, independent of
+// this ordering. That makes this reorder BELT-AND-BRACES, not unnecessary:
+// it still keeps sweep 1's `queueMap`-based branch dispatch in
+// `SimulationInputResolution::collectInputForCharacter` correct across the
+// teardown window (see the server `registerSimulatable` overload's own
+// item-94 paragraph, above, for the identical argument on the registration
+// side). A future author must not remove this reorder on the grounds that
+// "the crash it was fixing can't happen any more" — a DIFFERENT, real hazard
+// depends on it now.
+//
+// [item 94, Part F] THE MIRRORED INVARIANT, RE-CHECKED POST-94. "If storage
+// has id, queueMap/cache has id" (registration) / the reverse (teardown)
+// STILL HOLDS, and the per-tick TOLERANCE for a momentary violation is
+// STRICTLY WIDER than it was pre-94: previously only sweep 1 (queueMap-keyed
+// branch dispatch) tolerated the window silently; sweep 2 (frontier
+// allocation) did not, and that intolerance is exactly what item 92 patched
+// with a loud guard. Post-94, BOTH sweeps are nullable/storage-filtered — the
+// allocation sweep now degrades the same way sweep 1 always has (a quiet
+// skip or a plausible-but-wrong branch choice, never a crash). The guarantee
+// this ordering states is therefore: *no path from a fully-executed
+// register/unregister sequence, in the stated order, ever produces a window
+// visible to a concurrent physics tick* — unchanged in its literal text, but
+// now backed by two tolerant sweeps instead of one tolerant and one
+// abort-on-violation.
 template <typename SimulatableT, typename... Ts>
 void unregisterSimulatable(
     SimulationObjectStorage<Ts...>&   storage,

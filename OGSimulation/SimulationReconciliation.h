@@ -145,14 +145,17 @@ public:
     }
 
     // -----------------------------------------------------------------------
-    // Prediction push — the ALLOCATING half of THE FRONTIER-PAIR CONTRACT.
+    // Prediction push — the low-level PER-CACHE allocating primitive THE
+    // FRONTIER-PAIR CONTRACT's opening half is built from.
     // -----------------------------------------------------------------------
-    // [og-netcode-v2-input-relay item 86] The frontier-pair contract's full
-    // text now lives at its FINAL HOME — SimulationInputResolution.h, above
-    // `collectInputAll` (design §B.4.3(1)) — the allocating call this method
-    // serves. See that banner for the predicate, the cache check, the three
-    // named blind spots, and why the push must not move to capture time. It
-    // was parked here (item 84) only until that peer existed.
+    // [og-netcode-v2-input-relay item 86, relocated item 94] The frontier-pair
+    // contract's full text now lives at its FINAL HOME — `allocateFrontierSlotsAll`
+    // below, the per-tick sweep that calls this method for every prediction-owned
+    // id. See that banner for the predicate, the cache-population filter, the
+    // blind spots, and why the push must not move to capture time. (Parked
+    // above `SimulationInputResolution::collectInputAll` from item 84 through
+    // item 93; item 94 moved the allocating SWEEP itself into this class,
+    // alongside the slots it opens, and the contract text moved with it.)
     // -----------------------------------------------------------------------
 
     template <typename T>
@@ -163,11 +166,14 @@ public:
 
     // [og-netcode-v2-input-relay T16] `pushPredictionInput` — the wrapper around
     // StateCorrectionCache's input-column writer — IS GONE with the column. Its
-    // two production callers were both arms of SimulationNetSync::collectInputAll
-    // (now SimulationInputResolution::prepareSimulationStep, item 90's rename);
-    // both now push only the prediction TICK, which is what allocates the slot.
-    // A cache slot is state + the applied-capture-tick ref; it holds no input
-    // value, and nothing in this class can put one there.
+    // two production callers were both arms of what was then
+    // `SimulationNetSync::collectInputAll` (item 90 renamed the peer's method
+    // `prepareSimulationStep`; item 94 reverted that once allocation left the
+    // method entirely — see `collectInputAll`'s own banner on
+    // `SimulationInputResolution.h`); both now push only the prediction TICK,
+    // which is what allocates the slot. A cache slot is state + the
+    // applied-capture-tick ref; it holds no input value, and nothing in this
+    // class can put one there.
 
     // Called on StepKind::Skip — back-fills the skipped tick with the prior state.
     // skippedTick is step.getTick() - 1 (the tick that was jumped over).
@@ -188,6 +194,130 @@ public:
         cache.pushPredictionState(priorState);
     }
 
+    // =========================================================================
+    // THE FRONTIER-PAIR CONTRACT — this method's ALLOCATING half of the pair.
+    // =========================================================================
+    // [og-netcode-v2-input-relay item 84, relocated item 86 -> item 90's sweep
+    // 2 -> RELOCATED HERE AT ITEM 94] Both halves of the frontier pair now
+    // live in the class that owns the slots: this sweep is the OPENING half,
+    // `postPredictionAll` below (one screen away) is the CLOSING half, the
+    // detector (`m_frontierSlotAwaitingState`) and the cache it guards are
+    // both members of the class this method is defined on. Every tick this
+    // method pushes via `pushPredictionTick` is completed by
+    // `postPredictionAll`'s `pushPredictionState` later in the SAME manager
+    // tick sequence (collect -> pre -> integrate -> post -> capture). Both
+    // halves gate on ONE predicate, `stepAllocatesFrontierSlot(StepKind)`
+    // (SimulationTimeContext.h) — never re-derive it. The pairing is why the
+    // cache may stamp `Predicted` at allocation; a violation is caught by the
+    // cache's `m_frontierSlotAwaitingState` check at the NEXT allocation
+    // (CorrectionCache.h, write site 1). Frontier advance touches no gate
+    // state (item 45); do not add gate writes here, and do not move this push
+    // to capture time — frontier timing is what `FrontierExact`'s anchor-set
+    // predicate is defined against (DesignInputResolutionPeer.md §B, §F).
+    //
+    // [item 94] THREE PRODUCTION CALL SITES OF `stepAllocatesFrontierSlot`
+    // STILL, NOT FEWER — but TWO OF THE THREE ARE NOW LOCAL TO THIS FILE, for
+    // the first time: this method's own evaluation below, and
+    // `postPredictionAll`'s early return. The third — the sweep-1 delay-line
+    // capture-history gate — stays in `SimulationInputResolution::
+    // collectInputForCharacter`, unmoved (see SimulationTimeContext.h's own
+    // banner for the full enumeration).
+    //
+    // [item 94] WHY THIS SWEEP CAN FILTER ON ITS OWN CACHE POPULATION, WITH NO
+    // REFERENCE TO RESOLUTION. "Prediction-owned id" is equivalent to "id with
+    // a correction cache" for every fully-registered id, on both roles: the
+    // client creates a cache for every registered id (cache-before-storage
+    // ordering, `SimulationNetSync.h`'s client `registerSimulatable` overload);
+    // the server creates none, ever (the server overload never calls
+    // `createCacheFor`). Filtering on `findInputCache<T>(id) != nullptr`
+    // therefore answers exactly "is this id prediction-owned" — no resolution
+    // reference, no cycle, no id-set duplicated in a second place (this is the
+    // fact that dissolves ground (i) of task 84's §B.3 caller-hoist rejection;
+    // see the corrected paragraph there).
+    //
+    // ⛔ ITERATION MUST BE STORAGE-DRIVEN, FILTERED ON THE NULLABLE
+    // `findInputCache` — NOT A BARE WALK OF THE CACHE MAP. A cache-map walk has
+    // its own client-teardown hazard: if `storage.remove` ran before the cache
+    // erase (it does not — item 93's reorder makes storage the FIRST thing to
+    // stop exposing an id — but this sweep must not assume that ordering to be
+    // safe), a dying id would still be swept — a `Skip` step's backfill would
+    // read absent storage, and a `Normal` step would allocate a slot whose
+    // capture (which also iterates storage) never completes, firing
+    // `m_frontierSlotAwaitingState` as a FALSE POSITIVE BY CONSTRUCTION.
+    // `for id in storage: cache = findInputCache(id); if (!cache) continue;`
+    // has neither problem, and makes the allocate-set a SUBSET of the
+    // capture-set by construction — both sweeps below and in `postPredictionAll`
+    // visit exactly the same population, storage's, for exactly this reason.
+    //
+    // ⚠ WHAT THIS TRADES AWAY, PRICED HERE RATHER THAN HIDDEN:
+    //   1. ITEM 92's LOUD GUARD IS GONE. This class cannot distinguish "an
+    //      authority id (correct skip)" from "a half-registered prediction id
+    //      (broken invariant)" — both read as `findInputCache == nullptr`, and
+    //      both are now silently skipped where item 92's `OG_CHECK` used to
+    //      abort loudly in `SimulationInputResolution::
+    //      allocateFrontierSlotForCharacter` (deleted by this task). The
+    //      ordering invariants that guard describes remain enforced by items
+    //      92/93's landed reorders and the registration-site comments and
+    //      LLTs — but the RUNTIME BACKSTOP that turned a broken invariant into
+    //      an immediate, attributed abort is gone. If it reopens, this sweep
+    //      no longer tells you; it just quietly does not allocate for that id.
+    //   2. THE CAN'T-MISUSE-IT FUSION WEAKENS. `SimulationInputResolution::
+    //      collectInputAll` is now callable without a paired call to this
+    //      method — a caller who collects and lets capture (`postPredictionAll`)
+    //      run anyway pushes state into the OLD frontier slot: blind spot #2 of
+    //      the detector below (the reverse direction — state pushed without a
+    //      paired allocation — is legal at the cache and is covered only by
+    //      the shared predicate, never by `m_frontierSlotAwaitingState`). See
+    //      `collectInputAll`'s own banner for the successor obligation this
+    //      trade motivates. [item 96] `SimulationInputResolution::
+    //      preparePredictionSimulationStep` is the documented door that calls
+    //      this method paired with `collectInputAll`, on the register/
+    //      unregister facade precedent — default-correctness and
+    //      discoverability, NOT enforcement; both methods stay public and
+    //      independently callable, and this blind spot is unchanged by its
+    //      existence.
+    //
+    // [item 90 / item 94] `[item 45]` RESTATED HERE, AT THE ALLOCATION SITE
+    // ITSELF: frontier advance touches no gate state. `pushPredictionTick` and
+    // `backfillSkippedTick` write the ring's slot directory and its state
+    // buffer; neither reads nor writes `needsResimulation` or any other gate-
+    // decision input. Do not add a gate write to this method.
+    //
+    // This method now JOINS `SimulationReconciliationConcept` — it is
+    // reconciliation-DISTINGUISHING, alongside `postPredictionAll` and
+    // `consumeResimAnchorsAll` (see this file's own concept, below, and the
+    // proof namespace in `SimulationManager.h`).
+    // =========================================================================
+    void allocateFrontierSlotsAll(const SimulationTimeStep& step)
+    {
+        // ONE evaluation for the whole tick — the same discipline item 90
+        // established for the (now-deleted) resolution-side sweep 2.
+        const bool allocatesSlot = stepAllocatesFrontierSlot(step.getStepKind());
+
+        m_storage.forEachSimulatable([&](unsigned int id, auto& simulatable) {
+            using T = std::remove_reference_t<decltype(simulatable)>;
+
+            // [item 94] THE FILTER — see the banner above for why this alone
+            // is sound: nullptr here means authority id, half-registered id or
+            // half-torn-down id, all correctly and silently skipped by the
+            // same test. Re-derived via the public nullable accessor rather
+            // than a private cache-pointer cache, so `pushPredictionTick` /
+            // `backfillSkippedTick` below re-look-up through `getCacheFor`'s
+            // `.at(id)` — safe, because this line already proved the entry
+            // exists; the double lookup mirrors the pre-94 loud-failure guard's
+            // own shape (`findInputCache` check, then `getCacheFor` writes) and
+            // is not a new cost.
+            if (findInputCache<T>(id) == nullptr)
+                return;
+
+            if (step.getStepKind() == StepKind::Skip)
+                backfillSkippedTick<T>(id, step.getTick() - 1, simulatable.getAllState().getState());
+
+            if (allocatesSlot)
+                pushPredictionTick<T>(id, step.getTick());
+        });
+    }
+
     // -----------------------------------------------------------------------
     // Post-prediction state push — called by SimulationManager after integrate
     // (replaces postSimulationAll from the retired SimulationNetworking class).
@@ -195,11 +325,28 @@ public:
 
     void postPredictionAll(const SimulationTimeStep& step)
     {
-        // [og-netcode-v2-input-relay item 84] THE COMPLETING half of the
-        // frontier-pair contract — see pushPredictionTick's header above.
-        // Was a literal `== StepKind::Stall` early return; now shares the one
-        // predicate both halves of the pair gate on, so a new StepKind can no
-        // longer make the two independently-written gates diverge.
+        // [og-netcode-v2-input-relay item 84, relocated item 94] THE
+        // COMPLETING half of the frontier-pair contract — see
+        // `allocateFrontierSlotsAll`'s banner above (one screen up, same file,
+        // as of item 94) for the full text. Was a literal `== StepKind::Stall`
+        // early return; now shares the one predicate both halves of the pair
+        // gate on, so a new StepKind can no longer make the two
+        // independently-written gates diverge.
+        //
+        // [item 94, D-2] NO CAPTURE-SIDE `OG_CHECK` HERE, AND THAT WAS
+        // AUDITED, NOT ASSUMED. A per-cache `getPredictionTick() ==
+        // step.getTick()` check was considered to close blind spot (ii)
+        // (state pushed without a paired allocation) and REJECTED: this
+        // method's one production caller (`SimulationManager::
+        // onPostGameSimulation`) always passes the SAME step
+        // `allocateFrontierSlotsAll` just ran for, but a character whose
+        // GAME-thread registration (`storage.add`, unsynchronized against
+        // this physics-thread sequence) completes between this tick's
+        // allocate call and this call is visible here with its cache still
+        // at its just-constructed frontier — an ordinary player-join
+        // condition indistinguishable, with the information available here,
+        // from a real violation. See DesignInputResolutionPeer.md's D-2
+        // section for the full audit and the named failing path.
         if (!stepAllocatesFrontierSlot(step.getStepKind()))
             return;
 
@@ -883,6 +1030,11 @@ template <typename T, typename... SimulatableTs>
 concept SimulationReconciliationConcept = requires(
     T& t, const SimulationTimeStep& step, uint32 tick)
 {
+    // [item 94] THE OPENING half of the frontier-pair contract, relocated
+    // here from the resolution peer's tick concept — reconciliation-
+    // distinguishing alongside postPredictionAll / consumeResimAnchorsAll
+    // below, per this method's own banner.
+    { t.allocateFrontierSlotsAll(step) };
     { t.postPredictionAll(step) };
     { t.postResimulationAll(step) };
     // [item 45] The gate read takes the DEPTH POLICY (0 == no policy) and reports
