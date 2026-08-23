@@ -8,8 +8,35 @@ piloted here by backlog item 65 (RN-15) — see that task's impl notes for the v
 split works. The header is the operational reference; read it first. Come here when you need the
 *why*, not the *what*.
 
+**If this file and `ResimGatePolicy.h` disagree, the header is authoritative and this file is
+stale.** The header holds the fences, the per-parameter contracts and the operational reference;
+this file holds only the *why*. Fix this file; do not soften the header to match it.
+
 Origin: `og-netcode-v2-input-relay` items 45/46/47/48, `design_task43_resim_gate_fix.md` §1/§3/§3.1/§4,
 `finding_task31_resim_rate.md` (the defect this repairs), and `ReviewNotes.md` RN-15 (this split).
+
+> ⚠ **Every document named in that Origin line — and `finding_task43_resim_gate_live.md`,
+> `current_state.md` and `impl/impl_notes_task65.md` named later — is private working material from
+> the `og-netcode-v2-input-relay` initiative archive and is NOT distributed with this submodule.**
+> They are named as provenance, deliberately unlinked; every claim this file *asserts* is anchored
+> to a file in this repository and only to those. The declarations below tell
+> `tools/lint/doc_anchor_lint.ps1` that these names are intentionally unresolvable.
+>
+> ⚠ **Retired names, kept on purpose.** This file is largely history, so it names identifiers that
+> no longer exist. Each is declared below with what it became, per the initiative's amended tense
+> rule (closed tense protects the *claim*, never the *symbols* the claim names):
+> `m_isResimulated` → retired with item 45; the edge-triggered replacement is the single atomic word
+> `m_pendingResimAnchorTick` (§1). `resimCooldownTicks` → **never shipped**: built during item 45,
+> then removed on the 2026-08-11 user ruling §3 records; there is no successor by design.
+
+<!-- lint-external-ref: design_task43_resim_gate_fix.md -- og-netcode-v2-input-relay initiative archive; private working material, not distributed with this submodule -->
+<!-- lint-external-ref: finding_task31_resim_rate.md -- og-netcode-v2-input-relay initiative archive; private working material, not distributed with this submodule -->
+<!-- lint-external-ref: finding_task43_resim_gate_live.md -- og-netcode-v2-input-relay initiative archive; private working material, not distributed with this submodule -->
+<!-- lint-external-ref: ReviewNotes.md -- og-netcode-v2-input-relay initiative archive; private working material, not distributed with this submodule -->
+<!-- lint-external-ref: current_state.md -- og-netcode-v2-input-relay initiative archive; private working material, not distributed with this submodule -->
+<!-- lint-external-ref: impl/impl_notes_task65.md -- og-netcode-v2-input-relay initiative archive; private working material, not distributed with this submodule -->
+<!-- lint-external-ref: m_isResimulated -- RETIRED NAME (item 45): the per-slot provenance bitset; became the single atomic m_pendingResimAnchorTick and must not resolve -->
+<!-- lint-external-ref: resimCooldownTicks -- RETIRED NAME (item 45): a rate ceiling built and then removed on the 2026-08-11 ruling in section 3; it has no successor and must not resolve -->
 
 ## 1. What the gate used to be, and why it changed
 
@@ -62,8 +89,9 @@ The argument is about correctness, not cost:
    free-runs on state the authority has already contradicted. That is the same defect with a smaller
    constant.
 2. **The throttle is already structural**, and it is demand-driven rather than arbitrary: the gate is
-   consulted only on non-resim physics frames (Chaos calls `TriggerRewindIfNeeded_Internal` on solver
-   advances, never inside its own rewind loop), and the anchor is consumed only on the completion edge.
+   consulted only on non-resim physics frames — the host physics engine asks whether to rewind on
+   solver advances only, never from inside its own rewind loop (one adapter's binding: Chaos calling
+   `TriggerRewindIfNeeded_Internal`) — and the anchor is consumed only on the completion edge.
    So at most one resim can be in flight, and at most one more can be pending. Corrections arriving
    during a replay coalesce into the pending anchor via the CAS-max and fire once, as a single deeper
    replay, instead of N shallow ones. The bound is "one resim per completed resim", which scales with
@@ -73,14 +101,17 @@ The argument is about correctness, not cost:
    red, the rate ceiling is gone too.
 3. The storm this point once argued "sequencing forbids" already ships. `OnDisagreement` combined
    with item 30's degenerate always-false verdict has been the live shipped configuration since
-   item 43 (`Config/DefaultEngine.ini:371` — check that file for the current value, not this
+   item 43 (set at the `ResimTriggerPolicy` key under `[OGNetcode]` in one adapter's host
+   configuration, `Config/DefaultEngine.ini` — check that key for the current value, not this
    sentence, since it can change again). Item 43 measured it directly: resims fired on 86–87% of
    physics frames at 6.35×/4.18× integration cost (`finding_task43_resim_gate_live.md`). The user
    ruling that shipped it anyway (`current_state.md`, 2026-08-12) is that the direct behavioural
    improvement — a proxy's wrong prediction converging instead of persisting — outweighs the
    degenerate metrics; the storm is accepted, not prevented by sequencing. Item 46 (the *compiled
-   default's* own flip to `OnDisagreement`) remains blocked on item 30 — that only governs what a
-   build with no ini override runs, not whether this storm runs today.
+   default's* own flip to `OnDisagreement`) is **sequenced after** item 30, which the same
+   2026-08-12 ruling reclassified from a blocker into a cost reduction — see §10, which states the
+   same sequencing. Either way it governs only what a build with no ini override runs, not whether
+   this storm runs today.
 4. If the measured rate is still unaffordable once the verdict works (design §4's honest unknown:
    remote proxies may carry a structural disagreement rate), the correct knob is **per-class
    triggering** — proxies weighted differently from locally-predicted characters — not a blanket delay.
@@ -116,10 +147,12 @@ reach the apply edge, and the frontier keeps advancing throughout). Legacy retri
 the skip abandons it. That is a real behaviour change in a regime whose duration nobody has measured
 yet — which is why the ceiling is gated on the trigger policy rather than always on.
 
-The shipped config (`Config/DefaultEngine.ini:371`, `OnDisagreement` since item 43) already turns the
+The shipped config (the `ResimTriggerPolicy` key under `[OGNetcode]`, `OnDisagreement` since
+item 43; one adapter reads it from `Config/DefaultEngine.ini`) already turns the
 trigger and its depth ceiling on together — this is the live configuration §4's cost envelope is
 computed for, and item 43 measured it directly (§10). Item 46 (the *compiled default's* own flip) is
-the separate, still-blocked question of what a build with no ini override runs; it does not gate
+the separate question of what a build with no ini override runs, **sequenced after** item 30 rather
+than blocked by it (2026-08-12 ruling; §3 and §10 state the same sequencing). It does not gate
 whether this configuration runs today.
 
 ## 6. The defect this repairs — the HOLLOW ANCHOR
@@ -201,7 +234,7 @@ supposed to act on. It misses (a) when the mid-replay landing sits *below* the c
 is reachable because the restore tick is a min across characters and another character's deeper anchor
 can drag the span below this one's.
 
-**Why the naive form fails, precisely:** `containsCorrectTick && tick > runningAnchor` reaches for a
+**Why the naive form fails, precisely:** `containsCorrectTick && tick > runningAnchor` reaches for a <!-- lint-anchor-ignore: the NAIVE form the header's fence forbids; `runningAnchor` is deliberately not a name in this tree and must not resolve -->
 single global (min-folded) anchor. With that anchor, population (b) misclassifies wholesale — the
 newer-anchored character's slots sit above the global min, so everything reads "fresh" and the counter
 stops discriminating. The anchor compared against must be the **per-cache** capture taken at
@@ -215,7 +248,7 @@ structural zero below honest.
 
 **Stale is a 2+-character-only signal — a free classifier-wiring check** (item 47's reachability
 analysis, inherited rather than re-derived). For a single character the replay span is
-`anchor+1..frontier` and "stale" needs `tick < capturedAnchor`: disjoint ranges. The only reachable
+`anchor+1..frontier` and "stale" needs `tick < capturedAnchor`: disjoint ranges. The only reachable <!-- lint-anchor-ignore: prose shorthand for the per-cache capture; the real parameter is capturedAnchorTick, named in full two paragraphs above -->
 stale population is a non-min character B restored at the shared min, whose span `min+1..frontier` dips
 below B's own captured anchor `A_B`, passing B's older corrections in `(min, A_B)`. So
 `staleClobbersAvoided` must read 0 in any single-character session; a nonzero there means the classifier
@@ -226,7 +259,7 @@ is wired to the wrong anchor, not that a new population appeared.
 `ResimSlotWriteOutcome::outcome != Written` **is** the protection — the action is derived from the
 classifier's return value, rather than decided beside it, and that is a correctness property, not a
 style choice. It was found by a mutation run: an earlier draft had a separate
-`replayMayOverwriteSlot(bit)` predicate at the write site and used `classifyResimSlotWrite` only for
+`replayMayOverwriteSlot(bit)` predicate at the write site and used `classifyResimSlotWrite` only for <!-- lint-anchor-ignore: a REJECTED earlier draft's predicate; the mutation run is the reason it does not exist, so it must not resolve -->
 the counter. Breaking that predicate alone (a one-line mutation) produced a build in which the slot
 *was* overwritten while the outcome still reported `ProtectedFresh` — i.e. `freshClobbersAvoided`
 counting clobbers it had not avoided, which is precisely the "instrument measuring the wrong quantity
@@ -258,7 +291,8 @@ fallback so far; recorded here so a future implementer does not have to re-deriv
 - Design §4's modelled cost of the degenerate always-false verdict under `OnDisagreement`: a 3-6x
   physics-cost storm — superseded by item 43's live measurement (6.35×/4.18× integration cost,
   above), not a hypothetical this sequencing prevents. Items 28→30 are sequenced as COST REDUCTIONS
-  for a gate that already ships (`Config/DefaultEngine.ini:371`, since item 43), not as blockers
+  for a gate that already ships (the `ResimTriggerPolicy` key under `[OGNetcode]`, since item 43;
+  one adapter reads it from `Config/DefaultEngine.ini`), not as blockers
   that prevent it from shipping; item 46 (the compiled default's own flip) remains sequenced after
   30.
 

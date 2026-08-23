@@ -10,9 +10,10 @@
 // ReplicatedTierConsumer — the CLIENT half of C.2 (Stage 5 / D5.1, T9).
 //
 // OPTION A, locked 2026-07-19 (backlog C1). The RTT tier is derived exactly
-// once, by the SERVER, from the server's own per-connection FNetPing RoundTrip
-// (ASimulationManagerUImpl::sampleAndDeriveConnectionTier), and the resulting
-// index is replicated COND_OwnerOnly to the owning client. This class is the
+// once, by the SERVER, from the server's own per-connection round-trip estimate,
+// in the adapter's composition root — one adapter binds that to
+// `ASimulationManagerUImpl::sampleAndDeriveConnectionTier` — and the resulting
+// index reaches the OWNING CLIENT ONLY. This class is the
 // client's entire share of the tier system:
 //
 //   * it does NOT own a ConnectionTierTable,
@@ -35,9 +36,9 @@
 // estimator.
 //
 // POST-T10 PLACEMENT, and it is load-bearing for T11. Since the tier-channel
-// migration this class is instantiated ONCE PER WORLD, owned by
-// ASimulationManagerUImpl and fed by the per-connection ASimulationConnectionRelay
-// (it used to be one instance per CHARACTER on the update component). It is
+// migration this class is instantiated ONCE PER WORLD, owned by the adapter's
+// composition root and fed by its per-connection tier relay (it used to be one
+// instance per CHARACTER on the update component). It is
 // therefore THE client's tier cache, and `effectiveInputDelayTicks` below is the
 // tier half of T11's shared two-input recompute — the floor half is the
 // session-scoped `TimeConfig::relayDelayFloorTicks`, written into the SAME
@@ -57,16 +58,19 @@
 // tier-0 timing.
 //
 // ENGINE-AGNOSTIC. Sim core: STL plus `OGSimulation/` headers only. The
-// replicated value arrives as a plain integer; the UE transport
-// (USimmableUpdateComponent's COND_OwnerOnly uint8 + OnRep_ConnectionTier) stays
-// entirely on the UE side.
+// replicated value arrives as a plain integer; the transport that carries it —
+// a replicated byte narrowed to the owning client, plus the arrival callback
+// that hands it over — stays entirely on the adapter side. One adapter binds
+// that to `ASimulationConnectionRelay`'s `OnRep_ConnectionTier`, where the
+// narrowing is the relay actor's owner-only RELEVANCY rather than a per-property
+// replication condition.
 //
 // THREADING. Not thread-safe, and single-threaded by construction: the only
-// mutator (`onReplicatedTierReceived`) is called from OnRep_ConnectionTier, which
-// is a GAME-THREAD UObject callback. A reader on the physics thread would be an
-// unsynchronised cross-thread read — see the THREADING CONTRACT block in
-// ServerInputDelayQueue.h for why adding a lock is the wrong fix for that shape
-// of problem.
+// mutator (`onReplicatedTierReceived`) is called from that arrival callback,
+// which is a GAME-THREAD replication callback. A reader on the physics thread
+// would be an unsynchronised cross-thread read — see the THREADING CONTRACT
+// block in ServerInputDelayQueue.h for why adding a lock is the wrong fix for
+// that shape of problem.
 //
 // NAMESPACE NOTE: declared in the GLOBAL namespace, matching the rest of the
 // OGSim core (same note as ConnectionTierTable / NetConfig / SimulatableList).

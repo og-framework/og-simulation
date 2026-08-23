@@ -97,8 +97,9 @@
 // this container is ever touched from the physics thread. A future caller that
 // wants to dequeue from the physics thread must NOT simply add a lock here: a
 // lock would fix this container's internal race and still leave the caller doing
-// UObject traversal (`TWeakObjectPtr::Get`, `AActor::GetNetConnection`) from the
-// physics thread, which this codebase forbids.
+// ENGINE-OBJECT traversal on the physics thread — resolving a weak object handle
+// (one adapter: `TWeakObjectPtr::Get`), then walking from the owning actor to its
+// transport connection (`AActor::GetNetConnection`) — which this codebase forbids.
 // ---------------------------------------------------------------------------
 //
 // CONSUMER: wired in Phase B (T10) — the UE server binding parks inbound RPC

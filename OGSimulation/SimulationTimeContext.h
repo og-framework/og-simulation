@@ -15,7 +15,8 @@
 OGSIM_OPTIMIZE_OFF
 
 // Replaces bool isStalling / bool isSkipping pair on SimulationTimeStep.
-// isResimulation stays a separate axis — resim is driven by Chaos, not the clock.
+// isResimulation stays a separate axis — resim is driven by the physics engine's
+// rewind, not the clock.
 enum class StepKind : uint8_t
 {
     Normal,     // sim tick advances by 1

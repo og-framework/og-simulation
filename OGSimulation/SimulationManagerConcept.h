@@ -14,10 +14,13 @@ concept SyncedTimingBufferConcept = requires(BufferT& b, const ServerTickClock& 
     { b.write(clock) };
 };
 
-// Owner-layer concept for ASimulationManagerUImpl.
+// Owner-layer concept for the composition root that owns a SimulationManager.
+// One adapter's binding: `ASimulationManagerUImpl`, whose replicated timing-info
+// arrival callback is `OnRep_TimingInfo`.
 // Server side: getSyncedTimingBuffer() is writable; SimulationManager writes the server
 // clock into it each tick via write(). Client side: setOnTimingInfoReceivedCallback
-// registers the deserialized-tick+RTT handler; OnRep_TimingInfo fires it.
+// registers the deserialized-tick+RTT handler; the adapter's timing-info arrival
+// callback fires it.
 template <typename OwnerT>
 concept SimulationManagerOwnerConcept =
     requires(OwnerT& owner,

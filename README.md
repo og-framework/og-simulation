@@ -5,7 +5,7 @@ OG Simulation is a game-agnostic, deterministic C++20 simulation framework. It p
 
 ## Position in the og-framework graph
 
-og-simulation is the **pure C++ simulation core**. It has no build-system root and no Unreal Engine dependencies.
+og-simulation is the **pure C++ simulation core**. It has no build-system root and no Unreal Engine dependencies, with exactly one documented exception: `OGSimulation/OGSimulation.cpp`, the UE module stub, carries the only UE include and the only UE macro (`IMPLEMENT_MODULE`) in the core — and `OGSimulation/CMakeLists.txt` removes that one file from the standalone build, under the comment *"UE-only files that cannot compile in the standalone CMake build"*. Consume this repo standalone and that stub is never compiled.
 
 ```
 og-simulation  (this repo — pure source)

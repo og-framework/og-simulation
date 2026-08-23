@@ -4,9 +4,22 @@
 This is the one place the diagnostics vocabulary used across `og-simulation` is defined. Files that
 carry a view or a fenced instrument point here with a one-line comment instead of restating this.
 
+**If this file and a header disagree, the header is authoritative and this file is stale.** This doc
+defines the vocabulary; the sites named below hold the truth about what they actually do. Fix this
+file; do not soften a header to match it.
+
 Origin: `ReviewNotes.md` RN-2/RN-3/RN-4/RN-5/RN-7/RN-9 (+ the RN-9 amendment) and
 `ObservabilityGapAnalysis.md` §7.6, in the `og-netcode-v2-input-relay` initiative workspace. This doc
 supersedes the RN-9 amendment's wording (below); it does not change any ruling's outcome.
+
+> ⚠ **Those two documents are private working material and are NOT distributed with this
+> submodule.** They are named here as provenance, deliberately unlinked; every claim this file
+> *asserts* is anchored to a file in this repository and only to those. The declarations below tell
+> `tools/lint/doc_anchor_lint.ps1` that the two names are intentionally unresolvable, so it
+> enumerates them with this reason instead of reporting them as drift.
+
+<!-- lint-external-ref: ReviewNotes.md -- og-netcode-v2-input-relay initiative archive; private working material, not distributed with this submodule -->
+<!-- lint-external-ref: ObservabilityGapAnalysis.md -- og-netcode-v2-input-relay initiative archive; private working material, not distributed with this submodule -->
 
 ## 1. The view convention
 
@@ -15,9 +28,10 @@ supersedes the RN-9 amendment's wording (below); it does not change any ruling's
 `editNetworkEstimator`, `editClientClock`, `editPhysicsComposite`. `getDiagnostics()` (const) /
 `editDiagnostics()` (non-const) apply that same pair to diagnostics.
 
-Members *inside* a view carry no `get` prefix and no `Diagnostic` infix — the view's TYPE is the
+Members *inside* a view carry no `get` prefix and no `Diagnostic` infix — the view's TYPE is the <!-- lint-anchor-ignore: `Diagnostic` here is a naming INFIX under discussion, not a type this file claims exists -->
 marker. `cache.getDiagnostics().slotLandingSeqNr(i)`, not
-`cache.getDiagnostics().getDiagnosticSlotLandingSeqNr(i)`: the outer call already says "diagnostics",
+`cache.getDiagnostics().getDiagnosticSlotLandingSeqNr(i)`: the outer call already says "diagnostics", <!-- lint-anchor-ignore: the ANTI-example this rule forbids; `getDiagnosticSlotLandingSeqNr` must NOT resolve, and the day it does this convention has been broken -->
+
 so repeating it on every member triples the word for no information. A nested view class has the
 same access to its outer class's private members as any other member function — no `friend` needed.
 
@@ -77,7 +91,7 @@ examples, none of them touchable by this convention:
   — under the shipped `ResimTriggerPolicy=OnDisagreement` this boolean decides whether a resim runs at
   all. `CorrectionInsertVerdict`/`outDiagnosticVerdict` is a copy for reporting; the fact itself is not
   diagnostic and `isSimilarTo` must never be described as removable.
-- **The depth-policy skip** (`checkDivergenceAll`'s `if (!withinDepth) { ++deepAnchorSkips; return; }`)
+- **The depth-policy skip** (`checkDivergenceAll`'s `if (!withinDepth) { ++diagnosticDeepAnchorSkips; return; }`)
   — the `return` is the depth policy doing its job (item 45); only the `++` is observation. The four
   dual-use locals that feed both the decision and the log line (`needsResim`, `anchorTick`,
   `predictionTick`, `withinDepth`) are never marked, moved, or guarded behind a diagnostic branch.

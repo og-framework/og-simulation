@@ -1,0 +1,1 @@
+- [Fork identity & duplicate-dispatch](feedback_fork_identity_and_duplicate_dispatch.md) — ListAgents' "main session" string doesn't disambiguate fork vs parent; use spawn/nesting behavior instead; de-dupe collisions cooperatively, not by rewrite war.

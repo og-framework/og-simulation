@@ -10,81 +10,76 @@
 #include <vector>
 
 // ---------------------------------------------------------------------------
-// RemoteInputCache<InputT> — the CLIENT-side read cache of RELAYED inputs.
-// (og-netcode-v2-input-relay T5; RelayDelaySpectrumDesign.md §4, §5.2, §8.6/§8.7.)
+// RemoteInputCache<InputT> -- the CLIENT-side read cache of RELAYED inputs.
 //
-// WHAT IT IS. One store per REMOTE character (a character this client does not
-// control). It accumulates the `(captureTick, dA, input)` entries the server
-// relays for that character — `dA` being the SCHEDULE STAMP, the effective input
-// delay the server held for that wire at receipt — so that:
+// ORIENTATION
 //
-//   * T7's proxy prediction can read `find(N - dLatest)` and integrate the
-//     character's REAL input at (approximately) the tick the authority applies
-//     it, instead of extrapolating the last correction; and
-//   * T6's resim can resolve `find(ref)` for the applied-capture-tick reference
-//     the correction state carries, i.e. replay exactly what the authority did.
+// ONE STORE PER REMOTE CHARACTER -- a character this client does not control. It
+// accumulates the `(captureTick, dA, input)` triples the server relays for that
+// character. `dA` is the SCHEDULE STAMP: the effective input delay the server held
+// for that wire when it received the capture.
+//
+// TWO READERS, ONE STORE:
+//   proxy prediction  find(N - dLatest)  integrate the sender's REAL input at
+//                                        (about) the tick the authority applies it
+//   resim             find(ref)          replay exactly what the authority did;
+//                                        `ref` is the applied-capture-tick reference
+//                                        the correction state carries
+//
+// THE THREE NAMES. Two of them are now symmetric and their contracts are not:
+//   LocalInputCache<InputT>   this machine's OWN captures, read at `T - d`.
+//                             Sender-side delay mechanism. CLOCK-KEYED.
+//   the relayed input ring    the WIRE payload, server -> peers. Bytes, plus its
+//                             codec in core. One adapter's binding:
+//                             `FRelayedInputRing`.
+//   RemoteInputCache<InputT>  THIS: the client's typed read-side cache. SENDER-KEYED.
+//
+// THE CONTRACTS, one line each. Every one is fenced at its own declaration:
+//   find()               PURE hit/miss. Never invents; the miss stays visible.
+//   findLatest()         A DERIVATION over the slots. `dLatest` / `lastKnown` are
+//                        views on it; neither is a field.
+//   fallback()           ARGUMENT-LESS. Newest arrived input, else the INJECTED zero.
+//   push()               LAST-WINS on a resident tick, so ingest is idempotent.
+//   kNoInputCaptureTick  NEVER a store key, on the write path or the read path.
+//   capacity             64 slots -- and the number is load-bearing for the relay
+//                        delay floor's hard cap.
+//
+// THREADING: GAME-thread write, PHYSICS-thread read, NO SEAM. Accepted, priced,
+// correction-healed debt -- `docs/ThreadingCrossings.md` row 1, analysis of record in
+// `docs/RemoteInputCache-rationale.md` §6. The PROHIBITIONS stay here.
+//
+// WHAT PINS WHAT, so a reader knows which test breaks on a change:
+//   no wipe surface exists       `RemoteInputCacheTest.cpp` -- the `HasClearMethod`
+//                                static_assert pair, and its own TEST_CASE
+//   the wipe asymmetry, live     `SimulationInputResolutionTest.cpp` -- three cases,
+//                                named at the WIPE ASYMMETRY fence
+//   ingest + the version fence   `RemoteInputCacheTest.cpp`
+//   the one-shot mismatch gate   `NetSyncTelemetryTest.cpp` (it left this class)
+//
+// ENGINE-AGNOSTIC. STL plus other OGSimulation core headers only. The ring arrives as
+// a template parameter satisfying the codec's BUFFER CONCEPT, which is what lets the
+// pure-C++ Low-Level-Tests drive the REAL ingest path against a std::vector buffer.
+// GLOBAL NAMESPACE, like the rest of the OGSim core (same note as LocalInputCache /
+// ConnectionTierTable / SimulatableList). The design corpus writes `ogsim::`; no such
+// namespace exists in this tree.
+//
+// Derivations, history and the deferred work: `docs/RemoteInputCache-rationale.md`.
+// The end-to-end narrative:                   `docs/Perspective-RemoteInputFlow.md`.
 //
 // ---------------------------------------------------------------------------
-// THE THREE NAMES, AND WHY THIS IS NOT A LocalInputCache
-// (architect ruling 2026-08-04; vocabulary lockdown in the design doc's §4 table).
+// WHY THIS IS NOT A LocalInputCache -- three facts, and the third is decisive. §1
 //
-//   LocalInputCache<InputT>       the LOCAL character's own captures, read at
-//                                 `T - d`. Sender-side delay mechanism.
-//   FRelayedInputRing (+ codec)   the WIRE payload, server -> peers. Bytes.
-//   RemoteInputCache<InputT>      THIS: the client's typed read-side cache.
-//
-// The earlier plan was to reuse LocalInputCache. Three accumulated facts
-// flipped that trade, and the third is decisive:
-//
-//   1. THE PAYLOAD DIFFERS. A slot here is `(dA, input)`, not `InputT` — reuse
-//      already meant a widened slot plus sidecar fields.
-//   2. THE MISS SEMANTICS DIFFER. `at()` on the delay line INVENTS the neutral on
-//      a miss; `find()` here is pure hit/miss and never invents anything, because
-//      T7's ladder must SEE the miss in order to fall back to last-known. The
-//      store has no neutral on the lookup path at all.
-//   3. THE WIPE DIVERGES — and this is the one that makes reuse unsafe rather
-//      than merely awkward. `LocalInputCache::clear()` is CONTRACTUALLY swept
-//      by SimulationInputResolution::wipeAllForResync (re-pointed off
-//      SimulationNetSync, item 87; item 91 part J1), because a local capture is keyed
-//      to the pre-resync PREDICTION clock and stops meaning anything when that
-//      clock jumps. A relayed entry is keyed to the SENDER's capture tick — a
-//      server-domain identity that a LOCAL hard resync does not invalidate. A
-//      reused type would be wiped by whoever next mirrors the existing per-id map
-//      loops in that function, silently, and the only symptom would be a proxy
-//      that goes blind for a window after every resync. See the deliberate
-//      NON-wipe comment at the wipeAllForResync site.
-//
-// COMBINED SLOT, NEVER PARALLEL RINGS (architect ruling). `dA` and `input` live
-// in ONE slot keyed by ONE capture tick. Two parallel rings would silently defeat
-// T7's verify step, which checks a candidate tick against ITS OWN stamp — with
-// two rings it would be checking ring-A's tick against ring-B's stamp.
+// * THE PAYLOAD DIFFERS: a slot here is `(dA, input)`, not `InputT`.
+// * THE MISS SEMANTICS DIFFER: the delay line's `at()` INVENTS the neutral on a miss;
+//   `find()` here never invents anything.
+// * THE WIPE DIVERGES -- see the WIPE ASYMMETRY fence at the class declaration.
 //
 // ---------------------------------------------------------------------------
 // "LATEST" IS DERIVED, NOT STORED (architect ruling 2026-08-04, user-directed).
 //
-// `findLatest()` — a scan of the occupied slots for the highest capture tick — IS
-// the truth. The design vocabulary's `dLatest` and `lastKnown` are VIEWS on that
-// derivation (`findLatest().dA` and `findLatest().input`, the latter surfaced as
-// `fallback()`); they are not fields and there is no second source of truth.
-//
-// WHY THIS IS A RULING AND NOT A PREFERENCE. A stored "latest" scalar needs a
-// `>=` update rule, not a `>` one: `push` is last-wins, so a re-stamp of the
-// ALREADY-latest capture tick with a FRESHER `dA` must overwrite the scalar. Get
-// that wrong and `dLatest` goes stale precisely during a delay transition — the
-// one moment it matters. Deriving deletes the invariant outright: `push` rewrites
-// the slot in place and the derivation reads the slot's current `dA`.
-//
-// COST is <= `capacity()` comparisons. The only site that could ever matter is
-// T6's frontier ticks inside a deep resim (<= ~20 replayed ticks x N characters).
-// IF A PROFILE EVER JUSTIFIES A MEMO it must be `private`, `mutable`, co-located
-// immediately with `findLatest()`, refreshed ONLY inside the mutators, never
-// writable from outside, carry the header comment "this is a memo; if it and
-// findLatest() disagree, findLatest() is right" — and it may NOT land without the
-// randomized-equivalence test named in T5's acceptance criteria.
-//
-// `fallback()` shares the SAME private scan as `findLatest()` (see
-// `latestSlotIndex`) precisely so that "one derivation" stays literally true
-// rather than being two functions that happen to agree today.
+// ⛔ DO NOT ADD A STORED `dLatest`: `push` is last-wins, so it needs `>=`, not `>`. §3
+// ⛔ A MEMO NEEDS private + mutable + mutator-only refresh + an equivalence test. §3
+// ⛔ COMBINED SLOT, NEVER PARALLEL RINGS -- two rings verify tick A against stamp B. §1
 //
 // ---------------------------------------------------------------------------
 // FALLBACK, AND THE DELIBERATELY ABSENT HOLD RULE (scope ruling 2026-08-04).
@@ -98,14 +93,14 @@
 //     geometry entirely (two different leads over the server, ~5-15 ticks of
 //     noise). The future rule adds the parameter; pre-adding it unused would
 //     invite someone to feed it a tick from the wrong domain.
-//   * Unbounded hold is ALREADY today's behaviour — the proxy branch reads the
+//   * Unbounded hold is ALREADY today's behaviour -- the proxy branch reads the
 //     correction cache's last input, which persists indefinitely if corrections
 //     stop. Deferring therefore preserves the increment's headline
 //     no-observable-regression gate rather than risking it.
 //
-// THE DEFERRED RULE, so it is not lost (also RelayDelaySpectrumDesign.md §8.7 and
-// the Backlog's "Out of scope"): hold last-known at most K ticks, then fall to the
-// game zero. It matters because relay silence does NOT mean "the player is idle" —
+// THE DEFERRED RULE, so it is not lost (also `docs/RemoteInputCache-rationale.md`
+// §5): hold last-known at most K ticks, then fall to the
+// game zero. It matters because relay silence does NOT mean "the player is idle" --
 // the input provider is polled every tick, so a motionless player still emits a
 // full-rate stream of neutral-CONTENT captures. Silence means the WIRE is quiet
 // (starvation, loss burst, pre-registration, disconnect-in-progress), and the
@@ -113,143 +108,64 @@
 // connection. Holding a stale "moving forward + attacking" input indefinitely is
 // the phantom-hit class. Eviction does not bound it by itself: slots are reclaimed
 // by OVERWRITE, never by time, so a silent relay evicts nothing. It becomes
-// LOAD-BEARING at sparse state (a longer heal interval is a longer hold window) —
-// a named prerequisite of that increment, not optional polish. T9's probe records
-// the max consecutive `fallback()` run so K is set from data.
-//
-// THE NEUTRAL IS INJECTED, NEVER `InputT{}` — the same load-bearing distinction
-// LocalInputCache documents: `simulatableBrawler::getZeroPlayerInput()`
-// builds forward vectors of (0,0,1), while a value-initialised PlayerInput would
-// carry a (0,0,0) forward vector into normalisation. The default `InputT{}` here
-// exists purely so an engine-free unit test can construct a store without a game
-// type. SimulationInputResolution::setNeutralInput (re-pointed off SimulationNetSync,
-// item 87; item 91 part J1) injects the real one into every store.
+// LOAD-BEARING at sparse state (a longer heal interval is a longer hold window) --
+// a named prerequisite of that increment, not optional polish.
+// `RelayReadProbe.h`'s `maxConsecutiveFallbackRun` records the longest observed run,
+// so K is set from data.
 //
 // ---------------------------------------------------------------------------
-// SENTINEL + INITIAL-STATE CONTRACTS.
-//
-//   * `kNoInputCaptureTick` is NEVER a store key. `push` rejects it outright and
-//     `find` refuses to look it up. This is defensive — the relay path only ever
-//     carries real capture ticks — but the store must not be poisonable by a
-//     future feeder, because the semantic layer above (T6) resolves a sentinel ref
-//     to the game zero and must never see it become a successful lookup.
-//     Reserving the value costs nothing: 2^32 ticks at 60 Hz is ~828 days.
-//   * `!findLatest().valid` (nothing has ever arrived) MUST mean NO SCHEDULED
-//     PROBE AT ALL, not a probe with a default `dA` of 0. Probing `find(N)` can
-//     genuinely HIT for a LAN peer; T7's verify would then reject it on the stamp,
-//     so it is not a correctness hole today — but "accidentally safe because a
-//     later check catches it" is not a contract. T7 states and honours the skip.
+// ⛔ THE NEUTRAL IS INJECTED, NEVER `InputT{}` -- value-init aims (0,0,0), not (0,0,1). §4
+// ⛔ `InputT{}` exists ONLY so an engine-free unit test can build a store. §4
+// ⛔ `kNoInputCaptureTick` IS NEVER A STORE KEY: `push` rejects it, `find` refuses it. §4
+// ⛔ `!findLatest().valid` MEANS NO SCHEDULED PROBE AT ALL, never a probe at `dA` 0. §4
 //
 // ---------------------------------------------------------------------------
-// THREADING — GAME-THREAD WRITE / PHYSICS-THREAD READ. ACCEPTED DEBT.
-// (Ruling 2026-08-04, option (a); the claims below were source-verified by the
-//  2026-08-04 pre-dispatch review and are stated here as FACT, not as hope.)
+// THREADING -- GAME-THREAD WRITE / PHYSICS-THREAD READ. ACCEPTED DEBT.
+// (Ruling 2026-08-04, option (a); source-verified at the time, stated as fact.)
 //
-// WRITER: `USimmableUpdateComponent::OnRep_RelayedInputRing` fires on the GAME
-// thread and calls straight through to `populateRemoteInputCache` below.
-// READER: `SimulationInputResolution::prepareSimulationStep` (T7; named
-// `collectInputAll` before item 90's rename) and
-// `SimulationInputResolution::collectResimInputAll` (T6, which relocated it off
-// SimulationReconciliation) read on the PHYSICS
-// thread under `bTickPhysicsAsync`. [item 91 part J1: both re-pointed off
-// SimulationNetSync onto SimulationInputResolution, item 87's promotion —
-// this block is the one `docs/ThreadingCrossings.md` row 1 cites as
-// authoritative, so it must name the current owner.]
+// WRITER: the adapter's relayed-ring arrival callback, on the GAME thread, routed into
+// `populateRemoteInputCache`. READER: `SimulationInputResolution::collectInputAll` and
+// `SimulationInputResolution::collectResimInputAll`, on the PHYSICS thread, i.e. only
+// where the host ticks physics asynchronously. ONE ADAPTER'S BINDING FOR BOTH ENDS:
+// the async-physics switch is `bTickPhysicsAsync`; the arrival callback is
+// `ASimulationInputRelay::OnRep_RelayedInputRing`, which hands the ring to the owning
+// per-character component and thence to the core callback `registerPredictionOwner`
+// installed. `docs/ThreadingCrossings.md` row 1 cites this block as authoritative.
 //
-// DO NOT COPY LocalInputCache's "NOT thread-safe; single-threaded by
-// construction... both on the PHYSICS thread" claim along with the ring mechanics.
-// That sentence is TRUE for the delay line (its push and its read are two
-// statements inside one `prepareSimulationStep` call) and FALSE for this type. A false
-// threading contract is worse than none, and a reviewer should reject a copied one
-// outright.
-//
-// WHY THIS IS ACCEPTED RATHER THAN FIXED HERE:
-//   * IT IS INHERITED, NOT INTRODUCED. `OnRep_CorrectionState` is likewise
-//     game-thread and calls `injectCorrectionState` DIRECTLY — no queue, no seam —
-//     while the same two physics-thread readers read the correction cache. T2
-//     recorded the same inheritance for `m_lastUsedInputs` and, after T8 retired
-//     that map, for its surviving twin `m_lastUsedCaptureTicks`. This store widens
-//     nothing.
-//   * THE FAILURE MODE IS A TORN SLOT, NOT CONTAINER UB. Storage is a fixed-size
-//     slot array (as `CorrectionCache` and `RemoteMoveQueue` both are): there is no
-//     rehash to race, so this is emphatically NOT the situation that forced T10's
-//     R2 restructuring. The worst case is one bad input, on one proxy, for one
-//     tick.
-//   * ITS WORST CONCRETE SHAPE, stated plainly rather than left abstract: a torn
-//     FORWARD VECTOR can transiently read near-zero, producing one tick of
-//     degenerate (or NaN) state on that proxy.
-//   * AND IT IS CORRECTION-HEALED, INCLUDING ON A FRONTIER TICK. The heal is the
-//     STATE anchor, not corrected-input replay: a torn read on a frontier tick
-//     mispredicts, but at every-frame correction cadence that tick is itself
-//     corrected shortly after — and the resim then re-reads the store, by which
-//     time the write has long since completed (tears are transient). Hit detection
-//     is server-side, so a degenerate proxy tick cannot adjudicate anything. The
-//     ONLY escape is corrections STOPPING, which is the already-named
-//     starving-wire / stale-hold class and already a recorded sparse-state
-//     prerequisite.
-//
-// DEFERRED CLEANUP — RECORDED HERE, NOT DONE HERE. The proper fix is this
-// codebase's own seam pattern: have the OnRep decode into an SPSC staging ring
-// (game-thread producer) drained at the top of `collectInputAll` (physics-thread
-// consumer), exactly as `RemoteMoveQueue` does the server-side GT->PT crossing and
-// `PendingInputQueue` the client-side PT->GT one. That would make this store
-// genuinely physics-thread-only (and would make the cribbed comment true). It is
-// deliberately out of scope because fixing only the relay store while the
-// correction cache retains the identical pattern buys little — the whole receive
-// path should move together. Logged in three places so it cannot be lost: here,
-// the Backlog's "Out of scope" section, and RelayDelaySpectrumDesign.md §8.6.
-//
-// ---------------------------------------------------------------------------
-// ENGINE-AGNOSTIC. STL + other OGSimulation core headers only; no UE types, no
-// engine headers. The ring it is fed from arrives as a template parameter
-// satisfying the codec's BUFFER CONCEPT, which is what lets the pure-C++
-// Low-Level-Tests drive the REAL ingest path against a std::vector-backed buffer.
-//
-// NAMESPACE NOTE: global namespace, matching the rest of the OGSim core (same note
-// as LocalInputCache / ConnectionTierTable / SimulatableList). The design
-// corpus writes `ogsim::` but no such namespace exists in this tree.
+// ⛔⛔ DO NOT COPY LocalInputCache's "not thread-safe; single-threaded by construction"
+//   claim with the ring mechanics: TRUE of the delay line (its push and read are two
+//   statements in one `collectInputAll` call), FALSE here. Reject a copied one. §6
+// ⛔ ACCEPTED, NOT OVERLOOKED -- inherited, torn-slot-bounded, correction-healed. §6
+// ⛔ THE DEFERRED FIX IS AN SPSC RING at `collectInputAll`, as `RemoteMoveQueue` does. §6
 // ---------------------------------------------------------------------------
 
 // Slot count of a default-constructed RemoteInputCache.
-//
-// Declared as a FREE constant — exactly like `kLocalInputCacheCapacityTicks`,
-// and for the same reason: config-layer code must be able to derive bounds from it
-// without naming an arbitrary `InputT` to reach a static member of a class
-// template.
-//
-// THIS CONSTANT IS LOAD-BEARING FOR THE RELAY DELAY FLOOR. It is one of the two
-// inputs to `relayDelayFloorHardCapTicks` (Network/ConnectionTierTable.h) — GO
-// READ THE DERIVATION THERE rather than trusting a formula mirrored here. In one
-// sentence: an entry must stay resident until the frontier passes
-// `captureTick + dA + rollbackWindowHardCap`, and is evicted at about
-// `captureTick + capacity + wire`, so `dA <= capacity - rollbackWindowHardCap`.
-// Lower this number and the floor's hard cap must follow it down, or a configured
-// floor silently schedules reads against entries that have already been evicted.
+// ⛔ A FREE CONSTANT, so config code derives bounds without naming an `InputT`. §2
+// ⛔⛔ LOWER IT AND `relayDelayFloorHardCapTicks` (Network/ConnectionTierTable.h) MUST
+//   FOLLOW IT DOWN, or a configured floor schedules reads against evicted entries. §2
 inline constexpr std::size_t kRemoteInputCacheCapacityTicks = 64u;
 
 // ---------------------------------------------------------------------------
-// Formerly RelayedInputStore (renamed 2026-08-16, RN-14).
+// Formerly RelayedInputStore, renamed 2026-08-16 to pair with LocalInputCache.
 //
-// WIPE ASYMMETRY — THE SIGNAL THE OLD, ASYMMETRIC NAMES WERE CARRYING.
-// This cache is SENDER-KEYED and is deliberately NOT wiped by
-// SimulationInputResolution::wipeAllForResync (re-pointed off SimulationNetSync,
-// item 87; item 91 part J1) — see "THE WIPE DIVERGES" above and the
-// non-wipe comment at the wipeAllForResync call site. Its counterpart,
-// LocalInputCache (Network/LocalInputCache.h), is CLOCK-KEYED and IS wiped:
-// its keys are the local prediction clock's tick numbers, which a hard resync
-// invalidates. `LocalInputCache` / `RemoteInputCache` are now symmetric
-// names; wiping this cache too would leave a proxy blind for a window after
-// every resync (the 2026-08-04 failure) — restated here because the symmetric
-// names no longer carry that warning on their own.
+// ⛔⛔ NEVER WIPE THIS CACHE ON A RESYNC, AND NEVER GIVE IT A `clear()`. SENDER-KEYED --
+//   the keys are the SENDER's capture ticks, which a LOCAL clock jump cannot invalidate
+//   -- so mirroring `wipeAllForResync`'s per-id `LocalInputCache` loop for a third map
+//   blinds every remote proxy for a window after every resync. OBSERVED 2026-08-04. §7
+// ⛔ THE SYMMETRIC NAMES CANNOT CARRY THAT; this fence and `LocalInputCache.h`'s do. §7
+// ⛔ ENFORCED, NOT ADVISORY -- a wipe fails the suite: `HasClearMethod` + "no wipe
+//   surface" (`RemoteInputCacheTest.cpp`), and `ResyncWipeClearsTheLocalInputCache` /
+//   `RemoteInputCacheSURVIVESAHardResyncWipe` /
+//   `ResimRemoteStillResolvesAfterAHardResyncWipe` (`SimulationInputResolutionTest.cpp`). §7
+// ⛔ Both keying domains: `docs/Perspective-RemoteInputFlow.md` §7, not re-derived here.
 // ---------------------------------------------------------------------------
 
 template <typename InputT>
 class RemoteInputCache
 {
 public:
-    // The result of the `findLatest()` DERIVATION. Returned by value because it is
-    // an answer computed from the slots, not a handle into them — there is
-    // deliberately no way to obtain a reference to "the latest slot" and hold it.
+    // The result of the `findLatest()` DERIVATION.
+    // ⛔ BY VALUE -- an answer computed from the slots, never a handle into them. §3
     struct LatestEntry
     {
         bool          valid       = false;
@@ -267,9 +183,8 @@ public:
     {
     }
 
-    // Replace the injected game zero after construction — the same
-    // order-independence LocalInputCache::setNeutralInput provides, so the
-    // composition root need not order itself before every registration.
+    // Replace the injected game zero after construction.
+    // ⛔ ORDER-INDEPENDENT, exactly as `LocalInputCache::setNeutralInput` is. §4
     void setNeutralInput(const InputT& neutralInput)
     {
         m_neutral = neutralInput;
@@ -286,17 +201,8 @@ public:
     }
 
     // Record a relayed entry.
-    //
-    // LAST-WINS on an already-resident capture tick, matching both
-    // LocalInputCache::push and the wire codec's writeLatest: the codec
-    // explicitly permits REWRITING a resident tick with a fresher `dA` (a re-stamp
-    // after a delay change), so the store must accept the same rewrite rather than
-    // treating the first arrival as immutable. This is also what makes the ingest
-    // idempotent, which is what lets `populateRemoteInputCache` re-consume the
-    // whole ring on every arrival instead of diffing.
-    //
-    // Returns false — changing nothing — only for `kNoInputCaptureTick`, which is
-    // never a key here (see the SENTINEL contract above).
+    // ⛔ LAST-WINS on a resident capture tick -- what makes the ingest idempotent. §5
+    // ⛔ Returns false -- changing nothing -- ONLY for `kNoInputCaptureTick`. §4
     bool push(std::uint32_t captureTick, std::uint8_t dA, const InputT& input)
     {
         if (captureTick == kNoInputCaptureTick)
@@ -323,14 +229,10 @@ public:
         return slot.occupied && slot.captureTick == captureTick;
     }
 
-    // PURE HIT/MISS lookup — the store NEVER invents a neutral on this path.
-    //
-    // That is the whole difference from LocalInputCache::at(), and it is what
-    // keeps a miss VISIBLE to T7's three-step ladder (probe -> verify -> fallback)
-    // and to T6's resolution table, instead of being silently swallowed as a
-    // neutral that both layers would then be unable to distinguish from a real
-    // neutral-content input. On a miss `outDA` and `outInput` are left untouched,
-    // mirroring the codec's findEntry.
+    // PURE HIT/MISS lookup.
+    // ⛔ NEVER INVENTS A NEUTRAL -- the whole difference from `LocalInputCache::at()`,
+    //   and what keeps a miss VISIBLE to the ladder and to the resim table. §1
+    // ⛔ ON A MISS `outDA` AND `outInput` ARE LEFT UNTOUCHED, mirroring `findEntry`. §5
     bool find(std::uint32_t captureTick, std::uint8_t& outDA, InputT& outInput) const
     {
         if (captureTick == kNoInputCaptureTick)
@@ -349,11 +251,9 @@ public:
         return true;
     }
 
-    // THE DERIVATION. The newest relayed entry, computed from the slots on every
-    // call. `valid == false` iff nothing has ever arrived for this character.
-    //
-    // This is what `dLatest` and `lastKnown` MEAN (`.dA` and `.input`); neither is
-    // a field. See the ruling in the header block above before adding a memo.
+    // THE DERIVATION -- the newest relayed entry, computed from the slots on every call.
+    // `valid == false` iff nothing has ever arrived for this character.
+    // ⛔ THIS IS WHAT `dLatest` AND `lastKnown` MEAN. Neither is a field. §3
     LatestEntry findLatest() const
     {
         bool              found = false;
@@ -373,16 +273,10 @@ public:
         return latest;
     }
 
-    // The terminal value of T7's ladder: the newest arrived input once ANYTHING
-    // has arrived, otherwise the injected game zero.
-    //
-    // ARGUMENT-LESS BY DESIGN — the stale-input hold rule is deferred; see the
-    // header block for why deferring is a no-regression choice and what the future
-    // rule looks like. Do not add a `frontierTick` parameter here "for later".
-    //
-    // Shares `latestSlotIndex` with `findLatest()` so the two cannot drift, and
-    // returns a reference rather than a copy because it is on the per-tick proxy
-    // path.
+    // The terminal value of the scheduled-read ladder: the newest arrived input once
+    // ANYTHING has arrived, otherwise the injected game zero.
+    // ⛔ ARGUMENT-LESS. DO NOT ADD A `frontierTick` "FOR LATER" -- see the absence fence. §5
+    // ⛔ Shares `latestSlotIndex` with `findLatest()`; returns a reference, per-tick path. §3
     const InputT& fallback() const
     {
         bool              found = false;
@@ -390,37 +284,21 @@ public:
         return found ? m_slots[index].input : m_neutral;
     }
 
-    // [og-netcode-v2-input-relay T20] THE RESIDENT SPAN — oldest, newest, count.
+    // THE RESIDENT SPAN -- oldest, newest, count.
     //
-    // WHAT IT IS FOR, because the distinction it enables is the whole of T20's
-    // Probe B. `find(probeTick)` answering false says a scheduled read MISSED; it
+    // WHAT IT IS FOR. `find(probeTick)` answering false says a scheduled read MISSED; it
     // does not say WHY, and the three whys have three different remedies:
     //
-    //   probeTick inside [oldest, newest] but absent  A COVERAGE HOLE. The tick was
-    //                                                 produced by the sender and
-    //                                                 clobbered before it could be
-    //                                                 replicated (the relay ring is
-    //                                                 replace-latest at depth 1).
-    //                                                 Remedy: raise the depth.
-    //   probeTick > newest                            The receiver is asking for a
-    //                                                 capture that has not been
-    //                                                 produced or has not landed yet.
-    //                                                 DEPTH IS IRRELEVANT to this
-    //                                                 class — it is the delay deficit.
-    //   probeTick < oldest                            Asking older than the store
-    //                                                 retains: clock misalignment, or
-    //                                                 capacity.
+    //   inside [oldest, newest], absent   A COVERAGE HOLE -- produced by the sender and
+    //                                     clobbered before replication. Raise the depth.
+    //   > newest                          Not produced yet, or not landed yet. DEPTH IS
+    //                                     IRRELEVANT: this is the delay deficit.
+    //   < oldest                          Older than the store retains: clock
+    //                                     misalignment, or capacity.
     //
-    // THE SPAN IS THE STORE'S, NOT THE RING'S, and conflating the two would
-    // invalidate the classification. The ring carries `depth` entries per
-    // replication; this store ACCUMULATES up to `capacity()` arrivals. That is
-    // exactly why an in-span hole is meaningful even at depth 1 — the store's span
-    // grows across arrivals while each individual arrival carried only one entry.
-    //
-    // ONE SCAN, same shape as `findLatest()` and `residentCount()`, and deliberately
-    // not memoized for the reason the header block gives for `findLatest()`. `newest`
-    // is by construction identical to `findLatest().captureTick`; both are the max
-    // over occupied slots.
+    // ⛔ THE SPAN IS THE STORE'S, NOT THE RING'S -- the store ACCUMULATES arrivals, so
+    //   an in-span hole is meaningful even at depth 1. §8
+    // ⛔ ONE SCAN, not memoized, for the reason `findLatest()` gives. §3
     struct ResidentSpan
     {
         bool          valid  = false;   // false iff nothing has ever arrived
@@ -470,17 +348,9 @@ public:
         return count;
     }
 
-    // [og-netcode-v2-input-relay task 79] `shouldLogVersionMismatchOnce()` USED
-    // TO LIVE HERE — one-shot gate for the wire-version-mismatch log, exactly
-    // once per store (= per character = per replicated component) per session.
-    // It moved to `NetSyncTelemetry::shouldLogVersionMismatchOnce(id)`
-    // (`NetSyncTelemetry.h`), id-keyed instead of store-resident: log-suppression
-    // state belongs with the logger, not with the data container being logged
-    // about, and handing the telemetry sibling a reference to THIS store so it
-    // could call the old method would have been exactly the production-container
-    // coupling that task's split exists to avoid. `RemoteInputCacheTest.cpp`'s
-    // four assertions against the old method moved to `NetSyncTelemetryTest.cpp`
-    // against the new one — see that task's impl notes for the before/after.
+    // ⛔ `shouldLogVersionMismatchOnce()` IS GONE FROM THIS CLASS -- `NetSyncTelemetry.h`. §9
+    // ⛔ DO NOT RE-ADD IT HERE: log-suppression state belongs with the logger, not the
+    //   container. Its four assertions live in `NetSyncTelemetryTest.cpp`. §9
 
 private:
     struct Slot
@@ -497,13 +367,8 @@ private:
     }
 
     // THE single scan behind both `findLatest()` and `fallback()`.
-    //
-    // Plain `>` on the capture tick is correct because the relay stream is
-    // MONOTONIC in capture tick by construction (the server relays only on
-    // `parked && acceptedNew`, so an out-of-order-older input is never sent —
-    // RelayDelaySpectrumDesign.md §5.3a). Ring wraparound of the tick COUNTER
-    // itself is out of scope for the same reason the sentinel is safe to reserve:
-    // 2^32 ticks at 60 Hz is ~828 days of continuous session.
+    // ⛔ PLAIN `>` IS CORRECT: the relay stream is MONOTONIC in capture tick. §3
+    // ⛔ Tick-counter wraparound is out of scope: 2^32 ticks at 60 Hz is ~828 days. §4
     std::size_t latestSlotIndex(bool& outFound) const
     {
         std::size_t   bestIndex = 0u;
@@ -534,59 +399,36 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// populateRemoteInputCache — THE ingest, in one place, carrying the wire fence.
+// populateRemoteInputCache -- THE ingest, in one place, carrying the wire fence.
 //
-// Lives in core beside the store (the RelayedInputRingCodec precedent) so the
-// UE-free Low-Level-Tests exercise the REAL path rather than a mirror of it: the
-// UE side does nothing but call this with the freshly-replicated ring.
+// It lives in core beside the store (the RelayedInputRingCodec precedent) so the
+// engine-free Low-Level-Tests exercise the REAL path: the adapter side does nothing
+// but call this with the freshly-replicated ring.
 //
-// ---------------------------------------------------------------------------
-// THE WIRE-VERSION FENCE. T5 IS THE FIRST READER — NOBODY CHECKS IT TODAY.
+// ONE ADAPTER'S BINDING FOR THE WIRE NAMES IN THIS BLOCK: the replicated wrapper is
+// `FRelayedInputRing`, its property serializer is `NetSerialize`, and the archive's
+// failure switch is `SetError`. Another adapter substitutes its own; every claim here
+// is about those ROLES, not about one engine.
 //
-// T1 shipped `relayedInputRing::kWireFormatVersion` and
-// `getWireFormatVersionOnWire()`, but `FRelayedInputRing::NetSerialize` only
-// LENGTH-checks. Entry stride is a COMPILE-TIME constant per `InputType`, so a
-// layout change makes an old peer read arbitrary bytes as `captureTick` / `dA` /
-// `input`: plausible-looking garbage capture ticks inserted as STORE KEYS and then
-// applied to a proxy. Silent corruption, no crash. Hence the version is checked
-// BEFORE ANY STRUCTURAL READ — `entryCount` lives in the same header and is
-// equally untrustworthy on a mismatch, and a stride mismatch would send
-// `forEachEntry` off the end into the buffer's fatal bounds `checkf`.
+// ⛔⛔ THE VERSION IS CHECKED BEFORE ANY STRUCTURAL READ. The serializer only
+//   LENGTH-checks, so a layout change makes an old peer read arbitrary bytes as
+//   `captureTick` / `dA` / `input` and insert them as STORE KEYS. Silent corruption. §9
 //
-// Three-way:
-//   version 0  -> never written / never replicated. No-op, and deliberately NO
-//                 log: the codec writes its header lazily, so an empty ring reads
-//                 0 and can never false-positive as a mismatch.
-//   version ==
-//   kWireFormat -> consume.
-//   anything else -> DROP THE WHOLE RING. Consume nothing. The caller logs, once
-//                 per component per session (see
-//                 NetSyncTelemetry::shouldLogVersionMismatchOnce, task 79).
+// Three-way, and `RelayedInputIngestOutcome` names all three:
+//   version 0        never written / never replicated. No-op, and deliberately NO log:
+//                    the codec writes its header lazily, so an empty ring reads 0 and
+//                    can never false-positive as a mismatch.
+//   version matches  consume.
+//   anything else    DROP THE WHOLE RING. Consume nothing. The caller logs once per
+//                    component per session
+//                    (`NetSyncTelemetry::shouldLogVersionMismatchOnce`).
 //
-// DROP AT CONSUME — DO NOT `Ar.SetError()`, AND DO NOT "FIX" THIS TO MATCH THE
-// LENGTH CHECK. The two are asymmetric on purpose. A bad LENGTH prefix means the
-// property cannot know how many bytes to consume, so the archive position
-// desynchronizes and every subsequent property in that bunch parses garbage —
-// failing the bunch is then mandatory, and that is exactly what T1 shipped. A
-// VERSION mismatch is discovered AFTER `NetSerialize` completed cleanly: the
-// byte count was consumed exactly, the archive is still in sync, and unrelated
-// properties in the same bunch deserialize fine. Failing the bunch there would
-// destroy them for no integrity gain. And, concretely: at THIS site — the OnRep /
-// populate path — `SetError` is not even available, because serialization has
-// already completed by the time we get here.
-//
-// THE UNSTATED INVARIANT THAT ARGUMENT RESTS ON, now stated (AM-4): the u16
-// LENGTH-PREFIX FRAMING is VERSION-INVARIANT FOREVER. Only the payload layout
-// BEHIND the prefix may change across wire versions; the prefix itself may never.
-// Without that, "the byte count is correct on a mismatch" is unfounded and the
-// whole drop-not-SetError asymmetry collapses.
-//
-// ---------------------------------------------------------------------------
-// INGEST: RE-CONSUME EVERYTHING, NO DIFFING. Every resident entry is pushed, and
-// `push` is idempotent by capture tick, so re-consuming an entry that is already
-// resident simply rewrites it (which is also how a re-stamp lands). Cost is
-// O(depth) — 1 today, <= kMaxDepth ever. The identical code stays correct
-// unchanged when depth rises, which is the point: §8.2 expects exactly that.
+// ⛔⛔ DROP AT CONSUME -- DO NOT FAIL THE ARCHIVE, AND DO NOT "FIX" THIS TO MATCH THE
+//   LENGTH CHECK. A bad LENGTH prefix desynchronizes the archive, so failing the bunch
+//   is mandatory; a VERSION mismatch is found AFTER a clean, exact read, so failing
+//   there destroys unrelated properties in the same bunch for no integrity gain. §9
+// ⛔ IT RESTS ON ONE INVARIANT: THE u16 LENGTH-PREFIX FRAMING IS VERSION-INVARIANT. §9
+// ⛔ INGEST RE-CONSUMES EVERYTHING, NO DIFFING -- `push` is idempotent by capture tick. §5
 // ---------------------------------------------------------------------------
 
 enum class RelayedInputIngestOutcome : std::uint8_t
@@ -606,53 +448,28 @@ struct RelayedInputIngestReport
     std::uint8_t              entriesIngested = 0u;
 
     // -----------------------------------------------------------------------
-    // [T34 loss-counter fix] HOW MANY CAPTURE TICKS THIS ARRIVAL ACTUALLY ADDED.
+    // HOW MANY CAPTURE TICKS THIS ARRIVAL ACTUALLY ADDED.
     //
-    // `entriesIngested` is the count of entries PUSHED, and under the re-consume
-    // ingest above that includes every already-resident entry the ring carried
-    // again. This field counts only the entries whose capture tick was NOT
-    // resident when the arrival began — i.e. the NEW COVERAGE this arrival
-    // delivered — and it is what `RelayArrivalProbe::noteArrival` charges loss
-    // against.
+    // `entriesIngested` counts entries PUSHED, which under the re-consume ingest
+    // includes every already-resident entry the ring carried again. This counts only
+    // entries whose capture tick was NOT resident when the arrival began -- the NEW
+    // COVERAGE -- and it is what `RelayArrivalProbe::noteArrival` charges loss against.
     //
-    // WHY THE DISTINCTION IS LOAD-BEARING, and it is the whole defect this field
-    // exists to close: under the retired replace-latest write path one arrival
-    // carried exactly one new capture tick, so "the newest watermark advanced by
-    // g" and "g-1 ticks were lost" were the same statement. Under flush-on-poll
-    // ONE ARRIVAL CARRIES THE WHOLE BURST, so a 2-entry burst advances the
-    // watermark by 2 while losing nothing — and a probe that assumes 1 charges
-    // the burst RATE as loss. The measured Run 1 consequence: ~120 per mille
-    // reported against a ~11 per mille pass condition, on a flush that was
-    // working perfectly.
-    //
-    // RE-DELIVERY IS NOT COVERAGE. A ring that carries a tick this store already
-    // holds (a dA re-stamp, or the flush republishing an entry that had not yet
-    // been evicted from the ring) adds nothing, so it is deliberately NOT counted
-    // — counting it would let a stalled sender re-delivering the same entry look
-    // like a sender delivering new ones.
-    //
-    // FREE: `has()` is an O(1) slot probe and the ingest already visits every
-    // entry, so this costs one comparison per entry and no second walk.
+    // ⛔⛔ DO NOT SUBSTITUTE `entriesIngested`, AND DO NOT ASSUME 1. One flush-on-poll
+    //   arrival carries the whole BURST, so assuming 1 charges the burst RATE as loss:
+    //   ~120 per mille against a ~11 pass condition, on a flush that lost nothing. §8
+    // ⛔ RE-DELIVERY IS NOT COVERAGE: a `dA` re-stamp or a republished unevicted entry
+    //   adds nothing, and counting it would flatter a stalled sender. §8
+    // ⛔ FREE: `has()` is an O(1) slot probe and the ingest already visits every entry. §8
     // -----------------------------------------------------------------------
     std::uint8_t              newCaptureTicksIngested = 0u;
 
-    // [T19] THE NEWEST CAPTURE TICK THIS ARRIVAL CARRIED — the replication-cadence
-    // probe's entire data source (Network/RelayReadProbe.h, probe 2).
+    // THE NEWEST CAPTURE TICK THIS ARRIVAL CARRIED -- the replication-cadence probe's
+    // entire data source (`Network/RelayReadProbe.h`, probe 2).
     //
-    // WHY IT LIVES HERE rather than being re-derived at the call site: the ingest
-    // already walks every entry, so the maximum is free, whereas a caller would
-    // have to either walk the ring a second time or call `store.findLatest()` —
-    // and `findLatest()` is the wrong answer. It scans the STORE, which holds up
-    // to 64 accumulated capture ticks, so on an arrival that carried nothing new
-    // it would keep reporting the previous arrival's tick and the cadence gap
-    // would silently read 0 forever. This field is the newest tick THIS RING
-    // carried, which is the quantity "ticks between successful relay-ring OnReps"
-    // is actually about.
-    //
-    // `valid` is false on NeverWritten and VersionMismatch (nothing was read), and
-    // also on the degenerate case of a version-matching ring whose every entry was
-    // rejected by `push` — which is why it is a separate flag rather than a
-    // sentinel value: tick 0 is a perfectly ordinary capture tick.
+    // ⛔ `store.findLatest()` IS THE WRONG ANSWER HERE: it scans the STORE, so an arrival
+    //   carrying nothing new would report the previous tick and the gap would read 0. §8
+    // ⛔ `valid` IS A FLAG, NOT A SENTINEL VALUE -- tick 0 is an ordinary capture tick. §8
     bool          newestCaptureTickValid = false;
     std::uint32_t newestCaptureTick      = 0u;
 };
@@ -680,8 +497,7 @@ RelayedInputIngestReport populateRemoteInputCache(RemoteInputCache<InputType>& s
         ring,
         [&store, &report](std::uint32_t captureTick, std::uint8_t dA, const InputType& input)
         {
-            // [T34 loss-counter fix] Asked BEFORE the push, because the push is
-            // what makes it resident. See `newCaptureTicksIngested`.
+            // ⛔ Asked BEFORE the push, because the push is what makes it resident. §8
             const bool wasAlreadyResident = store.has(captureTick);
 
             if (store.push(captureTick, dA, input))
@@ -692,8 +508,7 @@ RelayedInputIngestReport populateRemoteInputCache(RemoteInputCache<InputType>& s
                     ++report.newCaptureTicksIngested;
                 }
 
-                // [T19] Track the maximum over the entries that were ACCEPTED, so
-                // a rejected sentinel can never become the reported newest.
+                // ⛔ Maximum over ACCEPTED entries, so a rejected sentinel cannot win. §8
                 if (!report.newestCaptureTickValid || captureTick > report.newestCaptureTick)
                 {
                     report.newestCaptureTickValid = true;

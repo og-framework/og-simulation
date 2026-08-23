@@ -35,10 +35,10 @@
 //   - void          bundleAddZeroedBytes(std::int32_t n);  // grow by n zeroed bytes
 //   - template <typename T> void writeToBuffer(std::uint32_t off, const T& v);
 //   - template <typename T> T    readFromBuffer(std::uint32_t off) const;
-// FInputRedundancyBundle (TArray-backed) and the test buffer (std::vector-backed)
-// both satisfy this. The per-slot input serialization reuses the same field-wise
-// machinery as FSimulationStateSyncBuffer (SimulationSerialization.h /
-// SimulationComposite.h): the serialized size of one slot's input is a
+// FInputRedundancyBundle (the adapter's array-backed payload) and the test buffer
+// (std::vector-backed) both satisfy this. The per-slot input serialization reuses
+// the same field-wise machinery as the state-sync buffers (SimulationSerialization.h
+// / SimulationComposite.h): the serialized size of one slot's input is a
 // compile-time constant for a given InputType, so slots are a fixed stride and
 // the bundle can be scanned without an explicit per-slot length prefix:
 //   - plain Serializable InputType -> syncSize<InputType>()
@@ -76,8 +76,9 @@
 // through the current call graph. The kernel bound exists so a future caller
 // that skips the clamp — or a rewritten client driving the codec directly —
 // cannot emit an over-budget bundle in a shipping build, where an unguarded
-// append previously produced a bounded-but-MALFORMED payload (the TArray grows,
-// so this was never an out-of-bounds write; it was a wire-budget violation).
+// append previously produced a bounded-but-MALFORMED payload (the backing array
+// grows, so this was never an out-of-bounds write; it was a wire-budget
+// violation).
 //
 // The version byte exists so pre/post-Stage-1 builds refuse to interop loudly
 // (compat fence, Task 11).

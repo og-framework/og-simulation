@@ -93,12 +93,12 @@
 //
 // The neutral is INJECTED, not value-initialised, and that distinction is
 // load-bearing: the game's zero input is NOT `InputT{}`.
-// `simulatableBrawler::getZeroPlayerInput()` (SimulatableBrawlerTypes.h:94)
+// `simulatableBrawler::getZeroPlayerInput()` (SimulatableBrawlerTypes.h)
 // builds forward vectors of (0,0,1); a value-initialised PlayerInput would carry
 // a (0,0,0) forward vector into normalisation. The composition root injects the
-// game's real zero input (see ASimulationManagerUImpl::BeginPlay). The default
-// is `InputT{}` purely so an engine-free unit test can construct the line
-// without a game type.
+// game's real zero input at start-up; one adapter's binding for that injection is
+// `ASimulationManagerUImpl::BeginPlay`. The default is `InputT{}` purely so an
+// engine-free unit test can construct the line without a game type.
 //
 // ---------------------------------------------------------------------------
 // THREADING. NOT thread-safe; single-threaded by construction. Both the push
@@ -110,6 +110,12 @@
 //
 // ENGINE-AGNOSTIC. STL only; no UE types, no engine headers, no other
 // OGSimulation headers (this container needs no config).
+//
+// Where this ring sits in the whole path a captured input travels — and the
+// asymmetry that this line IS swept on a hard resync while its relayed twin
+// `RemoteInputCache` deliberately is NOT:
+// `docs/Perspective-RemoteInputFlow.md` §4 ("A's half — why two different
+// values leave one branch") and §7 ("The wipe asymmetry — the centrepiece").
 //
 // NAMESPACE NOTE: global namespace, matching the rest of the OGSim core (same
 // note as ConnectionTierTable / ServerInputDelayQueue / SimulatableList). The

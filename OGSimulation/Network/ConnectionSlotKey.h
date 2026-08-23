@@ -14,10 +14,10 @@
 // WHY THIS TYPE EXISTS — the distinction it encodes is the whole point.
 //
 // This game ships MULTIPLE PLAYER-CONTROLLED CHARACTERS ON ONE CLIENT: a shared
-// isometric camera for couch brawls and co-op. UE implements that with one real
-// UNetConnection per machine plus one UChildConnection per additional local
-// player. That is a NORMAL, DESIGNED topology here — not split-screen exotica
-// and not an edge case.
+// isometric camera for couch brawls and co-op. A network stack carries that as
+// one real transport connection per machine, plus one CHILD connection per
+// additional local player riding that same physical link. That is a NORMAL,
+// DESIGNED topology here — not split-screen exotica and not an edge case.
 //
 // It splits the per-connection state of this subsystem in two, and the two
 // halves must be keyed DIFFERENTLY:

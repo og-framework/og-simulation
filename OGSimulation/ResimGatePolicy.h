@@ -37,6 +37,14 @@
 // Full derivation, defect history, and measurement records:
 // `docs/ResimGatePolicy-rationale.md`.
 //
+// How that shape was ARRIVED AT — decision by decision, with what was
+// measured, what was refuted, and what was built and then removed — is that
+// document's history sibling, `docs/History-ResimGate.md`; its §7.1 ("The
+// no-cooldown ruling, 2026-08-11") carries the evidence behind the fence
+// immediately below. One pointer, not two competing links: the rationale
+// doc answers "why is the code this shape", the history "how did it get
+// there" — neither is re-derived here.
+//
 // NAMESPACE NOTE: global namespace, matching the rest of the OGSim core.
 // ---------------------------------------------------------------------------
 namespace resimGate
@@ -59,9 +67,11 @@ namespace resimGate
     //
     // ⭐ `FrontierExact` REPRODUCES THE LEGACY GATE'S OBSERVABLE BEHAVIOUR AND
     // IS THE COMPILED DEFAULT (`TimeConfig.h`) — but NOT the shipped
-    // configuration: `Config/DefaultEngine.ini:371` has overridden it to
-    // `OnDisagreement` since item 43 (check that file for the current value,
-    // not this comment). It does NOT consult `predictionWasCorrect` — the
+    // configuration: the host project's netcode config has overridden it to
+    // `OnDisagreement` since item 43 (read the live value there, not this
+    // comment — one adapter's binding is the `ResimTriggerPolicy` key under
+    // `[OGNetcode]` in `Config/DefaultEngine.ini`). It does NOT consult
+    // `predictionWasCorrect` — the
     // legacy gate never read it either (item 30) — so ANDing a verdict check
     // onto this predicate would make it trigger no more often than it already
     // does, and STRICTLY less often only once a real verdict (item 30)
@@ -81,9 +91,11 @@ namespace resimGate
     //
     // `OnDisagreement` is the DESIGNED trigger: any landed correction whose
     // authority state disagrees with prediction. It is the LIVE SHIPPED
-    // CONFIGURATION (`Config/DefaultEngine.ini:371`, since item 43) — not
+    // CONFIGURATION (the `ResimTriggerPolicy` config key, since item 43) — not
     // dormant. Item 46 (the *compiled default's* own flip to `OnDisagreement`)
-    // remains blocked on item 30; that only governs what a build with no ini
+    // is SEQUENCED AFTER item 30, not blocked by it: the same 2026-08-12 ruling
+    // that shipped `OnDisagreement` via ini reclassified item 30 from a blocker
+    // into a cost reduction. Either way it governs only what a build with no ini
     // override runs, not whether this trigger runs today. Full argument:
     // `docs/ResimGatePolicy-rationale.md` §3 point 3, §5.
     //

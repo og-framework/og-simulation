@@ -16,7 +16,8 @@ OGSIM_OPTIMIZE_OFF
 // ServerTickClock — server-side monotonic tick counter with sync-buffer serialization.
 // Replaces AuthoritySimulationTimeManager (renamed for clarity).
 // The serialization byte layout is identical to AuthoritySimulationTimeManager so that
-// existing replicated FSmallSimulationStateSyncBuffer data is fully backward-compatible.
+// an adapter's already-replicated timing-buffer data stays fully backward-compatible
+// (one adapter's buffer: `FSmallSimulationStateSyncBuffer`).
 class ServerTickClock
 {
 public:

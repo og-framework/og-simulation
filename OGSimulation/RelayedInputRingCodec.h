@@ -24,8 +24,8 @@
 // could disagree with its own two operands after a re-stamp.
 //
 // ---------------------------------------------------------------------------
-// WHY THIS IS NOT FInputRedundancyBundle (fable finding B2 — the reason this
-// codec exists at all).
+// WHY THIS IS NOT THE INBOUND REDUNDANCY BUNDLE (InputRedundancyBundleCodec.h;
+// fable finding B2 — the reason this codec exists at all).
 //
 // The INBOUND (client -> server) redundancy bundle is append-only and immutable
 // per capture tick: appendSlot() OG_CHECK-fails on a duplicate capture tick and
@@ -61,6 +61,16 @@
 // template, so the type-erased byte payload here is additionally what lets ONE
 // replicated property carry an arbitrary InputType.
 //
+// ⭐ ONE ADAPTER'S BINDING FOR THE ENGINE NAMES THIS FILE'S ROLE WORDS REPLACE.
+// The REPLICATION SYSTEM, its once-per-frame poll of a replicated property, the
+// PROPERTY COMPARISON that decides whether that property is dirty, and the
+// GAME-THREAD TICK whose early and late broadcasts run receipt then flush are all
+// engine-agnostic here, and nothing below depends on which engine supplies them.
+// In one adapter (Unreal) they are Iris, its poll of a replicated UPROPERTY,
+// `FProperty::Identical`, and `UWorld::Tick`'s `BroadcastTickDispatch` /
+// `BroadcastTickFlush` pair; that adapter's wire serializer, named above, is
+// `FRelayedInputRing::NetSerialize`. ANOTHER ADAPTER SUBSTITUTES ITS OWN.
+//
 // BUFFER CONCEPT: every template below operates on a `Buffer` exposing
 //   - std::int32_t bundleByteNum() const;                  // current byte count
 //   - void          bundleAddZeroedBytes(std::int32_t n);  // grow by n zeroed bytes
@@ -82,10 +92,10 @@
 // change). Only a buffer that is FLUSHED has to grow the fifth method.
 //
 // WHY A SHRINK IS UNAVOIDABLE ON THE FLUSH PATH: the transport ships
-// `bundleByteNum()` bytes (FRelayedInputRing::NetSerialize's `used`), so zeroing
-// the entry count without shrinking would leave the payload at its high-water
-// mark and send stale trailing entries forever. The per-entry input serialization
-// reuses the same field-wise machinery as the sync buffers
+// `bundleByteNum()` bytes — the `used` count FRelayedInputRing's wire serializer
+// emits — so zeroing the entry count without shrinking would leave the payload at
+// its high-water mark and send stale trailing entries forever. The per-entry input
+// serialization reuses the same field-wise machinery as the sync buffers
 // (SimulationSerialization.h / SimulationComposite.h), so the serialized size of
 // one input is a compile-time constant for a given InputType and entries are a
 // fixed stride — the ring can therefore be scanned, and any entry rewritten IN
@@ -121,9 +131,10 @@
 // 34's text.
 //
 // WIRE VERSION. This payload carries its OWN version byte, starting at 1. It is
-// NOT the `kWireFormatVersion` fence on FSimulationStateSyncBuffer that T4 bumps
-// 1 -> 2: this is a brand-new property whose first-ever format is version 1, so
-// nothing is being bumped and the initiative still has exactly one fence bump.
+// NOT the correction-state fence (`correctionStateBuffer::kWireFormatVersion`,
+// CorrectionStateBufferCodec.h) that T4 bumps 1 -> 2: this is a brand-new property
+// whose first-ever format is version 1, so nothing is being bumped and the
+// initiative still has exactly one fence bump.
 // ---------------------------------------------------------------------------
 
 #include "OGSimulation/SimulationSerialization.h"
@@ -143,11 +154,12 @@ namespace relayedInputRing
 	// for whatever value a caller passes, and `stageArrival` below is the sole
 	// production caller, always with `kMaxDepth` itself.
 	//
-	// 8 mirrors FInputRedundancyBundle::kMaxSlots deliberately: it is the same
-	// class of bound (a per-character input payload budget), so the two directions
-	// stay comparable when the T9 bandwidth measurement is taken. Raising it is a
-	// deliberate wire-budget decision, not a tuning tweak — depth 8 already costs
-	// 8x the per-character input bytes of today's depth-1 default.
+	// 8 mirrors `inputRedundancyBundle::kMaxSlots` (InputRedundancyBundleCodec.h)
+	// deliberately: it is the same class of bound (a per-character input payload
+	// budget), so the two directions stay comparable when the T9 bandwidth
+	// measurement is taken. Raising it is a deliberate wire-budget decision, not a
+	// tuning tweak — depth 8 already costs 8x the per-character input bytes of
+	// today's depth-1 default.
 	inline constexpr std::uint8_t kMaxDepth = 8;
 
 	// THE SHARED DEPTH GUARD. Runtime depth, clamped into [1, kMaxDepth].
@@ -183,7 +195,7 @@ namespace relayedInputRing
 	// --- MALFORMED-LENGTH BOUND ------------------------------------------------
 	// [og-netcode-v2-input-relay T29] These two constants and the predicate below
 	// were FRelayedInputRing::kMaxInputBytes / ::kMaxWireBytes and an inline
-	// comparison inside that USTRUCT's NetSerialize. They moved here for the same
+	// comparison inside that USTRUCT's wire serializer. They moved here for the same
 	// reason every other rule in this file lives here: the LLT target links Core +
 	// OGSimulation and cannot see a USTRUCT, so a guard expressed inside one is
 	// untestable. The USTRUCT keeps both names as aliases, so every existing
@@ -191,9 +203,10 @@ namespace relayedInputRing
 	// not a redesign.
 	//
 	// Upper bound on the serialized input payload of ONE entry. Anchored to the
-	// project's declared per-input wire budget (FSimulationInputSyncBuffer's
-	// kBufferBytes = 128, which covers a tick header + one input composite), so
-	// this bound cannot silently fall behind a growing input composite. It is
+	// project's declared per-input wire budget — the input sync buffer's 128-byte
+	// capacity, which covers a tick header + one input composite (one adapter:
+	// `FSimulationInputSyncBuffer::kBufferBytes`) — so this bound cannot silently
+	// fall behind a growing input composite. It is
 	// deliberately a plain constant here rather than a reference to that USTRUCT:
 	// core cannot name it, and the two are pinned together by this comment and by
 	// the alias on FRelayedInputRing.
@@ -213,9 +226,10 @@ namespace relayedInputRing
 	//
 	// NOTE FOR ANYONE READING THIS AS "the guard is enforced": this predicate is
 	// the RULE. Whether it RUNS is a property of the transport that calls it — and
-	// from the day Iris replication went live until T29 it did not run at all,
-	// because Iris never called the NetSerialize it lived in. That is why T29
-	// registers an Iris serializer as well as extracting this.
+	// from the day the current replication system went live until T29 it did not
+	// run at all, because that system never called the struct wire serializer the
+	// guard lived in. That is why T29 registers a serializer WITH the replication
+	// system as well as extracting the guard here.
 	constexpr bool isAcceptableWireLength(std::uint32_t byteCount)
 	{
 		return byteCount <= kMaxWireBytes;
@@ -463,12 +477,12 @@ namespace relayedInputRing
 	// ⭐ [og-netcode-v2-input-relay T34] FLUSH-ON-POLL — BARE C1, R = 0.
 	//
 	// THE PROBLEM THIS SOLVES. `writeLatest` is called from the RPC RECEIPT path,
-	// which is paced by packet arrival; Iris polls the replicated ring once per
-	// server game-thread frame. At the shipped depth of 1 a second arrival in the
-	// same frame OVERWRITES the first in server memory before replication ever
-	// compares the property — measured at ~89.3 % of relayed inputs surviving, and
-	// from a client that loss is indistinguishable from a wire drop
-	// (Network/RelayWritePathProbe.h states the whole elimination chain).
+	// which is paced by packet arrival; the replication system polls the replicated
+	// ring once per server game-thread frame. At the shipped depth of 1 a second
+	// arrival in the same frame OVERWRITES the first in server memory before
+	// replication ever compares the property — measured at ~89.3 % of relayed
+	// inputs surviving, and from a client that loss is indistinguishable from a
+	// wire drop (Network/RelayWritePathProbe.h states the whole elimination chain).
 	//
 	// THE SHAPE. Arrivals are staged into a SEPARATE ring buffer of the same wire
 	// format; once per poll the stage is PUBLISHED into the replicated ring and
@@ -480,8 +494,8 @@ namespace relayedInputRing
 	// measured wire loss, accepted by the user 2026-08-08 under the self-healing
 	// correction model, T38 §13). The 2-generation hybrid in
 	// design_task30_c1_flush_on_poll.md §11.5 is the recorded ESCALATION, not this.
-	// Because there is no send-success signal anywhere in Iris that game code can
-	// read (T38 §4.3), that loss is invisible by construction on this side — the
+	// Because the replication system exposes no send-success signal that game code
+	// can read (T38 §4.3), that loss is invisible by construction on this side — the
 	// binding instrument is the CLIENT-side `lostCaptureTicksX1000` in
 	// Network/RelayReadProbe.h, which counts the arithmetic gaps in the per-
 	// character monotonic capture-tick stream.
@@ -493,8 +507,9 @@ namespace relayedInputRing
 	// See RelayArrivalWindowSummary's loss block.
 	//
 	// THREADING: none. Receipt (staging) and the flush are both the game thread,
-	// in the same UWorld::Tick, receipt first (BroadcastTickDispatch runs early,
-	// BroadcastTickFlush at the end). Plain members, no lock, no atomics.
+	// in the same game-thread tick, receipt first (the engine's early tick-dispatch
+	// broadcast) and the flush last (its end-of-tick broadcast). Plain members, no
+	// lock, no atomics.
 	// -----------------------------------------------------------------------
 
 	// What one staging write did. `droppedOldest` is the ONLY loss this side can
@@ -573,15 +588,15 @@ namespace relayedInputRing
 	//
 	// ⭐ SUPPRESS-CLEAR-ON-EMPTY IS THE SKIP-RECOVERY MECHANISM, NOT AN
 	// OPTIMIZATION (T43 finding 3, which PROMOTED it to a requirement). With an
-	// empty stage this function touches NOTHING: `dst` stays byte-identical, so
-	// `FProperty::Identical` finds no change, so the property is not dirty, so the
-	// object is not scheduled and costs zero bytes — and, load-bearingly, a round
-	// that Iris SKIPPED under packet pressure stays resident and dirty across the
-	// empty frames that follow and gets retried, instead of being overwritten by an
-	// empty flush and losing its whole burst. Under R = 0 that retry is the only
-	// recovery that exists. Join-settling is precisely when empty frames are common
-	// (measured `emptyFrames` median 14, up to 98 per window), so it frequently
-	// wins.
+	// empty stage this function touches NOTHING: `dst` stays byte-identical, so the
+	// replication system's property comparison finds no change, so the property is
+	// not dirty, so the object is not scheduled and costs zero bytes — and,
+	// load-bearingly, a round the replication system SKIPPED under packet pressure
+	// stays resident and dirty across the empty frames that follow and gets retried,
+	// instead of being overwritten by an empty flush and losing its whole burst.
+	// Under R = 0 that retry is the only recovery that exists. Join-settling is
+	// precisely when empty frames are common (measured `emptyFrames` median 14, up
+	// to 98 per window), so it frequently wins.
 	//
 	// TYPE-ERASED BY CONSTRUCTION. The copy is byte-wise, so no InputType is named:
 	// the stage and the ring share one wire format, and the entry stride never has

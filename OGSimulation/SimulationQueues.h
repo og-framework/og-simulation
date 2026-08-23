@@ -44,9 +44,10 @@ public:
     //
     // 1. R-T5 dedup (first-writer-wins): if a still-pending entry already carries this
     //    captureTick, silently discard the new one. This is correct ONLY under the
-    //    FInputRedundancyBundle append-only/immutable-per-capture-tick invariant — the
-    //    client never revises a sent tick's input, so the first arrival is authoritative
-    //    and the redundant re-sends in the overlap window are duplicates to drop.
+    //    inbound redundancy bundle's append-only/immutable-per-capture-tick invariant
+    //    — the client never revises a sent tick's input, so the first arrival is
+    //    authoritative and the redundant re-sends in the overlap window are duplicates
+    //    to drop.
     // 2. Too-far-future guard: reject a captureTick beyond rollbackWindowTicks ahead of
     //    the server authority tick. rollbackWindowTicks is supplied by the caller from
     //    TimeConfig::rollbackWindowTicks (no hardcoded literal here — R-P1). A negative
@@ -193,8 +194,10 @@ public:
 
     // Drops all pending entries. Safe only when neither producer nor consumer
     // is concurrently accessing the queue — i.e. from the clock-resync wipe
-    // path, which runs on the physics thread inside advancePrediction while
-    // TG_EndPhysics is still blocked and the consumer cannot touch the queue.
+    // path, which runs on the physics thread inside advancePrediction while the
+    // game thread's end-of-physics tick group is still blocked, so the consumer
+    // cannot touch the queue. (One adapter's binding for that barrier:
+    // `TG_EndPhysics`.)
     void clear()
     {
         m_head.store(0, std::memory_order_relaxed);

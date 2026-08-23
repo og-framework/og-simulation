@@ -9,8 +9,9 @@ OGSIM_OPTIMIZE_OFF
 
 // =============================================================================
 // SimulationStepSequencing.h — CROSS-PEER SEQUENCING FACADES.
-// (og-netcode-v2-input-relay item 96; relocated here from
-//  SimulationInputResolution.h on the user's ruling, 2026-08-21.)
+// (Relocated here from `SimulationInputResolution.h` on the user's ruling,
+//  2026-08-21. The relocation record, and the argument for this home, are in
+//  `docs/SimulationInputResolution-rationale.md` §8 and §15.2.)
 // =============================================================================
 // WHAT BELONGS IN THIS FILE, stated as a test and not as a vibe:
 //
@@ -25,7 +26,7 @@ OGSIM_OPTIMIZE_OFF
 //
 // WHY THIS FILE EXISTS AT ALL — the misplacement it corrects.
 // `preparePredictionSimulationStep` first landed in `SimulationInputResolution.h`
-// (item 96). That cost nothing mechanically — that header already included
+// — and that cost nothing mechanically, because that header already included
 // `SimulationReconciliation.h`, so no new coupling appeared — which is exactly
 // why it slipped through. But the function NAMES NEITHER PEER: it is templated
 // on both and deduces its return through `decltype`. Its only named type is
@@ -38,37 +39,40 @@ OGSIM_OPTIMIZE_OFF
 // ⚠ THE SAME MISPLACEMENT ALREADY EXISTS, AND IS OLDER.
 // `registerSimulatable` / `unregisterSimulatable` (`SimulationNetSync.h`) are
 // multi-peer sequencing facades sitting in one participant's header for the
-// same reason — and item 94 made that home ACTIVELY WRONG, because NetSync is
-// no longer party to either call. They are candidates to move here.
-// ⛔ DELIBERATELY NOT MOVED BY ITEM 96. Relocating them touches the
-// registration ordering that items 92 and 93 have just hardened (and whose
-// invariant a live crash was fixed to protect); that move deserves its own
-// task with its own tests, not a ride-along in a placement fix. Recorded here
-// so the next author finds the reasoning rather than the omission.
+// same reason. ⚠ THAT home is merely ARBITRARY, not wrong: NetSync IS a
+// participant in those two. It is the COLLECT/ALLOCATE pair THIS FILE
+// sequences that NetSync stopped touching, and that is what ruled its header
+// out for THIS function. They are candidates to move here.
+// ⛔ DELIBERATELY NOT MOVED WHEN THIS FILE WAS CREATED. Relocating them
+// touches the registration ordering that the publish-last / unpublish-first
+// fixes hardened (and whose invariant a live crash was fixed to protect);
+// that move deserves its own task with its own tests, not a ride-along in a
+// placement fix. Recorded here so the next author finds the reasoning rather
+// than the omission.
 // =============================================================================
 
 
 // =============================================================================
 // preparePredictionSimulationStep — THE SEQUENCING FACADE FOR THE COLLECT/
-// ALLOCATE PAIR (og-netcode-v2-input-relay item 96, filed from item 94's
-// review push #2).
+// ALLOCATE PAIR.
 // =============================================================================
-// Item 90 fused collect and allocate into one call; its stated value was
-// explicitly can't-misuse-it. Item 94 deliberately un-fused them — allocation
+// The two calls were once FUSED into one, and the fusion's stated value was
+// explicitly can't-misuse-it. They were then deliberately un-fused — allocation
 // now lives in `SimulationReconciliation`, the class that owns the slots —
 // and the review confirmed the resulting cost: `collectInputAll` became
 // callable without `allocateFrontierSlotsAll`, and a caller who collects and
 // lets capture (`postPredictionAll`) run anyway pushes state into the OLD
 // frontier slot — the frontier-pair detector's uncovered direction (blind
 // spot #2, `CorrectionCache.h`'s `m_frontierSlotAwaitingState`; see
-// `collectInputAll`'s own banner, above, for the successor obligation this
-// trades on). Every EXISTING caller gets the order right today; nothing
+// `collectInputAll`'s own banner in `SimulationInputResolution.h` for the
+// successor obligation this trades on). Every EXISTING caller gets the order
+// right today; nothing
 // enforces that a future one will.
 //
 // THE PRECEDENT IS `registerSimulatable`/`unregisterSimulatable`
 // (`SimulationNetSync.h`) — free functions whose sole purpose is sequencing a
 // multi-peer operation that must not be got wrong, hardened for exactly that
-// reason at items 92 and 93. Same shape, same class of hazard, applied here.
+// reason after two live crashes. Same shape, same class of hazard, applied here.
 // ONE difference, and it is deliberate, not a departure: those two take the
 // CONCRETE `SimulationObjectStorage<Ts...>`/`SimulationReconciliation<Ts...>`/
 // etc. class templates, because their callers (the composition root) already
@@ -80,7 +84,7 @@ OGSIM_OPTIMIZE_OFF
 //
 // ⛔ BE HONEST ABOUT WHAT THIS IS NOT: enforcement. `collectInputAll` and
 // `allocateFrontierSlotsAll` both stay PUBLIC and INDEPENDENTLY CALLABLE —
-// item 94 needs them separate (the authority role calls only the former; see
+// the authority role needs them separate (it calls only the former; see
 // below). This function buys default-correctness and discoverability, the
 // same as the register/unregister facades do for their own pair — NOT a
 // compiler-checked guarantee. Blind spot #2 is UNCHANGED and stays open; DO
@@ -96,12 +100,18 @@ OGSIM_OPTIMIZE_OFF
 // facade. The name encodes that restriction; the matching statement lives at
 // that call site.
 //
-// HOME, DECIDED NOT DEFAULTED. This lives here, in
-// `SimulationInputResolution.h`, rather than `SimulationNetSync.h` (where the
+// HOME, DECIDED NOT DEFAULTED. ⚠ The argument below predates this file: it was
+// written against the function's first landing and weighs the same candidates;
+// only the home it names changed. The relocation record is in this file's own
+// top banner.
+//
+// This lives HERE, in `SimulationStepSequencing.h`, rather than in
+// `SimulationInputResolution.h`, `SimulationNetSync.h` (where the
 // register/unregister precedent lives) or `SimulationReconciliation.h`.
-// NetSync is no longer party to either call after item 94 — it would be
-// sequencing two peers it doesn't touch. `SimulationReconciliation.h` was
-// considered and rejected: this function is deliberately DUCK-TYPED (see
+// NetSync is no longer party to either call since frontier allocation moved
+// to `SimulationReconciliation`; it would be sequencing two peers it doesn't
+// touch. `SimulationReconciliation.h` was considered and rejected: this
+// function is deliberately DUCK-TYPED (see
 // below — it takes the sequence's two calls generically, not the concrete
 // `SimulationInputResolution<Ts...>`/`SimulationReconciliation<Ts...>` class
 // templates), specifically so `SimulationManager`'s duck-typed
@@ -112,20 +122,22 @@ OGSIM_OPTIMIZE_OFF
 // (`ResimGatePolicyTest.cpp`, `StateCorrectionCache4MethodApiTest.cpp`), and
 // the manager's own header comment states this duck-typing as a design rule
 // to preserve, not incidental. That removes the concrete-type argument either
-// candidate header would have offered; what is left is documentation
-// locality — this function fulfills `collectInputAll`'s own successor-
-// obligation banner (above), so it lives beside the call it opens, matching
-// where a reader already is when they need it.
+// candidate header would have offered; what is left is the file test at the top
+// of this header — a free function that sequences two peers and NAMES NEITHER
+// belongs to no participant, and hosting it in one of them would be arbitrary.
+// It fulfills the successor obligation stated at `collectInputAll`
+// (`SimulationInputResolution.h`), which is the banner to read next.
 //
 // THE SWEEP-BOUNDARY FENCE, RELOCATED HERE FROM
-// `SimulationManager::onGameSimulationPrediction` (item 94's home for it,
-// now item 96's, since this function is now the two-statement sequence the
-// fence governs): NO CONTROL FLOW may run between the two calls below. Every
+// `SimulationManager::onGameSimulationPrediction` (its previous home; it
+// belongs here because this function IS the two-statement sequence the fence
+// governs): NO CONTROL FLOW may run between the two calls below. Every
 // id's input has been consumed by collect (dequeued, delay-pushed, enqueued
 // for send) and NO frontier slot has been allocated for this tick yet — that
 // window is legal only because nothing intervenes.
 //
-// ⚠ [item 91 part I, carried forward verbatim — only the MECHANICS relocate]
+// ⚠ CARRIED FORWARD VERBATIM FROM ITS ORIGINAL SITE — only the
+// MECHANICS relocated.
 // "NOTHING RUNS BETWEEN THEM" IS CONTROL-FLOW-ONLY, NOT EXCEPTION-SAFE.
 // `collectInputAll`'s per-character body (`collectInputForCharacter`) makes
 // `.at(id)` lookups that throw a real, unwinding C++ exception under this
@@ -137,7 +149,7 @@ OGSIM_OPTIMIZE_OFF
 // before the throw point DESTRUCTIVELY CONSUMED WITH NO FRONTIER SLOT
 // ALLOCATED for that tick.
 //
-// DECISION, RECORDED (unchanged since item 91 part I; this function is now
+// DECISION, RECORDED (unchanged since it was first written; this function is now
 // its custodian): accepted as documented debt. Reasons: (1) this path is
 // reachable only via an ALREADY-BROKEN registration invariant (a second bug
 // required), so it is not a standalone defect surface; (2) making collect

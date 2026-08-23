@@ -14,6 +14,22 @@ exactly where it is. Local truth remains local; do not copy prose out of a THREA
 this file, and do not let this file's summary drift from it — if they disagree, the in-file block
 is authoritative and this row is stale.
 
+> ⚠ **`ArchitectureReview_Fable.md` and `DesignInputResolutionPeer.md` are private working material
+> from the `og-netcode-v2-input-relay` initiative archive and are NOT distributed with this
+> submodule.** They are named as provenance, deliberately unlinked. The declarations below tell
+> `tools/lint/doc_anchor_lint.ps1` that both names are intentionally unresolvable, so it enumerates
+> them with this reason rather than reporting them as drift.
+>
+> ⚠ **Retired name, kept on purpose.** Rows 1 and 7 name `prepareSimulationStep`. That identifier is
+> **gone from the tree**: it was `collectInputAll`'s name between backlog items 90 and 94 only, and
+> `collectInputAll` is what exists today (`SimulationInputResolution.h`). It is kept in those rows
+> because a reader holding a build from that window needs the mapping; it is declared below so the
+> anchor lint reports it as a marked retirement instead of as a broken anchor.
+
+<!-- lint-external-ref: ArchitectureReview_Fable.md -- og-netcode-v2-input-relay initiative archive; private working material, not distributed with this submodule -->
+<!-- lint-external-ref: DesignInputResolutionPeer.md -- og-netcode-v2-input-relay initiative archive; private working material, not distributed with this submodule -->
+<!-- lint-external-ref: prepareSimulationStep -- RETIRED NAME: collectInputAll carried it between items 90 and 94 only; it became collectInputAll again and must not resolve -->
+
 ## The standing rule
 
 > **Any new GT↔PT crossing adds its row here, and prefers the staged SPSC pattern** —
@@ -53,6 +69,23 @@ row 7 and row 8 were named by review (item 81 finding 1); rows 9 and 10 surfaced
 own completeness sweep (below), which the original six-row pass did not run. See "Completeness
 sweep (item 83)" for what was checked and how these two were found.
 
+⛔ **Every host-engine name in the table below is ONE adapter's binding, never the binding.** A
+crossing is a property of *this core* — which thread writes a member and which thread reads it —
+and that property survives whatever engine hosts it. Where a row needs to say *how* a thread is
+entered or *what* delivered a call, it names the symbol this project's shipping adapter uses; an
+adapter on another engine substitutes its own and the row's shape is unchanged. The three that
+recur, with the role each plays:
+
+| name in a row | the ROLE it plays | whose it is |
+|---|---|---|
+| `OnPreSimulate_Internal` | the **pre-simulate physics callback** — where the core's prediction step is entered, before the solve | one adapter's physics callback (`FSimulationManagerAsyncCallback`, on Chaos) |
+| `OnPostSolve_Internal` | the **post-solve physics callback** — where the core captures state, after the same frame's solve | the same callback object; the two are separate engine callbacks with the solve running between them, which is what widens row 11's window |
+| `UFUNCTION(Server,...)` | the declaration that makes a method a **client→server RPC entry point**, arriving on the game thread | one adapter's reflection macro; another declares its RPCs some other way, and row 8's GT attribution then rests on that declaration instead |
+
+`USimmableUpdateComponent` in row 11 is likewise one adapter's binding for the **per-character
+registration site** — the object that publishes a character into the core's storage and withdraws
+it at teardown.
+
 | # | Crossing | Direction | Shape | In-file THREADING block |
 |---|----------|-----------|-------|--------------------------|
 | 1 | Relay stores (`m_remoteInputCaches`) | GT write (`OnRep_RelayedInputRing`) → PT read (`collectInputAll`, `collectResimInputAll`; `collectInputAll` named `prepareSimulationStep` between item 90 and item 94) | Data — accepted debt, correction-healed | `Network/RemoteInputCache.h` — "THREADING — GAME-THREAD WRITE / PHYSICS-THREAD READ. ACCEPTED DEBT." block, and its DEFERRED CLEANUP paragraph naming the SPSC fix |
@@ -65,7 +98,7 @@ sweep (item 83)" for what was checked and how these two were found.
 | 8 | `m_currentAuthorityTick` / `m_rollbackWindowTicks` | PT write (`setAuthorityGuardContext`, from `onGameSimulationAuthority`) → GT read (the RPC-arrival lambda bound in `registerAuthorityOwner`, firing from `ServerReceiveRemoteMove` (`UFUNCTION(Server,...)`) and from `deliverDelayedRemoteInput`, both GAME thread) | **Data — accepted debt, unsynchronized.** Plain `uint32`/`int32`, not atomic. Direction is PT→GT — the doc's default framing is GT→PT, so this is the same reversed shape as row 3, not row 3 itself. Honest hazard: a naturally-aligned 4-byte word is a single-bus-cycle op on x86-64 (same practical argument row 10 documents for `NetworkTimeEstimator`'s plain fields) so true tearing is not the realistic exposure; the real one is *staleness* — the RPC-arrival read may see an authority tick up to one PT tick old, which the member's own comment already prices as acceptable ("an at-most-one-tick-stale value is fine for a multi-tick rollback window"). It gates an accept/reject decision (too-far-future capture-tick rejection) so it is control-*flavored* data, but unlike row 5 there is exactly one writer thread, so no lost-update/RMW race is possible — only staleness on a plain read. Not correction-healed by a later landing (unlike rows 1–4); self-heals by being overwritten every authority tick instead | `SimulationNetSync.h` — the members' own declaration comment above `m_currentAuthorityTick` |
 | 9 | `NetworkTimeEstimator::m_authorityTick` | GT write (`recordAuthorityTick`, from `OnRep_TimingInfo`) → PT read (`getTargetPredictionTick`/`getLastAuthorityTick`, called from `ClientPredictionClock::advancePrediction`) | **Correctly synchronized** — `std::atomic<unsigned int>`, explicit, single-writer/single-reader. A THIRD correctly-synchronized crossing, found by this task's own sweep, not by item 81's review | `PCTimeManagement/NetworkTimeEstimator.h` — the class's own "THREAD-SAFETY CONTRACT" banner |
 | 10 | `NetworkTimeEstimator::m_smoothedRTT` / `m_smoothedJitter` / `m_hasFirstSample` | GT write (`updateRTT`, from `OnRep_TimingInfo`) → PT read (`getSmoothedRTT`/`getSmoothedJitter`/`hasFirstRTTSample`, from `advancePrediction`) | **Data — accepted debt, a DIFFERENT mechanism from rows 1–4.** Plain `double`/`double`/`bool`, not atomic, not correction-healed by a later landing. Relies on an explicit *platform* assumption the class states itself: a naturally-aligned 8-byte load/store is a single-bus-cycle op and cannot tear on x86-64/MSVC/Clang (UE's primary PT target today) — and the same comment names its own limit: "if this class is ever ported to ARM or compiled with unaligned-access enabled, wrap these fields in `std::atomic<double>` as well." `m_hasFirstSample` is write-once (GT) / read-many (PT) and carries the same caveat | `PCTimeManagement/NetworkTimeEstimator.h` — the same "THREAD-SAFETY CONTRACT" banner |
-| 11 | Storage exposure at registration/teardown (`storage.add` / `storage.remove`) | **Both directions named.** GT write — `storage.add` via `USimmableUpdateComponent::tryRegisterWithNewFramework` (`GetTimerManager().SetTimerForNextTick`) at registration, `storage.remove` via the unregister facade at teardown — ↔ PT read/iterate, the `forEachSimulatable`-driven sweeps: `allocateFrontierSlotsAll`, `postPredictionAll`, `collectInputAll` | **Data — accepted debt.** Unsynchronized; no lock protects `m_storage`/cache/queueMap across the boundary. Not newly found — audited and priced by item 94's D-2 (`DesignInputResolutionPeer.md`, "D-2, AUDITED AND REJECTED AT ITEM 94"), whose rejection of a proposed capture-side pairing check rests entirely on this crossing; that section is the analysis of record for this row, not a duplicate of it. **The window is wider than a single-callback race**: the two PT sweeps run in **two separate Chaos callbacks** — `OnPreSimulate_Internal` (→ `onGameSimulationPrediction`, sweep 1 + `allocateFrontierSlotsAll`) and `OnPostSolve_Internal` (`postPredictionAll`, `SimulationManagerUImpl.cpp:282,308`) — with the actual physics solve running between them, so a GT registration or teardown can land anywhere across that whole span, not just inside one callback | `SimulationNetSync.h:1120-1124` (register facade — "cache must exist before storage" ordering) and `:1250-1263` (unregister facade — item-94 Part F's re-checked mirrored-invariant paragraph); local text stays authoritative, this row indexes it, not the other way around |
+| 11 | Storage exposure at registration/teardown (`storage.add` / `storage.remove`) | **Both directions named.** GT write — `storage.add` via `USimmableUpdateComponent::tryRegisterWithNewFramework` (`GetTimerManager().SetTimerForNextTick`) at registration, `storage.remove` via the unregister facade at teardown — ↔ PT read/iterate, the `forEachSimulatable`-driven sweeps: `allocateFrontierSlotsAll`, `postPredictionAll`, `collectInputAll` | **Data — accepted debt.** Unsynchronized; no lock protects `m_storage`/cache/queueMap across the boundary. Not newly found — audited and priced by item 94's D-2 (`DesignInputResolutionPeer.md`, "D-2, AUDITED AND REJECTED AT ITEM 94"), whose rejection of a proposed capture-side pairing check rests entirely on this crossing; that section is the analysis of record for this row, not a duplicate of it. **The window is wider than a single-callback race**: the two PT sweeps run in **two separate Chaos callbacks** — `OnPreSimulate_Internal` (→ `onGameSimulationPrediction`, sweep 1 + `allocateFrontierSlotsAll`) and `OnPostSolve_Internal` (`postPredictionAll`, `SimulationManagerUImpl.cpp:282,308`) — with the actual physics solve running between them, so a GT registration or teardown can land anywhere across that whole span, not just inside one callback | `SimulationNetSync.h`, the client `registerSimulatable` overload (the "PUBLISH LAST — createCacheFor BEFORE storage.add" guard) and the `unregisterSimulatable` facade (item-94 Part F's re-checked mirrored-invariant paragraph); local text stays authoritative, this row indexes it, not the other way around |
 
 Row 5 is this doc's own worked example of the data/control distinction above: it is *stored* as
 bitset data (priced on the tear-tolerance argument, like rows 1–4), but the bit it carries is read

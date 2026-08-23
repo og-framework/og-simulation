@@ -12,19 +12,20 @@
 // WHAT THIS IS. `SimulationNetSync::sendCorrectionAll` used to write EVERY
 // authority writer's correction-state buffer on EVERY tick. This kernel turns
 // that into a round-robin: K writers per call, the window advancing by K each
-// call, wrapping. A character not written is not dirty, and Iris rolls back the
-// headers of clean objects (`FReplicationWriter::WriteObjectBatch`), so a
-// skipped character costs ZERO bytes rather than a skipped batch.
+// call, wrapping. A character not written is not dirty, and the replication
+// system rolls back the headers of clean objects, so a skipped character costs
+// ZERO bytes rather than a skipped batch. (One adapter's binding: Iris, whose
+// clean-object rollback is `FReplicationWriter::WriteObjectBatch`.)
 //
 // WHY AT THE WRITE SITE AND NOT IN THE ENGINE (T38 §5.4). Two mechanisms could
-// throttle the state: static priority (let Iris skip it under pressure) or
-// write-site gating. Gating was chosen because it is DETERMINISTIC — the cadence
-// is a decided number that a probe can report and a test can pin — while a
-// priority-only scheme yields whatever cadence the packet happened to allow.
-// Static priority is still set (ring 4.0 above state 1.0) but it is the BACKSTOP
-// for the frames where a written state coincides with a burst, not the cadence
-// mechanism. "The state cadence must be a decided, configured number" is the
-// point of the change.
+// throttle the state: static priority (let the replication system skip it under
+// pressure) or write-site gating. Gating was chosen because it is DETERMINISTIC —
+// the cadence is a decided number that a probe can report and a test can pin —
+// while a priority-only scheme yields whatever cadence the packet happened to
+// allow. Static priority is still set (ring 4.0 above state 1.0) but it is the
+// BACKSTOP for the frames where a written state coincides with a burst, not the
+// cadence mechanism. "The state cadence must be a decided, configured number" is
+// the point of the change.
 //
 // ⚠ THE COUPLING THIS DELIBERATELY RELAXES (T38 §2.3). The retirement block at
 // `SimulationNetSync::sendCorrectionAll` names sparse state as "THE ONE THING
