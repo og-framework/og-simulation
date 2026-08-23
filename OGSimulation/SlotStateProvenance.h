@@ -96,7 +96,7 @@
 //   (b) `[ResimProbe.SlotMap] id=… frontier=… map=…` — one line per character,
 //       at most once per completed resim and once per wipe, at **Verbose** on the
 //       existing `LogOGResimProbe` category (see `SimulationReconciliation::
-//       dumpSlotProvenanceAll`).
+//       getDiagnostics().logSlotProvenanceAll`, RN-7/task 56).
 //
 // ⚠ VERBOSE IS DELIBERATE AND IS NOT NEGOTIABLE DOWNWARD. This is per-slot,
 // per-window data: 60 characters per character per resim. At Warning it would be
@@ -190,7 +190,7 @@ enum class SlotStateProvenance : std::uint8_t
 };
 
 // THE MAP ALPHABET — one character per value, for the `[ResimProbe.SlotMap]`
-// dump. Defined ONCE, here, beside the enum, so the spellings an operator greps
+// line. Defined ONCE, here, beside the enum, so the spellings an operator greps
 // for cannot drift between the shipped emitter and a test. Same rule and same
 // reason as `correctionLandingSiteName` in ResimGateProbe.h.
 //

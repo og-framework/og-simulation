@@ -7,8 +7,10 @@
 
 #include "OGSimulation/SimulatableList.h"
 
+#include "OGSimulation/CompilerControl.h"
+
 // pragma optimize off — debugger-friendliness; rationale in SimulationManager.h.
-#pragma optimize("", off)
+OGSIM_OPTIMIZE_OFF
 
 // Forward declaration for the friend grant inside StorageView — the sole
 // constructor of a StorageView is SimulationObjectStorage::projectTo<>()
@@ -137,5 +139,5 @@ private:
 	std::tuple<StorageViewThunk<WantedTs>...> m_thunks;
 };
 
-#pragma optimize("", on)
+OGSIM_OPTIMIZE_ON
 // pragma optimize on.

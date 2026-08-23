@@ -8,8 +8,10 @@
 #include "OGSimulation/SimulationObjectStorage.h"
 #include "OGSimulation/SimulationTimeContext.h"
 
+#include "OGSimulation/CompilerControl.h"
+
 // pragma optimize off — debugger-friendliness; rationale in SimulationManager.h.
-#pragma optimize("", off)
+OGSIM_OPTIMIZE_OFF
 
 // Adapter-dependent side of a simulatable: integrate() and firstResimStep().
 // Required by SimulationIntegrationExecutor.
@@ -105,7 +107,9 @@ private:
 };
 
 // Concept for types that implement the SimulationIntegrationExecutor interface.
-// Lives here so task 6 can static_assert ASimulationManagerUImpl's member against it.
+// Lives here, beside the class, so the composition root that owns an executor as a
+// member can static_assert that member against it. One adapter does exactly that,
+// in `SimulationManagerUImplConceptTest.cpp`.
 template <typename T>
 concept SimulationIntegrationExecutorConcept = requires(
     T& t, const SimulationTimeStep& step, int32_t physStep)
@@ -114,5 +118,5 @@ concept SimulationIntegrationExecutorConcept = requires(
     { t.captureBodyStatesAll() };
 };
 
-#pragma optimize("", on)
+OGSIM_OPTIMIZE_ON
 // pragma optimize on.

@@ -10,8 +10,10 @@
 #include "OGSimulation/SimulatableList.h"  // SimulatableList, apply_t, IsSimulatableList, list_contains_v
 #include "OGSimulation/StorageView.h"      // StorageView, StorageViewThunk (projectTo<> return + thunks)
 
+#include "OGSimulation/CompilerControl.h"
+
 // pragma optimize off — debugger-friendliness; rationale in SimulationManager.h.
-#pragma optimize("", off)
+OGSIM_OPTIMIZE_OFF
 
 // ---------------------------------------------------------------------------
 // SimulatableState concept — adapter-agnostic side of a simulatable.
@@ -38,7 +40,7 @@ using ResolvedInputs = std::tuple<
 
 // Variadic tuple-of-maps owning simulatable instances via unique_ptr for stable addresses.
 // SimulationIntegrationExecutor, SimulationReconciliation, and SimulationNetSync all
-// hold non-owning refs to this storage; ASimulationManagerUImpl owns it by value.
+// hold non-owning refs to this storage; the composition root owns it by value.
 template <typename... SimulatableTs>
 class SimulationObjectStorage
 {
@@ -184,7 +186,7 @@ private:
 };
 
 // Free function — drives visualization update for all simulatables.
-// Called by ASimulationManagerUImpl::OnPostPhysicsStep directly;
+// Called by the composition root directly, from its post-physics step;
 // not a networking or cache concern.
 template <typename... Ts>
 void updateVisualizationAll(SimulationObjectStorage<Ts...>& storage)
@@ -194,5 +196,5 @@ void updateVisualizationAll(SimulationObjectStorage<Ts...>& storage)
     });
 }
 
-#pragma optimize("", on)
+OGSIM_OPTIMIZE_ON
 // pragma optimize on.

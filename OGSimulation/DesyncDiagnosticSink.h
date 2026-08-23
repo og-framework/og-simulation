@@ -8,8 +8,10 @@
 #include "OGSimulation/PCTimeManagement/TimeConfig.h"
 #include "OGSimulation/SimulationLog.h"
 
+#include "OGSimulation/CompilerControl.h"
+
 // pragma optimize off — debugger-friendliness; rationale in SimulationManager.h.
-#pragma optimize("", off)
+OGSIM_OPTIMIZE_OFF
 
 // ---------------------------------------------------------------------------
 // Desync diagnostic sink boundary (proposal §2.4 / D3.8).
@@ -17,8 +19,9 @@
 // Layer: OGSimulation. Engine-agnostic — no UE, no Chaos, no game types.
 //
 // This header ships the BOUNDARY only. There is deliberately NO production
-// consumer yet: the hash-broadcast wire hookup (the OnRep handler that compares
-// the authoritative checksum against the local one and fires these callbacks)
+// consumer yet: the hash-broadcast wire hookup (the replication-arrival handler
+// that compares the authoritative checksum against the local one and fires these
+// callbacks)
 // belongs to the Stage 4 observability initiative. Landing the interface first
 // means Stage 4 wires a broadcast into an already-tested seam instead of
 // inventing the seam and the transport in the same change.
@@ -37,8 +40,9 @@
 //      built to expect.
 //
 // Header-only (no .cpp) — matching CorrectionCache.h / SimulationReconciliation.h
-// in this same directory. Both the standalone CMake build and the UE module glob
-// this directory, so nothing needs registering; and keeping the type header-only
+// in this same directory. Both the standalone CMake build and the adapter's
+// module build glob this directory, so nothing needs registering; and keeping
+// the type header-only
 // avoids exporting a class with std::atomic members across the DLL boundary.
 // ---------------------------------------------------------------------------
 
@@ -85,8 +89,9 @@ public:
 // The injected-logger shape mirrors NetworkTimeEstimator exactly: the same
 // `LoggerFn = std::function<void(const char*)>` alias, taken by value at
 // construction and moved into the member, null meaning "logging disabled". The
-// OGSimulation layer is engine-independent; the UE instantiation site passes a
-// lambda that routes into UE_LOG, and the tests pass a capturing lambda.
+// OGSimulation layer is engine-independent; one adapter's instantiation site
+// passes a lambda that routes into that host's logging macro (`UE_LOG`), and the
+// engine-free Catch2 tests pass a capturing lambda.
 //
 // Threading: the counters are std::atomic because the detection path may run on
 // the physics thread while a test or debug UI reads the counts from the game
@@ -161,5 +166,5 @@ inline bool shouldEscalateToLayer2(int32_t consecutiveMismatchRun, const TimeCon
     return consecutiveMismatchRun >= cfg.hashMismatchTickThreshold;
 }
 
-#pragma optimize("", on)
+OGSIM_OPTIMIZE_ON
 // pragma optimize on.

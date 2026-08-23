@@ -11,8 +11,10 @@
 #include "OGSimulation/SimulationTimeContext.h"
 #include "TimeConfig.h"
 
+#include "OGSimulation/CompilerControl.h"
+
 // pragma optimize off — debugger-friendliness; rationale in SimulationManager.h.
-#pragma optimize( "", off )
+OGSIM_OPTIMIZE_OFF
 
 // ClientPredictionClock — client-only tick counter with graduated drift correction
 // and resimulation cursor.
@@ -28,8 +30,9 @@ class ClientPredictionClock
 public:
 // Injected logger type. Pass nullptr (the default) to disable all logging.
 // Messages carry a level prefix: "[Log] ..." or "[Warning] ..."
-// The OGSimulation module is engine-independent; the TestYo layer bridges this
-// to UE_LOG via a lambda passed at construction.
+// The OGSimulation module is engine-independent; an adapter bridges this callback
+// to the host application's log via a lambda passed at construction. One adapter
+// does it in `SimulationManagerUImpl.cpp`'s `RouteOGMessage`.
 using PCClockLoggerFn = std::function<void(const char*)>;
 
     OGSIMULATION_API ClientPredictionClock(const TimeConfig& config, const NetworkTimeEstimator& estimator, PCClockLoggerFn logger);
@@ -147,5 +150,5 @@ private:
     PCClockLoggerFn m_logger;
 };
 
-#pragma optimize( "", on )
+OGSIM_OPTIMIZE_ON
 // pragma optimize on.

@@ -3,8 +3,10 @@
 
 #include <type_traits>
 
+#include "OGSimulation/CompilerControl.h"
+
 // pragma optimize off — debugger-friendliness; rationale in SimulationManager.h.
-#pragma optimize("", off)
+OGSIM_OPTIMIZE_OFF
 
 // ---------------------------------------------------------------------------
 // SimulatableList<...> marker + apply_t + list_contains_v + IsSimulatableList
@@ -84,5 +86,5 @@ struct is_simulatable_list<SimulatableList<Ts...>> : std::true_type {};
 template <typename T>
 concept IsSimulatableList = is_simulatable_list<T>::value;
 
-#pragma optimize("", on)
+OGSIM_OPTIMIZE_ON
 // pragma optimize on.

@@ -78,7 +78,7 @@
 //
 // NEITHER DOES IT LOG. It accumulates and hands back a summary struct; the
 // caller owns the logger and does the SIMLOG. Same convention as RelayReadProbe,
-// `populateRelayedInputStore` and `RemoteMoveQueue` — and it is what lets the
+// `populateRemoteInputCache` and `RemoteMoveQueue` — and it is what lets the
 // Low-Level Tests assert on numbers rather than on strings.
 //
 // ENGINE-AGNOSTIC. `<cstdint>` only — no UE types, no OGTypes, no other

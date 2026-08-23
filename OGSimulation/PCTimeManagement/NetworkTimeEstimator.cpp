@@ -4,8 +4,10 @@
 #include <algorithm>
 #include <cstdio>
 
+#include "OGSimulation/CompilerControl.h"
+
 // pragma optimize off — debugger-friendliness; rationale in SimulationManager.h.
-#pragma optimize( "", off )
+OGSIM_OPTIMIZE_OFF
 
 NetworkTimeEstimator::NetworkTimeEstimator(const TimeConfig& config, LoggerFn logger)
     : m_config(config)
@@ -21,10 +23,10 @@ void NetworkTimeEstimator::updateRTT(double rawRTTSeconds)
     // -----------------------------------------------------------------------
     // VALIDITY GATE (og-netcode-v2-input-relay T21).
     //
-    // THE DEFECT THIS CLOSES — it was LIVE, not hypothetical. The UE binding
-    // reads the client's RTT with `FNetPing::GetPingValues(...).Current`, which
-    // the engine documents as **-1.0 when the ping type is disabled or has zero
-    // samples** (NetPing.h: "The current/latest ping value, or -1.0 if not
+    // THE DEFECT THIS CLOSES — it was LIVE, not hypothetical. One adapter's
+    // binding reads the client's RTT with `FNetPing::GetPingValues(...).Current`,
+    // which that engine documents as **-1.0 when the ping type is disabled or has
+    // zero samples** (NetPing.h: "The current/latest ping value, or -1.0 if not
     // set"). That value reached here UNGUARDED, and because the branch below
     // latches the FIRST sample verbatim, a single pre-warm-up OnRep would set
     // m_smoothedRTT = -1.0 and m_hasFirstSample = true.
@@ -72,9 +74,9 @@ void NetworkTimeEstimator::updateRTT(double rawRTTSeconds)
     //
     // CALLER CONTRACT IS UNCHANGED. `updateRTT` remains total: callers may pass
     // the engine sentinel straight through and need no guard of their own. The
-    // UE read sites still log their own one-shot diagnostic naming the specific
-    // cause (no FNetPing, ping type not enabled, accumulator empty), which this
-    // layer cannot know.
+    // adapter's read sites still log their own one-shot diagnostic naming the
+    // specific cause (no ping source, ping type not enabled, accumulator empty),
+    // which this layer cannot know.
     // -----------------------------------------------------------------------
     if (!(rawRTTSeconds >= 0.0) || !std::isfinite(rawRTTSeconds))
     {
@@ -109,11 +111,11 @@ void NetworkTimeEstimator::updateRTT(double rawRTTSeconds)
     // The sample is well-formed — the engine says it is a real reading. This
     // second gate asks a different question: is it BELIEVABLE?
     //
-    // WHY IT HAS TO EXIST. UE computes RTT as
-    // `CurrentTime - OutLagTime[Index]`, where `CurrentTime` is
-    // `FApp::GetCurrentTime()` — FRAME-START time. When a frame hitches, ack
-    // processing is delayed by up to the hitch duration and that delay lands
-    // DIRECTLY in the measurement. On a loopback session with 5-10 ms of
+    // WHY IT HAS TO EXIST. The engine computes RTT as `now - sendTime`, where
+    // `now` is a FRAME-START timestamp (one adapter: `CurrentTime -
+    // OutLagTime[Index]`, with `CurrentTime = FApp::GetCurrentTime()`). When a
+    // frame hitches, ack processing is delayed by up to the hitch duration and that
+    // delay lands DIRECTLY in the measurement. On a loopback session with 5-10 ms of
     // emulated lag this produces readings near ONE SECOND: a hundredfold error
     // caused by the local game thread, not by the network. Pre-T26b updateRTT
     // believed them, jitterMultiplier = 2 doubled the excursion into the offset,
@@ -417,5 +419,5 @@ unsigned int NetworkTimeEstimator::getOutlierEscapeCount() const
     return m_outlierEscapes;
 }
 
-#pragma optimize( "", on )
+OGSIM_OPTIMIZE_ON
 // pragma optimize on.

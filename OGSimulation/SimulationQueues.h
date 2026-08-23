@@ -7,8 +7,10 @@
 #include <optional>
 #include <cstddef>
 
+#include "OGSimulation/CompilerControl.h"
+
 // pragma optimize off — debugger-friendliness; rationale in SimulationManager.h.
-#pragma optimize("", off)
+OGSIM_OPTIMIZE_OFF
 
 // Outcome of RemoteMoveQueue::queueMove — receive-side capture-tick
 // guard (proposal §3.3 step 10). Returned (rather than logged here) so the queue stays
@@ -19,6 +21,12 @@ enum class QueueMoveResult
     Enqueued,               // accepted and stored
     DuplicateDiscarded,     // capture_tick already pending — R-T5 first-writer-wins
     TooFarFutureDiscarded,  // capture_tick > serverAuthorityTick + rollbackWindowTicks
+    // [og-netcode-v2-input-relay item 86] Added for SimulationInputResolution's
+    // by-id queueRemoteMove door (design §C.3): a lookup miss on the id — the
+    // benign downgrade of what used to be a captured-reference dangling-UB
+    // hazard before the callback rebind. Never produced by RemoteMoveQueue
+    // itself; the caller returns this without calling queueMove at all.
+    IdNotRegistered,
 };
 
 // Generic circular move queue — physics thread writes on RPC arrival (game thread),
@@ -36,9 +44,10 @@ public:
     //
     // 1. R-T5 dedup (first-writer-wins): if a still-pending entry already carries this
     //    captureTick, silently discard the new one. This is correct ONLY under the
-    //    FInputRedundancyBundle append-only/immutable-per-capture-tick invariant — the
-    //    client never revises a sent tick's input, so the first arrival is authoritative
-    //    and the redundant re-sends in the overlap window are duplicates to drop.
+    //    inbound redundancy bundle's append-only/immutable-per-capture-tick invariant
+    //    — the client never revises a sent tick's input, so the first arrival is
+    //    authoritative and the redundant re-sends in the overlap window are duplicates
+    //    to drop.
     // 2. Too-far-future guard: reject a captureTick beyond rollbackWindowTicks ahead of
     //    the server authority tick. rollbackWindowTicks is supplied by the caller from
     //    TimeConfig::rollbackWindowTicks (no hardcoded literal here — R-P1). A negative
@@ -185,8 +194,10 @@ public:
 
     // Drops all pending entries. Safe only when neither producer nor consumer
     // is concurrently accessing the queue — i.e. from the clock-resync wipe
-    // path, which runs on the physics thread inside advancePrediction while
-    // TG_EndPhysics is still blocked and the consumer cannot touch the queue.
+    // path, which runs on the physics thread inside advancePrediction while the
+    // game thread's end-of-physics tick group is still blocked, so the consumer
+    // cannot touch the queue. (One adapter's binding for that barrier:
+    // `TG_EndPhysics`.)
     void clear()
     {
         m_head.store(0, std::memory_order_relaxed);
@@ -200,5 +211,5 @@ private:
     std::array<Entry, RingSize> m_buffer{};
 };
 
-#pragma optimize("", on)
+OGSIM_OPTIMIZE_ON
 // pragma optimize on.

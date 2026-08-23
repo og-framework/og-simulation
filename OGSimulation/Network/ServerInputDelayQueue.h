@@ -97,8 +97,9 @@
 // this container is ever touched from the physics thread. A future caller that
 // wants to dequeue from the physics thread must NOT simply add a lock here: a
 // lock would fix this container's internal race and still leave the caller doing
-// UObject traversal (`TWeakObjectPtr::Get`, `AActor::GetNetConnection`) from the
-// physics thread, which this codebase forbids.
+// ENGINE-OBJECT traversal on the physics thread — resolving a weak object handle
+// (one adapter: `TWeakObjectPtr::Get`), then walking from the owning actor to its
+// transport connection (`AActor::GetNetConnection`) — which this codebase forbids.
 // ---------------------------------------------------------------------------
 //
 // CONSUMER: wired in Phase B (T10) — the UE server binding parks inbound RPC
@@ -186,8 +187,9 @@ public:
     };
 
     // Tier-table-less form — Phase-A back-compat and any deployment that has not
-    // wired tier escalation. Every connection then gets the flat baseline
-    // `TimeConfig::forcedInputLatencyTicks`.
+    // wired tier escalation. Every connection then gets the no-tier fallback (see
+    // `effectiveDelay` below — `rttTierInputDelays[kMaxConnectionTierIndex]` since
+    // item 62 / RN-12).
     explicit ServerInputDelayQueue(const TimeConfig& cfg)
         : m_config(cfg)
         , m_tierTable(nullptr)
@@ -209,7 +211,7 @@ public:
     // LOCKED 2026-07-19 (backlog C2). effectiveDelay(addr) =
     // `tierTable.lookupInputDelayTicks(addr)`, i.e. the per-tier value
     // `rttTierInputDelays[tier]` IS the effective delay and REPLACES the
-    // baseline. It is NOT added to `forcedInputLatencyTicks`.
+    // baseline. It is NOT added to the no-tier fallback.
     //
     // AMENDED 2026-08-03 (RelayDelaySpectrumDesign.md §6, review C2/A2a). The
     // replacement value is floored by the session relay delay floor:
@@ -218,32 +220,41 @@ public:
     //
     // The tier arm gets that for free — `lookupInputDelayTicks` delegates to
     // `tierInputDelayTicks`, which applies the floor. The FALLBACK arm below has
-    // to apply it explicitly, and it is one of the two sites that reads
-    // `forcedInputLatencyTicks` directly: this is derivation site 2 of 4 (see the
-    // enumeration in ConnectionTierTable.h). Missing it would make the server
-    // park an untiered connection's input at `forcedInputLatencyTicks` while its
-    // own client predicts at the floor.
+    // to apply it explicitly: this is derivation site 2 of 4 (see the enumeration
+    // in ConnectionTierTable.h). Missing it would make the server park an
+    // untiered connection's input at the un-floored fallback while its own client
+    // predicts at the floor.
     //
-    // `forcedInputLatencyTicks` is the fallback in exactly two situations, both
-    // meaning "no per-connection tier is available":
+    // ⛔ RETIRED (item 62 / RN-12, 2026-08-16): the fallback used to read a
+    // dedicated no-tier-baseline field (its old identifier is on record in
+    // RN-12, ReviewNotes.md). It now reads
+    // `rttTierInputDelays[kMaxConnectionTierIndex]` — the WORST tier, chosen
+    // because under-estimating the pre-tier delay schedules inputs too early and
+    // they are MISSED (item 41's `aboveNewest` population), while over-estimating
+    // only costs a couple of extra ticks of lag in a window the player is not yet
+    // in combat. See TimeConfig.h's `rttTierInputDelays` comment and RN-12 in
+    // ReviewNotes.md for the full argument.
+    //
+    // This fallback fires in exactly two situations, both meaning "no
+    // per-connection tier is available":
     //   1. No tier table wired (single-argument constructor), and
     //   2. The tier table has never sampled this Address.
     //
     // Case 2 is why this asks `hasEntry` first rather than calling
     // `lookupInputDelayTicks` unconditionally: the tier table answers tier 0 for
     // an unknown Address (an optimistic default that is correct for ITS purpose),
-    // so a bare lookup would silently return the tier-0 delay and the baseline
+    // so a bare lookup would silently return the tier-0 delay and the fallback
     // would become unreachable dead config.
     //
-    // See TimeConfig.h:180-209, which states the same replacement semantics on
-    // the fields themselves.
+    // See TimeConfig.h's `rttTierInputDelays` comment, which states the same
+    // replacement semantics on the fields themselves.
     int32_t effectiveDelay(const Address& addr) const
     {
         if (m_tierTable != nullptr && m_tierTable->hasEntry(addr))
         {
             return m_tierTable->lookupInputDelayTicks(addr);   // floored inside tierInputDelayTicks
         }
-        return applyRelayDelayFloor(m_config.forcedInputLatencyTicks, m_config);
+        return applyRelayDelayFloor(m_config.rttTierInputDelays[kMaxConnectionTierIndex], m_config);
     }
 
     // Slot-key overload — convenience for the call sites that hold a full key
@@ -626,7 +637,8 @@ private:
     const TimeConfig& m_config;
 
     // Pointer, not reference, so "no tier table wired" is representable — that
-    // is the state `forcedInputLatencyTicks` exists to serve. Never owned.
+    // is the state the no-tier fallback (see `effectiveDelay`) exists to serve.
+    // Never owned.
     const TierTable* m_tierTable;
 
     // THE single container, variadic over the pack (proposal Correction 4).

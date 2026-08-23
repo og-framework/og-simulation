@@ -9,8 +9,10 @@
 
 #include "TimeConfig.h"
 
+#include "OGSimulation/CompilerControl.h"
+
 // pragma optimize off — debugger-friendliness; rationale in SimulationManager.h.
-#pragma optimize( "", off )
+OGSIM_OPTIMIZE_OFF
 
 // NetworkTimeEstimator — client-only network estimation component.
 // Tracks smoothed RTT and jitter via EMA, stores the last known authority tick,
@@ -22,7 +24,10 @@
 // This class is accessed from two threads without a mutex:
 //
 //   Game thread (GT)  — writes via: updateRTT(), recordAuthorityTick()
-//                       Called from OnRep_TimingInfo (UObject replication).
+//                       Called from the adapter's timing-buffer arrival callback,
+//                       on the thread replication delivers on. One adapter binds
+//                       that to `ASimulationManagerUImpl::onTimingInfoReceived`,
+//                       fed from `ASimulationTimingRelay::OnRep_Buffer`.
 //
 //   Physics thread (PT) — reads via: getTargetPredictionTick(), getLastAuthorityTick(),
 //                          getSmoothedRTT(), getSmoothedJitter(), getPredictionOffsetTicks()
@@ -46,21 +51,22 @@ class NetworkTimeEstimator
 public:
 // Injected logger type. Pass nullptr (the default) to disable all logging.
 // Messages carry a level prefix: "[Verbose] ..."
-// The OGSimulation module is engine-independent; the TestYo layer bridges this
-// to UE_LOG via a lambda passed at construction.
+// The OGSimulation module is engine-independent; the adapter layer bridges this
+// to the engine's own logging macro via a lambda passed at construction.
 using LoggerFn = std::function<void(const char*)>;
 
     OGSIMULATION_API explicit NetworkTimeEstimator(const TimeConfig& config, LoggerFn logger);
 
     // -----------------------------------------------------------------------
-    // Mutators — called from game thread (OnRep_TimingInfo)
+    // Mutators — called from the game thread (see the THREAD-SAFETY CONTRACT above)
     // -----------------------------------------------------------------------
 
     // Feed a new raw RTT sample (seconds).  Updates smoothed RTT and jitter.
     //
     // TOTAL — callers may pass the engine's "no reading" sentinel straight
-    // through. A sample that is negative (UE's FPingValues::Current is -1.0
-    // when the ping type is disabled or unsampled), NaN or infinite is REJECTED
+    // through. A sample that is negative (the ping source's "not set" reading is
+    // -1.0 when the ping type is disabled or unsampled; the implementation names
+    // one adapter's symbol for it), NaN or infinite is REJECTED
     // outright: it does not latch, does not move either EMA, and does not set
     // the first-sample flag. It is counted and logged ONCE at [Warning].
     // Rationale — including why rejecting beats clamping, and the live defect
@@ -164,5 +170,5 @@ private:
     LoggerFn m_logger;
 };
 
-#pragma optimize( "", on )
+OGSIM_OPTIMIZE_ON
 // pragma optimize on.
