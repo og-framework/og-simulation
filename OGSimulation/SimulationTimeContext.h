@@ -61,7 +61,7 @@ inline const char* stepKindName(StepKind k)
 //      here from `SimulationInputResolution::allocateFrontierSlotForCharacter`
 //      (item 90's sweep 2 of `prepareSimulationStep`), now storage-driven and
 //      filtered on reconciliation's OWN cache population
-//      (`findInputCache != nullptr`) rather than resolution's `queueMap`.
+//      (`findCorrectionCache != nullptr`) rather than resolution's `queueMap`.
 //      THE tick-push gate that OPENS the pair, evaluated ONCE per tick and
 //      shared by every registered prediction-owned id, local and proxy
 //      alike — unchanged in that respect by the move.

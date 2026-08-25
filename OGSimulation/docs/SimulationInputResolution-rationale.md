@@ -26,6 +26,7 @@ wins. §15 lists the three places task 14 knew that to be the case.
 <!-- lint-external-ref: remoteQueue -- a captured reference the by-id doors replaced at item 86 -->
 <!-- lint-external-ref: pushPredictionInput -- retired at T16 with the correction cache's input column -->
 <!-- lint-external-ref: currentEffectiveDelay -- prose shorthand inside a formula, never a symbol -->
+<!-- lint-external-ref: findInputCache -- renamed to findCorrectionCache at item 39; the archive quotes the header as it stood under the old name -->
 
 ⚠ **One adapter binding the quoted text names.** `og-simulation` is engine-free — it names no
 game-engine type and is reached from a host engine only through `concept`s. One quoted block names a

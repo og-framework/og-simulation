@@ -735,7 +735,7 @@ private:
         // the shipped OnDisagreement differ, and which SHIPS is stated once, with
         // both halves anchored, at TimeConfig::resimTriggerPolicy — not re-derived here. §12
         //
-        // ⛔ READ THROUGH findInputCache, NOT by giving StateCorrectionCache an identity —
+        // ⛔ READ THROUGH findCorrectionCache, NOT by giving StateCorrectionCache an identity —
         // a placement already ruled against. nullptr on the authority is the right answer:
         // no caches are allocated there and this callback cannot fire there. §12
         //
@@ -744,7 +744,7 @@ private:
         // on the PHYSICS thread, misfiling one sample AtFrontier->Behind. §13
         // ⛔ NOT WORTH SYNCHRONIZING — ±1 on a 120-sample window, non-accumulating. §13
         const auto* landingCache =
-            m_reconciliation.template findInputCache<SimulatableT>(id);
+            m_reconciliation.template findCorrectionCache<SimulatableT>(id);
         const CorrectionLandingSite landingSite = classifyCorrectionLanding(
             verdict.landed, verdict.tick,
             landingCache != nullptr ? landingCache->getPredictionTick() : 0u);

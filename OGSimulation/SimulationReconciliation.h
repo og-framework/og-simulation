@@ -90,7 +90,7 @@ struct ResimSweepDiagnostics
 //     map states, and are what a port must re-establish.
 //
 //   * NOTHING HERE RUNS ON THE AUTHORITY. The server allocates no correction
-//     cache at all, so `findInputCache` answers nullptr for every id there and
+//     cache at all, so `findCorrectionCache` answers nullptr for every id there and
 //     `SimulationManager` gates the tick calls behind `m_runsPrediction`.
 //
 //   * THE PREDICTION TICK — one PAIR, both halves on the PHYSICS thread:
@@ -186,9 +186,9 @@ public:
     //
     // ⛔ THREE PRODUCTION CALL SITES of `stepAllocatesFrontierSlot`, not fewer — §5.
     //
-    // ⛔ `findInputCache != nullptr` IS the prediction-ownership test here — §6.
+    // ⛔ `findCorrectionCache != nullptr` IS the prediction-ownership test here — §6.
     //
-    // ⛔ ITERATION IS STORAGE-DRIVEN, FILTERED ON `findInputCache` — a bare cache-map
+    // ⛔ ITERATION IS STORAGE-DRIVEN, FILTERED ON `findCorrectionCache != nullptr` — a bare cache-map
     // walk fires `m_frontierSlotAwaitingState` as a false positive by construction. §6.
     //
     // ⛔ ITEM 92's `OG_CHECK` IS GONE FROM HERE with `allocateFrontierSlotForCharacter`;
@@ -203,8 +203,8 @@ public:
         m_storage.forEachSimulatable([&](unsigned int id, auto& simulatable) {
             using T = std::remove_reference_t<decltype(simulatable)>;
 
-            // ⛔ `findInputCache` here proves the entry exists, which makes `getCacheFor`'s `.at(id)` safe. §6.
-            if (findInputCache<T>(id) == nullptr)
+            // ⛔ `findCorrectionCache` here proves the entry exists, which makes `getCacheFor`'s `.at(id)` safe. §6.
+            if (findCorrectionCache<T>(id) == nullptr)
                 return;
 
             if (step.getStepKind() == StepKind::Skip)
@@ -475,17 +475,17 @@ public:
     //
     // ⛔ `getLatestInput` IS ALSO GONE, with the column both readers read. §15.
     //
-    // ⛔ `findInputCache` is NOT an input reader despite the name — a slot answers WHICH capture was applied, never what it was. §15.
+    // ⛔ A SLOT ANSWERS WHICH CAPTURE WAS APPLIED, NEVER WHAT IT WAS — no route here reads an input value. §15.
 
     // The join key for `tick`: which capture the authority applied at that tick.
     //
     // ⛔ nullopt = outside the window; `kNoInputCaptureTick` = a slot naming no capture. Deliberately distinguishable. §16.
     //
-    // Routed through `findInputCache` (nullable): safe on the authority.
+    // Routed through `findCorrectionCache` (nullable): safe on the authority.
     template <typename T>
     std::optional<uint32> getAppliedCaptureTick(unsigned int id, uint32 tick) const
     {
-        const auto* cache = findInputCache<T>(id);
+        const auto* cache = findCorrectionCache<T>(id);
         if (cache == nullptr)
             return std::nullopt;
 
@@ -501,11 +501,11 @@ public:
     // ⛔ `getAppliedCaptureTick` reports the SLOT VALUE and cannot tell a no-capture
     // correction from an unreached slot; only this form is safe to dispatch on. §16.
     //
-    // Routed through `findInputCache`: safe on the authority, where it answers NoSlot for every id.
+    // Routed through `findCorrectionCache`: safe on the authority, where it answers NoSlot for every id.
     template <typename T>
     AppliedCaptureRef getAppliedCaptureTickRef(unsigned int id, uint32 simTick) const
     {
-        const auto* cache = findInputCache<T>(id);
+        const auto* cache = findCorrectionCache<T>(id);
         if (cache == nullptr)
             return AppliedCaptureRef{};
 
@@ -525,9 +525,9 @@ public:
 
     // Returns the cache for this id, or nullptr (e.g. on the authority).
     //
-    // ⛔ THE NAME IS HISTORICAL — `findInputCache` says nothing about inputs. §15.
+    // ⛔ RENAMED FROM `findInputCache` — the cache has no input column. §15.
     template <typename T>
-    const StateCorrectionCache<typename T::StateType, typename T::InputType>* findInputCache(unsigned int id) const
+    const StateCorrectionCache<typename T::StateType, typename T::InputType>* findCorrectionCache(unsigned int id) const
     {
         const auto& map = std::get<CacheMapFor<T>>(m_caches);
         auto it = map.find(id);

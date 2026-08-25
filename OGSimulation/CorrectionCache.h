@@ -442,7 +442,7 @@ public:
 	// ⛔ THE GATE, shape unchanged DELIBERATELY: the second clause makes a frontier landing wait
 	// for the frontier to move, which is the legacy timing `FrontierExact` must reproduce. §2
 	//
-	// `const` because it no longer computes anything — which is what lets `findInputCache`'s const
+	// `const` because it no longer computes anything — which is what lets `findCorrectionCache`'s const
 	// route ask the gate directly. §2
 	bool needsResimulation() const
 	{

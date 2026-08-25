@@ -1060,10 +1060,10 @@ private:
     // The whole-tick sweep method and its per-character helper used to
     // live here, gated on a `queueMap` lookup (this class's own
     // `m_remoteMoveQueues`) plus a loud-failure `OG_CHECK` against
-    // `m_reconciliation.findInputCache`. Both are DELETED, not moved
+    // `m_reconciliation.findCorrectionCache`. Both are DELETED, not moved
     // verbatim: the replacement, Reconciliation's own frontier-allocating
     // sweep, filters on reconciliation's OWN cache population
-    // (`findInputCache` alone, no `queueMap` reference — see that method's
+    // (`findCorrectionCache` alone, no `queueMap` reference — see that method's
     // banner for why this class's `m_remoteMoveQueues` was never
     // load-bearing for the exclusion, only a second, redundant way of
     // saying "has a cache") and silently skips rather than aborting loudly

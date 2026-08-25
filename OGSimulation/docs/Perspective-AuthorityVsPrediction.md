@@ -138,7 +138,7 @@ cannot crash** — which is exactly why it is used for the two publish sweeps an
 sweeps.
 
 **G4 — the per-id filter inside a sweep.** `allocateFrontierSlotsAll` iterates *all* of storage and
-skips any id whose correction cache is absent, via the nullable accessor `findInputCache`. This is
+skips any id whose correction cache is absent, via the nullable accessor `findCorrectionCache`. This is
 the only gate in `SimulationReconciliation` that tolerates a cacheless id **inside** an already-
 running sweep, and §5 is about the consequence of that being the only one.
 
@@ -204,7 +204,7 @@ cache. The other eight reach the cache through `getCacheFor`, whose entire body 
 `std::get<CacheMapFor<T>>(m_caches).at(id)` — a bare `std::unordered_map::at`, which **throws** on a
 missing key. (Counted 2026-08-21 by
 `grep -c 'm_storage.forEachSimulatable' SimulationReconciliation.h`; the filtered one is identifiable
-by the literal `findInputCache<T>(id) == nullptr`.)
+by the literal `findCorrectionCache<T>(id) == nullptr`.)
 
 ⇒ **If any of those eight ran on the authority, it would throw on the first character.** They do not
 run there because of gate **G1** alone — one `if (m_runsPrediction)` in `onPostGameSimulation`, plus

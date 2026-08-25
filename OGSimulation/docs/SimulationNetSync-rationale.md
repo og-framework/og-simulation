@@ -79,6 +79,7 @@ which is exactly why the count was wrong for two items and nothing reported it.
 <!-- lint-external-ref: m_isResimulated -- RETIRED at item 45; the resim gate is edge-triggered on an explicit anchor now -->
 <!-- lint-external-ref: getLastResimulationTick -- RETIRED at item 45 together with the frontier scan it drove -->
 <!-- lint-external-ref: allocateFrontierSlotForCharacter -- RETIRED at item 94; frontier allocation is storage-driven on reconciliation's own cache population -->
+<!-- lint-external-ref: findInputCache -- RENAMED at item 39 to findCorrectionCache; quoted verbatim in an archived block under its old spelling -->
 
 ---
 

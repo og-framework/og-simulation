@@ -36,6 +36,7 @@ not edited to say so.
 <!-- lint-external-ref: SimulationNetSync::collectInputAll -- DEAD OWNER: collectInputAll moved to SimulationInputResolution at item 87; the qualified form must not resolve -->
 <!-- lint-external-ref: SimulationManagerUImpl::EmitOGLine -- ⛔ FALSE SYMBOL, quoted verbatim from the pre-compression header: no such member exists anywhere in the tree. The prefix routing is the free function RouteOGMessage in SimulationManagerUImpl.cpp. Filed as finding F-10; the compressed header no longer repeats it -->
 <!-- lint-external-ref: prepareSimulationStep -- RETIRED NAME: collectInputAll carried it between items 90 and 94 only; must not resolve -->
+<!-- lint-external-ref: findInputCache -- RENAMED NAME (item 39): the accessor is findCorrectionCache since 2026-08-25; every hit below is inside a verbatim pre-compression block, so the old spelling must not resolve -->
 
 ---
 
