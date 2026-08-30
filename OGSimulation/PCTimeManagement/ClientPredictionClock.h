@@ -132,6 +132,59 @@ using PCClockLoggerFn = std::function<void(const char*)>;
     OGSIMULATION_API unsigned int registerResyncCallback(ResyncCallback cb);
     OGSIMULATION_API void         unregisterResyncCallback(unsigned int id);
 
+    // -----------------------------------------------------------------------
+    // Diagnostics
+    // -----------------------------------------------------------------------
+
+    // ⛔ The grouping rule these follow lives in `docs/DiagnosticsConventions.md`; not re-derived here.
+    //
+    // ⛔ THE VIEW'S TYPE IS THE MARKER: members carry no `get` prefix and no `Diagnostic` infix.
+    class Diagnostics
+    {
+    public:
+        explicit Diagnostics(const ClientPredictionClock& clock) : m_clock(clock) {}
+
+        // ⛔ The full contract and the fence test's name are at the seven members' declaration below.
+        unsigned int skipCount()              const { return m_clock.m_skipCount; }
+        unsigned int lastSkipTick()           const { return m_clock.m_lastSkipTick; }
+        unsigned int stallCount()             const { return m_clock.m_stallCount; }
+        unsigned int lastStallTick()          const { return m_clock.m_lastStallTick; }
+        unsigned int hardResyncCount()        const { return m_clock.m_hardResyncCount; }
+        unsigned int lastHardResyncFromTick() const { return m_clock.m_lastHardResyncFromTick; }
+        unsigned int lastHardResyncToTick()   const { return m_clock.m_lastHardResyncToTick; }
+
+    private:
+        const ClientPredictionClock& m_clock;
+    };
+
+    class MutableDiagnostics
+    {
+    public:
+        explicit MutableDiagnostics(ClientPredictionClock& clock) : m_clock(clock) {}
+
+        // ⛔ THE FENCE'S OWN INSTRUMENT: it has no production caller and must never acquire one.
+        //
+        // Every word takes a distinct non-zero value that moves with the seed, and all four tick
+        // words land ABOVE the prediction frontier, a value no real event can leave behind.
+        void scribbleEventCountersForFenceTest(unsigned int seed)
+        {
+            const unsigned int aboveFrontier = m_clock.m_predictionTick + seed + 1u;
+            m_clock.m_skipCount              = seed + 1u;
+            m_clock.m_lastSkipTick           = aboveFrontier;
+            m_clock.m_stallCount             = seed + 2u;
+            m_clock.m_lastStallTick          = aboveFrontier + 1u;
+            m_clock.m_hardResyncCount        = seed + 3u;
+            m_clock.m_lastHardResyncFromTick = aboveFrontier + 2u;
+            m_clock.m_lastHardResyncToTick   = aboveFrontier + 3u;
+        }
+
+    private:
+        ClientPredictionClock& m_clock;
+    };
+
+    Diagnostics        getDiagnostics()  const { return Diagnostics(*this); }
+    MutableDiagnostics editDiagnostics()       { return MutableDiagnostics(*this); }
+
 private:
     void fireResyncCallbacks(unsigned int newTick);
 
@@ -148,6 +201,34 @@ private:
 
     std::vector<ResyncCallback> m_resyncCallbacks;
     PCClockLoggerFn m_logger;
+
+    // THE CLOCK'S EVENT SEAM - seven plain words, written PER EVENT on the physics thread and
+    // read as `clock.getDiagnostics().skipCount()` and its six siblings.
+    //
+    // ⛔ DIAGNOSTIC ONLY: three write sites in `advancePrediction`, no production reader, no decision.
+    //
+    // ⭐ MACHINE-CHECKED, by the case named here so it cannot be quietly dropped:
+    // `ClientPredictionClock.Events.TheEventCountersCannotReachAnyClockDecision`.
+    //
+    // That case garbage-fills these seven words mid-lifecycle and asserts every clock output
+    // byte-identical to an unscribbled run: every AdvanceResult, both cursors, `evaluateDrift`,
+    // the stall debt and the resync callback's ticks.
+    //
+    // ⛔ EVERY BRANCH WRITES ITS TICK BEFORE ITS COUNT - a count-then-tick reader tears one way only.
+    //
+    // ⚠ Both stall branches write, debt and graduated; instrumenting one under-counts silently.
+    //
+    // ⛔ Nothing here reaches the wire, the correction payload or `compute_checksum`.
+    //
+    // ⛔ Gate state is NOT in this block: `m_predictionTick`, `m_gradualCorrectionCounter`,
+    // `m_requiredInputDelayIncreaseStallTicks`.
+    unsigned int m_skipCount              = 0;
+    unsigned int m_lastSkipTick           = 0;
+    unsigned int m_stallCount             = 0;
+    unsigned int m_lastStallTick          = 0;
+    unsigned int m_hardResyncCount        = 0;
+    unsigned int m_lastHardResyncFromTick = 0;
+    unsigned int m_lastHardResyncToTick   = 0;
 };
 
 OGSIM_OPTIMIZE_ON

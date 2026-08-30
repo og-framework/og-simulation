@@ -82,6 +82,11 @@ ClientPredictionClock::AdvanceResult ClientPredictionClock::advancePrediction()
         m_gradualCorrectionCounter = 0;
         m_requiredInputDelayIncreaseStallTicks = 0;
 
+        // ⛔ Event seam - the two ticks before the count, in that order.
+        m_lastHardResyncFromTick = oldTick;
+        m_lastHardResyncToTick   = targetTick;
+        ++m_hardResyncCount;
+
         if (m_logger)
         {
             char buf[192];
@@ -109,6 +114,10 @@ ClientPredictionClock::AdvanceResult ClientPredictionClock::advancePrediction()
     if (m_requiredInputDelayIncreaseStallTicks > 0)
     {
         --m_requiredInputDelayIncreaseStallTicks;
+
+        // ⛔ Event seam - tick before count. This is a Stall like the graduated one.
+        m_lastStallTick = m_predictionTick;
+        ++m_stallCount;
 
         if (m_logger)
         {
@@ -160,6 +169,10 @@ ClientPredictionClock::AdvanceResult ClientPredictionClock::advancePrediction()
                     m_logger(buf);
                 }
                 doNormalAdvance(m_predictionTick, m_resimulationTick, &m_logger);
+
+                // ⛔ Event seam - tick before count; the tick is the one JUMPED TO.
+                m_lastSkipTick = m_predictionTick;
+                ++m_skipCount;
                 return AdvanceResult::Skip;
             }
             else
@@ -174,6 +187,10 @@ ClientPredictionClock::AdvanceResult ClientPredictionClock::advancePrediction()
                         m_predictionTick, targetTick, drift);
                     m_logger(buf);
                 }
+
+                // ⛔ Event seam - tick before count; the frontier did not move.
+                m_lastStallTick = m_predictionTick;
+                ++m_stallCount;
                 return AdvanceResult::Stall;
             }
         }
