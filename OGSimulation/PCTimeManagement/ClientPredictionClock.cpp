@@ -83,9 +83,9 @@ ClientPredictionClock::AdvanceResult ClientPredictionClock::advancePrediction()
         m_requiredInputDelayIncreaseStallTicks = 0;
 
         // ⛔ Event seam - the two ticks before the count, in that order.
-        m_lastHardResyncFromTick = oldTick;
-        m_lastHardResyncToTick   = targetTick;
-        ++m_hardResyncCount;
+        m_eventSeamDiagnostics.lastHardResyncFromTick = oldTick;
+        m_eventSeamDiagnostics.lastHardResyncToTick   = targetTick;
+        ++m_eventSeamDiagnostics.hardResyncCount;
 
         if (m_logger)
         {
@@ -116,8 +116,8 @@ ClientPredictionClock::AdvanceResult ClientPredictionClock::advancePrediction()
         --m_requiredInputDelayIncreaseStallTicks;
 
         // ⛔ Event seam - tick before count. This is a Stall like the graduated one.
-        m_lastStallTick = m_predictionTick;
-        ++m_stallCount;
+        m_eventSeamDiagnostics.lastStallTick = m_predictionTick;
+        ++m_eventSeamDiagnostics.stallCount;
 
         if (m_logger)
         {
@@ -171,8 +171,8 @@ ClientPredictionClock::AdvanceResult ClientPredictionClock::advancePrediction()
                 doNormalAdvance(m_predictionTick, m_resimulationTick, &m_logger);
 
                 // ⛔ Event seam - tick before count; the tick is the one JUMPED TO.
-                m_lastSkipTick = m_predictionTick;
-                ++m_skipCount;
+                m_eventSeamDiagnostics.lastSkipTick = m_predictionTick;
+                ++m_eventSeamDiagnostics.skipCount;
                 return AdvanceResult::Skip;
             }
             else
@@ -189,8 +189,8 @@ ClientPredictionClock::AdvanceResult ClientPredictionClock::advancePrediction()
                 }
 
                 // ⛔ Event seam - tick before count; the frontier did not move.
-                m_lastStallTick = m_predictionTick;
-                ++m_stallCount;
+                m_eventSeamDiagnostics.lastStallTick = m_predictionTick;
+                ++m_eventSeamDiagnostics.stallCount;
                 return AdvanceResult::Stall;
             }
         }

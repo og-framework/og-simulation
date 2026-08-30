@@ -16,6 +16,36 @@
 // pragma optimize off — debugger-friendliness; rationale in SimulationManager.h.
 OGSIM_OPTIMIZE_OFF
 
+// THE CLOCK'S EVENT SEAM - seven plain words the clock owns as ONE member, written PER EVENT
+// on the physics thread and read as `clock.getDiagnostics().skipCount()` and its six siblings.
+//
+// ⛔ DIAGNOSTIC ONLY: four write sites in `advancePrediction`, no production reader, no decision.
+//
+// ⭐ STRUCTURAL, not merely asserted: clock logic cannot name a word without `m_eventSeamDiagnostics.`.
+//
+// ⭐ MACHINE-CHECKED, by the case named here so it cannot be quietly dropped:
+// `ClientPredictionClock.Events.TheEventCountersCannotReachAnyClockDecision`.
+//
+// That case garbage-fills these seven words mid-lifecycle and asserts every clock output
+// byte-identical to an unscribbled run: every AdvanceResult, both cursors, `evaluateDrift`,
+// the stall debt and the resync callback's ticks.
+//
+// ⛔ EVERY BRANCH WRITES ITS TICK BEFORE ITS COUNT - a count-then-tick reader tears one way only.
+//
+// ⚠ Both stall branches write, debt and graduated; instrumenting one under-counts silently.
+//
+// ⛔ Nothing here reaches the wire, the correction payload or `compute_checksum`.
+struct EventSeamDiagnostics
+{
+    unsigned int skipCount              = 0;
+    unsigned int lastSkipTick           = 0;
+    unsigned int stallCount             = 0;
+    unsigned int lastStallTick          = 0;
+    unsigned int hardResyncCount        = 0;
+    unsigned int lastHardResyncFromTick = 0;
+    unsigned int lastHardResyncToTick   = 0;
+};
+
 // ClientPredictionClock — client-only tick counter with graduated drift correction
 // and resimulation cursor.
 //
@@ -144,14 +174,14 @@ using PCClockLoggerFn = std::function<void(const char*)>;
     public:
         explicit Diagnostics(const ClientPredictionClock& clock) : m_clock(clock) {}
 
-        // ⛔ The full contract and the fence test's name are at the seven members' declaration below.
-        unsigned int skipCount()              const { return m_clock.m_skipCount; }
-        unsigned int lastSkipTick()           const { return m_clock.m_lastSkipTick; }
-        unsigned int stallCount()             const { return m_clock.m_stallCount; }
-        unsigned int lastStallTick()          const { return m_clock.m_lastStallTick; }
-        unsigned int hardResyncCount()        const { return m_clock.m_hardResyncCount; }
-        unsigned int lastHardResyncFromTick() const { return m_clock.m_lastHardResyncFromTick; }
-        unsigned int lastHardResyncToTick()   const { return m_clock.m_lastHardResyncToTick; }
+        // ⛔ The full contract and the fence test's name are at `EventSeamDiagnostics`.
+        unsigned int skipCount()              const { return m_clock.m_eventSeamDiagnostics.skipCount; }
+        unsigned int lastSkipTick()           const { return m_clock.m_eventSeamDiagnostics.lastSkipTick; }
+        unsigned int stallCount()             const { return m_clock.m_eventSeamDiagnostics.stallCount; }
+        unsigned int lastStallTick()          const { return m_clock.m_eventSeamDiagnostics.lastStallTick; }
+        unsigned int hardResyncCount()        const { return m_clock.m_eventSeamDiagnostics.hardResyncCount; }
+        unsigned int lastHardResyncFromTick() const { return m_clock.m_eventSeamDiagnostics.lastHardResyncFromTick; }
+        unsigned int lastHardResyncToTick()   const { return m_clock.m_eventSeamDiagnostics.lastHardResyncToTick; }
 
     private:
         const ClientPredictionClock& m_clock;
@@ -168,14 +198,15 @@ using PCClockLoggerFn = std::function<void(const char*)>;
         // words land ABOVE the prediction frontier, a value no real event can leave behind.
         void scribbleEventCountersForFenceTest(unsigned int seed)
         {
+            EventSeamDiagnostics& seam       = m_clock.m_eventSeamDiagnostics;
             const unsigned int aboveFrontier = m_clock.m_predictionTick + seed + 1u;
-            m_clock.m_skipCount              = seed + 1u;
-            m_clock.m_lastSkipTick           = aboveFrontier;
-            m_clock.m_stallCount             = seed + 2u;
-            m_clock.m_lastStallTick          = aboveFrontier + 1u;
-            m_clock.m_hardResyncCount        = seed + 3u;
-            m_clock.m_lastHardResyncFromTick = aboveFrontier + 2u;
-            m_clock.m_lastHardResyncToTick   = aboveFrontier + 3u;
+            seam.skipCount                   = seed + 1u;
+            seam.lastSkipTick                = aboveFrontier;
+            seam.stallCount                  = seed + 2u;
+            seam.lastStallTick               = aboveFrontier + 1u;
+            seam.hardResyncCount             = seed + 3u;
+            seam.lastHardResyncFromTick      = aboveFrontier + 2u;
+            seam.lastHardResyncToTick        = aboveFrontier + 3u;
         }
 
     private:
@@ -202,33 +233,8 @@ private:
     std::vector<ResyncCallback> m_resyncCallbacks;
     PCClockLoggerFn m_logger;
 
-    // THE CLOCK'S EVENT SEAM - seven plain words, written PER EVENT on the physics thread and
-    // read as `clock.getDiagnostics().skipCount()` and its six siblings.
-    //
-    // ⛔ DIAGNOSTIC ONLY: three write sites in `advancePrediction`, no production reader, no decision.
-    //
-    // ⭐ MACHINE-CHECKED, by the case named here so it cannot be quietly dropped:
-    // `ClientPredictionClock.Events.TheEventCountersCannotReachAnyClockDecision`.
-    //
-    // That case garbage-fills these seven words mid-lifecycle and asserts every clock output
-    // byte-identical to an unscribbled run: every AdvanceResult, both cursors, `evaluateDrift`,
-    // the stall debt and the resync callback's ticks.
-    //
-    // ⛔ EVERY BRANCH WRITES ITS TICK BEFORE ITS COUNT - a count-then-tick reader tears one way only.
-    //
-    // ⚠ Both stall branches write, debt and graduated; instrumenting one under-counts silently.
-    //
-    // ⛔ Nothing here reaches the wire, the correction payload or `compute_checksum`.
-    //
-    // ⛔ Gate state is NOT in this block: `m_predictionTick`, `m_gradualCorrectionCounter`,
-    // `m_requiredInputDelayIncreaseStallTicks`.
-    unsigned int m_skipCount              = 0;
-    unsigned int m_lastSkipTick           = 0;
-    unsigned int m_stallCount             = 0;
-    unsigned int m_lastStallTick          = 0;
-    unsigned int m_hardResyncCount        = 0;
-    unsigned int m_lastHardResyncFromTick = 0;
-    unsigned int m_lastHardResyncToTick   = 0;
+    // ⛔ THE EVENT SEAM, whole and behind its own type; the contract is at `EventSeamDiagnostics`.
+    EventSeamDiagnostics m_eventSeamDiagnostics;
 };
 
 OGSIM_OPTIMIZE_ON
