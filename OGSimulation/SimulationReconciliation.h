@@ -418,9 +418,10 @@ public:
         });
     }
 
-    // ⛔ The one SHIPPED reader of `StateCorrectionCache`'s provenance column. §14.
+    // ⛔ `logSlotProvenanceAll` is the one SHIPPED reader of the provenance column. §14.
     //
-    // ⛔ A DELIBERATE ONE-MEMBER VIEW — `logSlotProvenanceAll` has no production role. §14.
+    // ⛔ NEITHER MEMBER HAS A PRODUCTION ROLE — `logSlotProvenanceAll` only logs, and
+    // `slotStateProvenance` has no production caller at all. §14.
     //
     //
     // ⛔ Volume, routing and decides-nothing rulings all live at `logSlotProvenanceFor` (`LogOGResimProbe`) — read it before adding a third caller.
@@ -442,6 +443,27 @@ public:
                 using T = std::remove_reference_t<decltype(simulatable)>;
                 m_reconciliation.logSlotProvenanceFor(id, m_reconciliation.getCacheFor<T>(id));
             });
+        }
+
+        // The lineage of the slot holding `simTick`; nullopt when this id has no such slot.
+        //
+        // ⛔ Routed through `findCorrectionCache`, like `getAppliedCaptureTickRef`: safe on the authority.
+        //
+        // ⛔ nullopt = no slot; `Empty` = a slot nothing wrote. Distinguishable, as §16 keeps the join key's pair.
+        //
+        // ⛔ THE ONLY PER-TICK READER of the column — `logSlotProvenanceAll` formats the whole map. §14.
+        template <typename T>
+        std::optional<SlotStateProvenance> slotStateProvenance(unsigned int id, uint32 simTick) const
+        {
+            const auto* cache = m_reconciliation.findCorrectionCache<T>(id);
+            if (cache == nullptr)
+                return std::nullopt;
+
+            const uint32 idx = cache->getCacheIndex(simTick);
+            if (idx == StateCorrectionCache<typename T::StateType, typename T::InputType>::InvalidCacheIndex)
+                return std::nullopt;
+
+            return cache->getDiagnostics().stateProvenance(idx);
         }
 
     private:

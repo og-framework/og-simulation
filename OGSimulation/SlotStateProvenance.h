@@ -71,10 +71,24 @@
 // Do not weaken it in passing.
 //
 // ⚠ WHAT "PRODUCTION OUTPUT" EXCLUDES, stated so the scope is not mistaken for a
-// loophole: the two SANCTIONED readers of fence 3 obviously do change when the
-// column changes — that is what a diagnostic is. They are (a) the LLTs and (b)
-// the `[ResimProbe.SlotMap]` Verbose line. Neither feeds a decision, and neither
-// exists at all at shipped verbosity.
+// loophole. Fence 3's sanctioned readers do change when the column changes.
+//
+// They are (a) the LLTs, (b) the `[ResimProbe.SlotMap]` Verbose line and (c)
+// og-brawler's display fold — THREE, not the two this note counted before (c)
+// existed. That is what a diagnostic is, and none of the three feeds a decision;
+// the no-decision claim is the one carrying the weight and it holds for all three
+// unchanged.
+//
+// Their default-off arguments, however, are NOT the same argument. (a) and (b) do
+// not exist at all at shipped verbosity. (c) does exist: it is compiled into a
+// shipped build and gated by a default-`false` cvar rather than by a log verbosity,
+// so "absent" is simply the wrong word for it. What bounds (c) is direction instead
+// — it reads this column into a client-local display ring that is never replicated,
+// never enters a correction payload and never reaches `compute_checksum`. Setting
+// that cvar therefore changes pixels and nothing else.
+//
+// ⛔ (c) ALSO SITS OUTSIDE THE CASE ABOVE, which scribbles this column from inside
+// og-simulation. What keeps (c) a read is stated at the fold; do not relax it there.
 //
 // ⛔ AND THIS COLUMN NEVER ENTERS `compute_checksum` OR THE DETERMINISM
 // COMPARISON — same prohibition, same reasoning and same shape as the resim
@@ -97,6 +111,7 @@
 //       at most once per completed resim and once per wipe, at **Verbose** on the
 //       existing `LogOGResimProbe` category (see `SimulationReconciliation::
 //       getDiagnostics().logSlotProvenanceAll`, RN-7/task 56).
+//   (c) og-brawler's `captureSummaryOf` display fold — the one EXTERNAL, downstream reader.
 //
 // ⚠ VERBOSE IS DELIBERATE AND IS NOT NEGOTIABLE DOWNWARD. This is per-slot,
 // per-window data: 60 characters per character per resim. At Warning it would be

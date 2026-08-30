@@ -533,11 +533,12 @@ public:
     }
 
     // ===========================================================================
-    // DIAGNOSTIC VIEW -- the one probe this peer owns (`RelayReadProbe`, which arrived
-    // here with `InputResolutionTelemetry`).
+    // DIAGNOSTIC VIEW -- this peer's own probe (`RelayReadProbe`, which arrived here
+    // with `InputResolutionTelemetry`) plus a read seam onto `m_localInputCaches`.
     // ⛔ `SimulationNetSync::Diagnostics::relayReadProbe()` IS GONE, not delegating.
     //   Callers reach `inputResolution.getDiagnostics().relayReadProbe()`. §1
-    // ⛔ CONST-ONLY -- the only writer is the telemetry sibling, on one thread. §14
+    // ⛔ CONST-ONLY -- both members' data is written on the PHYSICS thread alone,
+    //   by the telemetry sibling and by `collectInputAll`'s capture push. §14
     // ===========================================================================
     class Diagnostics
     {
@@ -546,6 +547,17 @@ public:
 
         const RelayReadProbe& relayReadProbe() const
         { return m_resolution.m_inputResolutionTelemetry.relayReadProbe(); }
+
+        // The raw captures this peer recorded for `id`, or nullptr when it holds none.
+        // ⛔ ABSENT IS NOT AN ERROR -- only provider-owning ids have a line. Never throws. §2
+        template <typename SimulatableT>
+        const LocalInputCache<typename SimulatableT::InputType>* localInputCache(unsigned int id) const
+        {
+            const auto& map =
+                std::get<LocalInputCacheMapFor<SimulatableT>>(m_resolution.m_localInputCaches);
+            const auto it = map.find(id);
+            return it == map.end() ? nullptr : &it->second;
+        }
 
     private:
         const SimulationInputResolution& m_resolution;
