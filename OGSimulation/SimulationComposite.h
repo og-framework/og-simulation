@@ -14,6 +14,32 @@
 #include "OGSimulation/SimulationSerialization.h"
 
 // ---------------------------------------------------------------------------
+// High-level simulation-role concepts.
+// All three roles require Serializable<T>.
+//
+// [movement-sim task 22] Declared ABOVE SimulationComposite because the composite
+// constrains its zero() fold on SimulationInput, and a requires-clause cannot name
+// a concept declared later in the file. Nothing else about them moved.
+// ---------------------------------------------------------------------------
+
+template <typename T>
+concept SimulationState = Serializable<T>;
+
+// `zero()` is the type's NEUTRAL input — the value a resolution peer substitutes
+// when no input exists for a tick (SimulationInputResolution::setNeutralInput).
+// It is deliberately NOT required to equal T{}, and for aim-carrying inputs it
+// must not be: a value-initialised aim reaches normalize(), and the difference
+// between the two values is also the tag the input-resolution anti-vacuity tests
+// discriminate on (see SimulationInputResolution.h §6). Requiring it here is what
+// lets SimulationComposite::zero() fold the neutral input instead of every game
+// hand-building one argument per element.
+template <typename T>
+concept SimulationInput = Serializable<T> && requires { { T::zero() } -> std::same_as<T>; };
+
+template <typename T>
+concept SimulationInitialConditions = Serializable<T>;
+
+// ---------------------------------------------------------------------------
 // SimulationComposite<Ts...>
 // ---------------------------------------------------------------------------
 
@@ -42,6 +68,17 @@ public:
 			std::get<Ts>(m_data), std::get<Ts>(other.m_data)) && ...);
 	}
 
+	// THE NEUTRAL INPUT for the whole composite: each element's OWN zero(), folded.
+	// Adding an element to an input composite is therefore the only edit its neutral
+	// value costs — no caller ever hand-builds one argument per element again.
+	// ⛔ This is NOT SimulationComposite{}: an element's zero() may differ from its
+	// value-initialised value, and for aim-carrying inputs it deliberately does.
+	static SimulationComposite zero()
+		requires (SimulationInput<Ts> && ...)
+	{
+		return SimulationComposite(Ts::zero()...);
+	}
+
 	template <typename Func>
 	void forEach(Func&& func) { (func(std::get<Ts>(m_data)), ...); }
 
@@ -55,21 +92,36 @@ private:
 // Domain aliases (same underlying template, separate names for clarity).
 template <typename... Ts> using SimulationStateComposite  = SimulationComposite<Ts...>;
 template <typename... Ts> using SimulationInputComposite  = SimulationComposite<Ts...>;
+
+// SimulationDerivedComposite<Ts...> — per-simulatable LOCAL scratch: recomputed or reset
+// every tick, never serialized, never corrected, never checksummed.
+//
+// [movement-sim task 23] The requires-clause is the D1 off-wire discipline MADE
+// MECHANICAL. Until now "derived state never goes on the wire" was a comment on the
+// slice; here it is the compiler's problem. Giving any element a SerializableFields
+// specialization — the one edit that would silently start costing wire bytes and
+// checksum coverage — stops being a review catch and becomes a build break.
+//
+// ⛔ Do NOT relax this clause to make an instantiation compile. If an element needs to
+// cross the wire it belongs in the game's State composite, not here.
+//
+// The underlying template is the same SimulationComposite: get/edit/forEach work, and
+// isSimilarTo / the write*ToSyncedBuffer helpers are themselves constrained on
+// Serializable, so they simply do not participate for a derived element list.
+template <typename... Ts>
+	requires (!(Serializable<Ts> || ...))
+using SimulationDerivedComposite = SimulationComposite<Ts...>;
+
+// Every element of a SimulationPhysicsComposite is a body-owning sub-simulation's
+// physics declaration, and each one is expected to satisfy the
+// `PhysicsDeclaration<D, GameStaticDataType>` concept in OGSimulation/PhysicsDeclaration.h
+// — the contract the creation, capture and rewind-push folds reach into by name.
+//
+// It is NOT asserted here, and that is deliberate: the concept is parameterised on
+// the GAME's aggregate static data type, which this engine-side alias has no way to
+// name. The assertions belong in the game's own simulatable header, one per
+// declaration, where GameStaticDataType is in scope.
 template <typename... Ts> using SimulationPhysicsComposite = SimulationComposite<Ts...>;
-
-// ---------------------------------------------------------------------------
-// High-level simulation-role concepts.
-// All three roles require Serializable<T>.
-// ---------------------------------------------------------------------------
-
-template <typename T>
-concept SimulationState = Serializable<T>;
-
-template <typename T>
-concept SimulationInput = Serializable<T>;
-
-template <typename T>
-concept SimulationInitialConditions = Serializable<T>;
 
 // ---------------------------------------------------------------------------
 // Composite serialization helpers

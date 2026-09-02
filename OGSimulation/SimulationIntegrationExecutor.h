@@ -91,6 +91,10 @@ public:
             sim.editPhysicsComposite().forEach([&](auto& decl) {
                 using D = std::decay_t<decltype(decl)>;
                 using S = typename D::StateType;
+                static_assert(
+                    BodyStateLike<std::remove_cvref_t<decltype(
+                        D::bodyStateOf(sim.editAllState().editState().template edit<S>()))>>,
+                    "PhysicsDeclaration::bodyStateOf must return a BodyStateLike& — see PhysicsBodyState.h");
                 D::bodyStateOf(sim.editAllState().editState().template edit<S>()) =
                     m_physicsAdapter.captureBodyState(decl.bindings.ownBodyId);
             });
