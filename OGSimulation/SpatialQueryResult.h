@@ -42,3 +42,33 @@ struct SpatialQueryReport
 	auto begin() const { return hits.begin(); }
 	auto end() const { return hits.end(); }
 };
+
+// Engine-independent SWEEP result — the NEAREST BLOCKING hit only (v1), or a miss.
+// Produced by SpatialQueryAdapter::sweep.
+//
+// Field validity — read the two flags FIRST; the rest are conditional on them:
+//   • fraction / normal / impactPoint are valid IFF `blocked`. When `blocked` is
+//     false the volume travelled the full delta unobstructed, `fraction` is 1, and
+//     normal/impactPoint carry nothing.
+//   • penetrationDepth together with `normal` is the PUSH-OUT IFF `startPenetrating`
+//     — the volume was already overlapping at fraction 0, and displacing it
+//     `penetrationDepth` along `normal` separates it. `fraction` is 0 in that case
+//     and carries no distance information.
+//
+// Two-level identity, exactly as SpatialQueryHit above:
+//   • bodyId     — the SHAPE body the sweep hit.
+//   • rootBodyId — the root of that shape body's hierarchy; equal to bodyId when the
+//                  shape body is standalone. This is the id that identifies a whole
+//                  character regardless of which of its shapes the sweep struck.
+struct SweepHit
+{
+	bool blocked = false;                    // false => moved the full delta unobstructed
+	float fraction = 1.f;                    // [0,1] of delta travelled before contact
+	glm::vec3 normal{0.f};                   // surface normal at contact (unit, world)
+	glm::vec3 impactPoint{0.f};              // world
+	bool startPenetrating = false;           // already overlapping at fraction 0
+	float penetrationDepth = 0.f;            // valid iff startPenetrating; push-out along `normal`
+	BodyId bodyId;                           // SHAPE body hit
+	BodyId rootBodyId;                       // root of the body hierarchy (== bodyId for standalone)
+	CollisionCategories objectCategories;    // which collision categories the hit object belongs to
+};

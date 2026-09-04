@@ -18,6 +18,8 @@ concept PhysicsBodyAdapter = requires(
 	{ adapter.addBodyTorque(bodyId, vec) };
 	{ adapter.setBodyAngularVelocity(bodyId, vec) };
 	{ adapter.setBodyLinearVelocity(bodyId, vec) };
+	{ adapter.addBodyAcceleration(bodyId, vec) };     // accumulate an acceleration for THIS step; engine applies force = a * mass
+	{ adapter.addBodyVelocityChange(bodyId, vec) };   // instantaneous dv before this step's solve; engine applies impulse = dv * mass
 	{ cadapter.getBodyInertiaTensor(bodyId) } -> std::convertible_to<glm::vec3>;
 	{ cadapter.captureBodyState(bodyId) }     -> std::convertible_to<PhysicsBodyState>;
 };
