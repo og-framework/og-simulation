@@ -56,8 +56,14 @@ struct PhysicsRuntimeBindings
 // `staticDataOf` is the member that makes body creation fully generic: it maps
 // the GAME's aggregate static data to the SUB-simulation's own slice, which is
 // what `queryVolumes` and `attachmentOffset` take. Without it the creation fold
-// needs a hand-written per-declaration `if constexpr` arm in engine code — the
-// single engine edit adding a sub-simulation still costs today.
+// needs a hand-written per-declaration `if constexpr` arm in engine code — one
+// engine edit per sub-simulation added.
+//
+// ⭐ Updated 2026-09-08: that is now history, not a live cost. Every declaration in
+// the host game provides `staticDataOf`, the per-declaration `if constexpr` chain in
+// its creation fold has been DELETED, and adding a body-owning sub-simulation there
+// costs no engine edit at all. The sentence this replaces still said it "still costs
+// today".
 template <typename D, typename GameStaticDataType>
 concept PhysicsDeclaration = requires(
 	const GameStaticDataType& gsd,

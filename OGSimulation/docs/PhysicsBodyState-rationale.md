@@ -166,18 +166,27 @@ declaration missing a member failed inside a fold, far from the mistake.
 | `StateType` + `bodyStateOf` | where the body state lives; the mutable overload's referent must be `BodyStateLike`, and the **const** overload must WIDEN to `PhysicsBodyState` — the rewind push reads through it |
 | `bindings` | a **mutable member of the shared `PhysicsRuntimeBindings`** — `same_as`, not merely convertible: the creation fold writes all five of its members |
 
-`staticDataOf` is the member that does not exist on any declaration yet, and it is here on purpose:
-it is what lets the creation fold ask a declaration for its own static-data slice. Without it the
-fold needs a hand-written per-declaration branch in engine code — today the single engine edit that
-adding a sub-simulation still costs.
+`staticDataOf` is what lets the creation fold ask a declaration for its own static-data slice.
+Without it the fold needs a hand-written per-declaration branch in engine code — one engine edit
+per sub-simulation added.
+
+**Updated 2026-09-08.** When this section was written, no declaration carried the member and that
+engine edit was a live cost; the text said so in the present tense — *"the member that does not
+exist on any declaration yet"* and *"the single engine edit that adding a sub-simulation still
+costs"*. Both are now history. Every declaration in the host game provides `staticDataOf`, the
+per-declaration branch has been deleted from its creation fold, and adding a body-owning
+sub-simulation there costs no engine edit at all.
 
 ### 6.1 Why the assertions are not on the composite
 
 `SimulationComposite.h` carries a doc comment pointing here and **no `static_assert`**. The concept
 is parameterised on the game's aggregate static data type, and `SimulationPhysicsComposite` — an
 engine-side alias — has no way to name it. The assertions belong in the game's own simulatable
-header, one per declaration, where that type is in scope. Asserting earlier would also be false
-today: existing declarations have no `staticDataOf` yet.
+header, one per declaration, where that type is in scope. When this was written, asserting earlier
+would also have been false: no declaration carried `staticDataOf` yet. **Updated 2026-09-08:** they
+all do and the assertions exist — six of them, one per declaration, in the host game's own
+simulatable header. The placement argument above is what still decides where they go; the
+"would be false today" half no longer applies.
 
 ## 7. `PhysicsRuntimeBindings` — one struct, not four
 
@@ -186,9 +195,11 @@ adapter fills in after it creates a declaration's body. Local-only, never serial
 corrected — which is precisely why they must not live in the state that gets overwritten by a
 correction.
 
-Every body-owning sub-simulation declares its own byte-identical `RuntimeBindings` copy. This header
-adds the one shared definition; **the four per-sim copies are still there** and nothing uses the
-shared type yet — see §9. A **root** body carries `parentBodyId == ownBodyId`: it is its own parent
+This header adds the one shared definition. When it was written, every body-owning sub-simulation
+still declared its own byte-identical `RuntimeBindings` copy and nothing used the shared type — see
+§9. **Updated 2026-09-08:** each of those per-sim spellings is now an alias for this struct, so the
+duplication is gone and the concept's `same_as` requirement is met everywhere. A **root** body
+carries `parentBodyId == ownBodyId`: it is its own parent
 rather than carrying a null id every consumer would have to special-case.
 
 ## 8. Recipe — adding a body-owning sub-simulation
@@ -203,8 +214,9 @@ rather than carrying a null id every consumer would have to special-case.
 5. Add the integrate block.
 6. Assert the declaration against the concept in the game's simulatable header.
 
-Nothing in this list is an engine edit — with the exception noted in §6, which `staticDataOf`
-exists to remove.
+Nothing in this list is an engine edit. The exception §6 used to note — one hand-written
+per-declaration branch in the engine-side creation fold — is what `staticDataOf` exists to remove,
+and as of 2026-09-08 it has been removed from the host game.
 
 ## 9. What this does not do
 
@@ -213,12 +225,16 @@ exists to remove.
 * **It does not put any of the four attack/projectile sub-simulations on the slim shape.** They
   still carry `PhysicsBodyState`, correctly — none of them locks rotation. The movement
   skeleton's `State::bodyState` HAS since been swapped to `LinearBodyState` and is the only
-  adopter; the descriptor flag `lockRotation` does not exist yet, so what makes its drop sound in
-  the meantime is stated at the swap site itself, not by the choice rule.
+  adopter. **Updated 2026-09-08:** the first two sentences still hold; the third one's tail —
+  *"the descriptor flag `lockRotation` does not exist yet"* — does not. The flag exists, the
+  movement declaration's descriptor sets it, and it is what makes the dropped rotation sound.
 * **It does not put any existing declaration on the shared `PhysicsRuntimeBindings`.** The four
   per-sim `RuntimeBindings` copies remain. They are field-for-field identical to the shared struct
   and still distinct types, so each of them **fails** the concept's
   `{ d.bindings } -> std::same_as<PhysicsRuntimeBindings&>` requirement: adopting the shared type
   is a prerequisite for the assertions the next bullet defers, not a tidy-up.
+  **Updated 2026-09-08:** that adoption has since happened — every per-sim `RuntimeBindings` is an
+  alias for the shared struct and every declaration satisfies the requirement.
 * **It does not yet assert the concept anywhere.** The declarations lack `staticDataOf`; adding the
   member and the assertions is separate, sequenced work.
+  **Updated 2026-09-08:** that work has landed — all six assertions exist.
