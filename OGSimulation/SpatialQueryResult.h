@@ -1,5 +1,6 @@
 #pragma once
 // SPDX-License-Identifier: MPL-2.0
+// docs/SpatialQueryResult-rationale.md · docs/SpatialQueryResult-guards.md
 
 #include "glm/vec3.hpp"
 #include <vector>
@@ -7,30 +8,14 @@
 #include "OGSimulation/BodyId.h"
 #include "OGSimulation/QueryGeometry.h"
 
-// Engine-independent query result — one per overlapping object.
-//
-// Two-level identity (see current_state.md §D10):
-//   • bodyId     — the SHAPE body reported by the overlap. Use for shape-level physics
-//                  access (e.g. physics.getBodyTransform(hit.bodyId) to read a guard
-//                  sphere's aim-facing rotation).
-//   • rootBodyId — the root of the body hierarchy the shape body belongs to. Equal to
-//                  bodyId when the shape body is standalone (projectile bodies,
-//                  environment). For character shapes (hurtbox, guard), this is the
-//                  character capsule's body id — the id that identifies the whole
-//                  character regardless of which shape was actually hit. This is what
-//                  actor-hit mergers, cross-character hit routing, and projectile
-//                  hitRootBodyId use. Populated by the query adapter from a shape→root
-//                  map built at registerShape time; falls back to bodyId when no parent
-//                  was registered for the shape body.
 struct SpatialQueryHit
 {
-	glm::vec3 objectPosition{0.f};           // world position of colliding object
-	BodyId bodyId;                           // SHAPE body reported by the overlap
-	BodyId rootBodyId;                       // root of the body hierarchy (== bodyId for standalone)
-	CollisionCategories objectCategories;    // which collision categories this object belongs to
+	glm::vec3 objectPosition{0.f};
+	BodyId bodyId;
+	BodyId rootBodyId;
+	CollisionCategories objectCategories;
 };
 
-// Engine-independent query report — collection of hits.
 struct SpatialQueryReport
 {
 	std::vector<SpatialQueryHit> hits;
@@ -41,4 +26,20 @@ struct SpatialQueryReport
 
 	auto begin() const { return hits.begin(); }
 	auto end() const { return hits.end(); }
+};
+
+// ⛔G-01  docs/SpatialQueryResult-guards.md
+struct SweepHit
+{
+	bool blocked = false;
+	// ⛔G-02  docs/SpatialQueryResult-guards.md
+	float fraction = 1.f;
+	glm::vec3 normal{0.f};
+	glm::vec3 impactPoint{0.f};
+	bool startPenetrating = false;
+	// ⛔G-03  docs/SpatialQueryResult-guards.md
+	float penetrationDepth = 0.f;
+	BodyId bodyId;
+	BodyId rootBodyId;
+	CollisionCategories objectCategories;
 };
