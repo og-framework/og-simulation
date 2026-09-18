@@ -172,8 +172,11 @@ the step, fire post-integrate. Listing them side by side makes the whole differe
 | input resolution | `preparePredictionSimulationStep(…)` | `collectInputAll(step)` **direct** | `collectResimInputAll(tick)` |
 | frontier slot | **allocated** | never | never |
 | systems + integrate | identical | identical | identical |
+| … with one qualification | `isAuthority=false` | `isAuthority=true` | `isAuthority=false` |
 
-Two things are worth saying out loud.
+Three things are worth saying out loud.
+
+⚠ **The `systems` row is identical in the CALL, not in what every system does with it.** All three step functions fire the executor with the same arguments plus one: `!m_runsPrediction`, derived at each site. A system declaring `SystemRoleAffinity::AllRoles` — the hit router, and anything else that is part of the step — is unaffected and the row is literally true of it. A system declaring `AuthorityOnly` runs on the authority column only. So the row still says what it was written to say (there is no separate proxy path through the tick) and it is no longer the whole truth about the executor. See `<core>SystemRoleAffinity.h`.
 
 **The prediction path is the only one that synthesises step kinds.** `advancePrediction` can return
 `Stall`, `Skip` or `HardResync`, and the prediction step function wraps the base step into a

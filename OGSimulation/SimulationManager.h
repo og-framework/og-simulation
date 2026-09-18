@@ -101,6 +101,22 @@ concept SimulationInputResolutionTickConcept = requires(
     { t.wipeAllForResync(tick) };
 };
 
+// ⛔ THE FIFTH PEER, AND THE ONLY ONE WHOSE ARGUMENT TYPES THE MANAGER ACTUALLY HOLDS —
+// `StorageT`/`StaticDataT` ARE its own parameters, so this concept takes all three. §2
+//
+// ⛔ `isAuthority` IS NAMED LAST DELIBERATELY: a pre-`SystemRoleAffinity` three-parameter
+// executor fails HERE, not silently at a rig that kept the old shape. §2
+template <typename T, typename StorageT, typename StaticDataT>
+concept SimulationSystemsExecutorConcept = requires(
+    T& t, const SimulationTimeStep& step, StorageT& storage,
+    const StaticDataT& staticData, unsigned int id, bool isAuthority)
+{
+    { t.firePreIntegrate(step, storage, staticData, isAuthority) };
+    { t.firePostIntegrate(step, storage, staticData, isAuthority) };
+    { t.notifyCharacterRegistered(id, storage, staticData, isAuthority) };
+    { t.notifyCharacterUnregistered(id, storage, staticData, isAuthority) };
+};
+
 // SimulationManager<IntegrationExecT, NetSyncT, InputResolutionT,
 //                   ReconciliationT, SystemsExecT, StorageT, StaticDataT>
 //
@@ -573,13 +589,15 @@ public:
     // supplied so a hook can read the just-(un)registered character.
 
     void notifyCharacterRegistered(unsigned int id)
+        requires SimulationSystemsExecutorConcept<SystemsExecT, StorageT, StaticDataT>
     {
-        m_systemsExec.notifyCharacterRegistered(id, m_storage, m_staticData);
+        m_systemsExec.notifyCharacterRegistered(id, m_storage, m_staticData, !m_runsPrediction);
     }
 
     void notifyCharacterUnregistered(unsigned int id)
+        requires SimulationSystemsExecutorConcept<SystemsExecT, StorageT, StaticDataT>
     {
-        m_systemsExec.notifyCharacterUnregistered(id, m_storage, m_staticData);
+        m_systemsExec.notifyCharacterUnregistered(id, m_storage, m_staticData, !m_runsPrediction);
     }
 
 private:
@@ -647,7 +665,8 @@ private:
     // `onGameSimulationResimulation` draw only from the resolution group (`collectInputAll`). §2
     void onGameSimulationPrediction()
         requires SimulationInputResolutionTickConcept<InputResolutionT> &&
-                 SimulationReconciliationConcept<ReconciliationT>
+                 SimulationReconciliationConcept<ReconciliationT> &&
+                 SimulationSystemsExecutorConcept<SystemsExecT, StorageT, StaticDataT>
     {
         // ⛔ TAKEN BEFORE `advancePrediction`, so it reports what this frame INHERITED — entering
         // prediction while the clock still resimulates means the previous apply edge never ran, and
@@ -703,10 +722,10 @@ private:
         // ⛔ SEQUENCING: `preIntegrate` before `integrateAll`; `m_lastStep` saved before `postIntegrate`. §7
         auto&       storage    = m_storage;
         const auto& staticData = m_staticData;
-        m_systemsExec.firePreIntegrate(step, storage, staticData);
+        m_systemsExec.firePreIntegrate(step, storage, staticData, !m_runsPrediction);
         m_integrationLayer.integrateAll(step, inputs);
         m_lastStep = step;
-        m_systemsExec.firePostIntegrate(step, storage, staticData);
+        m_systemsExec.firePostIntegrate(step, storage, staticData, !m_runsPrediction);
     }
 
     // ⛔ THE ONE STEP FUNCTION NEEDING BOTH `SimulationNetSyncTickConcept` (for
@@ -714,7 +733,8 @@ private:
     // reconciliation concept, because it never calls `allocateFrontierSlotsAll`. §2
     void onGameSimulationAuthority()
         requires SimulationNetSyncTickConcept<NetSyncT> &&
-                 SimulationInputResolutionTickConcept<InputResolutionT>
+                 SimulationInputResolutionTickConcept<InputResolutionT> &&
+                 SimulationSystemsExecutorConcept<SystemsExecT, StorageT, StaticDataT>
     {
         m_serverClock->advanceTick();
         const SimulationTimeStep step = m_serverClock->getSimulationStep();
@@ -738,15 +758,16 @@ private:
         // Sequencing (see onGameSimulationPrediction).
         auto&       storage    = m_storage;
         const auto& staticData = m_staticData;
-        m_systemsExec.firePreIntegrate(step, storage, staticData);
+        m_systemsExec.firePreIntegrate(step, storage, staticData, !m_runsPrediction);
         m_integrationLayer.integrateAll(step, inputs);
         m_lastStep = step;
-        m_systemsExec.firePostIntegrate(step, storage, staticData);
+        m_systemsExec.firePostIntegrate(step, storage, staticData, !m_runsPrediction);
     }
 
     // ⛔ `collectResimInputAll` — the one `SimulationInputResolutionTickConcept` member this step needs. §2
     void onGameSimulationResimulation()
-        requires SimulationInputResolutionTickConcept<InputResolutionT>
+        requires SimulationInputResolutionTickConcept<InputResolutionT> &&
+                 SimulationSystemsExecutorConcept<SystemsExecT, StorageT, StaticDataT>
     {
         m_clientClock->advanceResimulation();
         const SimulationTimeStep step = m_clientClock->getResimulationStep();
@@ -758,13 +779,13 @@ private:
         // `collectResimInputAll` resolves against slots that ALREADY exist
         // (`getAppliedCaptureTickRef`) and never calls `pushPredictionTick`. §7
         auto inputs = m_inputResolution.collectResimInputAll(step.getTick());
-        // ⛔ Systems fire on every resim replay tick too, or rollback routing stops being deterministic (D4). §7
+        // ⛔ `AllRoles` systems fire on every resim replay tick too, or rollback routing stops being deterministic (D4). §7
         auto&       storage    = m_storage;
         const auto& staticData = m_staticData;
-        m_systemsExec.firePreIntegrate(step, storage, staticData);
+        m_systemsExec.firePreIntegrate(step, storage, staticData, !m_runsPrediction);
         m_integrationLayer.integrateAll(step, inputs);
         m_lastStep = step;
-        m_systemsExec.firePostIntegrate(step, storage, staticData);
+        m_systemsExec.firePostIntegrate(step, storage, staticData, !m_runsPrediction);
     }
 
     SimulationTimeStep currentStep() const
@@ -855,6 +876,37 @@ namespace simulationManagerConceptProof
         void captureBodyStatesAll() {}
     };
 
+    // The storage / static-data stand-ins the systems-executor concept needs as its second
+    // and third arguments. Opaque on purpose: the concept is presence-only. §8
+    struct SystemsStorageShaped {};
+    struct SystemsStaticDataShaped {};
+
+    // Shaped like the fifth peer. ⛔ THE FOURTH PARAMETER IS THE ROLE — `SystemsExecPreRoleShaped`
+    // below is this same type minus it, and is the pre-`SystemRoleAffinity` shape. §8
+    struct SystemsExecShaped
+    {
+        void firePreIntegrate(const SimulationTimeStep&, SystemsStorageShaped&,
+                              const SystemsStaticDataShaped&, bool /*isAuthority*/) {}
+        void firePostIntegrate(const SimulationTimeStep&, SystemsStorageShaped&,
+                               const SystemsStaticDataShaped&, bool /*isAuthority*/) {}
+        void notifyCharacterRegistered(unsigned int, SystemsStorageShaped&,
+                                       const SystemsStaticDataShaped&, bool /*isAuthority*/) {}
+        void notifyCharacterUnregistered(unsigned int, SystemsStorageShaped&,
+                                         const SystemsStaticDataShaped&, bool /*isAuthority*/) {}
+    };
+
+    struct SystemsExecPreRoleShaped
+    {
+        void firePreIntegrate(const SimulationTimeStep&, SystemsStorageShaped&,
+                              const SystemsStaticDataShaped&) {}
+        void firePostIntegrate(const SimulationTimeStep&, SystemsStorageShaped&,
+                               const SystemsStaticDataShaped&) {}
+        void notifyCharacterRegistered(unsigned int, SystemsStorageShaped&,
+                                       const SystemsStaticDataShaped&) {}
+        void notifyCharacterUnregistered(unsigned int, SystemsStorageShaped&,
+                                         const SystemsStaticDataShaped&) {}
+    };
+
     // --- POSITIVE CONTROLS — each shaped type satisfies its own concept. ---
     static_assert(SimulationNetSyncTickConcept<NetSyncShaped>,
         "NetSyncShaped must satisfy the manager's NetSync tick surface");
@@ -866,6 +918,9 @@ namespace simulationManagerConceptProof
         "ReconciliationShaped must satisfy SimulationReconciliationConcept");
     static_assert(SimulationIntegrationExecutorConcept<IntegrationExecShaped>,
         "IntegrationExecShaped must satisfy SimulationIntegrationExecutorConcept");
+    static_assert(SimulationSystemsExecutorConcept<SystemsExecShaped,
+                      SystemsStorageShaped, SystemsStaticDataShaped>,
+        "SystemsExecShaped must satisfy SimulationSystemsExecutorConcept");
 
     // ⛔ NEGATIVE CONTROLS — THE TRANSPOSITION `Params` guards, caught at compile time instead. §8
     static_assert(!SimulationReconciliationConcept<NetSyncShaped>,
@@ -911,7 +966,39 @@ namespace simulationManagerConceptProof
         "a Reconciliation-shaped type must NOT satisfy"
         " SimulationIntegrationExecutorConcept");
 
-    // A plain nonconforming type satisfies none of the four constrained concepts.
+    // The fifth peer's coverage: none of the other four shapes has the fire surface, and the
+    // pre-role shape fails on the ROLE PARAMETER alone — same four names, one argument short. §8
+    static_assert(!SimulationSystemsExecutorConcept<NetSyncShaped,
+                      SystemsStorageShaped, SystemsStaticDataShaped>,
+        "a NetSync-shaped type must NOT satisfy SimulationSystemsExecutorConcept");
+    static_assert(!SimulationSystemsExecutorConcept<InputResolutionShaped,
+                      SystemsStorageShaped, SystemsStaticDataShaped>,
+        "a resolution-shaped type must NOT satisfy SimulationSystemsExecutorConcept");
+    static_assert(!SimulationSystemsExecutorConcept<ReconciliationShaped,
+                      SystemsStorageShaped, SystemsStaticDataShaped>,
+        "a Reconciliation-shaped type must NOT satisfy SimulationSystemsExecutorConcept");
+    static_assert(!SimulationSystemsExecutorConcept<IntegrationExecShaped,
+                      SystemsStorageShaped, SystemsStaticDataShaped>,
+        "an IntegrationExec-shaped type must NOT satisfy SimulationSystemsExecutorConcept");
+    static_assert(!SimulationSystemsExecutorConcept<SystemsExecPreRoleShaped,
+                      SystemsStorageShaped, SystemsStaticDataShaped>,
+        "the pre-SystemRoleAffinity three-parameter fire signature must NOT satisfy"
+        " SimulationSystemsExecutorConcept -- this is the assertion that makes a rig"
+        " which kept the old shape a concept diagnostic instead of a silent pass");
+
+    // The transposition's other direction: the systems executor satisfies none of the four. §8
+    static_assert(!SimulationIntegrationExecutorConcept<SystemsExecShaped>,
+        "a SystemsExec-shaped type must NOT satisfy SimulationIntegrationExecutorConcept");
+    static_assert(!SimulationReconciliationConcept<SystemsExecShaped>,
+        "a SystemsExec-shaped type must NOT satisfy SimulationReconciliationConcept");
+    static_assert(!SimulationNetSyncTickConcept<SystemsExecShaped>,
+        "a SystemsExec-shaped type must NOT satisfy the manager's NetSync tick surface");
+    static_assert(!SimulationNetSyncPublishConcept<SystemsExecShaped>,
+        "a SystemsExec-shaped type must NOT satisfy the manager's NetSync publish surface");
+    static_assert(!SimulationInputResolutionTickConcept<SystemsExecShaped>,
+        "a SystemsExec-shaped type must NOT satisfy the manager's resolution tick surface");
+
+    // A plain nonconforming type satisfies none of the constrained concepts above.
     struct Empty {};
     static_assert(!SimulationIntegrationExecutorConcept<Empty>,
         "an empty type must NOT satisfy SimulationIntegrationExecutorConcept");
@@ -921,6 +1008,10 @@ namespace simulationManagerConceptProof
         "an empty type must NOT satisfy the manager's NetSync tick surface");
     static_assert(!SimulationInputResolutionTickConcept<Empty>,
         "an empty type must NOT satisfy the manager's resolution tick surface");
+    static_assert(!SimulationSystemsExecutorConcept<Empty,
+                      SystemsStorageShaped, SystemsStaticDataShaped>,
+        "an empty type must NOT satisfy SimulationSystemsExecutorConcept -- the shape"
+        " CorrectionRotationTest.cpp's MockSystemsExec still has");
 } // namespace simulationManagerConceptProof
 
 OGSIM_OPTIMIZE_ON

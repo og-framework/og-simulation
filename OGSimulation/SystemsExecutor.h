@@ -8,6 +8,8 @@
 #include "OGSimulation/StorageView.h"                // StorageView (apply_t<StorageView, RequiredSimulatables>)
 #include "OGSimulation/SimulationObjectStorage.h"    // SimulationObjectStorage (StorageT + projectTo<>)
 #include "OGSimulation/SimulationTimeContext.h"      // SimulationTimeStep
+#include "OGSimulation/SystemRoleAffinity.h"         // SystemRoleAffinity (T::kRoleAffinity) — its header is the doctrine
+#include "OGSimulation/OGAssert.h"                   // OG_CHECK (the AuthorityOnly exactly-once tripwire)
 
 #include "OGSimulation/CompilerControl.h"
 
@@ -31,17 +33,17 @@ OGSIM_OPTIMIZE_OFF
 // SimulationSystem<T, StaticDataT> — compile-time contract for a system.
 //
 // T satisfies the concept if it (a) declares a RequiredSimulatables type alias
-// (a SimulatableList<...> naming exactly the simulatables it needs to observe)
-// and (b) provides the four hook methods, each accepting a StorageView<...>
-// matching those requirements plus a const StaticDataT& for game-static config
-// lookup. No inheritance requirement — systems are plain classes that duck-type
-// into the concept.
+// (a SimulatableList<...> naming exactly the simulatables it needs to observe),
+// (b) declares kRoleAffinity, a static constant SystemRoleAffinity (that header
+// is the doctrine), and (c) provides the four hook methods, each accepting a
+// StorageView<...> matching those requirements plus a const StaticDataT& for
+// game-static config lookup. Duck-typed: no inheritance requirement.
 //
-// Requirement ordering is load-bearing: the "RequiredSimulatables is a
-// SimulatableList<>" gate fires FIRST — as its own requires-block — so a
-// system that forgets the wrap gets a legible IsSimulatableList diagnostic
-// before the hook checks (which reference apply_t<StorageView, ...> and would
-// otherwise produce a noisier failure).
+// Requirement ordering is load-bearing and is the order above — each gate is
+// its own requires-block, so a missing SimulatableList<> wrap and a missing or
+// malformed kRoleAffinity each get a short diagnostic of their own, BEFORE the
+// hook checks (which reference apply_t<StorageView, ...> and would otherwise
+// produce a noisier failure).
 //
 // View-parameter shape (NEW-4 honest scope): the requires-expression passes
 // `view` as an LVALUE, so a hook may take it by value, by
@@ -56,6 +58,11 @@ concept SimulationSystem = requires
 {
     typename T::RequiredSimulatables;
     requires IsSimulatableList<typename T::RequiredSimulatables>;   // clearer diagnostic than an undefined list_contains hit
+} && requires
+{
+    { T::kRoleAffinity } -> std::same_as<const SystemRoleAffinity&>;   // static, const, and of THIS type: a bool/int/non-static member fails here
+    requires (T::kRoleAffinity == SystemRoleAffinity::AllRoles
+           || T::kRoleAffinity == SystemRoleAffinity::AuthorityOnly);  // a constant expression naming a REAL enumerator
 } && requires(
     T& t,
     const SimulationTimeStep& step,
@@ -83,7 +90,9 @@ concept SimulationSystem = requires
 // Holds a compile-time-fixed tuple of concrete system objects, all satisfying
 // SimulationSystem. Fires hooks via a std::apply fold-expression over the tuple
 // in template-parameter order, projecting the full storage down to each system's
-// declared view before calling.
+// declared view before calling — but only for the systems the caller's ROLE
+// admits: every fire method takes `isAuthority` LAST and gates on kRoleAffinity,
+// so AllRoles fires on all three roles and AuthorityOnly on the authority only.
 //
 // Determinism: firing order == template-parameter order. Server and every
 // client compile the same type alias, so the order is byte-identical across
@@ -132,6 +141,30 @@ class SimulationSystemsExecutor<SimulatableList<SimulatableTs...>, StaticDataT, 
     using StorageT = SimulationObjectStorage<SimulatableTs...>;
     std::tuple<SystemTs...> m_systems;
 
+    template <typename SystemT>
+    static constexpr bool firesOnRole(bool isAuthority)
+    {
+        if constexpr (SystemT::kRoleAffinity == SystemRoleAffinity::AllRoles)
+            return true;
+        else
+            return isAuthority;
+    }
+
+    template <typename SystemT>
+    static void checkAuthorityOnlyStep(const SimulationTimeStep& step)
+    {
+        if constexpr (SystemT::kRoleAffinity == SystemRoleAffinity::AuthorityOnly)
+        {
+            OG_CHECK(!step.getIsResimulating(),
+                "SimulationSystemsExecutor: an AuthorityOnly system was fired on a RESIMULATION "
+                "step with isAuthority=true. An AuthorityOnly system's outputs are monotonic and "
+                "must be produced exactly once per tick, which only holds on a role that never "
+                "rewinds. Either the fire site passed the wrong role, or the authority has grown "
+                "a replay path and the affinity is no longer expressible - see "
+                "SystemRoleAffinity.h before relaxing this.");
+        }
+    }
+
 public:
     // Default construction — every system must be default-constructible. For
     // systems needing constructor args, use the piecewise ctor below.
@@ -159,26 +192,34 @@ public:
     // the executor must not pass a prvalue directly into the hook.
 
     void firePreIntegrate(const SimulationTimeStep& step, StorageT& storage,
-                          const StaticDataT& staticData)
+                          const StaticDataT& staticData, bool isAuthority)
     {
         std::apply([&](auto&... systems)
         {
             ([&]{
+                using SystemT = std::decay_t<decltype(systems)>;
+                if (!firesOnRole<SystemT>(isAuthority))
+                    return;
+                checkAuthorityOnlyStep<SystemT>(step);
                 auto view = storage.template projectTo<
-                    typename std::decay_t<decltype(systems)>::RequiredSimulatables>();
+                    typename SystemT::RequiredSimulatables>();
                 systems.preIntegrate(step, view, staticData);
             }(), ...);
         }, m_systems);
     }
 
     void firePostIntegrate(const SimulationTimeStep& step, StorageT& storage,
-                           const StaticDataT& staticData)
+                           const StaticDataT& staticData, bool isAuthority)
     {
         std::apply([&](auto&... systems)
         {
             ([&]{
+                using SystemT = std::decay_t<decltype(systems)>;
+                if (!firesOnRole<SystemT>(isAuthority))
+                    return;
+                checkAuthorityOnlyStep<SystemT>(step);
                 auto view = storage.template projectTo<
-                    typename std::decay_t<decltype(systems)>::RequiredSimulatables>();
+                    typename SystemT::RequiredSimulatables>();
                 systems.postIntegrate(step, view, staticData);
             }(), ...);
         }, m_systems);
@@ -189,26 +230,32 @@ public:
     // tick-scoped (they fire on spawn/despawn, out of band from integrateAll).
 
     void notifyCharacterRegistered(unsigned int id, StorageT& storage,
-                                   const StaticDataT& staticData)
+                                   const StaticDataT& staticData, bool isAuthority)
     {
         std::apply([&](auto&... systems)
         {
             ([&]{
+                using SystemT = std::decay_t<decltype(systems)>;
+                if (!firesOnRole<SystemT>(isAuthority))
+                    return;
                 auto view = storage.template projectTo<
-                    typename std::decay_t<decltype(systems)>::RequiredSimulatables>();
+                    typename SystemT::RequiredSimulatables>();
                 systems.onCharacterRegistered(id, view, staticData);
             }(), ...);
         }, m_systems);
     }
 
     void notifyCharacterUnregistered(unsigned int id, StorageT& storage,
-                                     const StaticDataT& staticData)
+                                     const StaticDataT& staticData, bool isAuthority)
     {
         std::apply([&](auto&... systems)
         {
             ([&]{
+                using SystemT = std::decay_t<decltype(systems)>;
+                if (!firesOnRole<SystemT>(isAuthority))
+                    return;
                 auto view = storage.template projectTo<
-                    typename std::decay_t<decltype(systems)>::RequiredSimulatables>();
+                    typename SystemT::RequiredSimulatables>();
                 systems.onCharacterUnregistered(id, view, staticData);
             }(), ...);
         }, m_systems);
