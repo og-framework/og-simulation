@@ -80,7 +80,10 @@
 // ---------------------------------------------------------------------------
 // THE WIRE FENCE. kWireFormatVersion is the SINGLE version fence of the input-
 // relay increment, bumped 1 -> 2 by T4 because this payload grew the second
-// field. The version BYTE itself is emitted by the UE buffer's NetSerialize (it
+// field, and 2 -> 3 by ring-out task 2 because the STATE COMPOSITE gained a
+// whole sub-simulation (the full reasoning is at the constant itself, below —
+// it is a different KIND of change from T4's and the difference is the point).
+// The version BYTE itself is emitted by the UE buffer's NetSerialize (it
 // is transport framing, not payload), and the refusal path lives in the
 // adapter's correction-state arrival callback (one adapter binds it to
 // `USimmableUpdateComponent::OnRep_CorrectionState`), which compares the
@@ -124,8 +127,51 @@ namespace correctionStateBuffer
 {
 	// Wire-format version of the CORRECTION STATE payload. 1 = Stage-1 format
 	// (tick + composite); 2 = the input-relay format (tick + appliedCaptureTick +
-	// composite). See THE WIRE FENCE above.
-	inline constexpr std::uint8_t kWireFormatVersion = 2;
+	// composite); 3 = the input-relay format with a state composite that carries a
+	// ring-out sub-simulation. See THE WIRE FENCE above.
+	//
+	// ⛔⛔ [ringout task 2, 2026-09-13] 2 -> 3, AND THE REASON IS NOT THE ONE THIS
+	// FENCE USUALLY FIRES FOR. What moved: `simulatableBrawler::State` grew
+	// 326 -> 335 B when `brawlerRingout::InitialConditions` (4 B) and
+	// `brawlerRingout::State` (5 B) were APPENDED to the composite. An append
+	// leaves every preceding field at the byte offset it already had, and that is
+	// exactly why movement-sim tasks 11, 27 and 50 each declined this bump when
+	// they grew a slice. Ring-out is a DIFFERENT CLASS OF CHANGE and the
+	// precedent does not carry:
+	//
+	//   * Those tasks added FIELDS to sub-simulations BOTH builds compiled in.
+	//     Every offset a stale peer knew about stayed put, and the only cost was
+	//     bytes it ignored.
+	//   * This task appends a WHOLE SUB-SIMULATION that an older build does not
+	//     have at all. The payload layout cannot express that difference: the
+	//     bytes are self-consistent in both directions and say nothing about
+	//     which build has the sub-simulation.
+	//
+	// ⛔ The direction that matters is NEW client / OLD server. The new client's
+	// `readCompositeFromSyncedBuffer` walks 335 bytes out of a payload the old
+	// server wrote 326 bytes into; the trailing 9 come from whatever the
+	// fixed-capacity kBufferBytes array last held at those offsets. Ring-out
+	// state — the dead bit and the absolute respawn tick — is then restored from
+	// garbage on EVERY correction, silently. The version byte is the only thing
+	// that turns that into the loud, expected build-mismatch refusal instead.
+	//
+	// ⚠ "That pair is not reachable, one machine builds both halves" is a claim
+	// about how this project is BUILT AND SHIPPED, and it is false here:
+	// `Source/*.Target.cs` declares three separate targets (Server, Client,
+	// Editor), and `PLAYTEST_PORTABLE_README.md` documents three archives cooked
+	// INDEPENDENTLY and handed to a host PC with nothing enforcing one revision —
+	// its own "Things that will not work" list names build-mixing as a known
+	// hazard. `Saved/StagedBuilds/Windows{Server,Client}/` currently holds a
+	// stale pair from 2026-07-20. Mixed builds are ordinary practice here, which
+	// is why the arrival callback's refusal path already tells the user to "get
+	// matching builds from Saved/Archive/".
+	//
+	// The forward direction (OLD client / NEW server) was benign and stays
+	// benign: the append meant every field the old build knew about decoded
+	// correctly and 9 trailing bytes were simply never read. It is now fenced too
+	// — a loud refusal, not a silent capability gap where a stale client watches
+	// characters teleport with no local explanation for the respawn.
+	inline constexpr std::uint8_t kWireFormatVersion = 3;
 
 	// Payload layout.
 	inline constexpr std::uint32_t kTickOffset               = 0;
