@@ -481,11 +481,24 @@ public:
     // ⛔ CENTRALIZED UNREGISTER, FIXED ORDER — and the order is load-bearing. §8
     // ⛔ Step 1 MUST precede step 3: clearing callbacks before any lifecycle erase is
     // the contract every owner is bound under, KEPT UNCHANGED rather than loosened. §8
+    //
+    // ⛔ SPLIT IN TWO BY THE REGISTRATION-RACE FIX, AND THE SPLIT IS ALONG A THREAD
+    // BOUNDARY, NOT A TASTE ONE. Step 1 is the only half that touches the OWNER, and an
+    // owner is a game-thread object that is leaving — it must be unbound while the game
+    // thread still holds it. Steps 2-4 touch no owner at all, which is what makes them
+    // the half an adapter COULD defer to a between-steps apply point. ⚠ NO ADAPTER IN
+    // THIS TREE DOES — nothing routes through `DeferredLifecycleQueue`; today both halves
+    // run on the GAME thread, back to back, through the composed facade below. ⛔ AND THE
+    // DEFERRED HALF IS NOT PHYSICS-ONLY EITHER: step 2 erases `m_authorityWriters` and
+    // `m_localInputSenders` (:529-530), which the GAME thread range-fors every tick at
+    // :599 and :656 — so deferring it is blocked on marshalling that send path first.
+    // The ruling is in DeferredLifecycleQueue.h's banner and docs/ThreadingCrossings.md
+    // row 11. The fixed order survives the split intact: step 1 still happens first,
+    // EARLIER than before rather than later.
+    // ⛔ THE COMPOSED FORM BELOW IS THE ONE SINGLE-THREADED CALLERS KEEP USING.
     template <typename T>
-    void unregisterSimulatable(
-        unsigned int id,
+    void clearOwnerCallbacks(
         PredictionOwnerFor<T>* predictionOwner,
-        SimulationInputResolution<SimulatableTs...>& inputResolution,
         AuthorityOwnerFor<T>* authorityOwner = nullptr)
     {
         // ⛔ Step 1: clear RPC-inbound callbacks — before any data-map erase.
@@ -500,7 +513,24 @@ public:
         {
             authorityOwner->clearOnRemoteMoveReceivedCallback();
         }
+    }
 
+    // ⛔ ID ONLY — NO OWNER POINTER MAY BE ADDED TO THIS SIGNATURE, AND THE REASON IS A
+    // FUTURE CALLER, NOT A PRESENT ONE. Today every caller in this repository reaches this
+    // through the composed facade below, on one thread, with the owner alive - so nothing
+    // here is deferred and nothing would break if an owner pointer were passed. The
+    // signature is id-only so that an adapter CAN defer this half: it is the half a
+    // `DeferredLifecycleQueue` job would carry, one or more frames after the game thread
+    // queued it, by which time the owner it was queued for may be gone.
+    // ⚠ NO ADAPTER IN THIS TREE DOES THAT YET — that adoption is held; the ruling and its
+    // precondition are in DeferredLifecycleQueue.h's banner and in
+    // docs/ThreadingCrossings.md row 11. Read this fence as a CONSTRAINT ON THE SIGNATURE,
+    // not as a claim about which thread calls it today. §8
+    template <typename T>
+    void unregisterSimulatableContainers(
+        unsigned int id,
+        SimulationInputResolution<SimulatableTs...>& inputResolution)
+    {
         // Step 2: erase writer structs.
         std::get<AuthorityWriterMapFor<T>>(m_authorityWriters).erase(id);
         std::get<LocalInputSenderMapFor<T>>(m_localInputSenders).erase(id);
@@ -516,6 +546,17 @@ public:
         // fenced on those two methods, not here. §8
         m_telemetry.forgetOwner(id);
         inputResolution.forgetOwner(id);
+    }
+
+    template <typename T>
+    void unregisterSimulatable(
+        unsigned int id,
+        PredictionOwnerFor<T>* predictionOwner,
+        SimulationInputResolution<SimulatableTs...>& inputResolution,
+        AuthorityOwnerFor<T>* authorityOwner = nullptr)
+    {
+        clearOwnerCallbacks<T>(predictionOwner, authorityOwner);
+        unregisterSimulatableContainers<T>(id, inputResolution);
     }
 
     // Outbound — authority STATE replication (game thread)
@@ -851,18 +892,27 @@ void registerSimulatable(
         const SimulationTimeStep&,
         const LocalInputCache<typename SimulatableT::InputType>&)> inputProvider = nullptr)
 {
-    // ⛔ PUBLISH LAST — createCacheFor BEFORE storage.add. A physics tick reaching a
-    // storage-visible id with no cache calls getCacheFor(id) and throws, and
-    // forEachSimulatable is what makes that window reachable. §14
-    // ⛔ INVERTED-ORDER INVARIANT: IF STORAGE HAS ID, CACHE HAS ID.
+    // ⛔ PUBLISH LAST — storage.add IS THE LAST STATEMENT, AND THAT IS THE WHOLE
+    // ORDERING. A physics tick reaching a storage-visible id calls getCacheFor(id) for
+    // the correction cache AND m_localInputCaches for the delay line, and
+    // forEachSimulatable is what makes that window reachable.
+    // ⛔ INVERTED-ORDER INVARIANT: IF STORAGE HAS ID, EVERY CONTAINER THE COLLECT LOOP
+    // WILL ASK IT FOR HAS ID — the reconciliation cache, the provider, the delay line,
+    // the pending queue.
+    // ⛔ THE ADD USED TO SIT BETWEEN createCacheFor AND registerPredictionOwner, and the
+    // window that left — storage-visible, provider present, delay line absent — was a
+    // SHIPPED, PROCESS-TERMINATING std::out_of_range on a client's physics thread
+    // (og-netcode-v2-field-defects task 3). Moving the add down is one line and it
+    // closes the window by construction; do not move it back up for symmetry with
+    // anything. §14
     // ⛔ STATED AT BOTH OVERLOADS ON PURPOSE, so an edit to either sees the sibling it
-    // mirrors — the server overload orders registerAuthorityOwner first instead. §14
+    // mirrors — the server overload already published last. §14
     reconciliation.template createCacheFor<SimulatableT>(id);
-    storage.template add<SimulatableT>(id, std::forward<SimulatableT>(simulatable));
     // ⛔ The inputResolution peer's containers must exist before registerPredictionOwner
     // binds callbacks against them — same order, same reason, one more call. §14
     netSync.template registerPredictionOwner<SimulatableT>(
         id, owner, std::move(inputProvider), inputResolution);
+    storage.template add<SimulatableT>(id, std::forward<SimulatableT>(simulatable));
 }
 
 // ⛔ No correction cache is allocated on the authority, and none should be: it does
@@ -922,6 +972,38 @@ void registerSimulatable(
 // ⛔ THE GUARANTEE, RE-CHECKED AFTER THAT MOVE — no fully-executed register/unregister
 // sequence, in the stated order, produces a window visible to a concurrent
 // physics tick. BOTH sweeps are now nullable- or storage-filtered. §14
+//
+// THE THREAD-SPLIT HALF OF THE UNREGISTER FACADE, and the split is along a THREAD
+// boundary rather than a taste one: everything here touches a container a concurrent
+// physics sweep reads, and NOTHING here touches an owner. The split is BEHAVIOUR-
+// PRESERVING — the facade below calls both halves in the original order — and it is a
+// SEAM, kept so the two halves can one day run on different threads.
+//
+// ⛔ THE UNPUBLISH-FIRST ORDER IS THE WHOLE POINT AND IS UNCHANGED — storage.remove,
+// then the net-sync/resolver erases, then removeCacheFor. §14
+// ⛔ NO OWNER PARAMETER, AND NONE MAY BE ADDED — a constraint kept for the caller this
+// shape exists to allow, which does not exist yet. An adapter that marshalled lifecycle
+// through `DeferredLifecycleQueue` would call this from its physics-thread apply point,
+// frames after the game thread queued it, with the owner possibly gone and its callbacks
+// already cleared by the facade below. ⚠ NOTHING IN THIS TREE DOES THAT TODAY: every
+// caller goes through the facade, on one thread. The ruling that held that adoption, and
+// what it would take to revisit it, are in DeferredLifecycleQueue.h and in
+// docs/ThreadingCrossings.md row 11. §8 §14
+template <typename SimulatableT, typename... Ts>
+void unregisterSimulatableContainers(
+    SimulationObjectStorage<Ts...>&   storage,
+    SimulationReconciliation<Ts...>&  reconciliation,
+    SimulationInputResolution<Ts...>& inputResolution,
+    SimulationNetSync<Ts...>&         netSync,
+    unsigned int                      id)
+{
+    storage.template remove<SimulatableT>(id);
+    netSync.template unregisterSimulatableContainers<SimulatableT>(id, inputResolution);
+    reconciliation.template removeCacheFor<SimulatableT>(id);
+}
+
+// The COMPOSED facade every single-threaded caller keeps using — unchanged in effect:
+// owner callbacks first, containers after.
 template <typename SimulatableT, typename... Ts>
 void unregisterSimulatable(
     SimulationObjectStorage<Ts...>&   storage,
@@ -932,10 +1014,9 @@ void unregisterSimulatable(
     PredictionOwnerFor<SimulatableT>* predictionOwner,
     AuthorityOwnerFor<SimulatableT>*  authorityOwner = nullptr)
 {
-    storage.template remove<SimulatableT>(id);
-    netSync.template unregisterSimulatable<SimulatableT>(
-        id, predictionOwner, inputResolution, authorityOwner);
-    reconciliation.template removeCacheFor<SimulatableT>(id);
+    netSync.template clearOwnerCallbacks<SimulatableT>(predictionOwner, authorityOwner);
+    unregisterSimulatableContainers<SimulatableT>(
+        storage, reconciliation, inputResolution, netSync, id);
 }
 
 OGSIM_OPTIMIZE_ON

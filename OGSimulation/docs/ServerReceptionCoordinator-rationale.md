@@ -70,7 +70,7 @@ A received input leaves `receiveRemoteInput` on exactly one of three paths, and 
 
 | result | meaning | what the caller must do |
 |---|---|---|
-| `parked == true` | queued in the delay queue; released on `captureTick + effectiveDelay` | nothing |
+| `parked == true` | the delay queue took the decision: queued and released on `captureTick + effectiveDelay`, or refused as a duplicate, or refused as LATE (§6) | nothing |
 | `parked == false`, `rejectedOutOfDomain == false` | the **malformed-slot fence**: the slot is outside the uint8 substitution-mask range | **deliver it undelayed**, or that player input is lost |
 | `rejectedOutOfDomain == true` | the receipt gate refused the capture tick (§5) | **discard it** — falling back defeats the gate |
 
@@ -95,7 +95,13 @@ because it owns the game-thread-safe tick source; the core never reads a physics
 `simTick - delay`.** Under due-or-overdue release an overdue entry is released a tick or more late,
 so `simTick - delay` would name a *future* input's tick. That collides with `RemoteMoveQueue`'s
 capture-tick dedup and makes the `[InputGap]` watermark meaningless. The delay is expressed purely
-as *when* the release fires; lateness is reported separately as `late=N`.
+as *when* the release fires; release lateness is reported separately as `[Release] late=N`, in
+**ticks**.
+
+⚠ `[InputStats]` and `[RelaySkip]` also carry a field spelled `late=`, and it is a **different
+quantity** — a per-window **count** of captures refused because their release tick had already
+passed (§6). The two share a spelling and nothing else. A grep for `late=` across a host log
+returns both; the tag disambiguates them.
 
 `staleBefore = firstUpcomingSimTick - rollbackWindowHardCap` is computed once and used for **both**
 the release gate and the purge. That single value is what makes the purge the one drop point:
@@ -271,6 +277,31 @@ a tick behaving exactly as it did before the gate existed.
 The cost is that the gate is unarmed until the first physics frame, a window in which the server
 tick is near 0 and warm-up capture ticks are legitimately in-domain anyway.
 
+### A second tick reference, for the late gate, and why it is not the first one
+
+The late gate (§6) needs a different question answered: *has the tick this capture would have been
+released on already been simulated?* `m_serverTick` cannot answer it. The adapter calls
+`reapConnections(firstUpcomingSimTick)` **after** the drain and with that frame's **first** tick, so
+after a frame that served ticks `T … T + numSteps - 1`, `m_serverTick` reads `T`. A capture released
+on `T + 1` inside that very frame would look not-yet-due to it, and the re-send that arrives a
+moment later would be re-admitted — exactly the failure the gate exists to stop.
+
+`noteDrainedThrough`, fed only by `releaseDelayedInputs`, records `firstUpcomingSimTick + numSteps`
+instead: the first tick the drain has **not** served. It is armed **before** the empty-claim-map
+early-out, so an idle server still advances it rather than freezing the reference at whatever the
+last busy frame left.
+
+It shares three properties with `noteServerTick`, for the same reasons argued above: exactly one
+feed, **last-write-wins rather than a max** (a max sticks forever after a clock restart and would
+then refuse every later capture on the connection), and **fail open until armed**
+(`m_drainTickKnown` separates "never drained" from "drained to tick 0"). Before the first drain the
+late gate is off entirely and the queue behaves as it did.
+
+The two references are deliberately separate members rather than one. They answer different
+questions, are written at different points of the same frame, and the cost of conflating them is a
+silently re-admitted capture — the most expensive kind of wrong, because the symptom is a permanent
+one-tick schedule shift several thousand ticks later.
+
 ### The second guard, kept deliberately
 
 `RemoteMoveQueue::queueMove` (`SimulationQueues.h`) already rejects
@@ -346,22 +377,76 @@ peer would schedule it wrongly. There is no relay on any fallback path.
 
 ### The other half of the gate
 
-`parked && !acceptedNew` holds two populations.
+`parked && !acceptedNew` holds **three** populations. It held two until the late gate was added
+(og-netcode-v2-field-defects task 1, 2026-09-19); the third had been silently folded into the first.
 
 * A **redundancy-bundle re-send** of an already-parked tick. Uninteresting.
 * A genuinely-new **out-of-order-older** tick — one that arrived after a newer tick had moved the
-  watermark. The server *does* apply it: the delay queue accepts it and capture-order release
-  delivers it. It is deliberately **not** relayed, because the relay stream is monotonic in capture
-  tick by construction, and at the shipped depth of 1 the payload is replace-latest, so writing an
-  older input would move every peer's "latest" backwards.
+  watermark, but whose release tick is still **ahead** of the drain. The server *does* apply it: the
+  delay queue accepts it and capture-order release delivers it. It is deliberately **not** relayed,
+  because the relay stream is monotonic in capture tick by construction, and at the shipped depth of
+  1 the payload is replace-latest, so writing an older input would move every peer's "latest"
+  backwards.
+* A **LATE** capture — a re-send of a tick the slot has **already released**, or one whose release
+  tick is behind the first undrained tick. It is refused outright: neither parked, nor applied, nor
+  relayed, nor counted as a relay hole.
 
-The peer instead experiences a hole: the scheduled read misses, it falls back to last-known, it
-mispredicts the proxy for a tick, and the every-frame state anchor heals it.
+The peer of the middle case instead experiences a hole: the scheduled read misses, it falls back to
+last-known, it mispredicts the proxy for a tick, and the every-frame state anchor heals it.
 
-The two populations are told apart by `enqueue`'s return value, and the second is counted as
+The first two are told apart by `enqueue`'s return value, and the second is counted as
 `relayOooSkipCount()` and traced, because the depth>1 future must reopen this gate decision on
 measured evidence rather than on argument. That counter is a lifetime total, never reset, zero in the
-ordered steady state, and not bumped by redundancy re-sends.
+ordered steady state, and not bumped by redundancy re-sends — nor by late drops.
+
+### The late gate — why a re-send of an applied capture must be refused
+
+Measured in play on 2026-09-13. The consumer-side bug report and the log join that produced these
+figures live in the integrating project's own initiative notes and are not distributed with this
+submodule; everything needed to judge the fix is restated here.
+
+`ServerInputDelayQueue::enqueue` de-duplicated against one memory only: what is parked *right now*.
+Each client packet re-sends the previous `redundancyDepthTicks` captures. When a packet landed after
+the server tick on which its **oldest** re-send had been released, that re-send was no longer in the
+deque, passed the duplicate scan as new, was parked a second time, and — being the oldest due entry
+— was released again on the next tick. Release and the downstream FIFO's consumption are both
+exactly one entry per tick, so the extra entry was never absorbed: **every later input was applied
+one tick late for the rest of the session.** The field session shows the delivered lag moving 3 → 4
+at server tick 1737 and staying there for 3,485 ticks, re-arming after a loss burst had drained the
+slot.
+
+**The discriminator is the release tick, not the arrival order.** A re-send of an already-applied
+capture has its release tick in the past; the out-of-order-older capture the bullet above exists for
+still has it in the future. Two independent facts are checked, both in `enqueue`, both counted as
+`lateDroppedCount()`:
+
+1. `captureTick + effectiveDelay(key) < firstUpcomingSimTick` — the release tick is behind the first
+   tick the drain has not served (§5). This arm also catches a capture that was never parked at all
+   because it was lost, and whose slot therefore underran.
+2. `captureTick <= lastReleasedBySlot[key]` — this slot has already handed that capture tick or a later
+   one to the simulation. Belt and braces for the same fact, and it holds even with no tick
+   reference armed.
+
+The duplicate scan runs **first**, so an ordinary re-send of a still-parked tick stays counted as a
+duplicate and does not inflate the late class.
+
+**Dropping is the correct outcome, not a lesser evil.** The authority already substituted the
+neutral on the tick the capture was for, and the client replays that tick by ref-resolution as the
+sentinel — the designed self-heal. Applying the capture late is the wrong input at the wrong tick
+*and* a permanent schedule shift; there is no tick left at which it could be applied correctly.
+Raising `relayDelayFloorTicks` was rejected as a fix: it hides the window rather than closing it,
+and the initiative's own clean measurement (`relayOooSkipCount = 0`) was taken at floor 6 precisely
+because re-sends always arrived while their original was still parked there.
+
+The `[Park]` line and the relay tap moved from `acceptedNew` to `acceptedNew && queuedNewEntry` with
+this change. Before it the two could not disagree; now they can — a capture that is the newest this
+id has sent *and* late would otherwise log a park that did not happen and relay a schedule the
+authority has already declined to keep.
+
+`parked` deliberately stays **true** for a late drop. It does not mean "an entry is in the deque"; it
+means "the core has taken the decision, do not deliver this undelayed" (§2). Returning false would
+route the refused capture down the malformed-slot fallback and apply it immediately — the very
+double-apply the gate removes.
 
 ---
 
@@ -396,9 +481,9 @@ stays at Log, which is hidden under the shipped `LogOGNet=Warning`.
 | `[InputGap]` | Warning | per hole in an id's delivered ticks | the primary, cause-agnostic drop signal |
 | `[InputDrop]` | Warning | per purged, never-released entry | the precise attributable record |
 | `[DelayShift]` | Warning | per wire, per change | keyed on the wire, so at most once per wire per drain |
-| `[InputStats]` | Warning | per ~2 s window | drop rate; silent on an idle server |
+| `[InputStats]` | Warning | per ~2 s window | drop rate + the late-drop count; silent on an idle server |
 | `[InputDomain]` | Warning | per ~2 s window | one line per rejection burst, naming the last offender |
-| `[RelaySkip]` | Verbose / Warning | per event / per window | Verbose per skipped tick, Warning for the window total |
+| `[RelaySkip]` | Verbose / Warning | per event / per window | Verbose per skipped tick, Warning for the window totals of the OOO-older and the late classes |
 | `[InputDelay]` | Warning | once per `(id, slot)` ever | the malformed-slot fence |
 
 ### The window, and why there is only one
@@ -411,7 +496,30 @@ so an idle server does not heartbeat a Warning every two seconds.
 point, same emit-only-if-carried rule. The rate limit each of them needs *is* that mechanism, not a
 second one. The three lines are independent — a window can carry rejects and no deliveries, or the
 reverse — but they share one timer. `[RelaySkip]` was given its own tag rather than an extra field on
-`[InputStats]` so that the `[InputStats]` string run scripts already grep stays byte-identical.
+`[InputStats]` so that each line stays greppable on its own tag.
+
+⚠ **Amended 2026-09-19 (og-netcode-v2-field-defects task 1).** That last sentence used to end "…so
+that the `[InputStats]` string run scripts already grep stays byte-identical", and that is no longer
+true: `[InputStats]` now ends with ` late=%zu`. The field was added under an acceptance criterion
+requiring the late class to be readable at shipped verbosity, and the two classes sit on the two
+window lines a host log already carries. The **leading** clause — `dropped %d / %d remote inputs =
+%d%%` — is unchanged to the byte, so a prefix or substring grep still matches; a script anchored to
+end-of-line does not.
+
+`[RelaySkip]` fires when **either** the OOO-older count **or** the late count is non-zero for the
+window, not on the OOO-older count alone. The whole point of the field is to make the late class
+visible at shipped verbosity, and a late-only window is the common shape — it is what the
+2026-09-13 session would have produced.
+
+### Where the late count actually lives
+
+The window figure on both lines is **differenced from the delay queue's lifetime total**
+(`ServerInputDelayQueue::lateDroppedCount()`), against a baseline the coordinator snapshots when
+each window opens. The queue owns the predicate, so the queue owns the count; duplicating a
+second counter here would let the two drift and would make `enqueue`'s three-way outcome something
+the coordinator has to re-derive from a boolean it cannot. The baseline is **seeded** at the first
+window rather than assumed zero, because input can arrive before the first physics frame opens the
+window and those drops belong to no window at all.
 
 ### Two counters that deliberately do not double-count
 

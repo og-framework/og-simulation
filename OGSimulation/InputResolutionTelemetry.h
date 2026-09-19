@@ -42,6 +42,10 @@ OGSIM_OPTIMIZE_OFF
 //       emitLocalInputRead                          collectInputForCharacter
 //       emitRemoteQueueRead                         collectInputForCharacter
 //       emitPredictionInputRead                     collectInputForCharacter
+//       emitLocalInputCacheMiss                     collectInputForCharacter
+//                                                     and collectResimInput-
+//                                                     ForCharacter — the only
+//                                                     helper with two call sites
 //       emitResimNoSlot / Sentinel / LocalRead /    collectResimInput-
 //         NoStore / RefRead / ScheduledRead           ForCharacter
 //       forgetOwner                                 forgetOwner, lifecycle
@@ -70,12 +74,19 @@ OGSIM_OPTIMIZE_OFF
 //       emitRelayReadWindowIfDue   NOTHING                  2 Warning, plus up
 //                                                           to 4 gated Warning,
 //                                                           plus 1 if stale
+//       emitLocalInputCacheMiss    NOTHING                  1 Warning PER TICK,
+//                                                           in a state that is
+//                                                           unreachable by
+//                                                           construction
 //       forgetOwner                NOTHING                  never logs
 //
 //     ⇒ The three `[CollectInput]` classification lines are the ONLY per-tick
 //       output of this class; every `[RelayProbe.*]` line it emits is a
-//       per-WINDOW or a rare-event line. That asymmetry is the whole point,
-//       and the per-method fences below are what hold it in place.
+//       per-WINDOW or a rare-event line, and the fourth `[CollectInput]` line
+//       (`NOCACHE`) is a rare-event line too — rate-limited to one per tick and
+//       emitted only in a state nothing in the tree can produce. That asymmetry
+//       is the whole point, and the per-method fences below are what hold it in
+//       place.
 //     ⇒ ON THE AUTHORITY THIS CLASS IS SILENT: neither collect path is reached
 //       there, so no window ever closes and no line is ever emitted.
 //
@@ -141,6 +152,51 @@ public:
     {
         SIMLOG(m_logger, "[CollectInput] id=%u tick=%u source=RemoteQueue queuedTick=%u",
             id, tick, queuedTick);
+    }
+
+    // THE NOCACHE TRIPWIRE — a locally-controlled id whose delay line is absent.
+    //
+    // ⛔ UNREACHABLE IN PROGRAM ORDER, AND THAT IS WHY IT EXISTS. `registerLocalCharacter`
+    // creates the line before the provider and `registerSimulatable` publishes to storage
+    // last, so no completed registration in this tree can produce the state this reports.
+    // ⚠ THAT IS AN ORDERING ARGUMENT AND NOTHING MORE. The registration path is NOT
+    // marshalled onto the physics thread — `DeferredLifecycleQueue` exists but no adapter
+    // uses it — so the concurrent game/physics mutation of these maps is UNCHANGED and
+    // remains the one route to this state (og-netcode-v2-field-defects task 4;
+    // docs/ThreadingCrossings.md row 11). It is the standing tripwire
+    // that turns any FUTURE tear into one logged neutral tick instead of a dead process
+    // — the shipped defect it replaces was a process-terminating `std::out_of_range` on a
+    // client's physics thread (og-netcode-v2-field-defects task 3).
+    //
+    // ⛔ WARNING, NOT VERBOSE, AND NOT A PER-WINDOW SUMMARY — the ONE line on this class
+    // that breaks the volume roster above, deliberately. The roster's rule is about
+    // STEADY-STATE chatter; this fires only in a state that must never occur, and the
+    // PIE acceptance check for the fix is `grep NOCACHE` coming back EMPTY, which a
+    // Verbose line could not serve in a shipped build. §9
+    //
+    // ⛔ ONE LINE PER TICK, NOT ONE PER CALL. `collectInputAll` calls this once per torn
+    // character and a resim calls it once per torn character per replayed tick, so an
+    // unrated tripwire would bury the log precisely when the log is the only instrument
+    // left. The rate limit is a TICK COMPARISON, not a latch: a tear that outlives a tick
+    // is reported again on the next one.
+    // ⛔ THE SUPPRESSED COUNT RIDES THE NEXT EMITTED LINE, so the rate is never silently
+    // lost — `suppressed=` is how many calls the previous line stood for. §9
+    void emitLocalInputCacheMiss(unsigned int id, uint32 tick, const char* source)
+    {
+        if (m_hasEmittedCacheMiss && tick == m_lastCacheMissTick)
+        {
+            ++m_suppressedCacheMisses;
+            return;
+        }
+
+        const uint32 suppressed = m_suppressedCacheMisses;
+        m_suppressedCacheMisses = 0u;
+        m_hasEmittedCacheMiss   = true;
+        m_lastCacheMissTick     = tick;
+
+        SIMLOG(m_logger,
+            "[Warning][CollectInput] id=%u tick=%u source=%s NOCACHE suppressed=%u",
+            id, tick, source, suppressed);
     }
 
     // ⛔ `hasStore` IS A BIT, NOT A POINTER — this method never dereferenced the store, only null-checked it, so no reference into `SimulationInputResolution`'s `RemoteInputCache` map crosses in here. §2
@@ -316,6 +372,14 @@ private:
     }
 
     std::function<void(const char*)> m_logger;
+
+    // ⛔ THE NOCACHE RATE LIMITER'S WHOLE STATE. PHYSICS THREAD ONLY, like every other
+    // member here, so none of the three is atomic. §3
+    uint32 m_lastCacheMissTick     = 0u;
+    uint32 m_suppressedCacheMisses = 0u;
+    // ⛔ A SEPARATE BOOL RATHER THAN A SENTINEL TICK — tick 0 is an ordinary tick at
+    // session start, which is exactly when this tripwire is most likely to fire. §9
+    bool   m_hasEmittedCacheMiss   = false;
 
     // ⛔ PHYSICS THREAD ONLY, and pure telemetry — nothing in the resolution path reads it, and every consumer is a SIMLOG. §11
     // ⛔ Its GAME-thread sibling `RelayArrivalProbe` is on `NetSyncTelemetry` — two objects because two threads. §3

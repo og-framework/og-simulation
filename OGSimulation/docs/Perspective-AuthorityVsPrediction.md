@@ -328,9 +328,9 @@ one place the local-vs-proxy distinction of §2's last two columns is decided.
 
 | overload | order | invariant established |
 |---|---|---|
-| client `registerSimulatable` | `createCacheFor` → `storage.add` → `registerPredictionOwner` | *if storage has id, cache has id* |
+| client `registerSimulatable` | `createCacheFor` → `registerPredictionOwner` → `storage.add` | *if storage has id, the correction cache, the provider, the delay line and the pending queue all have id* |
 | server `registerSimulatable` | `registerPredictionOwner` → `registerAuthorityOwner` → `storage.add` | *if storage has id, queueMap has id* |
-| `unregisterSimulatable` | `storage.remove` → `netSync.unregisterSimulatable` → `removeCacheFor` | the same, read backwards |
+| `unregisterSimulatable` | `clearOwnerCallbacks` → `storage.remove` → `netSync.unregisterSimulatableContainers` → `removeCacheFor` | the same, read backwards |
 
 **What crashed without it.** `storage.add` is the single point at which an id becomes visible to
 `forEachSimulatable`, and the physics thread runs those sweeps concurrently with game-thread
@@ -350,6 +350,30 @@ be classified as a simulated proxy instead of an authority id for the width of t
 read a relay store that no authority path populates. Lower severity, still real. The fence
 carrying this — including the explicit *"a future author must not remove this reorder"* — sits above
 `unregisterSimulatable` in `<core>SimulationNetSync.h`.
+
+⛔ **That "belt-and-braces" pricing is CORRECT FOR THE SERVER OVERLOAD ONLY, and the client overload
+has since gone back to load-bearing.** og-netcode-v2-field-defects task 3 found a *second*, live
+crash of exactly the shape the paragraph above says is retired: on the client overload `storage.add`
+ran BEFORE `registerPredictionOwner`, so an id was visible to `forEachSimulatable` with a provider
+and no delay line, and `collectInputForCharacter`'s `m_localInputCaches.at(id)` threw
+`std::out_of_range` on the physics thread and took the process. The fix moved `storage.add` to be the
+last statement of that overload and made `registerLocalCharacter` create the delay line BEFORE the
+provider. Read the table row, not that paragraph, for the current order.
+
+⛔ **The ordering IS still the only thing holding the invariant, and the alternative was measured and
+rejected.** `DeferredLifecycleQueue` exists in the core as a game→physics marshalling point — enqueue
+on the game thread, apply between physics steps — and **no adapter in this tree uses it.** Adopting it
+inverts the crossing rather than closing it: it makes the physics thread the sole writer, and the
+readers that then sit on the far side include two per-tick game-thread ITERATIONS,
+`sendCorrectionAll` over `m_authorityWriters` and `sendLocalInputToAuthorityAll` over
+`m_localInputSenders`. `ThreadingCrossings.md` row 11 carries the full reader list and the
+ruling. Treat the ordering as load-bearing.
+
+⛔ **The unregister facade is SPLIT along that same thread boundary, and the composed form is what
+every caller in this tree still uses.** `clearOwnerCallbacks` is the only half that touches an owner
+and must run where the owner is provably alive; `unregisterSimulatableContainers` takes an id and
+nothing else, and is what an adapter would defer if it ever adopted the queue. The fixed order is
+unchanged either way — callbacks first, then unpublish-first.
 
 ⚠ **One artefact of the ordering that reads like a bug and is not.** On the authority, the server
 overload reaches `registerPredictionOwner` with a null provider, which takes the *provider-absent*

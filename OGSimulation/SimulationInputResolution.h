@@ -2,11 +2,13 @@
 // SPDX-License-Identifier: MPL-2.0
 
 #include "OGTypes.h"
+#include <array>
 #include <atomic>
 #include <concepts>
 #include <functional>
 #include <optional>
 #include <tuple>
+#include <type_traits>
 #include <unordered_map>
 
 #include "OGSimulation/CorrectionStateBufferCodec.h"
@@ -162,6 +164,183 @@ using LocalInputCacheMapFor = std::unordered_map<
     unsigned int,
     LocalInputCache<typename T::InputType>>;
 
+// ---------------------------------------------------------------------------
+// THE RELAYED-READ OBSERVATION RING -- WHAT THE SCHEDULED READ ACTUALLY SERVED.
+//
+// The ladder decides which relayed capture a tick runs on and then drops the
+// decision: the report is projected into a counter and the served input goes to the
+// integrator. Nothing retains "at tick N this client applied capture C", which is
+// exactly the CLIENT half of the input-delay comparison a display already makes for
+// a locally controlled character, where the delay line answers it.
+//
+// Nothing here is replicated, enters a correction payload or reaches compute_checksum,
+// and no resolution decision may be steered by it.
+// ⛔ THIS IS A DIAGNOSTIC READ AND MUST STAY ONE.
+//
+// Every field is a plain integer, so a torn read is a wrong number on a display rather
+// than a crash -- the same accepted VALUE tear `Diagnostics::localInputCache` carries.
+// ⛔ WRITTEN ON THE PHYSICS THREAD, READ ON THE GAME THREAD, AND ACCEPTED. §14
+//
+// The map is touched at registration and unregistration only, both game-thread.
+// ⛔ NEITHER SIDE EVER REHASHES IT UNDER THE OTHER. §14
+// ---------------------------------------------------------------------------
+
+// One display window of ticks. The consumer's per-tick lane capacity is the reason
+// for the number; this layer may not name that constant, so the two are pinned
+// against each other by a case on the consuming side.
+inline constexpr std::size_t kRelayedReadObservationCapacityTicks = 240u;
+
+// What one scheduled read served, at the tick it was asked about.
+// ⛔ `appliedCaptureTick` IS MEANINGLESS UNLESS `hasAppliedCaptureTick` -- rung 0
+//   serves the injected zero, which stands behind no capture at all.
+struct RelayedReadObservation
+{
+    uint32                      simTick               = 0u;
+    uint32                      appliedCaptureTick    = 0u;
+    bool                        hasAppliedCaptureTick = false;
+    ScheduledRelayedReadOutcome outcome               = ScheduledRelayedReadOutcome::NoProbe;
+    std::uint8_t                dLatest               = 0u;
+
+    // The capture tick this read ASKED FOR, which is what a later arrival is joined on.
+    // ⛔ MEANINGLESS UNLESS `probeTickFormed` -- rung 0 and the underflow guard form none.
+    uint32                      probeTick             = 0u;
+    bool                        probeTickFormed       = false;
+
+    // WHY a miss missed, so a display can separate a coverage hole from starvation.
+    // ⛔ `NotAMiss` ON EVERY NON-MISS OUTCOME -- the report's own convention, not a second.
+    ScheduledRelayedReadMissClass missClass = ScheduledRelayedReadMissClass::NotAMiss;
+};
+
+// ⛔ A TORN READ MUST STAY A WRONG NUMBER -- a member owning memory would be a crash.
+static_assert(std::is_trivially_copyable_v<RelayedReadObservation>,
+    "RelayedReadObservation is written on the physics thread and read on the game "
+    "thread without a seam. That tear is accepted only because every field is a plain "
+    "value; a member owning memory would make the read a crash rather than a wrong "
+    "number on a display.");
+
+// One remote character's observations, addressed by sim tick.
+class RelayedReadObservationRing
+{
+public:
+    // ⭐ LAST WRITE WINS ON A SIM TICK. A resim re-answers a tick the prediction pass
+    // already answered, and the replay is what this client actually ran.
+    void note(const RelayedReadObservation& observation)
+    {
+        Slot& slot = m_slots[observation.simTick % kRelayedReadObservationCapacityTicks];
+        slot.observation = observation;
+        slot.filled      = true;
+
+        if (!m_hasNewestSimTick || observation.simTick > m_newestSimTick)
+        {
+            m_newestSimTick    = observation.simTick;
+            m_hasNewestSimTick = true;
+        }
+    }
+
+    // The highest sim tick this ring has ever answered for -- this client's own relay
+    // frontier for the character. ⛔ TRACKED, NEVER SCANNED FOR: the slots are unordered.
+    bool   hasNewestSimTick() const { return m_hasNewestSimTick; }
+    uint32 newestSimTick() const { return m_newestSimTick; }
+
+    static constexpr std::size_t size() { return kRelayedReadObservationCapacityTicks; }
+
+    // Slot `index`, or nullptr when nothing has ever been written there.
+    // ⛔ NOT ADDRESSED BY TICK FROM OUTSIDE: the slot carries its own `simTick`.
+    const RelayedReadObservation* at(std::size_t index) const
+    {
+        return m_slots[index].filled ? &m_slots[index].observation : nullptr;
+    }
+
+private:
+    struct Slot
+    {
+        RelayedReadObservation observation{};
+        bool                   filled = false;
+    };
+
+    std::array<Slot, kRelayedReadObservationCapacityTicks> m_slots{};
+    uint32                                                m_newestSimTick    = 0u;
+    bool                                                  m_hasNewestSimTick = false;
+};
+
+// ⛔ WRAPPED IN A STRUCT for LastUsedCaptureTickMapFor's reason: the map type does not
+//   mention `T`, so a bare alias would make every tuple slot the same type.
+template <typename T>
+struct RelayedReadObservationMapFor
+{
+    std::unordered_map<unsigned int, RelayedReadObservationRing> value;
+};
+
+// ---------------------------------------------------------------------------
+// WHEN A RELAYED CAPTURE FINALLY GOT HERE -- THE OTHER HALF OF "DID IT ARRIVE?".
+//
+// A scheduled read that missed says nothing about whether the capture it asked for ever
+// turned up: the store is 64 capture ticks wide and reclaims slots by overwrite, so by
+// the time a display asks, a capture that DID arrive may already be gone. This ring
+// answers for one display window instead.
+//
+// ⛔ THIS IS A DIAGNOSTIC READ AND MUST STAY ONE.
+// ⛔ WRITTEN AND READ ON THE GAME THREAD ALONE -- the arrival door and the display are
+//   both game-thread, so unlike the observation ring this crosses nothing. §14
+// ---------------------------------------------------------------------------
+
+struct RelayedInputArrival
+{
+    uint32 captureTick      = 0u;
+    uint32 arrivedAtSimTick = 0u;
+};
+
+// One remote character's arrivals, addressed by CAPTURE tick -- the observation ring's
+// key is a SIM tick, and the two are joined through the observation's own `probeTick`.
+class RelayedInputArrivalRing
+{
+public:
+    // The relay re-sends entries it has already sent, and a re-delivery is not when the
+    // capture got here.
+    // ⭐ FIRST ARRIVAL WINS.
+    void note(uint32 captureTick, uint32 atSimTick)
+    {
+        Slot& slot = m_slots[captureTick % kRelayedReadObservationCapacityTicks];
+        if (slot.filled && slot.arrival.captureTick == captureTick)
+            return;
+
+        slot.arrival = RelayedInputArrival{ captureTick, atSimTick };
+        slot.filled  = true;
+    }
+
+    // ⛔ JOINED ON THE SLOT'S OWN CAPTURE TICK: a wrapped slot holds a tick one whole
+    //   window older and must not answer for the one being asked about.
+    const RelayedInputArrival* findArrival(uint32 captureTick) const
+    {
+        const Slot& slot = m_slots[captureTick % kRelayedReadObservationCapacityTicks];
+        return (slot.filled && slot.arrival.captureTick == captureTick) ? &slot.arrival : nullptr;
+    }
+
+    static constexpr std::size_t size() { return kRelayedReadObservationCapacityTicks; }
+
+    // Slot `index`, or nullptr when nothing has ever been written there.
+    const RelayedInputArrival* at(std::size_t index) const
+    {
+        return m_slots[index].filled ? &m_slots[index].arrival : nullptr;
+    }
+
+private:
+    struct Slot
+    {
+        RelayedInputArrival arrival{};
+        bool                filled = false;
+    };
+
+    std::array<Slot, kRelayedReadObservationCapacityTicks> m_slots{};
+};
+
+// ⛔ WRAPPED IN A STRUCT for RelayedReadObservationMapFor's reason, and for no other.
+template <typename T>
+struct RelayedInputArrivalMapFor
+{
+    std::unordered_map<unsigned int, RelayedInputArrivalRing> value;
+};
+
 // Per-REMOTE store of the inputs the server relayed, keyed by the SENDER's
 // capture tick.
 // ⛔ THE EXACT COMPLEMENT of LocalInputCacheMapFor. PROVIDER PRESENCE IS THE TEST,
@@ -231,6 +410,14 @@ struct ScheduledRelayedReadDecision
     // ⛔ Set ONLY on the tick<dA guard. PROJECT must not re-derive it and must not
     //   pay `residentSpan()` for this rung -- property 3. §5
     bool isUnderflowMiss = false;
+
+    // The capture tick behind the input this read SERVES: the probe tick on a Hit, the
+    // fallback's own newest arrived capture on every other rung that has one, and
+    // ABSENT on rung 0, where the fallback is the injected zero and stands behind no
+    // capture at all.
+    // ⛔ AN OUTPUT ONLY -- no arm, condition, order or served value above reads it.
+    bool   appliedCaptureTickValid = false;
+    uint32 appliedCaptureTick      = 0u;
 };
 
 // ⛔ THE PURE LADDER -- property 1's reason for existing. Side-effect-free, `const`
@@ -252,9 +439,11 @@ ScheduledRelayedReadDecision<InputT> decideScheduledRelayedRead(
     //   Reported Miss, not NoProbe -- classification fence on this function's banner.
     if (tick < static_cast<uint32>(latest.dA))
     {
-        decision.outcome         = ScheduledRelayedReadOutcome::Miss;
-        decision.dLatest         = latest.dA;
-        decision.isUnderflowMiss = true;
+        decision.outcome                 = ScheduledRelayedReadOutcome::Miss;
+        decision.dLatest                 = latest.dA;
+        decision.isUnderflowMiss         = true;
+        decision.appliedCaptureTickValid = true;
+        decision.appliedCaptureTick      = latest.captureTick;
         return decision;
     }
 
@@ -264,6 +453,11 @@ ScheduledRelayedReadDecision<InputT> decideScheduledRelayedRead(
     decision.probeTickFormed = true;
     decision.newestResident  = latest.captureTick;
 
+    // The fallback's own capture tick, which every rung below serves unless the probe
+    // hits; the Hit arm overwrites it with the tick it actually read.
+    decision.appliedCaptureTickValid = true;
+    decision.appliedCaptureTick      = latest.captureTick;
+
     std::uint8_t candidateDA = 0u;
     InputT       candidate{};
     if (store.find(probeTick, candidateDA, candidate))
@@ -271,9 +465,10 @@ ScheduledRelayedReadDecision<InputT> decideScheduledRelayedRead(
         decision.candidateDA = candidateDA;
         if (candidateDA == latest.dA)
         {
-            decision.outcome        = ScheduledRelayedReadOutcome::Hit;
-            decision.candidateInput = candidate;
-            decision.useCandidate   = true;
+            decision.outcome            = ScheduledRelayedReadOutcome::Hit;
+            decision.candidateInput     = candidate;
+            decision.useCandidate       = true;
+            decision.appliedCaptureTick = probeTick;
             return decision;
         }
 
@@ -298,11 +493,105 @@ ScheduledRelayedReadDecision<InputT> decideScheduledRelayedRead(
 // ⛔ A DEFAULTED OUT-POINTER, not a widened return type, so every existing call
 //   site and test compiles unchanged. §5
 // ---------------------------------------------------------------------------
+// The decision, as the one observation the display keeps. Pure, and free: `decide`
+// already holds every field.
+// ⛔ A SECOND PROJECTION OF THE SAME DECISION, beside the report -- never a second
+//   ladder run, and never a re-derivation from the report. §5
+// ⛔ `missClass` IS PASSED IN, NOT RE-DERIVED: classifying a miss costs a span scan,
+//   and the one the caller already paid for is the one both projections must show.
+template <typename InputT>
+RelayedReadObservation relayedReadObservationOf(
+    const ScheduledRelayedReadDecision<InputT>& decision, uint32 tick,
+    ScheduledRelayedReadMissClass missClass = ScheduledRelayedReadMissClass::NotAMiss)
+{
+    RelayedReadObservation observation;
+    observation.simTick               = tick;
+    observation.appliedCaptureTick    = decision.appliedCaptureTick;
+    observation.hasAppliedCaptureTick = decision.appliedCaptureTickValid;
+    observation.outcome               = decision.outcome;
+    observation.dLatest               = decision.dLatest;
+    observation.probeTick             = decision.probeTick;
+    observation.probeTickFormed       = decision.probeTickFormed;
+    observation.missClass             = missClass;
+    return observation;
+}
+
+// The REF rung's observation. The replay serves the ref when it is resident and
+// `fallback()` otherwise, and `fallback()` stands behind the store's newest arrival --
+// or behind no capture at all when nothing ever arrived.
+// ⛔ THE SAME RULE THE LADDER'S OWN PROJECTION KEEPS: record the capture tick of the
+//   input this tick ACTUALLY RAN ON, never the one it asked for.
+// ⛔ IT FORMS NO PROBE TICK AND NAMES NO MISS CLASS: the replay read by the authority's
+//   ref, so there is no scheduled read here for an arrival to have been late for.
+template <typename InputT>
+RelayedReadObservation relayedReadObservationOfRefRead(const RemoteInputCache<InputT>& store,
+                                                       uint32 simTick, uint32 refCaptureTick,
+                                                       bool refWasResident)
+{
+    RelayedReadObservation observation;
+    observation.simTick = simTick;
+
+    if (refWasResident)
+    {
+        observation.appliedCaptureTick    = refCaptureTick;
+        observation.hasAppliedCaptureTick = true;
+        observation.outcome               = ScheduledRelayedReadOutcome::Hit;
+        return observation;
+    }
+
+    const auto latest = store.findLatest();
+    observation.appliedCaptureTick    = latest.captureTick;
+    observation.hasAppliedCaptureTick = latest.valid;
+    observation.outcome               = latest.valid ? ScheduledRelayedReadOutcome::Miss
+                                                     : ScheduledRelayedReadOutcome::NoProbe;
+    observation.dLatest               = latest.dA;
+    return observation;
+}
+
 template <typename InputT>
 InputT resolveScheduledRelayedInput(const RemoteInputCache<InputT>& store, uint32 tick,
-                                    ScheduledRelayedReadReport* outDiagnosticReport = nullptr)
+                                    ScheduledRelayedReadReport* outDiagnosticReport = nullptr,
+                                    RelayedReadObservation* outObservation = nullptr)
 {
     const auto decision = decideScheduledRelayedRead(store, tick);
+
+    // Property 3, now shared by two projections rather than one: a caller passing
+    // neither pointer is as cheap as before the observation existed.
+    // ⛔ THE SPAN IS STILL PAID ONLY ON A MISS AND ONLY WHEN A CALLER ASKED. §5
+    ScheduledRelayedReadMissClass missClass = ScheduledRelayedReadMissClass::NotAMiss;
+    typename RemoteInputCache<InputT>::ResidentSpan span{};
+    bool spanRead = false;
+
+    if ((outDiagnosticReport != nullptr || outObservation != nullptr)
+        && decision.outcome == ScheduledRelayedReadOutcome::Miss)
+    {
+        if (decision.isUnderflowMiss)
+        {
+            // ⛔ NO PROBE TICK EXISTS -- no delta, no span comparison. Its own miss class
+            //   rather than folded into BelowOldest, which it superficially resembles.
+            missClass = ScheduledRelayedReadMissClass::NoProbeTick;
+        }
+        else
+        {
+            span     = store.residentSpan();
+            spanRead = true;
+
+            // ⛔ UNREACHABLE BY DESIGN: this arm runs only on a Miss below the rung-0 gate,
+            //   so a slot is occupied. CLASSIFIED RATHER THAN ASSERTED. §5
+            missClass = !span.valid
+                ? ScheduledRelayedReadMissClass::NoProbeTick
+                : (decision.probeTick > span.newest) ? ScheduledRelayedReadMissClass::AboveNewest
+                : (decision.probeTick < span.oldest) ? ScheduledRelayedReadMissClass::BelowOldest
+                                                     : ScheduledRelayedReadMissClass::InSpan;
+        }
+    }
+
+    // ⛔ A SECOND DEFAULTED OUT-POINTER, for the reason the report's own is one: every
+    //   existing call site and test compiles unchanged.
+    if (outObservation != nullptr)
+    {
+        *outObservation = relayedReadObservationOf(decision, tick, missClass);
+    }
 
     if (outDiagnosticReport != nullptr)
     {
@@ -324,44 +613,21 @@ InputT resolveScheduledRelayedInput(const RemoteInputCache<InputT>& store, uint3
                 - static_cast<std::int64_t>(decision.newestResident));
         }
 
-        // ⛔ PROBE B half two -- WHY the miss happened. The one addition that costs
-        //   anything (a second scan), paid ONLY on a miss and ONLY behind the report
-        //   guard, so a caller passing no report is as cheap as before the probe. §5
-        // ⛔ THE SPAN IS THE STORE'S, NOT THE RING'S: the ring carries `depth` entries per
-        //   replication, the store up to 64 arrivals -- which is why an in-span hole is
-        //   meaningful at depth 1. The ring's span would make every miss trivially
-        //   out-of-span and the classification worthless. §5
-        if (decision.outcome == ScheduledRelayedReadOutcome::Miss)
-        {
-            if (decision.isUnderflowMiss)
-            {
-                // ⛔ NO PROBE TICK EXISTS -- no delta, no span comparison. Its own miss class
-                //   rather than folded into BelowOldest, which it superficially resembles.
-                outDiagnosticReport->missClass = ScheduledRelayedReadMissClass::NoProbeTick;
-            }
-            else
-            {
-                const auto span = store.residentSpan();
-                outDiagnosticReport->spanValid      = span.valid;
-                outDiagnosticReport->oldestResident = span.oldest;
-                outDiagnosticReport->newestResident = span.newest;
-                outDiagnosticReport->residentCount  = static_cast<std::uint32_t>(span.count);
+        // PROBE B half two -- WHY the miss happened, decided ABOVE so the observation
+        // shows the answer this report shows rather than a second scan's.
+        //
+        // The ring carries `depth` entries per replication and the store up to 64 arrivals,
+        // which is why an in-span hole is meaningful at depth 1; the ring's span would make
+        // every miss trivially out-of-span and the classification worthless.
+        // ⛔ THE SPAN IS THE STORE'S, NOT THE RING'S. §5
+        outDiagnosticReport->missClass = missClass;
 
-                if (!span.valid)
-                {
-                    // ⛔ UNREACHABLE BY DESIGN: this arm runs only on a Miss below the rung-0 gate, so
-                    //   a slot is occupied. CLASSIFIED RATHER THAN ASSERTED -- a probe must never be
-                    //   the thing that brings a session down. §5
-                    outDiagnosticReport->missClass = ScheduledRelayedReadMissClass::NoProbeTick;
-                }
-                else
-                {
-                    outDiagnosticReport->missClass =
-                          (decision.probeTick > span.newest) ? ScheduledRelayedReadMissClass::AboveNewest
-                        : (decision.probeTick < span.oldest) ? ScheduledRelayedReadMissClass::BelowOldest
-                                                              : ScheduledRelayedReadMissClass::InSpan;
-                }
-            }
+        if (spanRead)
+        {
+            outDiagnosticReport->spanValid      = span.valid;
+            outDiagnosticReport->oldestResident = span.oldest;
+            outDiagnosticReport->newestResident = span.newest;
+            outDiagnosticReport->residentCount  = static_cast<std::uint32_t>(span.count);
         }
     }
 
@@ -559,6 +825,34 @@ public:
             return it == map.end() ? nullptr : &it->second;
         }
 
+        // The relayed reads this peer SERVED for `id`, or nullptr when it holds none.
+        // ⛔ ABSENT IS NOT AN ERROR -- only remote-proxy ids have a ring, and a local
+        //   character's client-side delay is answered by its delay line instead. §2
+        //
+        // The accepted tear is argued at the ring's own declaration, not restated here.
+        // ⛔ A POINTER TO CONST: no reader may write back a tick the sim would run on. §14
+        template <typename SimulatableT>
+        const RelayedReadObservationRing* relayedReadObservations(unsigned int id) const
+        {
+            const auto& map =
+                std::get<RelayedReadObservationMapFor<SimulatableT>>(
+                    m_resolution.m_relayedReadObservations).value;
+            const auto it = map.find(id);
+            return it == map.end() ? nullptr : &it->second;
+        }
+
+        // When each relayed capture for `id` first arrived, or nullptr when it holds none.
+        // ⛔ A POINTER TO CONST, for the reason the ring above is one. §14
+        template <typename SimulatableT>
+        const RelayedInputArrivalRing* relayedInputArrivals(unsigned int id) const
+        {
+            const auto& map =
+                std::get<RelayedInputArrivalMapFor<SimulatableT>>(
+                    m_resolution.m_relayedInputArrivals).value;
+            const auto it = map.find(id);
+            return it == map.end() ? nullptr : &it->second;
+        }
+
     private:
         const SimulationInputResolution& m_resolution;
     };
@@ -585,13 +879,19 @@ public:
             const SimulationTimeStep&,
             const LocalInputCache<typename SimulatableT::InputType>&)> inputProvider)
     {
-        std::get<InputProviderMapFor<SimulatableT>>(m_inputProviders)
-            .emplace(id, std::move(inputProvider));
-
-        // ⛔ try_emplace default-constructs IN PLACE -- PendingInputQueue holds
-        //   std::atomic members and is neither copyable nor movable.
-        std::get<PendingInputQueueMapFor<SimulatableT>>(m_pendingInputQueues)
-            .try_emplace(id);
+        // ⛔ THE DELAY LINE AND THE PENDING QUEUE ARE CREATED BEFORE THE PROVIDER, AND
+        //   THE ORDER IS THE POINT. PROVIDER PRESENCE IS THE IDENTITY TEST every reader
+        //   forks on (`collectInputForCharacter`, `collectResimInputForCharacter`,
+        //   `isLocallyControlled`), so the provider is what PUBLISHES this id as locally
+        //   controlled -- and a reader that sees the provider must already see everything
+        //   the provider's branch will reach.
+        // ⛔ THE PROVIDER USED TO GO FIRST, and the window that left -- provider present,
+        //   delay line absent -- was a SHIPPED, PROCESS-TERMINATING std::out_of_range out
+        //   of `m_localInputCaches.at(id)` on a client's physics thread
+        //   (og-netcode-v2-field-defects task 3). §2
+        // ⛔ `unregisterCharacter` IS THE MIRROR AND ALREADY ERASES THE PROVIDER FIRST,
+        //   so the same invariant holds on the way out. Do not "tidy" either order into
+        //   matching the other. §2
 
         // ⛔ The delay line is created for exactly the provider-owning ids. A remote
         //   proxy has no capture of its own to delay, so it MUST NOT get a line --
@@ -599,6 +899,14 @@ public:
         std::get<LocalInputCacheMapFor<SimulatableT>>(m_localInputCaches)
             .try_emplace(id,
                 std::get<NeutralInputFor<SimulatableT>>(m_neutralInputs).value);
+
+        // ⛔ try_emplace default-constructs IN PLACE -- PendingInputQueue holds
+        //   std::atomic members and is neither copyable nor movable.
+        std::get<PendingInputQueueMapFor<SimulatableT>>(m_pendingInputQueues)
+            .try_emplace(id);
+
+        std::get<InputProviderMapFor<SimulatableT>>(m_inputProviders)
+            .emplace(id, std::move(inputProvider));
     }
 
     // The provider-absent half of the old registerPredictionOwner: the neutral-seeded
@@ -612,6 +920,15 @@ public:
         std::get<RemoteInputCacheMapFor<SimulatableT>>(m_remoteInputCaches)
             .try_emplace(id,
                 std::get<NeutralInputFor<SimulatableT>>(m_neutralInputs).value);
+
+        // Its physics-thread writer only ever LOOKS UP an id, so the map cannot rehash.
+        // ⛔ THE RING IS CREATED HERE, ON THE GAME THREAD, AND NOWHERE ELSE. §14
+        std::get<RelayedReadObservationMapFor<SimulatableT>>(m_relayedReadObservations)
+            .value.try_emplace(id);
+
+        // ⛔ THE SAME PAIRING, so an arrival record cannot outlive the id it describes.
+        std::get<RelayedInputArrivalMapFor<SimulatableT>>(m_relayedInputArrivals)
+            .value.try_emplace(id);
     }
 
     // The container-lifecycle half of the old registerAuthorityOwner.
@@ -642,6 +959,13 @@ public:
         std::get<RemoteInputCacheMapFor<SimulatableT>>(m_remoteInputCaches).erase(id);
         // ⛔ Erased here, populated in registerAuthorityCharacter -- one pairing. §3
         std::get<LastUsedCaptureTickMapFor<SimulatableT>>(m_lastUsedCaptureTicks).value.erase(id);
+        // ⛔ Erased here, populated in registerRemoteCharacter -- the same pairing the
+        //   relay store above keeps, so a diagnostic cannot outlive the id it describes.
+        std::get<RelayedReadObservationMapFor<SimulatableT>>(m_relayedReadObservations)
+            .value.erase(id);
+        // ⛔ Erased beside the ring it is joined to, and for the same reason.
+        std::get<RelayedInputArrivalMapFor<SimulatableT>>(m_relayedInputArrivals)
+            .value.erase(id);
     }
 
     // Drops this peer's telemetry sibling's per-id state.
@@ -676,7 +1000,17 @@ public:
             //   answer, and NetSync still logs it through the normal path. §7
             return RelayedInputIngestReport{};
         }
-        return populateRemoteInputCache<typename SimulatableT::InputType>(it->second, ring);
+        const RelayedInputIngestReport report =
+            populateRemoteInputCache<typename SimulatableT::InputType>(it->second, ring);
+
+        // `populateRemoteInputCache` is called from here and nowhere else, and it pushes
+        // every entry the wire carried -- `push` refuses the sentinel capture tick and
+        // nothing else -- so a late arrival is never turned away and this sees every
+        // capture that ever gets here.
+        // ⭐ THE ONE ARRIVAL DOOR IS ALSO WHERE ARRIVAL IS RECORDED.
+        // ⛔ A DIAGNOSTIC RECORD ONLY, AND NEVER A SECOND ADMISSION DECISION. §14
+        noteRelayedArrivals<SimulatableT>(id, ring, report);
+        return report;
     }
 
     // Replaces the RPC-bound remote-move callback's queueing call, by id.
@@ -911,15 +1245,18 @@ private:
     //   send enqueue, re-gated on the SAME captured predicate, not a second call. §8
     // ⛔ `T& simulatable` DROPPED FROM THE SIGNATURE with the allocation. §8
     //
-    // ⚠ MISATTRIBUTION CORRECTED -- TWO of this function's
-    // `.at(id)` lookups are in the LOCAL-PROVIDER branch and can throw a real,
-    // unwinding exception under `/EHsc` if provider-present-implies-entry-present has
-    // already been broken elsewhere: the delay-line fetch and the send enqueue. The
-    // THIRD -- the last-used-capture-tick write -- is NOT; it is in the
-    // AUTHORITY/QUEUE branch, guarding `registerAuthorityCharacter`'s pairing. An
-    // earlier version misattributed all three, through two reviews. What happens at
-    // the CALLER when one throws -- the debt-acceptance decision -- is at
-    // `preparePredictionSimulationStep` (`SimulationStepSequencing.h`). §8, §15
+    // ⚠ THE THROWING-LOOKUP INVENTORY, RE-TAKEN AFTER THE REGISTRATION-RACE FIX
+    // (og-netcode-v2-field-defects task 3). It used to read TWO in the LOCAL-PROVIDER
+    // branch -- the delay-line fetch and the send enqueue. The delay-line fetch is now a
+    // `find` with a NOCACHE degrade, so ONE is left there: the send enqueue's
+    // `m_pendingInputQueues.at(id)`, and it is UNREACHABLE ON A TORN ID because the
+    // degrade returns before it (the queue is created beside the line, so a missing line
+    // means a missing queue). The remaining `.at(id)` -- the last-used-capture-tick write
+    // -- is in the AUTHORITY/QUEUE branch, guarding `registerAuthorityCharacter`'s
+    // pairing, and is untouched by this change. An earlier version misattributed all
+    // three, through two reviews. What happens at the CALLER when one throws -- the
+    // debt-acceptance decision -- is at `preparePredictionSimulationStep`
+    // (`SimulationStepSequencing.h`). §8, §15
     template <typename T>
     void collectInputForCharacter(unsigned int id, const SimulationTimeStep& step,
                                   int32 effectiveDelay, ResolvedInputs<SimulatableTs...>& inputs)
@@ -933,12 +1270,35 @@ private:
             // HOISTED ABOVE THE PROVIDER CALL -- the line is passed INTO the provider,
             // which runs the game's motion-sequence matcher. The provider sees history up to
             // `tick - 1` ONLY; the current tick's sample is its own return value.
-            // ⛔ `.at(id)` RATHER THAN A NULLABLE LOOKUP, ON PURPOSE: the line is created iff a
-            //   provider is registered -- by `registerLocalCharacter`, THIS class, NOT by
-            //   `SimulationNetSync::registerPredictionOwner` -- so a throw here means that
-            //   invariant is already broken, exactly when a silent fallback would be wrong. §2
-            auto& delayLine =
-                std::get<LocalInputCacheMapFor<T>>(m_localInputCaches).at(id);
+            // ⛔ A NULLABLE LOOKUP RATHER THAN `.at(id)`, AND THE REVERSAL IS ON THE RECORD.
+            //   The line is created iff a provider is registered -- by `registerLocalCharacter`,
+            //   THIS class, NOT by `SimulationNetSync::registerPredictionOwner` -- so a miss
+            //   here means that invariant is already broken. The old fence argued a throw was
+            //   right "exactly when a silent fallback would be wrong"; it was measured wrong,
+            //   because the throw lands on the PHYSICS thread inside a Chaos step and takes the
+            //   PROCESS, and a dead process diagnoses nothing. The degrade is not silent: it is
+            //   one NOCACHE Warning per tick at shipped verbosity. §2
+            // ⛔ THE MISS IS UNREACHABLE IN PROGRAM ORDER and this branch is a TRIPWIRE, not a
+            //   fallback anyone may start relying on -- registration creates the line before the
+            //   provider and publishes to storage last, so no COMPLETED registration leaves this
+            //   state behind. ⚠ Ordering is the whole of the argument: registration is NOT
+            //   marshalled onto this thread, so a registration running CONCURRENTLY with this
+            //   sweep is still the live route here (task 4; docs/ThreadingCrossings.md row 11). §2
+            auto& localInputCaches = std::get<LocalInputCacheMapFor<T>>(m_localInputCaches);
+            const auto lineIt = localInputCaches.find(id);
+            if (lineIt == localInputCaches.end())
+            {
+                // ⛔ THE INJECTED NEUTRAL, never `InputType{}` -- the (0,0,0) forwards
+                //   `LocalInputCache.h` names as normalisation-breaking. Same answer the
+                //   underrun arm below gives, for the same reason. §6
+                // ⛔ NOTHING IS PUSHED AND NOTHING IS ENQUEUED ON THIS ARM: there is no line to
+                //   push into, and the send queue is created beside the line, so it is missing
+                //   too. A tick resolved this way is a tick the wire never carries. §11
+                m_inputResolutionTelemetry.emitLocalInputCacheMiss(id, step.getTick(), "Provider");
+                map.emplace(id, std::get<NeutralInputFor<T>>(m_neutralInputs).value);
+                return;
+            }
+            auto& delayLine = lineIt->second;
 
             // The RAW capture, as the local player produced it THIS tick.
             const auto capture = it->second(step, delayLine);
@@ -1043,10 +1403,20 @@ private:
             //   not counted -- folding it in makes an unregistered proxy look starved. §12
             const auto* store = this->template findRemoteInputCache<T>(id);
             ScheduledRelayedReadReport readReport;
+            RelayedReadObservation     readObservation;
             typename T::InputType input =
                 store != nullptr
-                    ? resolveScheduledRelayedInput(*store, step.getTick(), &readReport)
+                    ? resolveScheduledRelayedInput(*store, step.getTick(), &readReport,
+                                                   &readObservation)
                     : std::get<NeutralInputFor<T>>(m_neutralInputs).value;
+
+            // The first of the two remote read sites. Nothing below reads this back, and
+            // a missing store records nothing exactly as it counts nothing above.
+            // ⛔ A DIAGNOSTIC RECORD ONLY. §14
+            if (store != nullptr)
+            {
+                this->template noteRelayedRead<T>(id, readObservation);
+            }
 
             // ⛔ The probe/log block and the `[CollectInput]` line fold into ONE
             //   emit* call -- safe because nothing after this point branches on whether the
@@ -1130,10 +1500,22 @@ private:
 
         if (isLocal)
         {
-            // ⛔ `.at(id)` for the reason collectInputAll's local-provider branch uses it:
-            //   provider-present and line-present are the same condition. §2
-            const auto& delayLine =
-                std::get<LocalInputCacheMapFor<T>>(m_localInputCaches).at(id);
+            // ⛔ A NULLABLE LOOKUP for the reason collectInputAll's local-provider branch
+            //   uses one: provider-present and line-present are the same condition, so a miss
+            //   is a broken invariant -- and answering it by throwing off the physics thread
+            //   kills the process. The full argument is at that branch and is NOT re-derived
+            //   here; this site only mirrors it. §2 §9
+            auto& localInputCaches = std::get<LocalInputCacheMapFor<T>>(m_localInputCaches);
+            const auto lineIt = localInputCaches.find(id);
+            if (lineIt == localInputCaches.end())
+            {
+                // ⛔ ONE RATE LIMITER, SHARED WITH THE PREDICTION SITE, so a resim of a torn
+                //   window costs one line per replayed tick rather than one per rung. §9
+                m_inputResolutionTelemetry.emitLocalInputCacheMiss(id, simTick, "Resim");
+                map.emplace(id, neutral);
+                return;
+            }
+            const auto& delayLine = lineIt->second;
 
             const int32 captureTick = (ref.kind == AppliedCaptureRefKind::Ref)
                 ? static_cast<int32>(ref.captureTick)
@@ -1168,6 +1550,12 @@ private:
             typename T::InputType relayed{};
             const bool hit = store->find(ref.captureTick, ignoredScheduleStamp, relayed);
             m_inputResolutionTelemetry.emitResimRefRead(id, simTick, ref.captureTick, hit);
+
+            // The second remote read site's ref rung: the ref when it is resident, the
+            // store's newest arrival otherwise.
+            // ⛔ THE RECORDED TICK IS WHICHEVER OF THE TWO THIS TICK ACTUALLY RAN ON.
+            this->template noteRelayedRead<T>(id,
+                relayedReadObservationOfRefRead(*store, simTick, ref.captureTick, hit));
             // ⛔ THE SELF-HEAL: a miss degrades THIS TICK's replay input to last-known, never
             //   the injected state. The state is a complete anchor. §9
             map.emplace(id, hit ? relayed : store->fallback());
@@ -1181,9 +1569,11 @@ private:
         //   the prediction one; it does NOT feed the stale run (resim revisits ticks out
         //   of order) and does NOT advance the window (`simTick` walks backwards). §12
         ScheduledRelayedReadReport readReport;
+        RelayedReadObservation     readObservation;
         typename T::InputType scheduled =
-            resolveScheduledRelayedInput(*store, simTick, &readReport);
+            resolveScheduledRelayedInput(*store, simTick, &readReport, &readObservation);
         m_inputResolutionTelemetry.emitResimScheduledRead(id, simTick, readReport);
+        this->template noteRelayedRead<T>(id, readObservation);
         map.emplace(id, std::move(scheduled));
     }
 
@@ -1191,6 +1581,63 @@ private:
     //   probe write live on the PT telemetry sibling as `emitResimNoSlot` /
     //   `emitResimSentinel` / `emitResimLocalRead` / `emitResimNoStore` /
     //   `emitResimRefRead` / `emitResimScheduledRead`. §13
+
+    // Files one relayed-read observation for `id`.
+    // A missing ring is an id this peer serves no relayed read for -- nothing to record
+    // rather than an error.
+    // ⛔ A LOOKUP, NEVER AN INSERT: an insert here would rehash the map on the physics
+    //   thread, under the game-thread reader. §14
+    template <typename T>
+    void noteRelayedRead(unsigned int id, const RelayedReadObservation& observation)
+    {
+        auto& map = std::get<RelayedReadObservationMapFor<T>>(m_relayedReadObservations).value;
+        const auto it = map.find(id);
+        if (it != map.end())
+        {
+            it->second.note(observation);
+        }
+    }
+
+    // Files the arrival tick of every capture this ring delivered, for `id`.
+    //
+    // The stamp is the newest sim tick this client has SERVED A RELAYED READ FOR on that
+    // character -- its own relay frontier -- so lateness is measured on the same clock the
+    // observations are keyed by. A character whose first read has not run yet is stamped
+    // against nothing and is therefore not recorded: no observation exists for an arrival
+    // to have been late for.
+    // ⛔ GAME THREAD ON BOTH SIDES. The frontier read is the accepted value tear the
+    //   observation ring already carries; nothing here writes that ring. §14
+    template <typename SimulatableT, typename RingT>
+    void noteRelayedArrivals(unsigned int id, const RingT& ring,
+                             const RelayedInputIngestReport& report)
+    {
+        if (report.outcome != RelayedInputIngestOutcome::Consumed)
+            return;
+
+        auto& arrivalMap =
+            std::get<RelayedInputArrivalMapFor<SimulatableT>>(m_relayedInputArrivals).value;
+        const auto arrivals = arrivalMap.find(id);
+        if (arrivals == arrivalMap.end())
+            return;
+
+        const auto& observationMap =
+            std::get<RelayedReadObservationMapFor<SimulatableT>>(m_relayedReadObservations).value;
+        const auto observations = observationMap.find(id);
+        if (observations == observationMap.end() || !observations->second.hasNewestSimTick())
+            return;
+
+        const uint32 atSimTick = observations->second.newestSimTick();
+
+        relayedInputRing::forEachEntry<typename SimulatableT::InputType>(
+            ring,
+            [&arrivals, atSimTick](std::uint32_t captureTick, std::uint8_t, const auto&)
+            {
+                // The store refuses the sentinel, so recording it as arrived would name a
+                // capture nothing holds.
+                if (captureTick != kNoInputCaptureTick)
+                    arrivals->second.note(captureTick, atSimTick);
+            });
+    }
 
     // Variadic helper: expands over each per-type tuple slot using index_sequence.
     // Calls fn<SimulatableT>(perTypeMap) for each SimulatableT in the pack.
@@ -1227,6 +1674,15 @@ private:
     // Client Layer-1 input delay lines.
     // ⛔ Populated for provider-owning ids ONLY; touched EXCLUSIVELY from
     //   collectInputAll (physics) and wipeAllForResync. §14
+    // ⛔ THE ONE FRIEND, AND IT IS DECLARED HERE AND DEFINED NOWHERE IN SHIPPED CODE.
+    //   `collectInputForCharacter`'s NOCACHE degrade branch guards a provider-present /
+    //   line-absent state that registerLocalCharacter's ORDER (line before provider) makes
+    //   unreachable through any COMPLETED call of this repository's public API -- and a
+    //   tripwire nobody has watched fire is not a tripwire. This name synthesises that
+    //   state, and it is defined ONLY in og-simulation-tests. It adds no callable surface
+    //   a consumer would stumble into: naming this friend requires DEFINING the template,
+    //   so it is a policy seal rather than an export. §2 §14
+    template <typename...> friend struct LocalInputCacheTearProbe;
     std::tuple<LocalInputCacheMapFor<SimulatableTs>...> m_localInputCaches;
 
     // The game's zero input, per simulatable type.
@@ -1244,6 +1700,17 @@ private:
     //   its full rationale is the THREADING section of Network/RemoteInputCache.h.
     //   DO NOT RESTATE IT HERE; DO NOT WEAKEN IT THERE. §14
     std::tuple<RemoteInputCacheMapFor<SimulatableTs>...> m_remoteInputCaches;
+
+    // What the scheduled read SERVED, per remote character, per sim tick. Display-side
+    // diagnostic state only.
+    // Written on the PHYSICS thread (both collects), read on the GAME thread.
+    // ⛔ THE TEAR AND THE NO-REHASH PAIRING ARE ARGUED AT RelayedReadObservationRing. §14
+    std::tuple<RelayedReadObservationMapFor<SimulatableTs>...> m_relayedReadObservations;
+
+    // When each relayed capture first arrived, per remote character. Display-side
+    // diagnostic state only, and the join key is the observation's own `probeTick`.
+    // ⛔ WRITTEN AND READ ON THE GAME THREAD ALONE -- argued at RelayedInputArrivalRing. §14
+    std::tuple<RelayedInputArrivalMapFor<SimulatableTs>...> m_relayedInputArrivals;
 
     // OWNED HERE, NOT ON NETSYNC. The PHYSICS-THREAD-ONLY telemetry
     // sibling: `RelayReadProbe` and its ten `emit*` helpers.

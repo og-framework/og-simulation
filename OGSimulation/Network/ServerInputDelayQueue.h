@@ -171,6 +171,15 @@ public:
     // it cannot drift from the tuple it describes.
     static constexpr std::size_t kSimTypeCount = sizeof...(SimulatableTs);
 
+    // "No late gate" sentinel for `enqueue`'s `firstUpcomingSimTick`, mirroring
+    // the "no window gate" sentinel `tryDequeueForTick` already uses for
+    // `staleBefore`. It means the caller has no sim-tick reference to judge
+    // lateness against, so the LATE arm of the rejection below FAILS OPEN — the
+    // same fail-open choice, for the same reason, as the coordinator's
+    // out-of-domain receipt gate before it is armed: refusing player input on a
+    // reference that does not exist yet is the worse error.
+    static constexpr int32_t kNoLateGate = std::numeric_limits<int32_t>::min();
+
     // A single entry discarded by `purgeOlderThan`, surfaced to the caller.
     // (og-netcode-v2-arch-latency / T25.) The purge used to erase stranded input
     // silently; it now REPORTS what it reclaimed so the reception coordinator can
@@ -296,13 +305,58 @@ public:
     // genuinely-new but OUT-OF-ORDER-OLDER capture tick, which the server applies
     // but the monotonic relay stream deliberately skips (RelayDelaySpectrumDesign.md
     // §5.3a). Only the latter is counted as a relay hole.
+    //
+    // ---------------------------------------------------------------------
+    // THE LATE ARM — dedup against what was PARKED is not enough. (Added
+    // og-netcode-v2-field-defects / task 1, 2026-09-19, from the 2026-09-13
+    // session in impl/bugreport_authority_late_resend_double_apply.md.)
+    //
+    // The duplicate scan above consults ONE memory: what is parked right now. A
+    // redundancy bundle re-sends the previous `redundancyDepthTicks` captures, so
+    // if the bundle lands after the tick on which its OLDEST re-send was released,
+    // that re-send is no longer parked, passes the scan as "new", is parked a
+    // second time, and — being the oldest due entry — is released again on the
+    // next tick. Release here and consumption from the downstream FIFO are both
+    // exactly one entry per tick, so the extra entry is never absorbed: every
+    // later input is applied one tick late for the rest of the session. Measured
+    // in the field as a permanent lag-4-at-delay-3 shift over 3,485 ticks.
+    //
+    // THE DISCRIMINATOR IS THE RELEASE TICK, not the arrival order. A re-send of
+    // an already-applied capture has its release tick in the PAST; the genuinely-
+    // new out-of-order-older capture T26 exists for still has its release tick in
+    // the FUTURE, so it still parks and still releases in capture order. Two
+    // independent facts say "already gone", and both are checked:
+    //
+    //   (1) `captureTick + effectiveDelay(key) < firstUpcomingSimTick` — the
+    //       release tick is behind the first tick the next drain will simulate.
+    //       This is the arm that also catches a capture that was never parked at
+    //       all because it was LOST, and whose slot therefore underran.
+    //   (2) `captureTick <= lastReleased(key)` — this slot has already handed the
+    //       simulation that capture tick or a later one. Belt and braces for the
+    //       same fact, and it holds even when the caller has no tick reference.
+    //
+    // Both are counted as `lateDroppedCount()`, which is DISTINCT from the
+    // rollback-window STALE purge (`purgeOlderThan`, many ticks further back) and
+    // distinct from the duplicate above. DROPPING IS THE CORRECT OUTCOME, not a
+    // lesser evil: the authority already substituted the neutral on the tick the
+    // capture was for, and the client replays that tick by ref-resolution as the
+    // sentinel — the designed self-heal. Applying the capture late is the wrong
+    // input at the wrong tick AND a permanent schedule shift; there is no tick
+    // left at which it could be applied correctly.
+    //
+    // ORDER MATTERS: the duplicate scan runs FIRST, so an ordinary re-send of a
+    // still-parked tick stays counted as a duplicate and does not inflate the
+    // late class. `firstUpcomingSimTick` defaults to `kNoLateGate`, so every
+    // pre-existing call site keeps its exact behaviour on arm (1).
     template <typename SimT>
-    bool enqueue(const SlotKey& key, int32_t captureTick, const InputFor<SimT>& input)
+    bool enqueue(const SlotKey& key, int32_t captureTick, const InputFor<SimT>& input,
+                 int32_t firstUpcomingSimTick = kNoLateGate)
     {
         static_assert(is_type_in_pack<SimT>(),
             "ServerInputDelayQueue::enqueue<SimT>: SimT is not in this queue's simulatable pack");
 
-        std::deque<Entry<SimT>>& slot = queueFor<SimT>().bySlot[key];
+        PerSimQueue<SimT>& queue = queueFor<SimT>();
+        std::deque<Entry<SimT>>& slot = queue.bySlot[key];
 
         for (const Entry<SimT>& existing : slot)
         {
@@ -310,6 +364,20 @@ public:
             {
                 return false;   // duplicate capture tick — first value wins
             }
+        }
+
+        if (firstUpcomingSimTick != kNoLateGate
+            && captureTick + effectiveDelay(key) < firstUpcomingSimTick)
+        {
+            ++m_lateDroppedTotal;
+            return false;       // LATE: its release tick is already behind the drain
+        }
+
+        const auto releasedIt = queue.lastReleasedBySlot.find(key);
+        if (releasedIt != queue.lastReleasedBySlot.end() && captureTick <= releasedIt->second)
+        {
+            ++m_lateDroppedTotal;
+            return false;       // LATE: this slot already released that tick or later
         }
 
         slot.emplace_back(captureTick, input);
@@ -417,6 +485,17 @@ public:
             *outCaptureTick = best->first;      // F1: the TRUE stored capture tick
         }
         out = best->second;
+
+        // The per-slot released watermark that arm (2) of `enqueue`'s late gate
+        // reads. LAST-WRITE-WINS, not a max, for the reason the coordinator's
+        // server-tick reference is also last-write-wins: a max sticks forever
+        // after a clock restart and would then refuse every subsequent capture on
+        // this slot. Last-write costs nothing in the ordered steady state — the
+        // min-scan above releases in capture order, so successive writes are
+        // already non-decreasing — and self-heals within one release if the tick
+        // domain ever moves backwards under the queue.
+        queue.lastReleasedBySlot[key] = best->first;
+
         slot.erase(best);
         return true;
     }
@@ -566,6 +645,25 @@ public:
         return count;
     }
 
+    // Captures refused by `enqueue`'s LATE arm since construction, across every
+    // slot and every simulatable. Never reset — a session-scoped diagnostic, the
+    // companion to the coordinator's `relayOooSkipCount()`, and deliberately NOT
+    // the same population as either the duplicate re-send or the rollback-window
+    // purge. The coordinator differences it at its stats-window boundary to
+    // report `late=N`.
+    std::size_t lateDroppedCount() const { return m_lateDroppedTotal; }
+
+    // Highest capture tick this slot has RELEASED to the simulation, or the
+    // "never released" sentinel. Exists so a test can pin arm (2) of the late
+    // gate directly rather than only through its effect.
+    template <typename SimT>
+    int32_t lastReleasedCaptureTick(const SlotKey& key) const
+    {
+        const PerSimQueue<SimT>& queue = queueFor<SimT>();
+        const auto it = queue.lastReleasedBySlot.find(key);
+        return it == queue.lastReleasedBySlot.end() ? kNoLateGate : it->second;
+    }
+
     bool hasConnection(const Address& addr) const
     {
         return m_lastActivityTick.find(addr) != m_lastActivityTick.end();
@@ -589,6 +687,15 @@ private:
         // this file: this is the per-CHARACTER half of the split, and it is the
         // only member here that is not keyed per-wire.
         std::unordered_map<SlotKey, std::deque<Entry<SimT>>> bySlot;
+
+        // Per-slot released watermark — arm (2) of `enqueue`'s late gate. Kept
+        // in its OWN map rather than beside the deque on purpose: `purgeOlderThan`
+        // erases an empty `bySlot` bucket, and the whole point of this watermark
+        // is that it must OUTLIVE the emptying of the slot it describes. It is
+        // cleared only where the wire itself is forgotten
+        // (`eraseAddressFromAllQueues`), so it is bounded by live slots on live
+        // connections exactly as `bySlot` is.
+        std::unordered_map<SlotKey, int32_t> lastReleasedBySlot;
     };
 
     template <typename SimT>
@@ -628,6 +735,19 @@ private:
                     {
                         it = (it->first.address == addr) ? queue.bySlot.erase(it) : std::next(it);
                     }
+
+                    // The released watermark is per-slot state of the same wire,
+                    // so it dies with it. Leaving it behind would be a leak no
+                    // later reap could reach — nothing stamps a dead address
+                    // active again — and would refuse the FIRST captures of a
+                    // reconnecting client that reused the handle.
+                    for (auto it = queue.lastReleasedBySlot.begin();
+                         it != queue.lastReleasedBySlot.end();)
+                    {
+                        it = (it->first.address == addr)
+                            ? queue.lastReleasedBySlot.erase(it)
+                            : std::next(it);
+                    }
                 };
                 (eraseFrom(queues), ...);
             },
@@ -648,4 +768,10 @@ private:
     // the tuple deliberately: connection liveness is a per-CONNECTION fact, not a
     // per-simulatable one, and keeping one copy is what makes the reap uniform.
     std::unordered_map<Address, int32_t> m_lastActivityTick;
+
+    // Lifetime total for `enqueue`'s LATE arm. One counter for the whole pack,
+    // matching `m_lastActivityTick`'s breadth rather than the per-sim tuple's:
+    // the late class is a property of the reception SCHEDULE, which is decided
+    // once per connection and applies uniformly across every simulatable.
+    std::size_t m_lateDroppedTotal = 0;
 };

@@ -142,7 +142,10 @@ struct NullRemoteInputRelaySink
 // ⛔ EXCEPT `rejectedOutOfDomain`, which must NOT be delivered - check it first. §5
 // ⛔ `acceptedNew` IS FIRST-SIGHT of (id, captureTick): false for a redundancy
 // re-send AND for a genuinely-new out-of-order-OLDER tick. §6
-// ⛔ IT GATES THE RELAY TAP, and gates nothing about parking or delivery. §6
+// ⛔ IT GATES THE RELAY TAP TOGETHER WITH the park actually happening, and gates
+// nothing about parking or delivery itself. §6
+// ⚠ `parked == true` DOES NOT MEAN AN ENTRY IS IN THE DEQUE: a duplicate and a
+// LATE-refused capture both report it. It means the core took the decision. §2
 // ⛔ `rejectedOutOfDomain` = DISCARDED: not parked, claimed, relayed or delivered. §5
 struct ReceiveRemoteInputResult
 {
@@ -276,17 +279,24 @@ public:
     // ⛔ IT IS A TAP: it reads what this path computed and changes nothing. §6
     // ⛔ AT RECEIPT, NOT AT RELEASE - holding shortens every peer's runway. §6
     // ⚠ We relay the RECEIVED input, not the APPLIED one; the state channel heals. §6
-    // ⛔ THE GATE IS `parked && acceptedNew`, AND IT IS STRUCTURAL, not re-tested. §6
+    // ⛔ THE GATE IS `parked && acceptedNew && queuedNewEntry`, AND IT IS
+    // STRUCTURAL, not re-tested: the tap sits inside that arm. §6
     // ⛔ BARE `acceptedNew` IS WRONG: it is computed before the parked/fallback
     // split, so an UNDELAYED malformed slot would be stamped and mis-scheduled. §6
+    // ⛔ `queuedNewEntry` IS THE THIRD TERM: a LATE-dropped newest capture is
+    // `acceptedNew` and was never parked, so relaying it promises a schedule the
+    // authority has already declined to keep. §6
     // ⛔ THERE IS NO RELAY ON ANY FALLBACK PATH. §6
-    // ⛔ `parked && !acceptedNew` IS TWO POPULATIONS: a re-send, and an older tick. §6
+    // ⛔ `parked && !acceptedNew` IS THREE POPULATIONS: a re-send of a PARKED tick,
+    // a genuinely-new OLDER tick, and a LATE capture already past its release. §6
     // ⛔ THE OLDER TICK IS APPLIED BUT NOT RELAYED - at the shipped depth of 1 the
     // payload is replace-latest, so an older write moves every peer's latest BACK. §6
+    // ⛔ THE LATE ONE IS NEITHER APPLIED NOR RELAYED, and is NOT a relay hole. §6
     // ⚠ The peer sees a HOLE instead, healed by the every-frame state anchor. §6
-    // ⚠ The two are told apart by `enqueue`'s return value. §6
+    // ⚠ The first two are told apart by `enqueue`'s return value. §6
     // ⚠ The second is counted as `relayOooSkipCount()`, because a depth>1 future
     // must reopen this gate on a measured rate rather than on argument. §6
+    // ⚠ The third is counted as `lateDroppedCount()`, on the queue that owns it. §6
     template <typename SimT, typename RelaySink = NullRemoteInputRelaySink>
         requires RemoteInputRelaySink<RelaySink, InputFor<SimT>>
     ReceiveRemoteInputResult receiveRemoteInput(unsigned int id,
@@ -319,14 +329,22 @@ public:
         // ⚠ Two characters on one machine are two distinct keys, never conflated. §3
         m_delayedInputTargets[key] = id;
 
-        // TRUE when this capture tick was not already resident in the slot's deque
-        // - the discriminator the relay-tap gate (`parked && !acceptedNew`) turns on. §6
+        // ⛔ THE LATE GATE'S REFERENCE IS THE DRAIN'S, never the receipt gate's. §5
+        // ⛔ FAIL OPEN UNTIL THE FIRST DRAIN - the same choice as `noteServerTick`. §5
+        const int32_t lateGate = m_drainTickKnown ? m_nextUndrainedSimTick
+                                                  : DelayQueue::kNoLateGate;
+
+        // TRUE when a NEW entry was parked; FALSE for a duplicate of a still-parked
+        // tick AND for a LATE refusal - the discriminator the relay-tap gate turns on. §6
+        // ⛔ A LATE DROP IS NOT A RELAY HOLE: nothing was applied for a peer to miss. §6
         const bool queuedNewEntry =
-            m_inputDelayQueue.template enqueue<SimT>(key, captureTick, input);
+            m_inputDelayQueue.template enqueue<SimT>(key, captureTick, input, lateGate);
 
         // ⛔ [Park] IS GATED ON `acceptedNew`, so a re-send does not spam it. §8
+        // ⛔ AND ON `queuedNewEntry`, or a LATE-DROPPED newest capture would log a
+        // park that did not happen and relay a schedule the authority will not keep. §6
         // ⚠ No prefix, so it stays at Log, hidden under the shipped `LogOGNet=Warning`. §8
-        if (acceptedNew)
+        if (acceptedNew && queuedNewEntry)
         {
             const int32_t delay = m_inputDelayQueue.effectiveDelay(key);
             SIMLOG(m_logger, "[Park] id=%u captureTick=%d delay=%d releaseTick=%d",
@@ -344,6 +362,9 @@ public:
             noteRelayOooSkip(id, captureTick);
         }
 
+        // ⛔ `parked` STAYS TRUE FOR A LATE DROP - it means THE CORE HANDLED IT. §2
+        // ⛔ A FALSE HERE WOULD MAKE THE ADAPTER DELIVER THE DROPPED CAPTURE
+        // UNDELAYED, which is the double-apply this gate exists to remove. §2
         return ReceiveRemoteInputResult{ /*parked=*/true, acceptedNew,
                                          /*rejectedOutOfDomain=*/false };
     }
@@ -398,10 +419,17 @@ public:
     // ⛔ DELIVER THE STORED captureTick, NEVER `simTick - delay`. §2
     // ⛔ AN OVERDUE ENTRY WOULD OTHERWISE NAME A FUTURE TICK and collide with
     // `RemoteMoveQueue`'s capture-tick dedup. §2
-    // ⚠ Lateness is reported separately, as `late=N`. §8
+    // ⚠ Release lateness is reported separately, as `[Release] late=N` TICKS. §8
+    // ⚠ NOT the same quantity as `[InputStats] late=N`, which is a COUNT. §8
     template <typename SimT, typename DeliverFn>
     void releaseDelayedInputs(int32_t firstUpcomingSimTick, int32_t numSteps, DeliverFn&& deliver)
     {
+        // ⛔ RECORDED BEFORE THE EMPTY EARLY-OUT, so an idle server still advances it. §5
+        // ⛔ `+ numSteps`, NOT `firstUpcomingSimTick`: this frame serves the whole
+        // span, so the first tick a LATER capture could still be served on is past it. §5
+        // ⛔ LAST-WRITE-WINS, NOT A MAX - a max sticks forever after a clock restart. §5
+        noteDrainedThrough(firstUpcomingSimTick, numSteps);
+
         if (m_delayedInputTargets.empty())
         {
             return;
@@ -565,6 +593,12 @@ public:
     // ⛔ THIS IS THE EVIDENCE THE depth>1 DECISION MUST READ, not argument. §6
     std::size_t relayOooSkipCount() const { return m_relayOooSkipTotal; }
 
+    // Capture ticks the delay queue REFUSED because their release tick had already
+    // passed - a redundancy re-send of an applied capture. Never reset. §6
+    // ⛔ A DISJOINT POPULATION FROM `relayOooSkipCount()`: that one is applied and
+    // not relayed, this one is neither applied nor relayed. §6
+    std::size_t lateDroppedCount() const { return m_inputDelayQueue.lateDroppedCount(); }
+
     bool hasClaim(const SlotKey& key) const
     {
         return m_delayedInputTargets.find(key) != m_delayedInputTargets.end();
@@ -600,6 +634,20 @@ private:
             "[Verbose][RelaySkip] id=%u captureTick=%d watermark=%d out-of-order-older; "
             "applied by the authority, not relayed",
             id, captureTick, watermark);
+    }
+
+    // -----------------------------------------------------------------------
+    // The drain's tick reference, and the ONLY feed for it. §5
+    //
+    // ⛔ SEPARATE FROM `m_serverTick`: that one is armed by `reapConnections` and
+    // names the FIRST tick of the frame just drained; this one names the first
+    // tick NOT yet drained. Conflating them re-admits the capture released on the
+    // frame's own last tick. §5
+    // ⛔ `m_drainTickKnown` KEEPS "never drained" DISTINCT FROM "drained to 0". §5
+    void noteDrainedThrough(int32_t firstUpcomingSimTick, int32_t numSteps)
+    {
+        m_drainTickKnown      = true;
+        m_nextUndrainedSimTick = firstUpcomingSimTick + numSteps;
     }
 
     // First-seen watermark per owner id: `captureTick > seen` => newly accepted,
@@ -721,8 +769,12 @@ private:
 
         if (!m_statsWindowStarted)
         {
-            m_statsWindowStarted  = true;
+            m_statsWindowStarted   = true;
             m_statsWindowStartTick = serverTick;
+
+            // Seeded, not assumed zero: input can arrive before the first frame
+            // arms this window, and those drops belong to no window at all.
+            m_lateDroppedAtWindowStart = m_inputDelayQueue.lateDroppedCount();
             return;
         }
         if (serverTick - m_statsWindowStartTick < window)
@@ -730,12 +782,21 @@ private:
             return;         // window still open
         }
 
+        // ⛔ DIFFERENCED FROM THE QUEUE'S LIFETIME TOTAL - the queue owns the
+        // predicate, so it owns the count; this is the only window view of it. §8
+        const std::size_t lateTotal  = m_inputDelayQueue.lateDroppedCount();
+        const std::size_t windowLate = lateTotal - m_lateDroppedAtWindowStart;
+
         const int32_t total = m_windowDelivered + m_windowDropped;
         if (total > 0)
         {
             const int32_t pct = (m_windowDropped * 100) / total;
-            SIMLOG(m_logger, "[Warning][InputStats] dropped %d / %d remote inputs = %d%%",
-                m_windowDropped, total, pct);
+
+            // ⛔ `late=` IS APPENDED, never interleaved: the leading clause run
+            // scripts already grep stays byte-identical. §8
+            SIMLOG(m_logger,
+                "[Warning][InputStats] dropped %d / %d remote inputs = %d%% late=%zu",
+                m_windowDropped, total, pct, windowLate);
         }
 
         // [InputDomain] names the most recent offender and the window it was judged
@@ -752,20 +813,24 @@ private:
                 m_lastRejectedServerTick, lower, upper);
         }
 
-        // ⛔ [RelaySkip] HAS ITS OWN TAG, so the [InputStats] string is unchanged. §8
-        if (m_windowRelayOooSkips > 0)
+        // ⛔ [RelaySkip] HAS ITS OWN TAG, kept so its own string stays greppable. §8
+        // ⛔ IT ALSO FIRES ON A LATE-ONLY WINDOW, or the class this line exists to
+        // make distinguishable would be invisible whenever the other one is zero. §8
+        if (m_windowRelayOooSkips > 0 || windowLate > 0)
         {
             SIMLOG(m_logger,
                 "[Warning][RelaySkip] %d out-of-order-older capture ticks applied but not "
-                "relayed this window; lifetime %zu",
-                m_windowRelayOooSkips, m_relayOooSkipTotal);
+                "relayed this window; lifetime %zu; late=%zu dropped as already-released "
+                "re-sends this window, lifetime %zu",
+                m_windowRelayOooSkips, m_relayOooSkipTotal, windowLate, lateTotal);
         }
 
-        m_windowDelivered          = 0;
-        m_windowDropped            = 0;
-        m_windowOutOfDomainRejects = 0;
-        m_windowRelayOooSkips      = 0;
-        m_statsWindowStartTick     = serverTick;
+        m_windowDelivered           = 0;
+        m_windowDropped             = 0;
+        m_windowOutOfDomainRejects  = 0;
+        m_windowRelayOooSkips       = 0;
+        m_lateDroppedAtWindowStart  = lateTotal;
+        m_statsWindowStartTick      = serverTick;
     }
 
     // ⛔ ONE-SHOT PER (id, slot), keyed on a packed `(id<<8 | slot)`. §8
@@ -836,12 +901,24 @@ private:
     int32_t     m_lastRejectedCaptureTick  = 0;
     int32_t     m_lastRejectedServerTick   = 0;
 
+    // --- The drain's tick reference -----------------------------------------
+    // The first sim tick the drain has NOT yet served, fed ONLY by
+    // `releaseDelayedInputs` through `noteDrainedThrough`. §5
+    // ⛔ NOT `m_serverTick`, and not interchangeable with it - see that helper. §5
+    bool    m_drainTickKnown      = false;
+    int32_t m_nextUndrainedSimTick = 0;
+
     // --- Relay tap ----------------------------------------------------------
     // Lifetime total plus the per-window burst counter for out-of-order-older
     // capture ticks the server applied but did not relay. §6
     // ⛔ NOT RESET IN `forgetOwner` - session-scoped, not per-owner state. §6
     std::size_t m_relayOooSkipTotal  = 0;
     int32_t     m_windowRelayOooSkips = 0;
+
+    // The late-drop lifetime total as it stood when the current [InputStats]
+    // window opened. The count itself lives in the queue, which owns the
+    // predicate; this is only the window baseline it is differenced against. §8
+    std::size_t m_lateDroppedAtWindowStart = 0;
 
     std::function<void(const char*)> m_logger;
 };
