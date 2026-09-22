@@ -985,3 +985,36 @@ they were ever two objects rather than one.
 
 ---
 
+## 12. The field tail on the correction line — og-netcode-v2-field-defects task 6
+
+`CorrectionArrivalDecision` carries a `fieldDivergence`, and
+`[Verbose][DivergenceProbe.Correction]` gains a TAIL:
+
+```
+[Verbose][DivergenceProbe.Correction] id=42357 tick=1523 class=LocallyPredicted correct=0 field=dAttackRadialSimulation::State.bodyState.angularVelocity delta=12.25
+```
+
+An enum prints `old=` / `new=` instead of `delta=`, because a magnitude between two enumerators
+is not a quantity.
+
+⛔ **A TAIL, NOT A NEW LINE AND NOT A NEW TAG.** `[DivergenceProbe.Correction]` and `correct=`
+are the strings operators grep for and the strings one adapter's configuration file documents;
+renaming `correct=` to `similar=` would read better and silence every archived recipe. The
+pre-task-6 prefix is asserted character for character by a test case, which is the control for
+the LINE the way the verdict is the control for the DECISION.
+
+⛔ **THE TAIL IS EMPTY UNLESS THE WALK RAN.** At the shipped verbosity nothing walks, and a
+`field=` token there would assert an observation nothing made. `formatFieldDivergence` returns an
+empty fragment when `evaluated` is false, and the line is then byte-for-byte its former self.
+
+**No new volume class, and no new truncation risk.** This site already logs twice per arriving
+correction; the tail rides one of the two. `SIMLOG` formats into `char[256]`, the fixed part is
+~101 characters at maximum field widths, and the path capacity (96) plus the widest payload keeps
+a maximal line strictly inside that — asserted, because a silent truncation would cut exactly the
+`delta=` the tail exists to carry.
+
+⛔ **THE WALK IS NOT HERE AND CANNOT MOVE HERE.** By the time this class sees a decision, a
+disagreeing correction has already overwritten the cache slot, so the predicted value is gone.
+`StateCorrectionCache::tryInsertingCorrectState` walks it, under its own gate;
+`SimulationNetSync::decideCorrectionArrival` carries the result without touching it. The cost
+gate and its measurements are in `docs/SimulationComparison-rationale.md`.

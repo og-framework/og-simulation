@@ -20,6 +20,7 @@
 #include <glm/gtc/quaternion.hpp>
 #include "OGSimulation/SimulationTimeContext.h"
 #include "OGSimulation/SimulationComposite.h"
+#include "OGSimulation/SimulationComparison.h"
 #include "OGSimulation/CorrectionStateBufferCodec.h"
 #include "OGSimulation/PCTimeManagement/TimeConfig.h"
 #include "OGSimulation/ResimGatePolicy.h"
@@ -123,6 +124,20 @@ struct CorrectionInsertVerdict
     // The correction's tick, echoed back so the caller needs no second wire decode.
     // ⛔ Set on BOTH paths. §10
     uint32 tick                 = 0u;
+
+    // WHICH FIELD DISAGREED, AND BY HOW MUCH. §13
+    //
+    // ⛔ THIS ONE IS NOT FREE, WHICH IS WHY IT HAS A GATE AND THE OTHERS DO NOT.
+    // `predictionWasCorrect` above is a copy of a boolean the cache had already
+    // computed; this is a SECOND WALK over the whole state. `evaluated` is false —
+    // and nothing here is read — unless ALL THREE of the call site's conditions
+    // held: an observer asked, the prediction was WRONG, and the host says the
+    // per-correction Verbose line is actually going to be emitted. §13
+    //
+    // ⛔ REPORTING ONLY. Nothing in the cache, the gate policy or the resim path
+    // may ever branch on it, or the shipped build's behaviour starts depending on
+    // the log verbosity. §13
+    FieldDivergence fieldDivergence;
 };
 
 // ---------------------------------------------------------------------------
@@ -719,6 +734,35 @@ public:
 
 			const bool predictionWasCorrect = m_stateBuffer[cacheIndex].isSimilarTo(state);
 
+			// THE DIFF'S COST GATE, AND THE ONLY PLACE IT IS SPELLED. §13
+			//
+			// ⛔ THE GATE IS HERE, AHEAD OF THE CALL, NOT INSIDE IT. Every operand is
+			// evaluated before `describeFirstDivergingField` names its arguments, so at
+			// `LogOGDivergenceProbe=Warning` NOT ONE FIELD IS READ — and `&&` short-circuits
+			// left to right, so the two free tests come first and the host predicate is
+			// only invoked on a correction that already disagreed.
+			//
+			// ⛔ ALL THREE CONDITIONS ARE LOAD-BEARING and none of them is the other's
+			// restatement: no observer means nobody can read the answer; a CORRECT
+			// prediction has no first differing field to name; and the host's live log
+			// configuration is what decides whether the line this feeds even exists.
+			//
+			// ⛔ IT IS A MEASUREMENT, NOT A CLAIM. `correctionFieldDiff::walkCount()`
+			// counts entries to the walk, and `Network/CorrectionFieldDivergenceTest.cpp`
+			// asserts the delta is ZERO across a run of disagreeing corrections with the
+			// predicate unset and with it returning false — and NON-zero with it returning
+			// true, so the zero cannot be a dead instrument.
+			//
+			// ⛔ BEFORE THE `std::move` BELOW, NECESSARILY — the slot is the PREDICTION and
+			// `state` the AUTHORITY, and after the move there is nothing left to compare.
+			FieldDivergence fieldDivergence;
+			if (outDiagnosticVerdict != nullptr
+				&& !predictionWasCorrect
+				&& correctionFieldDiff::enabled())
+			{
+				describeFirstDivergingField(m_stateBuffer[cacheIndex], state, fieldDivergence);
+			}
+
 			m_containsCorrectTick.set(cacheIndex);
 			m_predictionWasCorrect[cacheIndex] = predictionWasCorrect;
 
@@ -757,8 +801,14 @@ public:
 			m_appliedCaptureTickBuffer[cacheIndex] = appliedCaptureTick;
 
 			// Reported before the state move for locality only; the ordering is not load-bearing.
+			//
+			// ⛔ ...EXCEPT FOR `fieldDivergence`, WHICH IS ORDERING-BOUND — it was computed
+			// above, from the slot, and the `std::move` below empties the source it read. §13
 			if (outDiagnosticVerdict != nullptr)
+			{
 				*outDiagnosticVerdict = CorrectionInsertVerdict{ true, predictionWasCorrect, tick };
+				outDiagnosticVerdict->fieldDivergence = fieldDivergence;
+			}
 
 			if (!predictionWasCorrect)
 				m_stateBuffer[cacheIndex] = std::move(state);

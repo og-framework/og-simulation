@@ -170,6 +170,38 @@ bool fieldwiseIsSimilarTo(const T& a, const T& b)
 }
 
 // ---------------------------------------------------------------------------
+// leafIsSimilarToAsFieldwiseDoes<V> — the LEAF HALF of the fold above, exported so
+// a second reader can ask the SAME question and get the SAME answer.
+//
+// ⛔ ITS POSITION IN THIS FILE IS THE WHOLE POINT, AND MOVING IT IS A BEHAVIOUR
+// CHANGE. `isSimilarToField` is called DEPENDENTLY, so under /permissive- (which
+// every target in this tree compiles with) ordinary lookup is frozen at the
+// TEMPLATE'S DEFINITION POINT and ADL adds only the argument's own namespaces.
+// Declared IMMEDIATELY AFTER `fieldwiseIsSimilarTo`, with nothing declared between the
+// two but this banner, it sees EXACTLY the overload set the fold above sees — including
+// the fact that the `Serializable<T>` and `std::vector<T>` overloads BELOW are not yet
+// declared, and that the glm overloads in SimulationComparisonGlm.h are never found
+// from here at all (they are in the global namespace, not in `glm`, so a glm::vec3
+// field falls to the generic template's `a == b` — an EXACT compare, not the 1e-4
+// epsilon).
+//
+// ⛔ MOVE IT BELOW THE TWO OVERLOADS AND `describeFirstDivergingField` STARTS
+// DISAGREEING WITH THE VERDICT IT EXISTS TO EXPLAIN: the fold would report
+// `similar=0` on a vector field the walk then calls similar, and the line would
+// name no field. `Network/CorrectionFieldDivergenceTest.cpp`'s agreement case is the tripwire.
+//
+// ⚠ NOT a second notion of similarity, and it must never grow one: the body is a
+// single forwarding call and that is all it may ever be. Rationale:
+// docs/SimulationComparison-rationale.md §4.
+// ---------------------------------------------------------------------------
+
+template <typename V>
+bool leafIsSimilarToAsFieldwiseDoes(const V& a, const V& b)
+{
+	return isSimilarToField(a, b);
+}
+
+// ---------------------------------------------------------------------------
 // isSimilarToField overload for Serializable types.
 // Preferred over the unconstrained template by C++20 partial ordering.
 // Placed after fieldwiseIsSimilarTo since it calls it.

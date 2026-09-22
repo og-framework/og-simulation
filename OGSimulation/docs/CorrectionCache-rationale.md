@@ -2306,3 +2306,47 @@ than re-adding the tag to the header.
 are a verbatim record of what the header said before compression; repairing them would
 stop them being a record. What changed is the **header**, which now names symbols and
 roles a standalone reader can resolve.
+
+---
+
+## 13. The field-level divergence report — og-netcode-v2-field-defects task 6
+
+`CorrectionInsertVerdict` carries a fourth field, `fieldDivergence`, and
+`tryInsertingCorrectState` has one new gated call. Both are additive; `isSimilarTo`, the slot
+overwrite, the provenance write, the landing stamp and the resim-anchor decision are unchanged,
+and every case in `CorrectionVerdictReportTest.cpp` is unchanged and still green.
+
+**Why it is here and not at the emit site.** The projection site,
+`NetSyncTelemetry::emitCorrectionArrival`, knows the character id and its class — the two facts
+this cache deliberately does not have. What it does NOT have is the PREDICTED state: by the time
+it runs, a disagreeing correction has already executed `m_stateBuffer[cacheIndex] =
+std::move(state)`. The comparison can only happen where both values still exist, which is here,
+between the verdict and the move.
+
+**⛔ The three conditions at the call site are the whole cost story**, and none of them is
+another's restatement:
+
+| condition | what it excludes |
+|---|---|
+| `outDiagnosticVerdict != nullptr` | callers with nowhere to read the answer — the common case, since the out-pointer is defaulted |
+| `!predictionWasCorrect` | agreeing corrections, which have no first differing field to name |
+| `correctionFieldDiff::enabled()` | the shipped verbosity, where the line this feeds does not exist |
+
+They are evaluated BEFORE `describeFirstDivergingField` names its arguments, so at the shipped
+setting not one field is read. That is a measured claim, not a structural one:
+`correctionFieldDiff::walkCount()` counts entries to the walk, and the test file asserts zero
+across five disagreeing corrections with no predicate installed and with one returning false —
+and FIVE with one returning true, so the zeros cannot be a dead instrument.
+
+⛔ **Reporting only.** Nothing in this cache, in `ResimGatePolicy` or in the resim path may
+branch on `fieldDivergence`. Doing so makes the shipped build's behaviour depend on the log
+verbosity. This is `docs/DiagnosticsConventions.md` §4's rule — the marker names the channel,
+never the fact — applied to a payload rather than to a name.
+
+⚠ **`fieldDivergence` is ORDERING-BOUND, unlike the other three fields.** `landed`,
+`predictionWasCorrect` and `tick` can be written anywhere in the hit branch; this one is computed
+from the slot before the `std::move` empties the source it read, and the fence at the write site
+says so.
+
+The design, the rejected alternatives, the cost-gate measurements and the field-naming mechanism
+live in `docs/SimulationComparison-rationale.md`; they are not re-derived here.

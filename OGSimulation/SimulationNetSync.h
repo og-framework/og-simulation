@@ -725,6 +725,11 @@ private:
         // ⛔ THE COMPARISON ITSELF IS NOT HERE and does not move here — it stays in
         // StateCorrectionCache::tryInsertingCorrectState's isSimilarTo. THIS site adds the
         // two facts the cache cannot supply: the character id and its CLASS. §11
+        //
+        // ⛔ NOR DOES THE FIELD-LEVEL DIFF, AND FOR A STRONGER REASON: by the time this
+        // returns, a disagreeing correction has already overwritten the slot, so the
+        // predicted value this site would need no longer exists. `verdict.fieldDivergence`
+        // is the cache's answer, carried. §11
         CorrectionInsertVerdict verdict;
         m_reconciliation.template injectCorrectionState<SimulatableT>(id, buffer, &verdict);
 
@@ -796,6 +801,11 @@ private:
         decision.landed               = verdict.landed;
         decision.tick                 = verdict.tick;
         decision.predictionWasCorrect = verdict.predictionWasCorrect;
+
+        // ⛔ CARRIED, NEVER RECOMPUTED — this class has no access to the two states and
+        // must never acquire one. The cache walked them under its own gate; this is the
+        // pure half's only job with the result. §11
+        decision.fieldDivergence      = verdict.fieldDivergence;
         return decision;
     }
 

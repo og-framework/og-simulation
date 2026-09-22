@@ -17,6 +17,9 @@
 //     get() returning std::make_tuple(SIM_MEMBER(MyType, member), ...).
 //  2. writeToSyncedBuffer / readFromSyncedBuffer / fieldwiseIsSimilarTo
 //     in SimulationComposite.h handle serialization automatically.
+//
+// Rationale: docs/SimulationComparison-rationale.md §3 — this file has no rationale
+// doc of its own, and every `§3` below is a section of THAT document.
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
@@ -67,6 +70,13 @@ struct FieldDesc
 
 	static Value read(const Owner& obj) { return (obj.*Getter)(); }
 	static void write(Owner& obj, Value v) { (obj.*Setter)(v); }
+
+	// ⛔ A NON-STATIC MEMBER, NEVER A TEMPLATE PARAMETER. Making the spelling a
+	// second NTTP would change the DESCRIPTOR'S TYPE, and a dozen APPEND-ONLY wire
+	// fences across the games pin `decltype(SerializableFields<S>::get())` against
+	// an exact `std::tuple<MemberFieldDesc<&S::f>, ...>`. Every one of them would
+	// fire. As a member the type is byte-for-byte the same one they name. §3
+	const char* name = nullptr;
 };
 
 // ---------------------------------------------------------------------------
@@ -88,17 +98,38 @@ struct FieldDescReadOnly
 	}();
 
 	static Value read(const Owner& obj) { return (obj.*Getter)(); }
+
+	// See FieldDesc::name — a member, not a template parameter, and for the same reason.
+	const char* name = nullptr;
 };
 
 // ---------------------------------------------------------------------------
 // Convenience macros
 // ---------------------------------------------------------------------------
 
+// THE FIELD SPELLING IS CARRIED BY THE MACRO, AND ONLY BY THE MACRO. §3
+//
+// ⛔ IT CANNOT BE RECOVERED FROM THE MEMBER POINTER. MEASURED on this tree's
+// toolchain (MSVC 14.38.33130, the version UBT selects): `__FUNCSIG__` for a
+// function template taking a pointer-to-member NTTP prints
+// `sigOf<pointer-to-member(0x0)>` — the SPELLING IS GONE. The `nameof` trick that
+// works for TYPES (`tsigOf<struct dAttackRadialSimulation::State>`, which
+// SimulationComparison.h does use) does not work for MEMBERS here.
+//
+// ⚠ sigOf AND tsigOf ARE NOT IN THIS TREE. They were throwaway probe
+// templates, never committed; §3 writes both of them out beside the output quoted
+// above, and that is the only place they exist. Do not go looking for them here.
+//
+// ⛔ SO A DESCRIPTOR WRITTEN AS A BARE TYPE — `MemberFieldDesc<&S::f>{}`, which
+// four sub-simulations still use — HAS NO NAME, by construction, and the
+// divergence walk falls back to `#<index>`. That is the design's honest edge, not
+// a defect to patch by editing those call sites.
+//
 // SIM_FIELD(Type, getter, setter) — creates a FieldDesc instance (read+write).
-#define SIM_FIELD(Type, getter, setter) FieldDesc<&Type::getter, &Type::setter>{}
+#define SIM_FIELD(Type, getter, setter) FieldDesc<&Type::getter, &Type::setter>{#getter}
 
 // SIM_FIELD_RO(Type, getter) — creates a FieldDescReadOnly instance (read only).
-#define SIM_FIELD_RO(Type, getter) FieldDescReadOnly<&Type::getter>{}
+#define SIM_FIELD_RO(Type, getter) FieldDescReadOnly<&Type::getter>{#getter}
 
 // ---------------------------------------------------------------------------
 // MemberFieldDesc<MemberPtr> — describes a plain aggregate data member.
@@ -132,10 +163,18 @@ struct MemberFieldDesc
 
 	static Value read(const Owner& obj) { return obj.*MemberPtr; }
 	static void write(Owner& obj, Value v) { obj.*MemberPtr = std::move(v); }
+
+	// The member's SPELLING, for `describeFirstDivergingField`'s path. See FieldDesc::name.
+	//
+	// ⛔ `nullptr` IS A REACHABLE VALUE, not a "can't happen": `forEachField`
+	// default-constructs each descriptor (`std::tuple_element_t<Is, Fields>{}`) and
+	// four sub-simulations spell their descriptors as bare types. Every reader must
+	// have an index fallback. §3
+	const char* name = nullptr;
 };
 
 // SIM_MEMBER(Class, member) — creates a MemberFieldDesc instance for a plain data member.
-#define SIM_MEMBER(Class, member) MemberFieldDesc<&Class::member>{}
+#define SIM_MEMBER(Class, member) MemberFieldDesc<&Class::member>{#member}
 
 // ---------------------------------------------------------------------------
 // VectorMemberFieldDesc<MemberPtr, MaxCount> — fixed-max-capacity std::vector
@@ -174,6 +213,9 @@ struct VectorMemberFieldDesc
 
 	static const VectorType& read(const Owner& obj) { return obj.*MemberPtr; }
 	static void write(Owner& obj, VectorType v) { obj.*MemberPtr = std::move(v); }
+
+	// See FieldDesc::name.
+	const char* name = nullptr;
 
 	// Tier-1 custom serialization — detected by writeToSyncedBuffer via requires.
 	template <typename SyncedBuffer>
@@ -225,4 +267,4 @@ struct VectorMemberFieldDesc
 };
 
 // SIM_VECTOR(Class, member, MaxCount) — fixed-max-capacity vector descriptor.
-#define SIM_VECTOR(Class, member, MaxCount) VectorMemberFieldDesc<&Class::member, MaxCount>{}
+#define SIM_VECTOR(Class, member, MaxCount) VectorMemberFieldDesc<&Class::member, MaxCount>{#member}

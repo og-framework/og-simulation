@@ -10,6 +10,7 @@
 #include "OGSimulation/Network/RelayReadProbe.h"
 #include "OGSimulation/Network/RemoteInputCache.h"
 #include "OGSimulation/ResimGateProbe.h"
+#include "OGSimulation/SimulationComparison.h"
 #include "OGSimulation/SimulationLog.h"
 
 #include "OGSimulation/CompilerControl.h"
@@ -128,6 +129,18 @@ struct CorrectionArrivalDecision
 
     // ⛔ Meaningless when `!landed` — no comparison happened, so this must never be read as either an agreement or a disagreement. §4
     bool predictionWasCorrect = false;
+
+    // WHICH FIELD DISAGREED, AND BY HOW MUCH — carried through from the cache's
+    // `CorrectionInsertVerdict`, unmodified. §12
+    //
+    // ⛔ THE WALK THAT FILLS IT DOES NOT HAPPEN HERE, AND MUST NOT MOVE HERE — by the
+    // time this struct exists the cache has already adopted the authority's state and
+    // the predicted value is gone. The gate is at the cache's call site for the same
+    // reason. §12
+    //
+    // ⛔ `evaluated == false` IS THE STEADY STATE, not a fault: at the shipped
+    // `LogOGDivergenceProbe=Warning` nothing walked, so nothing here may be printed. §12
+    FieldDivergence fieldDivergence;
 };
 
 class NetSyncTelemetry
@@ -247,11 +260,28 @@ public:
 
         // ⛔ VERBOSE ON EVERY LANDED CORRECTION, not on disagreements only — a disagreement-only line cannot distinguish "predicted correctly" from "no correction arrived". §6
         // ⛔ It adds no new volume CLASS: this site already logs twice per correction. §6
+        //
+        // THE FIELD TAIL — ` field=<path> delta=<f>`, or ` field=<path> old=.. new=..`
+        // for an enum. §12
+        //
+        // ⛔ IT IS A TAIL, NOT A NEW LINE AND NOT A NEW TAG. `[DivergenceProbe.Correction]`
+        // and `correct=` are what operators grep for and what `Config/DefaultEngine.ini`'s
+        // [T24] block documents; a rename would silence every archived recipe. The tail is
+        // APPENDED, and it is EMPTY unless the walk ran. §12
+        //
+        // ⛔ NO EXTRA VOLUME AND NO EXTRA LINE-LENGTH RISK: `SIMLOG` formats into
+        // `char[256]`, the fixed part is ~101 characters at maximum field widths, and
+        // `kFieldPathCapacity` (96) plus the widest payload keeps the whole line inside
+        // that. `formatFieldDivergence` bounds its own half; `snprintf` bounds the rest. §12
+        char fieldTail[160];
+        formatFieldDivergence(decision.fieldDivergence, fieldTail, sizeof(fieldTail));
+
         SIMLOG(m_logger,
-            "[Verbose][DivergenceProbe.Correction] id=%u tick=%u class=%s correct=%u",
+            "[Verbose][DivergenceProbe.Correction] id=%u tick=%u class=%s correct=%u%s",
             id, decision.tick,
             predictedCharacterClassName(decision.characterClass),
-            decision.predictionWasCorrect ? 1u : 0u);
+            decision.predictionWasCorrect ? 1u : 0u,
+            fieldTail);
 
         CorrectionVerdictWindowSummary window;
         if (!m_correctionVerdictProbe.noteCorrection(
