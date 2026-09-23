@@ -5,6 +5,7 @@
 #include <unordered_map>
 #include "OGSimulation/PhysicsBodyAdapter.h"
 #include "OGSimulation/SpatialQueryAdapter.h"
+#include "OGSimulation/SimulationLog.h"
 #include "OGSimulation/SimulationObjectStorage.h"
 #include "OGSimulation/SimulationTimeContext.h"
 
@@ -74,7 +75,12 @@ public:
             const auto& map = std::get<
                 std::unordered_map<unsigned int, typename SimulatableT::InputType>>(inputs);
             if (auto it = map.find(id); it != map.end())
+            {
+                // The ONE set site of the (id, tick) log context: see SimulationLog.h.
+                // Never around firstResimStep, body-state capture or systems.
+                simulationLog::IntegrateScope logScope(id, step.getTick());
                 simulatable.integrate(step, it->second, m_physicsAdapter, m_queryAdapter, m_staticData);
+            }
         });
     }
 
