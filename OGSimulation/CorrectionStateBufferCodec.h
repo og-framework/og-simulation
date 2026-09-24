@@ -82,7 +82,9 @@
 // relay increment, bumped 1 -> 2 by T4 because this payload grew the second
 // field, and 2 -> 3 by ring-out task 2 because the STATE COMPOSITE gained a
 // whole sub-simulation (the full reasoning is at the constant itself, below —
-// it is a different KIND of change from T4's and the difference is the point).
+// it is a different KIND of change from T4's and the difference is the point),
+// and 3 -> 4 by og-netcode-v2-field-defects task 9 because a field left the
+// middle of the state composite and every later offset moved.
 // The version BYTE itself is emitted by the UE buffer's NetSerialize (it
 // is transport framing, not payload), and the refusal path lives in the
 // adapter's correction-state arrival callback (one adapter binds it to
@@ -128,7 +130,14 @@ namespace correctionStateBuffer
 	// Wire-format version of the CORRECTION STATE payload. 1 = Stage-1 format
 	// (tick + composite); 2 = the input-relay format (tick + appliedCaptureTick +
 	// composite); 3 = the input-relay format with a state composite that carries a
-	// ring-out sub-simulation. See THE WIRE FENCE above.
+	// ring-out sub-simulation; 4 = the same, with a field REMOVED from the middle of
+	// the composite (og-netcode-v2-field-defects task 9: the brawler's radial
+	// `hasHitGuard`, 1 B, second slice), so every later offset moved. See THE WIRE
+	// FENCE above.
+	//
+	// ⛔ [task 9] 3 -> 4 IS THE PLAIN CASE this fence exists for, not the ring-out
+	// one: the LAYOUT moved. A peer on 3 reading a 4 payload decodes every field
+	// after the removed byte one byte out of place; no size check can see it.
 	//
 	// ⛔⛔ [ringout task 2, 2026-09-13] 2 -> 3, AND THE REASON IS NOT THE ONE THIS
 	// FENCE USUALLY FIRES FOR. What moved: `simulatableBrawler::State` grew
@@ -171,7 +180,7 @@ namespace correctionStateBuffer
 	// correctly and 9 trailing bytes were simply never read. It is now fenced too
 	// — a loud refusal, not a silent capability gap where a stale client watches
 	// characters teleport with no local explanation for the respawn.
-	inline constexpr std::uint8_t kWireFormatVersion = 3;
+	inline constexpr std::uint8_t kWireFormatVersion = 4;
 
 	// Payload layout.
 	inline constexpr std::uint32_t kTickOffset               = 0;
