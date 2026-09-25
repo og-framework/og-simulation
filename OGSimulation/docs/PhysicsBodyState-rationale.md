@@ -44,7 +44,7 @@ wire shape is cheap.
 | Own | a sim's `State`, e.g. `OGBrawler/BrawlerMovementSimulation.h` | `SerializableFields` | **sim author** |
 | Locate | `OGSimulation/PhysicsDeclaration.h` | `bodyStateOf` | **sim author** |
 | Capture | `OGSimulation/SimulationIntegrationExecutor.h` | `captureBodyStatesAll` | nobody |
-| Correct | `SimulationManagerUImpl.cpp` | `pushBodyState`, `SetTargetStateAtFrame` | nobody |
+| Correct | `SimulationManagerUImpl.cpp` | `pushBodyState`, `writeRestoredBodyState` | nobody |
 | Create | `SimulationManagerUImpl.cpp` | `createPhysicalObject`, `queryVolumes`, `attachmentOffset` | **sim author, in engine code** |
 | Bindings | `OGSimulation/PhysicsDeclaration.h` | `PhysicsRuntimeBindings` | nobody (was: four copies) |
 | Checksum / similarity | `OGSimulation/SimulationComposite.h` | `isSimilarTo` | nobody |
