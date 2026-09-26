@@ -130,8 +130,8 @@ longer claims otherwise.
   the crossing does not exist at runtime yet. Consistent with item 81's original ruling to keep task
   73 absent from this doc (verified 0 mentions there); when 73 is revived, its row lands then.
 - **`ChaosTickMapper` (`m_offset`, an `std::atomic<int32_t>`)** is a real, *wired* GT/PT-shaped
-  crossing (production call sites in `SimulationManagerUImpl.cpp`/`.h` and
-  `SimmableUpdateComponent.h`) — but it lives in `OGSimulationUnreal`, which is a different module in
+  crossing (production call sites in `SimulationManagerUImpl.cpp`/`.h`; `SimmableUpdateComponent.h` only
+  forward-declares it) — but it lives in `OGSimulationUnreal`, which is a different module in
   the outer game repository (`Source/OGSimulationUnreal/`), not inside the `og-simulation` submodule
   this doc's own path (`OGSimulation/docs/ThreadingCrossings.md`) lives in and scopes itself to ("the
   one place every ... crossing in `og-simulation` is enumerated," line 4 above). Out of this doc's
@@ -201,7 +201,8 @@ such by its own comment (not a new row); or a genuinely uninventoried crossing.
   pattern family. Filed as rows 9 and 10.
 - **Adapter boundary**, per the dispatch's explicit instruction to check it: `SimmableUpdateComponent.h`
   (confirms the GT attribution row 8 depends on — `ServerReceiveRemoteMove` is a
-  `UFUNCTION(Server,...)`, `deliverDelayedRemoteInput` states "Called on the GAME THREAD" inline) and
+  `UFUNCTION(Server,...)`, `deliverDelayedRemoteInput` stated "Called on the GAME THREAD" inline; since the outer repository's
+  2026-09-26 comment conversion that statement lives in its component rationale doc) and
   `PCTimeManagement/ChaosTickMapper.h` (a real, wired atomic crossing — excluded on the repo-boundary
   reason recorded under "What is not on this list," not overlooked).
 

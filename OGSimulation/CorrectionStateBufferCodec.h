@@ -84,7 +84,8 @@
 // whole sub-simulation (the full reasoning is at the constant itself, below —
 // it is a different KIND of change from T4's and the difference is the point),
 // and 3 -> 4 by og-netcode-v2-field-defects task 9 because a field left the
-// middle of the state composite and every later offset moved.
+// middle of the state composite and every later offset moved (and again 4 -> 5
+// by task 17 and 5 -> 6 by task 27, the same plain case).
 // The version BYTE itself is emitted by the UE buffer's NetSerialize (it
 // is transport framing, not payload), and the refusal path lives in the
 // adapter's correction-state arrival callback (one adapter binds it to
@@ -135,14 +136,19 @@ namespace correctionStateBuffer
 	// `hasHitGuard`, 1 B, second slice), so every later offset moved; 5 = the same
 	// again for og-netcode-v2-field-defects task 17 (the brawler projectile slot's
 	// `hitRootBodyId`, 4 B, removed from each of the 3 pool slots, composite
-	// 338 -> 326 B). See THE WIRE FENCE above.
+	// 338 -> 326 B); 6 = the same again for og-netcode-v2-field-defects task 27 (the
+	// radial's two slices: the dead InitialConditions `activeRootBodyId`, 4 B, removed
+	// from the composite's FIRST slice, and a 3 B per-swing hit ledger added to the
+	// radial State, the second; composite 326 -> 325 B), so every later offset moved.
+	// See THE WIRE FENCE above.
 	//
 	// ⛔ [task 9] 3 -> 4 IS THE PLAIN CASE this fence exists for, not the ring-out
 	// one: the LAYOUT moved. A peer on 3 reading a 4 payload decodes every field
 	// after the removed byte one byte out of place; no size check can see it.
 	// [task 17] 4 -> 5 is the same plain case: the removed field is the last of
 	// each slot, but the slots are an array in the middle of the composite, so
-	// slots 1 and 2 and every later slice moved.
+	// slots 1 and 2 and every later slice moved. [task 27] 5 -> 6 is the plain case
+	// once more: the removed field is inside the composite's first slice.
 	//
 	// ⛔⛔ [ringout task 2, 2026-09-13] 2 -> 3, AND THE REASON IS NOT THE ONE THIS
 	// FENCE USUALLY FIRES FOR. What moved: `simulatableBrawler::State` grew
@@ -185,7 +191,7 @@ namespace correctionStateBuffer
 	// correctly and 9 trailing bytes were simply never read. It is now fenced too
 	// — a loud refusal, not a silent capability gap where a stale client watches
 	// characters teleport with no local explanation for the respawn.
-	inline constexpr std::uint8_t kWireFormatVersion = 5;
+	inline constexpr std::uint8_t kWireFormatVersion = 6;
 
 	// Payload layout.
 	inline constexpr std::uint32_t kTickOffset               = 0;
