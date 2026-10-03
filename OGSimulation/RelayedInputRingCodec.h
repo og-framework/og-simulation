@@ -147,7 +147,7 @@ namespace relayedInputRing
 	// Wire-format version of the relay ring payload. Bumped when the on-wire
 	// layout changes so a mismatched peer can be detected. Independent of the
 	// sync buffers' fences (see the WIRE VERSION note above).
-	inline constexpr std::uint8_t kWireFormatVersion = 1;
+	inline constexpr std::uint8_t kWireFormatVersion = 2;
 
 	// Hard upper bound on resident entries, for wire safety, and — since item 34
 	// — the ONLY bound: `writeLatest`'s runtime depth is `min(requested, kMaxDepth)`

@@ -95,7 +95,7 @@ namespace inputRedundancyBundle
 {
 	// Wire-format version. Bumped when the on-wire layout changes so a
 	// mismatched peer is detected and rejected (compat fence).
-	inline constexpr std::uint8_t  kWireFormatVersion = 1;
+	inline constexpr std::uint8_t  kWireFormatVersion = 2;
 	// Hard upper bound on slots for wire safety; the runtime depth is
 	// min(TimeConfig::redundancyDepthTicks, kMaxSlots).
 	inline constexpr std::uint8_t  kMaxSlots          = 8;
