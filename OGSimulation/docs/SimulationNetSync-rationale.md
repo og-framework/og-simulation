@@ -80,6 +80,7 @@ which is exactly why the count was wrong for two items and nothing reported it.
 <!-- lint-external-ref: getLastResimulationTick -- RETIRED at item 45 together with the frontier scan it drove -->
 <!-- lint-external-ref: allocateFrontierSlotForCharacter -- RETIRED at item 94; frontier allocation is storage-driven on reconciliation's own cache population -->
 <!-- lint-external-ref: findInputCache -- RENAMED at item 39 to findCorrectionCache; quoted verbatim in an archived block under its old spelling -->
+<!-- lint-external-ref: SyncedRemoteInputBufferType -- RETIRED at og-syncedInput-rework task 9 (2026-10-03) with the client->server input buffer requirement of PredictionSyncedBufferOwnerConcept; quoted verbatim in an archived block -->
 
 ---
 
@@ -268,6 +269,11 @@ CLIENT->SERVER buffer handed back by getClientToServerInputSyncedBuffer
 below. What is gone is its server->client role — the correction-input
 arrival callback pair used to be required right here.
 ```
+
+⚠ *Superseded 2026-10-03 (og-syncedInput-rework task 9), not repaired above: the client->server role is
+retired too. `PredictionSyncedBufferOwnerConcept` no longer requires the input buffer typedef, its
+composite-buffer constraint or its accessor — nothing called the accessor once the input left through
+`sendLocalInputToAuthority`. The header states the absence at the site.*
 
 ### archived block — PRE-COMPRESSION lines 194–202 (coordinates into the 1,281-line original, which no longer exists; NOT live anchors) — **FENCE** (F3 + F2)
 

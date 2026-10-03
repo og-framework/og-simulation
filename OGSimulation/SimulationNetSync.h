@@ -77,7 +77,7 @@ using LocalInputSenderMapFor = std::unordered_map<unsigned int, LocalInputSender
 //
 // ⛔ THE WRITE/READ MIRROR PAIR — breaking write() or readInto() must be a compile
 // error at the registerSimulatable call site, never runtime wire corruption. Read
-// side: SimulationReconciliation::injectCorrectionState + registerAuthorityOwner. §2
+// side: SimulationReconciliation::injectCorrectionState. §2
 
 template <typename BufferT, typename CompositeT>
 concept CompositeSyncedBufferConcept =
@@ -92,8 +92,9 @@ concept CompositeSyncedBufferConcept =
     };
 
 // ⛔ THE applied-capture-tick ref REFINES this contract, it does not extend it —
-// requiring it on every tick-stamped buffer puts a meaningless field on the
-// input buffer. §2
+// requiring it on every tick-stamped buffer puts a meaningless field on any
+// buffer whose payload is not a state (the input buffer that was the case
+// retired in og-syncedInput-rework task 9). §2
 //
 // ⛔ Both halves in one place: writer sendCorrectionAll and reader
 // injectCorrectionState must stay in lockstep. §2
@@ -129,19 +130,16 @@ concept PredictionSyncedBufferOwnerConcept =
              uint32 redundancyDepth)
     {
         typename OwnerT::SyncedCorrectionBufferType;
-        typename OwnerT::SyncedRemoteInputBufferType;
         typename OwnerT::RelayedInputRingType;
         requires CorrectionStateSyncedBufferConcept<typename OwnerT::SyncedCorrectionBufferType, StateT>;
-        // ⛔ SyncedRemoteInputBufferType survives the SERVER->CLIENT CHANNEL'S RETIREMENT
-        // in its CLIENT->SERVER role only, as getClientToServerInputSyncedBuffer's
-        // return. Its server->client role is gone. §3
-        requires CompositeSyncedBufferConcept<typename OwnerT::SyncedRemoteInputBufferType, InputT>;
+        // ⛔ NO CLIENT->SERVER INPUT BUFFER IS REQUIRED: input leaves only through
+        // sendLocalInputToAuthority below. The buffer typedef and its accessor were
+        // removed (og-syncedInput-rework task 9) — nothing called the accessor. §3
         { owner.setOnCorrectionStateReceivedCallback(corrFn) };
         { owner.clearOnCorrectionStateReceivedCallback() };
         { owner.setOnRelayedInputReceivedCallback(relayFn) };
         { owner.clearOnRelayedInputReceivedCallback() };
         { constOwner.getRelayedInputRing() } -> std::same_as<const typename OwnerT::RelayedInputRingType&>;
-        { owner.getClientToServerInputSyncedBuffer() } -> std::same_as<typename OwnerT::SyncedRemoteInputBufferType*>;
         // ⛔ FInputRedundancyBundle NEVER appears in this layer — only the core
         // PendingInputQueue and the redundancyDepth scalar cross this line. §2
         { owner.sendLocalInputToAuthority(pendingQueue, currentTick, redundancyDepth) };

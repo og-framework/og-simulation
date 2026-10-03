@@ -202,14 +202,14 @@ namespace relayedInputRing
 	// reference still compiles and the WIRE FORMAT IS UNCHANGED — this is a move,
 	// not a redesign.
 	//
-	// Upper bound on the serialized input payload of ONE entry. Anchored to the
-	// project's declared per-input wire budget — the input sync buffer's 128-byte
-	// capacity, which covers a tick header + one input composite (one adapter:
-	// `FSimulationInputSyncBuffer::kBufferBytes`) — so this bound cannot silently
-	// fall behind a growing input composite. It is
-	// deliberately a plain constant here rather than a reference to that USTRUCT:
-	// core cannot name it, and the two are pinned together by this comment and by
-	// the alias on FRelayedInputRing.
+	// Upper bound on the serialized input payload of ONE entry. It used to be
+	// anchored, by comment only, to one adapter's 128-byte input sync buffer; that
+	// buffer was retired in og-syncedInput-rework task 9 and nothing ever checked
+	// the two against each other. The bound now rests on the static_assert in
+	// detail::entryStride: an InputType whose entry input exceeds it does not
+	// compile, so a well-formed full-depth ring can never exceed kMaxWireBytes.
+	// The value 128 is kept, not re-derived — the adapter's FRelayedInputRing
+	// alias pins the kMaxWireBytes it produces.
 	inline constexpr std::uint32_t kMaxInputBytes = 128;
 
 	// Largest payload a well-formed ring can produce: header + kMaxDepth entries of
@@ -276,6 +276,9 @@ namespace relayedInputRing
 		template <typename InputType>
 		constexpr std::uint32_t entryStride()
 		{
+			static_assert(entryInputSize<InputType>() <= kMaxInputBytes,
+				"relayed input exceeds kMaxInputBytes: a full-depth ring would be refused by isAcceptableWireLength. "
+				"Was a comment-only anchor to the retired 128-byte input sync buffer (og-syncedInput-rework task 9)");
 			return static_cast<std::uint32_t>(sizeof(std::uint32_t))
 			     + static_cast<std::uint32_t>(sizeof(std::uint8_t))
 			     + entryInputSize<InputType>();
