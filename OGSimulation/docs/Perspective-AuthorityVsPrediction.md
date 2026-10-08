@@ -288,7 +288,7 @@ core whether to rewind and then drives the replay (one adapter binds these to Ch
 | phase | manager entry | reconciliation / executor call |
 |---|---|---|
 | ask | `onCheckIsSimilar` | `checkDivergenceAll(maxAnchorDepthTicks, &deepSkips)` |
-| arm | `prepareResimulation` | `prepareResimAll(simTick)` + `firstResimStepAll(chaosStep)` |
+| arm | `prepareResimulation` | `prepareResimAll(simTick)` + `firstResimStepAll(physicsStep)` |
 | replay | `onGameSimulationResimulation` (once per replayed tick) | `collectResimInputAll` + `integrateAll` |
 | record | `onPostGameSimulation`, resim branch | `postResimulationAll` |
 | land | `onPostGameSimulation`, catch-up edge | `applyResimAll` |

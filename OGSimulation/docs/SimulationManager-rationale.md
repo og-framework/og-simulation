@@ -1416,3 +1416,32 @@ Not quoted (3), each with the reason it needs no archive:
 - `:1252` — NARRATIVE (carried to the shipped file UNCHANGED — there is nothing removed to archive)
 - `:1331` — KEEP-VERBATIM (carried to the shipped file UNCHANGED — there is nothing removed to archive)
 
+## 12. Additions after the archive (step-driver task, 2026-10-06)
+
+These are not archived prose. They were written with the code they describe, and the header's
+`§12` pointers land here.
+
+### The `chaosStep=` log token is a frozen spelling
+
+`prepareResimulation`'s first parameter is `physicsStep`: it is the raw step of whichever physics
+engine the host runs, and the core names no engine. It was called `chaosStep` until the engine-free
+step driver (`SimulationStepDriver.h`) became its second caller. **The `[Resim.Prepare]` line keeps
+the token `chaosStep=`**, because archived log greps key on that spelling. The value printed is the
+same one under either name: the physics step the replay was armed at. Renaming the token would
+make every archived grep silently match nothing on new logs.
+
+### `lastIntegratedStep()`
+
+It returns `m_lastStep`: the step the most recent `integrateAll` ran, tick and kind, and empty
+before the first. `currentIntegratedTick()` returns only the tick, and `currentStep()` is private,
+so before this accessor a caller outside the class could not learn the step **kind**.
+
+The step driver needs the kind. It keys its physics snapshot ring on the same predicate the
+correction cache keys its frontier on (`stepAllocatesFrontierSlot(kind)`), and on a `Skip` it
+commits the pre-step world under the skipped tick. It reads the kind after `onGameSimulation`
+returns, which is the only point at which `advancePrediction` has decided it.
+
+`getStepKind()` collapses `HardResync` to `Normal` (`onGameSimulationPrediction` keeps the base step
+for a `HardResync`). A caller that must react to a HardResync learns of it from a
+`ClientPredictionClock` resync callback, which fires inside `advancePrediction`; the step driver
+does exactly that.

@@ -91,6 +91,40 @@ public:
         });
     }
 
+    // Writes every declaration's body state from og-sim state into the physics world, after a
+    // rollback restored og-sim state from the correction cache. Position and linear velocity
+    // always; rotation and angular velocity only for a full `PhysicsBodyState` declaration,
+    // because a `LinearBodyState` carries neither and its widening would write identity and zero.
+    // The step driver calls it once per resim, after `prepareResimulation`.
+    void pushCorrectedBodyStatesAll()
+    {
+        m_storage.forEachSimulatable([&](unsigned int /*id*/, auto& sim) {
+            const auto& state = sim.getAllState().getState();
+            sim.getPhysicsComposite().forEach([&](const auto& decl) {
+                using D = std::decay_t<decltype(decl)>;
+                using S = typename D::StateType;
+                using BodyStateT = std::remove_cvref_t<decltype(D::bodyStateOf(state.template get<S>()))>;
+                const PhysicsBodyState body = static_cast<PhysicsBodyState>(D::bodyStateOf(state.template get<S>()));
+                const BodyId bodyId = decl.bindings.ownBodyId;
+                if constexpr (std::is_same_v<BodyStateT, PhysicsBodyState>)
+                {
+                    glm::mat4 transform = glm::mat4_cast(body.rotation);
+                    transform[3] = glm::vec4(body.position, 1.f);
+                    m_physicsAdapter.setBodyTransform(bodyId, transform);
+                    m_physicsAdapter.setBodyLinearVelocity(bodyId, body.linearVelocity);
+                    m_physicsAdapter.setBodyAngularVelocity(bodyId, body.angularVelocity);
+                }
+                else
+                {
+                    glm::mat4 transform = m_physicsAdapter.getBodyTransform(bodyId);
+                    transform[3] = glm::vec4(body.position, 1.f);
+                    m_physicsAdapter.setBodyTransform(bodyId, transform);
+                    m_physicsAdapter.setBodyLinearVelocity(bodyId, body.linearVelocity);
+                }
+            });
+        });
+    }
+
     void captureBodyStatesAll()
     {
         m_storage.forEachSimulatable([&](unsigned int /*id*/, auto& sim) {
@@ -126,6 +160,7 @@ concept SimulationIntegrationExecutorConcept = requires(
 {
     { t.firstResimStepAll(physStep) };
     { t.captureBodyStatesAll() };
+    { t.pushCorrectedBodyStatesAll() };
 };
 
 OGSIM_OPTIMIZE_ON

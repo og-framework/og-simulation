@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <string>
 
 #include "OGSimulation/CompilerControl.h"
 
@@ -89,18 +90,26 @@ void NetworkTimeEstimator::updateRTT(double rawRTTSeconds)
         if (!m_rejectedRTTLogged && m_logger)
         {
             m_rejectedRTTLogged = true;
-            char buf[384];
-            std::snprintf(buf, sizeof(buf),
-                "[Warning][RttSample] NetworkTimeEstimator REJECTED an invalid RTT sample "
-                "(raw=%.6f s) - the engine reports NO usable ping reading. hasFirstRTTSample=%d. "
-                "While that is 0 the prediction offset is NOT tracking the network - it reports "
-                "the structural floor (predOffsetFloorTicks=%u) and nothing else. THIS LINE is the "
-                "only signal that the offset is unmeasured; do not read the offset value as evidence. "
-                "One-shot; running total via getRejectedRTTSampleCount().",
-                rawRTTSeconds,
-                m_hasFirstSample ? 1 : 0,
-                static_cast<unsigned int>(m_config.predOffsetFloorTicks));
-            m_logger(buf);
+            const auto format = [&](char* out, std::size_t size)
+            {
+                return std::snprintf(out, size,
+                    "[Warning][RttSample] NetworkTimeEstimator REJECTED an invalid RTT sample "
+                    "(raw=%.6f s) - the engine reports NO usable ping reading. hasFirstRTTSample=%d. "
+                    "While that is 0 the prediction offset is NOT tracking the network - it reports "
+                    "the structural floor (predOffsetFloorTicks=%u) and nothing else. THIS LINE is the "
+                    "only signal that the offset is unmeasured; do not read the offset value as evidence. "
+                    "One-shot; running total via getRejectedRTTSampleCount().",
+                    rawRTTSeconds,
+                    m_hasFirstSample ? 1 : 0,
+                    static_cast<unsigned int>(m_config.predOffsetFloorTicks));
+            };
+            const int length = format(nullptr, 0);
+            if (length >= 0)
+            {
+                std::string message(static_cast<std::size_t>(length), '\0');
+                format(message.data(), message.size() + 1);
+                m_logger(message.c_str());
+            }
         }
         return;
     }
