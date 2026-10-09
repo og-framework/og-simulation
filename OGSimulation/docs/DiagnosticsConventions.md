@@ -24,7 +24,7 @@ supersedes the RN-9 amendment's wording (below); it does not change any ruling's
 ## 1. The view convention
 
 `get`/`edit` on the *outer* accessor is existing house style, not new: `editStorage`, `editState`,
-`editResimGateProbe`, `editReconciliation`, `editQueryAdapter`, `editAllState`, `editServerClock`,
+`editResimGateProbe`, `editReconciliation`, `editAllState`, `editServerClock`,
 `editNetworkEstimator`, `editClientClock`, `editPhysicsComposite`. `getDiagnostics()` (const) /
 `editDiagnostics()` (non-const) apply that same pair to diagnostics.
 
