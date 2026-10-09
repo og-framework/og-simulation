@@ -253,9 +253,9 @@ therefore records it. No adapter signature changed to arm this gate.
 `noteRttSample` also receives a `serverTick` and could plausibly feed the same reference. It is
 deliberately **not** wired in, for two reasons:
 
-1. **Source quality.** `reapConnections` is called from the same game-thread hook as the drain and
-   is passed the tick↔physics-frame mapper's `firstUpcomingSimTick` — the tick source documented as
-   game-thread-safe. `noteRttSample`'s tick is `getServerReceptionTick()`, an acknowledged wart: an
+1. **Source quality.** `reapConnections` is called by the host on the game thread, once per physics
+   frame, and is passed that frame's `firstUpcomingSimTick` from the host's game-thread-safe tick
+   source (a tick↔physics-step mapper, or an offset the step publishes). `noteRttSample`'s tick is `getServerReceptionTick()`, an acknowledged wart: an
    unsynchronized read of the physics-thread-written server clock. A gate that *discards* player
    input should judge against the safe source, not the racy one.
 2. **A monotonic-enough reference.** Two feeds a tick apart could hand the gate a reference that
@@ -287,7 +287,8 @@ on `T + 1` inside that very frame would look not-yet-due to it, and the re-send 
 moment later would be re-admitted — exactly the failure the gate exists to stop.
 
 `noteDrainedThrough`, fed only by `releaseDelayedInputs`, records `firstUpcomingSimTick + numSteps`
-instead: the first tick the drain has **not** served. It is armed **before** the empty-claim-map
+instead: the first tick the drain has **not** served. Under the per-step drain it advances one tick per
+step and ends each frame at the same value the frame's batch would have left. It is armed **before** the empty-claim-map
 early-out, so an idle server still advances it rather than freezing the reference at whatever the
 last busy frame left.
 
@@ -318,10 +319,24 @@ documented, not silent.
 
 ### The reap cadence, and the boundary it can step over
 
-`reapConnections` runs **once per physics frame**, from the same hook as the drain and immediately
-after it. Its predecessor fired only when a bundle arrived on a dwell-boundary tick, so an idle
-server never reaped at all — a latent leak. This one runs regardless of traffic; the internal
+`reapConnections` runs **once per physics frame**, called by the host after the frame's steps, with
+the frame's first upcoming tick. The drain runs **per step**: the authority's pre-step hook calls
+`releaseDelayedInputs` with that step's tick and `numSteps = 1` (a host that hands its steps to an
+engine in one batch may instead drain the frame's ticks in one call, before the first step). Its
+predecessor fired only when a bundle arrived on a dwell-boundary tick, so an idle server never
+reaped at all — a latent leak. This one runs regardless of traffic; the internal
 `serverTick % tierMinDwellTicks` gate keeps the frequency on a busy server the same as before.
+
+⛔ **The reap must not move per step**, because it is `noteServerTick`'s only feed (above). Per step,
+the receipt gate's reference would be the frame's **last** tick, not its first, when the next frame's
+receipts are judged, and the gate's acceptance window would shift by the frame's step count in every
+multi-step frame. No receipt lands between a frame's steps, so the per-frame value is the one every
+receipt is judged against.
+
+`[DelayShift]`'s `tick=` is the first tick of the drain call that first sees a delay change: under the
+per-step drain, that step's tick. The effective delay changes only at receipt or at the reap, never
+between a frame's steps, so in practice it is still the frame's first tick. The field is diagnostic
+only.
 
 ⚠ **A frame simulates `numSteps` sim ticks**, so consecutive calls can advance the tick reference by
 more than one. The dwell gate is therefore sampled at *frame* granularity and a dwell boundary can
