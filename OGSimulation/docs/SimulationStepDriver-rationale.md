@@ -93,7 +93,10 @@ tick, exactly as it did when an engine refused a rewind.
 3. `manager.prepareResimulation(physicsStep, anchor)`: the clock's resim cursor goes to the anchor
    and og-sim state is restored from the correction cache.
 4. `integration.pushCorrectedBodyStatesAll()`: the restored og-sim body states are written into the
-   physics world (§9).
+   physics world (§9). Only the declarations that differ from the restored physics body are written:
+   step 1 already put back the world's own snapshot of the anchor, and for a declaration nobody
+   corrected that snapshot already holds the cached state, so a resim with no correction writes nothing
+   and replays exactly what the unreplayed run computed.
 5. **Exactly `predictionTick - anchor` replay steps** (guard G-04; user ruling Q1: one physics step
    per sim tick, Stall and Skip multiplicity not reproduced). For replayed tick `t`:
    `applyOccupancy(occ[t])`, `onGameSimulation({resim, first})`, `world.step(dt)`,
@@ -248,18 +251,35 @@ test-only.
 
 After `prepareResimulation` restored og-sim state from the cache, the physics bodies must carry the
 same state before the first replay step. `SimulationIntegrationExecutor::pushCorrectedBodyStatesAll`
-writes, for every physics declaration of every simulatable:
+visits every physics declaration of every simulatable and first compares the declaration's state with
+the adapter's capture of the restored body (`captureBodyState`), exactly: all four fields for a full
+`PhysicsBodyState`, position and linear velocity for a `LinearBodyState`. An equal declaration is
+skipped (the restore skip). Otherwise it writes:
 - position and linear velocity, always;
 - rotation and angular velocity only when the declaration's body state is a full `PhysicsBodyState`.
 
+The skip is exact because the cache entry at the anchor of a declaration nobody corrected is the capture
+taken right before the world saved that tick, so it equals the restored body bit for bit; an adopted
+correction differs and is written. It exists because a seam write is not always exact: on the Jolt
+backend the centimetre-to-metre conversion and the centre-of-mass offset can move an unchanged body by
+an ULP, and the next exact comparison then disagrees and triggers another resim. og-simulation-jolt's
+JoltUnits-rationale.md §5 says when the skip can go. The skip lives in the push, not in the adapter
+setters, because the simulations rewrite bodies from seam state every tick and that rewrite must keep
+quantizing identically on every peer.
+
 A `LinearBodyState` carries no rotation or spin; widened, it reads as identity rotation and zero spin,
 and writing those would overwrite the body's real orientation. So a linear declaration keeps the
-body's own rotation: the push reads the body's transform, replaces its translation, and writes it
-back. A full declaration writes one transform built from position and rotation.
+body's own rotation. When the adapter models the optional `PhysicsBodyPoseWriter` capability, the pose
+is written with `setBodyPose` (position and quaternion): a full declaration passes its own rotation, a linear
+one the captured rotation of the body, so neither goes through a matrix. Otherwise the push keeps the
+matrix path: a full declaration writes one transform built from position and rotation, and a linear one
+reads the body's transform, replaces its translation, and writes it back. The matrix path costs a
+quaternion-to-matrix-to-quaternion round trip, which can change rotation bits.
 
 This is the engine-free port of an engine adapter's direct writes of position, velocity, rotation
 and angular velocity at the first resim step. It goes through the `PhysicsBodyAdapter` seam
-(`setBodyTransform`, `setBodyLinearVelocity`, `setBodyAngularVelocity`), so any backend receives it.
+(`setBodyTransform` or `setBodyPose`, `setBodyLinearVelocity`, `setBodyAngularVelocity`), so any backend
+receives it.
 
 ## §10 The physics step handed to the manager
 

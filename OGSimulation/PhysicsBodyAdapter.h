@@ -23,3 +23,17 @@ concept PhysicsBodyAdapter = requires(
 	{ cadapter.getBodyInertiaTensor(bodyId) } -> std::convertible_to<glm::vec3>;
 	{ cadapter.captureBodyState(bodyId) }     -> std::convertible_to<PhysicsBodyState>;
 };
+
+// OPTIONAL capability, deliberately NOT part of PhysicsBodyAdapter: write a body's pose from a
+// position and a quaternion, with no matrix in between. SimulationIntegrationExecutor's restore
+// push uses it when the adapter models it (`if constexpr`) and otherwise keeps the
+// setBodyTransform matrix path, which costs a quaternion -> matrix -> quaternion round trip and so
+// can change rotation bits. Optional so that every existing PhysicsBodyAdapter model (the Chaos
+// adapter and the test mocks) compiles unchanged; an adapter that implements it should
+// static_assert it, so a signature slip fails the build instead of silently falling back.
+template <typename T>
+concept PhysicsBodyPoseWriter = requires(T adapter, BodyId bodyId,
+                                         const glm::vec3& position, const glm::quat& rotation)
+{
+	{ adapter.setBodyPose(bodyId, position, rotation) };
+};
