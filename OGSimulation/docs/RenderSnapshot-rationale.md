@@ -74,7 +74,7 @@ captures when it pumps the step and passes in; the header neither knows nor need
 consumer that interpolates must take its render time from the same clock, or the interpolation
 drifts.
 
-## §5 `hasRotation`
+## §5 `hasRotation`, `renderCorrection` and `isRoot`
 
 A declaration's body state is either a full `PhysicsBodyState` (position, rotation, both velocities)
 or a `LinearBodyState` (position and linear velocity) for a rotation-locked body
@@ -86,6 +86,20 @@ than apply the identity.
 Only the position and, for full states, the rotation are carried: no velocities, because a consumer
 that interpolates between two snapshots does not extrapolate.
 
+Two more per-body bytes are for a render-side correction smoother (`RenderCorrectionSmoothing-rationale.md`
+§14), which reads them from the pose set it is handed:
+- `renderCorrection` is the declaration's `RenderCorrectionMode` as a byte (`renderCorrectionModeOf`,
+  `PhysicsDeclaration-rationale.md` §7): 0 for `Smooth`, 1 for `SnapInRootFrame`. Like `hasRotation` it
+  is a compile-time property of the declaration.
+- `isRoot` is 1 when the declaration's descriptor marks its body as its simulatable's root (the `isRoot`
+  of the body its `descriptor()` returns), and 0 otherwise, including for a declaration with no
+  `descriptor()`.
+  A smoother finds a body's root through it: the root is the body with `isRoot` among the bodies with the
+  same `simulatableId`.
+
+A root that declares `SnapInRootFrame` fails an `OG_CHECK` in the fill: a root has no root frame to be
+drawn in, and the bodies drawn in its frame need its own error.
+
 ## §6 Sizing
 
 `MaxBodies` is the template argument: the most bodies a game can have, every simulatable it can hold
@@ -94,16 +108,18 @@ storage holds more bodies than that, the fill fails an `OG_CHECK` and drops the 
 where the check does not stop the process, the snapshot then holds the first `MaxBodies` bodies of
 the walk, sorted).
 
-Measured on Win64 (MSVC): `RenderBody` is 36 bytes, and a snapshot of 48 bodies is 1,760 bytes.
+Measured on Win64 (MSVC): `RenderBody` is 36 bytes, and a snapshot of 48 bodies is 1,760 bytes. The two
+bytes of §5 after `hasRotation` took what was padding before `positionCm`, so the size did not change.
 
 A fill rewrites only the first `bodyCount` entries; entries beyond it keep whatever an earlier, larger
 fill left there. A consumer reads `bodies[0 .. bodyCount)` only.
 
 ## §7 What it does not carry, and where the game's instantiation lives
 
-- **No query state.** A body's id, its root and whether a query could find it are not here: a
-  consumer that needs to run spatial queries against the rendered poses keeps its own physics world
-  for that (a shadow world restored from the step's saved state), not a pose list.
+- **No query state.** A body's id and whether a query could find it are not here: a consumer that
+  needs to run spatial queries against the rendered poses keeps its own physics world for that (a
+  shadow world restored from the step's saved state), not a pose list. Whether a body is its
+  simulatable's root is here (`isRoot`, §5), for the correction smoother's root frame, not for queries.
 - **No visualisation or HUD state**, which has its own hand-over.
 - **No alias for a particular game.** A game names its own instantiation, a `RenderSnapshotT` sized
   to its most simulatables times the declarations of each, beside its other per-game aliases. The
@@ -123,3 +139,7 @@ simulatables with two declarations (one full, one linear) and one declaration (l
   empty one, sets `bodyCount` to the new count.
 - `RenderSnapshot.KeyOrderSpansSimulatableTypes`: two simulatable types with interleaved ids give one
   key order across both.
+- `RenderSnapshot.RenderCorrectionModeAndRootAreCopiedPerBody`: one simulatable with a root declaration
+  (a `descriptor()` whose body is the root), a `SnapInRootFrame` declaration and a declaration with
+  neither a `descriptor()` nor the member, filled into a snapshot whose two fields were set to 0xAB in every body first:
+  the three bodies read 0/1, 1/0 and 0/0 (`renderCorrection`/`isRoot`).

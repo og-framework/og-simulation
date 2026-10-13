@@ -169,7 +169,8 @@ the guards doc.
 
 The header ends with a small `physicsDeclarationSelfCheck` namespace: one conforming probe
 declaration, four deliberately broken ones, and the assertions that the concept accepts the first
-and rejects the rest.
+and rejects the rest. Two more probes pin `renderCorrectionModeOf` (§7): one that declares the member
+and one that does not.
 
 ⭐ **It is there because this submodule ships standalone.** The equivalent negative controls exist
 in the test suite, but the test suite is a separate module and is **not distributed with
@@ -186,14 +187,51 @@ translation unit that includes the header.
 | `ProbeNonWideningConst` | `convertible_to<PhysicsBodyState>` on the const overload | G-03 |
 | `ProbeMutableNotBodyStateLike` | `BodyStateLike` on the mutable overload's referent | G-03 |
 | `ProbeLookAlikeBindings` | every candidate spelling alike | **nothing** — it is kept, labelled, as the NON-discriminating control, so it is not mistaken for the check |
+| `ProbeSnapInRootFrame` | — (the trait must return its member, `SnapInRootFrame`) | nothing: it is new with the trait (§7) |
+| `ProbeWithoutRenderCorrection` | — (the trait must return `Smooth`) | nothing: the vacuity control of the one above |
 
 ⚠ **The probes are declarations, not definitions**, and no object of any of them is ever created.
-They cost the consumer six concept instantiations per translation unit and nothing at run time.
+They cost the consumer six concept instantiations and two trait instantiations per translation unit,
+and nothing at run time.
 
 ⛔ **Do not delete a probe because "the test suite covers it".** The test suite is not distributed
 with this submodule; that is the whole reason the block exists.
 
-## 7. History
+## 7. The render correction mode
+
+`RenderCorrectionMode` says how a host's render-side correction smoothing draws a declaration's body
+after a resimulation moved it (`RenderCorrectionSmoothing-rationale.md` §14):
+- `Smooth`: the body keeps being drawn where it was, and the difference decays over a short time;
+- `SnapInRootFrame`: the body drops its own correction error and is drawn at its corrected pose, offset
+  by the error its simulatable's root body is still being drawn with, so it stays where it belongs on
+  the root.
+
+**The member.** A declaration opts in with
+`static constexpr RenderCorrectionMode renderCorrection = RenderCorrectionMode::SnapInRootFrame;`.
+`renderCorrectionModeOf<D>()` reads it at compile time; `fillRenderSnapshot` copies it into each body
+of a snapshot (`RenderSnapshot-rationale.md` §5).
+
+**Why the default is `Smooth`.** A declaration without the member reads as `Smooth`, the behaviour
+every declaration had before the member existed. So no existing declaration needs an edit, and the
+concept `PhysicsDeclaration` does not change: the many declarations that exist only in tests, and the
+minimal ones `fillRenderSnapshot` is tested with, are untouched.
+
+**A wrongly typed member** (an `int`, a `bool`) fails a `static_assert` inside the trait instead of
+reading as the default.
+
+**A misspelt member** (renderCorection, say) is invisible to any trait: it is simply not the member, and
+the declaration reads as `Smooth`. It is caught at the opt-in site instead. The header that declares
+the opting declaration asserts `renderCorrectionModeOf<D>() == RenderCorrectionMode::SnapInRootFrame`
+beside it. This header cannot write that assertion, for the reason of **G-01**: only the consumer's
+own header can name its declaration.
+
+**Why it is not a field of `BodyDescriptor`.** `BodyDescriptor` describes the physics body to create.
+A backend's physics factory reads it to create and configure the body, can compare it field by field
+to match a declaration to a prepared body, and a determinism check can build its bodies from it. A
+render flag there would become part of the physics identity of the body. It is also only reachable
+through `descriptor()`, which the minimal declarations `fillRenderSnapshot` accepts need not have.
+
+## 8. History
 
 * The contract was duck-typed before this header existed. A declaration missing a member failed
   inside a template fold, far from the mistake; the concept converts that into one named line at

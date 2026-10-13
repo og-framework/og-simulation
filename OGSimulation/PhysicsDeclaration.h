@@ -3,6 +3,7 @@
 // docs/PhysicsDeclaration-rationale.md · docs/PhysicsDeclaration-guards.md
 
 #include <concepts>
+#include <cstdint>
 #include <type_traits>
 #include <vector>
 
@@ -40,6 +41,28 @@ concept PhysicsDeclaration = requires(
 
 	{ d.bindings } -> std::same_as<PhysicsRuntimeBindings&>;
 };
+
+enum class RenderCorrectionMode : uint8_t
+{
+	Smooth,
+	SnapInRootFrame
+};
+
+template <typename D>
+constexpr RenderCorrectionMode renderCorrectionModeOf()
+{
+	if constexpr (requires { D::renderCorrection; })
+	{
+		static_assert(std::is_same_v<std::remove_cv_t<decltype(D::renderCorrection)>, RenderCorrectionMode>,
+			"renderCorrectionModeOf: a declaration's `renderCorrection` member must be exactly a RenderCorrectionMode. Any "
+			"other type is rejected here instead of being read as the default Smooth.");
+		return D::renderCorrection;
+	}
+	else
+	{
+		return RenderCorrectionMode::Smooth;
+	}
+}
 
 namespace physicsDeclarationSelfCheck
 {
@@ -134,4 +157,18 @@ static_assert(std::is_convertible_v<
 		decltype(ProbeMutableNotBodyStateLike::bodyStateOf(constProbeState())), PhysicsBodyState>,
 	"PhysicsDeclaration self-check: DISCRIMINATION. ProbeMutableNotBodyStateLike must be rejected "
 	"for its MUTABLE overload alone - its const overload widens correctly. Guards G-03.");
+
+struct ProbeSnapInRootFrame : Conforming
+{
+	static constexpr RenderCorrectionMode renderCorrection = RenderCorrectionMode::SnapInRootFrame;
+};
+struct ProbeWithoutRenderCorrection : Conforming {};
+
+static_assert(renderCorrectionModeOf<ProbeSnapInRootFrame>() == RenderCorrectionMode::SnapInRootFrame,
+	"renderCorrectionModeOf: a declaration's `renderCorrection` member must be what the trait returns. If this fires, the "
+	"trait no longer reads the member and every opt-in silently smooths.");
+
+static_assert(renderCorrectionModeOf<ProbeWithoutRenderCorrection>() == RenderCorrectionMode::Smooth,
+	"renderCorrectionModeOf: VACUITY CONTROL. A declaration without a `renderCorrection` member must read as Smooth, the "
+	"mode every declaration had before the member existed.");
 } // namespace physicsDeclarationSelfCheck

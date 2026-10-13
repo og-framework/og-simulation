@@ -33,7 +33,9 @@ difference out over a short time. This header is that cure, on top of the pose s
   decays it linearly to zero over a configured time, counted in physics steps;
 - **snap** (§6): a correction too large to hide is dropped, and the body shows the corrected pose at once;
 - **apply** (§7, §8): every frame, the remaining error is added to the pose set, so everything the caller draws from
-  the pose set moves together.
+  the pose set moves together;
+- **per-body mode** (§14): a body whose declaration says `SnapInRootFrame` carries no error of its own and is drawn in
+  its root's smoothed frame.
 
 The reference is the linear error decay of Unreal Engine 5.6's Chaos physics (the single-particle proxy's
 interpolation error data, its pull from the physics state and its rewind data's pre-resimulation cache). §9 lists
@@ -80,7 +82,7 @@ resimulation, the first one on the corrected timeline. The caller passes it thro
 (`SpscRing` in `Mailbox.h` fits), not through the snapshot channel: the channel keeps only the newest few snapshots and
 may skip one the render never needed, but a correction must never be skipped, or that correction pops.
 
-`RenderCorrectionSmoother::correctPoses(corrections, frame, params, poses, summary)` drains the ring every frame and keeps
+`RenderCorrectionSmoother::correctPoses(corrections, frame, params, poses, summary, next)` drains the ring every frame and keeps
 each correction **pending** until the render's bracket reaches it: it is accumulated on the first frame whose *next*
 step (`RenderInterpolationFrame::nextStep`) is at or after its carrier step. That is the frame on which the bracket
 first blends towards corrected data.
@@ -98,8 +100,9 @@ list full is dropped and counted as `pendingDrops`.
 
 ## §4 Accumulate
 
-On the frame it is due, each body of the correction (present in the pose set) is accumulated into that body's
-`RenderCorrectionSmoother::BodyError`, exactly as the reference engine accumulates a replication error:
+On the frame it is due, each body of the correction (present in the pose set, and not in `SnapInRootFrame`, §14) is
+accumulated into that body's `RenderCorrectionSmoother::BodyError`, exactly as the reference engine accumulates a
+replication error:
 - the decay window is reset to start at this frame's *next* step: lastStep = next − 1,
   endDecayStep = lastStep + steps, where steps is the configured duration (§5), or 0 for a snap (§6);
 - if the window is open (lastStep < endDecayStep), the new error is **added** to whatever error the body still
@@ -149,7 +152,8 @@ correctionSeconds = 0 every correction snaps, which is how a caller turns the sm
 
 ## §7 Apply, and the straddle
 
-After the update, every body whose window is still open has its error added to its pose in the pose set:
+After the update, and after the root-frame pass of §14, every body whose window is still open has its error added to
+its pose in the pose set:
 - position: pose + lerp(fromError, errorCm, alpha);
 - rotation (a body that carries one): pose × slerp(fromRotation, errorRotation, alpha), in the body's local frame
   as captured (§2). A body without a rotation keeps the rotation the pose set gives it.
@@ -172,12 +176,19 @@ decayed error the next bracket starts from
 (`RenderCorrection.Straddle.TheRenderedPathStaysContinuousAcrossTheCorrectedStepAndMatchesChaossCorrectedPrev`, which
 also shows the same run with zero seconds jumping by more than 40 % of the correction in one frame).
 
+A `SnapInRootFrame` body (§14) has no error, so none of this applies to it; what it draws on the straddle is §15.
+
 ## §8 Per-body lifetime
 
 The smoother keeps one `BodyError` per body key, in a fixed array of `MaxBodies` entries, so a frame allocates
 nothing. Before the accumulations, every error whose body is no longer in the pose set is released (the body left);
 a correction is not accumulated for a body absent from the pose set. So the errors in use are always a subset of the
-pose set's bodies and the array never overflows (an `OG_CHECK` holds it). An error whose window closed is released at
+pose set's bodies and the array never overflows (an `OG_CHECK` holds it). A body in `SnapInRootFrame` (§14) never
+creates one; it may hold a carrier record instead (§15), kept in a second fixed array of `MaxBodies` entries and
+released with the errors when its body leaves the pose set, so that array never overflows either (an `OG_CHECK`
+holds it too). Its mode is fixed by its declaration, so a key keeps its mode while its simulatable stays in the pose set;
+only a simulatable id reused by a different simulatable type, with no frame in between in which the id is absent from
+the pose set, would carry an earlier body's remaining error over, as it would for any reused key. An error whose window closed is released at
 the update that finds it closed
 (`RenderCorrection.Lifetime.AnErrorIsReleasedWhenItsBodyLeavesThePoseSetAndNoneIsCreatedForAnAbsentBody`).
 
@@ -192,6 +203,7 @@ the update that finds it closed
 | directional decay, velocity-based error smoothing | present, off by default (multiplier 0, experimental flag off) | not implemented | both default off |
 | per-body settings override | an optional per-proxy settings struct | one `RenderCorrectionParams` per frame | the project uses the defaults |
 | precision | double positions and quaternions, a single-precision decay factor and alpha | the same | the decay is reproduced bit for bit |
+| a body drawn in its parent's smoothed frame (`SnapInRootFrame`, §14) | no counterpart: each proxy smooths its own error | the body drops its own error and takes its root's applied offset | the game asks for an attached body that shows its corrected pose at once and stays on its root |
 
 `RenderCorrection.Decay.EveryStepMatchesChaossLinearDecayBitForBit` drives the smoother and an engine-free
 transcription of the reference engine's error type (kept in the test, in the engine's own shape) through 24,000
@@ -211,8 +223,12 @@ outside a straddle.
 | `pendingDrops` | corrections dropped because the pending list was full (§3) |
 | `finished`, `finishedSteps`, `maxFinishedSteps` | windows that closed this frame, and their length in steps from the accumulation |
 | `active` | bodies whose error was added to the pose set this frame |
-| `maxErrorCm` | the largest error accumulated this frame, snapped ones included |
-| `maxAppliedCm` | the largest offset added to a pose this frame |
+| `maxErrorCm` | the largest error accumulated this frame, snapped ones (§6) included, `SnapInRootFrame` bodies (§14) not |
+| `maxAppliedCm` | the largest offset added to a pose this frame by the apply loop (§7); the root-frame pass (§14) does not add to it |
+| `policySnaps` | correction bodies not accumulated because their pose body is `SnapInRootFrame` (§14) |
+| `rootFramed` | `SnapInRootFrame` bodies moved by their root's applied offset this frame (§14) |
+| `maxPolicySnapCm`, `maxPolicySnapDeg` | the largest position error and rotation error angle among the bodies counted in `policySnaps` |
+| `straddleSnaps` | `SnapInRootFrame` bodies given *next*'s rotation this frame because the bracket straddles their carrier step (§15) |
 
 ## §11 What stays with the caller
 
@@ -225,7 +241,10 @@ outside a straddle.
 - counting the capture outcomes, and pushing a `Captured` correction into the ring;
 - calling `correctPoses` right after `interpolateRenderPoses`, every frame, and drawing everything from the pose set
   it returns;
-- logging and diagnostics; `appliedErrorCm` reads the offset a body received on the current frame, for a trace.
+- passing `correctPoses` the bracket's *next* snapshot, the copy `interpolateRenderPoses` writes through its
+  `nextCopy` argument, on every frame (§15); without it a `SnapInRootFrame` body is blended across the straddle;
+- logging and diagnostics; `appliedErrorCm` reads the offset a body received on the current frame, for a trace. It
+  returns 0 for a `SnapInRootFrame` body (§14): that body has no error of its own and is drawn with its root's offset.
 
 ## §12 Tests
 
@@ -260,6 +279,32 @@ the counters and the ring) and drives both through 48,000 random steps: publishe
 granted one or two at a time, bodies joining and leaving, corrections below and above the thresholds, integrated ticks
 off by one or more, and a small ring that overflows. It compares the outcome, the counters and every correction that
 leaves the ring, bit for bit, and counts each outcome, so a run that stops reaching one fails.
+
+`RenderCorrectionBodyPolicyTest.cpp` (tag `[RenderInterpolation]`), the per-body mode of §14:
+- `RenderCorrection.BodyPolicy.ASnappedBodyCarriesNoErrorAndItsRootStillSmooths`: a root with a 2 cm error and a
+  `SnapInRootFrame` body with 117° and 2 cm, at the carrier frame with no *prev*: the body has no error, its rotation
+  is the pose's, its position is the pose's plus the root's applied offset, the counters read one snap of 117°, and the
+  root's error and pose are byte-equal to a run without the body.
+- `RenderCorrection.BodyPolicy.TheSnappedBodyKeepsItsOffsetFromItsRootOnEveryFrame`: two simulatables, each with a
+  snapped body, a smoothed body and a root, over 5,000 random frames (steps advancing by −1 to 3, straddles, roots
+  snapped above the maximum, three parameter sets), with a *next* snapshot whose poses differ from the supplied ones:
+  the §14 invariant to 1e-3 cm on every frame, and the exact rotation, which is *next*'s on the frames an
+  independent model of §15's carrier records says straddle a carrier step and the supplied one on every other frame;
+  `straddleSnaps` equals the model's count every frame. It counts root-framed frames, straddled root frames, frames
+  given the carrier rotation and root snaps, so a run that stops reaching one fails.
+- `RenderCorrection.BodyPolicy.BodiesWithoutThePolicyAreBitExactWithAndWithoutASnappedNeighbour`: the same random
+  frames run with the snapped bodies and without them. Every other body's `BodyError` and pose are byte-equal between
+  the two runs and the frame summary's existing fields are equal; all three are equal in value to an independent
+  transcription of the smoother as it was before §14. The transcription is compared by value, not by bytes: the compiler may fold the
+  shared identity slerp differently in the two copies and give a zero of the other sign. The two smoothers are passed
+  their *next* snapshots (§15); the transcription has none.
+- `RenderCorrection.BodyPolicy.OnTheStraddleASnappedBodyTakesTheCarrierPose`: a root with a 2 cm error and a
+  `SnapInRootFrame` body whose rotation differs between the old step and the carrier step, drawn through the real
+  `blendRenderPoses`. On the straddle at alpha 0.3 and 0.8 the body's rotation is *next*'s, byte for byte, and
+  `straddleSnaps` is 1; its position is the blended one plus the root's applied offset, so the §14 offset holds to
+  1e-3 cm and the body is not at *next*'s position. On the four brackets after it (both steps corrected) the rotation
+  is the plain blend, byte for byte, and `straddleSnaps` is 0. Every frame checks that the blend differs from *next*'s
+  rotation, so the comparison can fail.
 
 ## §13 The capture object: `RenderCorrectionCapture`
 
@@ -299,3 +344,96 @@ outcomes, and only its first `bodyCount` bodies; the bodies after them keep what
 push `out` into the ring of §3. The object holds no correction of its own, so the caller's `out` may live on the
 stepping thread's stack. Nothing else reads the object: it has no synchronization and needs none, because the snapshot
 copy, the scratch and the count are touched only by the thread that steps.
+
+## §14 Per-body correction mode
+
+A declaration may say that its body is not smoothed: `RenderCorrectionMode::SnapInRootFrame`
+(`PhysicsDeclaration-rationale.md` §7). `fillRenderSnapshot` copies the mode and the root mark into every
+`RenderBody` (`renderCorrection`, `isRoot`; `RenderSnapshot-rationale.md` §5), and the interpolation copies
+the bodies of its *next* snapshot into the pose set, so the smoother reads both from the pose set it is
+handed. The mode is a compile-time property of the declaration. There is no runtime switch: a body in
+`SnapInRootFrame` takes the path below on every frame.
+
+**What it is for.** A body attached to a moving root (a weapon held by a character) is corrected
+together with the root. Smoothing its own error blends its rotation across whatever it did between the
+old and the corrected timeline, which can show motion that never happened. Dropping its error alone
+would draw it at its corrected pose while the root still glides by its own decaying error, so it would
+leave the root by that error. Drawing it in its root's smoothed frame keeps both: its corrected rotation
+and its corrected place relative to the root, from the first frame that draws the corrected step.
+
+**Accumulate.** For a correction body whose pose body is `SnapInRootFrame`, no `BodyError` is created or
+changed: there is no window, and `smoothedBodies` and `snappedBodies` do not count it. It is counted in
+`policySnaps`, its position error length is folded into `maxPolicySnapCm` and its rotation error angle,
+2·acos(min(1, |w|)) in degrees, into `maxPolicySnapDeg`. `corrections` still counts the correction it
+came in. `maxErrorCm` does not include it.
+
+**The root-frame pass.** After the update and before the apply loop of §7, with the same alpha, every
+pose body in `SnapInRootFrame` is moved by its root's applied offset:
+- the root is the pose body with `isRoot` and the same `simulatableId`, found within that simulatable's
+  key range of the sorted pose set;
+- if the root has an error in use whose window is open, the body's position becomes
+  pose + `appliedErrorCm` of the root's error, the same function and the same expression the apply loop
+  then uses to move the root itself, and `rootFramed` counts the body;
+- the rotation is the pose's, untouched.
+
+The offset is read from the root's `BodyError`, not from the root's already moved pose, so the order of
+the two loops does not matter.
+
+**The invariant.** On every frame, rendered(body) − rendered(root) = pose(body) − pose(root), up to the
+rounding of the two single-precision positions, and rendered(body).rotation = pose(body).rotation exactly,
+except on the straddle of the body's own carrier step, where it is *next*'s rotation exactly (§15).
+So a snapped body keeps the offset from its root that the interpolation gave it, whether the root is
+smoothing, has snapped (§6) or has no error, on a straddle (§7) or not.
+
+**Only a translating root.** The root's correction error is composed as a translation only. A root with a
+rotation fails an `OG_CHECK`: composing its frame would also need its rotation error applied to the
+body's lever arm, which no root needs today. A body in `SnapInRootFrame` with no root in the pose set
+fails an `OG_CHECK` too. A root that declares `SnapInRootFrame` fails one in `fillRenderSnapshot`
+(`RenderSnapshot-rationale.md` §5). All three are runtime checks with no unit test.
+
+**Everything else is unchanged.** A body without the mode takes exactly the path of §4–§8, bit for bit,
+whether or not a snapped body of the same simulatable is present: the snapped body never takes an error
+slot, never feeds `maxErrorCm`, and the root-frame pass writes only snapped bodies.
+`appliedErrorCm(frame, simulatableId, declarationIndex)` returns 0 for a snapped body: it has no
+`BodyError`, and the offset it is drawn with is its root's.
+
+**The capture is unchanged.** `captureRenderCorrection` and `RenderCorrectionCapture` still record a
+snapped body's error, so the step-side capture is the same for every body; only the game-thread smoother
+decides, and it counts what it dropped.
+
+## §15 The straddle for a snapped body
+
+A `SnapInRootFrame` body (§14) carries no error, so on every frame it is drawn at the interpolated pose in its root's
+frame. The interpolation itself still blends it across the straddle (§7): *prev* is the last step of the old timeline
+and *next* the carrier step, so for one step the body's rotation turns from the old pose to the corrected one. When
+the correction changed the body's rotation (an attached body that the corrected timeline has already turned), that
+blend draws, for a frame or two, a rotation that neither timeline had.
+
+So `correctPoses` takes the bracket's *next* snapshot as its optional last argument, `next` (the copy
+`interpolateRenderPoses` writes through `nextCopy`; `RenderInterpolation-rationale.md`), and on the straddle such a
+body takes *next*'s rotation unblended:
+- **The carrier record.** When §14's accumulate drops a correction body for its mode, it also records the body's key
+  and the correction's carrier step (`RenderCorrectionT::physicsStep`, §3) in a `RenderCorrectionSmoother::PolicyCarrier`,
+  in a fixed array of `MaxBodies` entries. A later correction for the same body overwrites the step.
+- **The pass**, after the update and before the root-frame pass of §14. For each record: when the frame has a *prev*,
+  *prev* is before the carrier step and *next* at or after it (prevStep < correctionStep ≤ nextStep), `next` is
+  given, and the body carries a rotation, the pose body's rotation becomes *next*'s body's rotation, and
+  `straddleSnaps` counts it.
+- **Release.** A record is released in that pass on the first frame with no *prev*, or whose *prev* is at or after
+  the carrier step: the bracket has left the straddle, and from there the blend is between two corrected steps. It is
+  also released, before the accumulations, when its body leaves the pose set (§8). A *next* step that went back
+  before the carrier step keeps the record and takes nothing.
+- **Not the position.** On the straddle the root is still blending from its old-timeline pose, compensated by its
+  pre-correction error (§7). The body's position stays the blended one plus the root's applied offset (§14), so it
+  stays where the root's frame puts it. *next*'s position is where the body will be at alpha 1; copied now, it would
+  leave the root by up to (1 − alpha) times the root's motion over the step and its correction. Only the rotation,
+  the part whose blend shows an orientation neither timeline had, is taken.
+- **Without `next`** (a null pointer, the default) nothing is taken and the body is blended as before; the records
+  are still kept and released, so a caller may pass it on some frames only.
+
+**What a viewer sees.** No in-between rotation at a correction. The corrected rotation appears up to one step early:
+from the first straddle frame (alpha below 1) the body shows the carrier step's rotation, at most one step's worth of
+rotation ahead of where the blend would have it. On every other bracket the rotation is the plain blend.
+
+Nothing else changes: a body without the mode is never recorded, so the paths of §4–§8 are untouched, and the step-side
+capture records the snapped body's error as before (§14).

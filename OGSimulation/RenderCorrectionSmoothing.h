@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <numbers>
 #include <type_traits>
 
 #include "glm/geometric.hpp"
@@ -15,6 +16,7 @@
 #include "glm/vec3.hpp"
 #include "OGSimulation/OGAssert.h"
 #include "OGSimulation/PhysicsBodyState.h"
+#include "OGSimulation/PhysicsDeclaration.h"
 #include "OGSimulation/RenderInterpolation.h"
 #include "OGSimulation/RenderSnapshot.h"
 #include "OGSimulation/SimulationObjectStorage.h"
@@ -66,6 +68,11 @@ struct RenderCorrectionFrame
 	uint32_t active = 0;
 	double maxErrorCm = 0.0;
 	double maxAppliedCm = 0.0;
+	uint32_t policySnaps = 0;
+	uint32_t rootFramed = 0;
+	double maxPolicySnapCm = 0.0;
+	double maxPolicySnapDeg = 0.0;
+	uint32_t straddleSnaps = 0;
 };
 
 static_assert(std::is_trivially_copyable_v<RenderCorrectionBody> && std::is_trivially_copyable_v<RenderCorrectionParams>
@@ -127,6 +134,16 @@ namespace renderCorrectionDetail
 	inline bool keyLess(const RenderCorrectionBody& body, uint32_t simulatableId, uint8_t declarationIndex)
 	{
 		return body.simulatableId != simulatableId ? body.simulatableId < simulatableId : body.declarationIndex < declarationIndex;
+	}
+
+	inline double rotationDegrees(const glm::dquat& rotation)
+	{
+		return 2.0 * std::acos(std::min(1.0, std::abs(rotation.w))) * (180.0 / std::numbers::pi);
+	}
+
+	inline bool snapsInRootFrame(const RenderBody& body)
+	{
+		return body.renderCorrection == static_cast<uint8_t>(RenderCorrectionMode::SnapInRootFrame);
 	}
 } // namespace renderCorrectionDetail
 
@@ -324,13 +341,22 @@ public:
 		bool isSmoothing() const { return lastStep < endDecayStep; }
 	};
 
-	static_assert(std::is_trivially_copyable_v<Correction> && std::is_trivially_copyable_v<BodyError>,
-		"RenderCorrectionSmoother keeps its corrections and per-body errors in fixed arrays of flat values, so a frame "
-		"allocates nothing. Was task 19's allocation-free render path, extended by task 57.");
+	struct PolicyCarrier
+	{
+		uint32_t simulatableId = 0;
+		uint8_t declarationIndex = 0;
+		bool inUse = false;
+		uint64_t correctionStep = 0;
+	};
+
+	static_assert(std::is_trivially_copyable_v<Correction> && std::is_trivially_copyable_v<BodyError>
+			&& std::is_trivially_copyable_v<PolicyCarrier>,
+		"RenderCorrectionSmoother keeps its corrections, per-body errors and policy carrier steps in fixed arrays of flat "
+		"values, so a frame allocates nothing. Was task 19's allocation-free render path, extended by tasks 57 and 76.");
 
 	template <typename Ring>
 	void correctPoses(Ring& corrections, const RenderInterpolationFrame& frame, const RenderCorrectionParams& params,
-		Snapshot& poses, RenderCorrectionFrame& summary)
+		Snapshot& poses, RenderCorrectionFrame& summary, const Snapshot* next = nullptr)
 	{
 		RenderCorrectionFrame result;
 		while (auto correction = corrections.tryPop())
@@ -379,7 +405,9 @@ public:
 		m_lastNextStep = frame.nextStep;
 		m_hasLastNextStep = true;
 
+		takeCarrierRotationsOnTheStraddle(frame, next, poses, result);
 		const double alpha = static_cast<double>(static_cast<float>(frame.alpha));
+		drawSnappedBodiesInRootFrame(frame, alpha, poses, result);
 		for (const BodyError& error : m_errors)
 		{
 			if (!error.inUse || !error.isSmoothing())
@@ -430,6 +458,7 @@ public:
 	void reset()
 	{
 		m_errors = {};
+		m_policyCarriers = {};
 		m_pendingCount = 0;
 		m_lastNextStep = 0;
 		m_hasLastNextStep = false;
@@ -439,6 +468,76 @@ private:
 	static RenderBody* findPoseBody(Snapshot& poses, uint32_t simulatableId, uint8_t declarationIndex)
 	{
 		return const_cast<RenderBody*>(findRenderBody(static_cast<const Snapshot&>(poses), simulatableId, declarationIndex));
+	}
+
+	static const RenderBody* findRootBody(const Snapshot& poses, uint32_t simulatableId)
+	{
+		RenderBody key;
+		key.simulatableId = simulatableId;
+		const RenderBody* const end = poses.bodies.data() + poses.bodyCount;
+		const RenderBody* const first = std::lower_bound(poses.bodies.data(), end, key, &renderSnapshotDetail::keyLess);
+		for (const RenderBody* body = first; body != end && body->simulatableId == simulatableId; ++body)
+		{
+			if (body->isRoot != 0u)
+			{
+				return body;
+			}
+		}
+		return nullptr;
+	}
+
+	void drawSnappedBodiesInRootFrame(const RenderInterpolationFrame& frame, double alpha, Snapshot& poses, RenderCorrectionFrame& result) const
+	{
+		for (uint16_t index = 0; index < poses.bodyCount; ++index)
+		{
+			RenderBody& body = poses.bodies[index];
+			if (!renderCorrectionDetail::snapsInRootFrame(body))
+			{
+				continue;
+			}
+			const RenderBody* const root = findRootBody(poses, body.simulatableId);
+			OG_CHECK(root != nullptr, "RenderCorrectionSmoother: a body drawn in its root's frame has no root body in the pose set; its simulatable must have exactly one isRoot body");
+			if (root == nullptr)
+			{
+				continue;
+			}
+			OG_CHECK(root->hasRotation == 0u, "RenderCorrectionSmoother: a body drawn in its root's frame has a root that carries a rotation; only a translating root's frame is composed, a rotating root's error would also have to turn the body's lever arm");
+			const BodyError* const rootError = findError(root->simulatableId, root->declarationIndex);
+			if (rootError != nullptr && rootError->isSmoothing())
+			{
+				body.positionCm = glm::vec3(glm::dvec3(body.positionCm) + appliedErrorCm(*rootError, frame, alpha));
+				++result.rootFramed;
+			}
+		}
+	}
+
+	void takeCarrierRotationsOnTheStraddle(const RenderInterpolationFrame& frame, const Snapshot* next, Snapshot& poses,
+		RenderCorrectionFrame& result)
+	{
+		for (PolicyCarrier& carrier : m_policyCarriers)
+		{
+			if (!carrier.inUse)
+			{
+				continue;
+			}
+			if (!frame.hasPrev || frame.prevStep >= carrier.correctionStep)
+			{
+				carrier = PolicyCarrier{};
+				continue;
+			}
+			if (next == nullptr || carrier.correctionStep > frame.nextStep)
+			{
+				continue;
+			}
+			RenderBody* const body = findPoseBody(poses, carrier.simulatableId, carrier.declarationIndex);
+			const RenderBody* const carried = findRenderBody(*next, carrier.simulatableId, carrier.declarationIndex);
+			if (body == nullptr || carried == nullptr || body->hasRotation == 0u)
+			{
+				continue;
+			}
+			body->rotation = carried->rotation;
+			++result.straddleSnaps;
+		}
 	}
 
 	static bool straddlesCorrection(const BodyError& error, const RenderInterpolationFrame& frame)
@@ -466,6 +565,39 @@ private:
 			{
 				error = BodyError{};
 			}
+		}
+		for (PolicyCarrier& carrier : m_policyCarriers)
+		{
+			if (carrier.inUse && findRenderBody(poses, carrier.simulatableId, carrier.declarationIndex) == nullptr)
+			{
+				carrier = PolicyCarrier{};
+			}
+		}
+	}
+
+	void recordPolicyCarrier(uint32_t simulatableId, uint8_t declarationIndex, uint64_t correctionStep)
+	{
+		PolicyCarrier* free = nullptr;
+		for (PolicyCarrier& carrier : m_policyCarriers)
+		{
+			if (carrier.inUse && carrier.simulatableId == simulatableId && carrier.declarationIndex == declarationIndex)
+			{
+				carrier.correctionStep = correctionStep;
+				return;
+			}
+			if (!carrier.inUse && free == nullptr)
+			{
+				free = &carrier;
+			}
+		}
+		OG_CHECK(free != nullptr, "RenderCorrectionSmoother: more bodies carry a policy carrier step than the pose set holds; "
+			"every carrier of a body that left the pose set is released before a correction is accumulated");
+		if (free != nullptr)
+		{
+			free->simulatableId = simulatableId;
+			free->declarationIndex = declarationIndex;
+			free->inUse = true;
+			free->correctionStep = correctionStep;
 		}
 	}
 
@@ -503,8 +635,17 @@ private:
 		for (uint16_t index = 0; index < correction.bodyCount; ++index)
 		{
 			const RenderCorrectionBody& body = correction.bodies[index];
-			if (findRenderBody(poses, body.simulatableId, body.declarationIndex) == nullptr)
+			const RenderBody* const poseBody = findRenderBody(poses, body.simulatableId, body.declarationIndex);
+			if (poseBody == nullptr)
 			{
+				continue;
+			}
+			if (renderCorrectionDetail::snapsInRootFrame(*poseBody))
+			{
+				++result.policySnaps;
+				result.maxPolicySnapCm = std::max(result.maxPolicySnapCm, glm::length(body.errorCm));
+				result.maxPolicySnapDeg = std::max(result.maxPolicySnapDeg, renderCorrectionDetail::rotationDegrees(body.errorRotation));
+				recordPolicyCarrier(body.simulatableId, body.declarationIndex, correction.physicsStep);
 				continue;
 			}
 			BodyError* const error = findOrAddError(body.simulatableId, body.declarationIndex);
@@ -594,6 +735,7 @@ private:
 	}
 
 	std::array<BodyError, MaxBodies> m_errors{};
+	std::array<PolicyCarrier, MaxBodies> m_policyCarriers{};
 	std::array<Correction, MaxPending> m_pending{};
 	size_t m_pendingCount = 0;
 	uint64_t m_lastNextStep = 0;

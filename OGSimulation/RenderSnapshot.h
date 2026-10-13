@@ -13,6 +13,7 @@
 #include "glm/vec3.hpp"
 #include "OGSimulation/OGAssert.h"
 #include "OGSimulation/PhysicsBodyState.h"
+#include "OGSimulation/PhysicsDeclaration.h"
 #include "OGSimulation/PhysicsWorldAdapter.h"
 #include "OGSimulation/SimulationObjectStorage.h"
 #include "OGSimulation/SimulationTimeContext.h"
@@ -23,6 +24,8 @@ struct RenderBody
 	uint32_t simulatableId = 0;
 	uint8_t declarationIndex = 0;
 	uint8_t hasRotation = 0;
+	uint8_t renderCorrection = 0;
+	uint8_t isRoot = 0;
 	glm::vec3 positionCm{ 0.f };
 	glm::quat rotation{ 1.f, 0.f, 0.f, 0.f };
 };
@@ -96,6 +99,17 @@ void fillRenderSnapshot(RenderSnapshotT<MaxBodies>& snapshot,
 			out.simulatableId = static_cast<uint32_t>(simulatableId);
 			out.declarationIndex = static_cast<uint8_t>(index);
 			out.hasRotation = hasRotation ? uint8_t{ 1 } : uint8_t{ 0 };
+			out.renderCorrection = static_cast<uint8_t>(renderCorrectionModeOf<D>());
+			if constexpr (requires { D::descriptor(); })
+			{
+				out.isRoot = D::descriptor().body.isRoot ? uint8_t{ 1 } : uint8_t{ 0 };
+			}
+			else
+			{
+				out.isRoot = 0;
+			}
+			OG_CHECK(!(out.isRoot != 0u && renderCorrectionModeOf<D>() == RenderCorrectionMode::SnapInRootFrame),
+				"fillRenderSnapshot: a root body declares RenderCorrectionMode::SnapInRootFrame; a root has no root frame to be drawn in, and the bodies drawn in its frame need its own error");
 			out.positionCm = body.position;
 			out.rotation = hasRotation ? body.rotation : glm::quat(1.f, 0.f, 0.f, 0.f);
 		});
