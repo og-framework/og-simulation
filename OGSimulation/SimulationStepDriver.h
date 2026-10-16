@@ -11,7 +11,6 @@
 #include "OGSimulation/BodySlotOccupancy.h"
 #include "OGSimulation/OGAssert.h"
 #include "OGSimulation/PhysicsWorldAdapter.h"
-#include "OGSimulation/SimulationIntegrationExecutor.h"
 #include "OGSimulation/SimulationManager.h"
 #include "OGSimulation/SimulationTimeContext.h"
 #include "OGSimulation/StepHooks.h"
@@ -29,16 +28,13 @@ struct StepDriverConfig
 	uint32_t alwaysDepthTicks = 0;
 };
 
-template <typename ManagerT, PhysicsWorldAdapter WorldT, typename IntegrationExecT, StepHooks HooksT>
-	requires SimulationIntegrationExecutorConcept<IntegrationExecT>
+template <typename ManagerT, PhysicsWorldAdapter WorldT, StepHooks HooksT>
 class SimulationStepDriver
 {
 public:
-	SimulationStepDriver(ManagerT& manager, WorldT& world, IntegrationExecT& integration, HooksT& hooks,
-		const StepDriverConfig& config)
+	SimulationStepDriver(ManagerT& manager, WorldT& world, HooksT& hooks, const StepDriverConfig& config)
 		: m_manager(manager)
 		, m_world(world)
-		, m_integration(integration)
 		, m_hooks(hooks)
 		, m_config(config)
 		, m_isClient(manager.runsPrediction())
@@ -219,7 +215,6 @@ private:
 		OG_CHECK(restored, "SimulationStepDriver: restoreTick failed for a tick hasTick reported held");
 		applyOccupancy(occupancyAt(*anchor));
 		m_manager.prepareResimulation(static_cast<int32_t>(physicsStep), *anchor);
-		m_integration.pushCorrectedBodyStatesAll();
 
 		// ⛔G-04  docs/SimulationStepDriver-guards.md
 		const uint32_t replayTicks = present - *anchor;
@@ -316,7 +311,6 @@ private:
 
 	ManagerT& m_manager;
 	WorldT& m_world;
-	IntegrationExecT& m_integration;
 	HooksT& m_hooks;
 	const StepDriverConfig m_config;
 	const bool m_isClient;

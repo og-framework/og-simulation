@@ -1445,3 +1445,31 @@ returns, which is the only point at which `advancePrediction` has decided it.
 for a `HardResync`). A caller that must react to a HardResync learns of it from a
 `ClientPredictionClock` resync callback, which fires inside `advancePrediction`; the step driver
 does exactly that.
+
+### `prepareResimulation` pushes
+
+`prepareResimulation` ends with the integration executor's push, `pushCorrectedBodyStatesAll`: after
+the probe note, the clock's resim cursor (`startResimulation`), the cache restore (`prepareResimAll`)
+and the first-resim-step hook (`firstResimStepAll`), it writes each declaration's restored body state
+into the host's physics world. Its requires-clause already named `SimulationIntegrationExecutorConcept`,
+so the call needed no new constraint, and the function stays `void`.
+
+**Why the push lives here.** This is the push's only production caller. A host that runs a rollback
+therefore depends on the manager and on its own physics world, and never on the integration executor:
+the step driver holds no executor, and an engine-scheduled host holds no forwarder to one.
+
+**The precondition.** The host's physics world already holds `simTick` when this is called; the
+fence above the function says so, and nothing checks it. Each kind of host meets it in its own way:
+* a step-driving host (`SimulationStepDriver`) restores its world's snapshot of the anchor, and applies
+  that tick's slot occupancy, before it calls `prepareResimulation`;
+* an engine-scheduled host calls `prepareResimulation` from the engine's first-resim-step hook, which
+  the engine runs after its own rewind of the physics world.
+
+**Why the push runs last.** It reads the og-sim state `prepareResimAll` has just restored from the
+correction cache, and compares each declaration with the restored body (`SimulationStepDriver-rationale.md`
+§9). Above the restore it would write the present-tick state into the anchor's world.
+
+**The known limitation.** `prepareResimAll` restores a simulatable only when its cache holds a slot
+for `simTick` (`[ResimCheck.PrepareRestore] found=1`). A simulatable whose anchor slot is missing
+(`found=0`, for example one that joined after the anchor) keeps its present-tick state, and the push
+writes that state into the anchor's world as it is.

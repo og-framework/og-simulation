@@ -20,16 +20,15 @@ engine and no other repository.
 ## §1 What it is
 
 One `runTick(physicsStep)` per physics step the scheduler issues (`SimulationScheduler.h`). Each call
-drives the `SimulationManager`, the physics world (any `PhysicsWorldAdapter`), the integration
-executor and the host's `StepHooks` in a fixed order, on one thread. It replaces the four physics
+drives the `SimulationManager`, the physics world (any `PhysicsWorldAdapter`) and the host's
+`StepHooks` in a fixed order, on one thread. It replaces the four physics
 callbacks a host engine used to call into the manager (pre-simulate step, post-solve step, rewind
 request, first resim step) with one function the core owns.
 
 | template parameter | what the driver uses |
 |---|---|
-| `ManagerT` | a `SimulationManager` (duck-typed): `runsPrediction`, `onGameSimulation`, `onPostGameSimulation`, `onCheckIsSimilar`, `prepareResimulation`, `currentIntegratedTick`, `lastIntegratedStep`, `editResimGateProbe`, `editClientClock` / `getClientClock`, `getServerClock` |
+| `ManagerT` | a `SimulationManager` (duck-typed): `runsPrediction`, `onGameSimulation`, `onPostGameSimulation`, `onCheckIsSimilar`, `prepareResimulation` (which also pushes the restored bodies into the world, §9), `currentIntegratedTick`, `lastIntegratedStep`, `editResimGateProbe`, `editClientClock` / `getClientClock`, `getServerClock` |
 | `WorldT` | a `PhysicsWorldAdapter`: the step, the snapshot ring keyed by sim tick, the scratch slot, occupancy |
-| `IntegrationExecT` | a `SimulationIntegrationExecutorConcept`: `pushCorrectedBodyStatesAll` after a rollback (§9) |
 | `HooksT` | `StepHooks` (`StepHooks.h`): `beforeTick`, `beforeSimulate`, `beforePhysics`, `afterTick` |
 
 The role comes from `manager.runsPrediction()` at construction. A predicting client saves ticks and
@@ -90,14 +89,13 @@ tick, exactly as it did when an engine refused a rewind.
 1. `world.restoreTick(anchor)`, with an `OG_CHECK` on false: `hasTick` said it was held, so a failed
    restore is a backend defect, never a load condition.
 2. `world.applyOccupancy(occ[anchor])` (§6).
-3. `manager.prepareResimulation(physicsStep, anchor)`: the clock's resim cursor goes to the anchor
-   and og-sim state is restored from the correction cache.
-4. `integration.pushCorrectedBodyStatesAll()`: the restored og-sim body states are written into the
-   physics world (§9). Only the declarations that differ from the restored physics body are written:
-   step 1 already put back the world's own snapshot of the anchor, and for a declaration nobody
-   corrected that snapshot already holds the cached state, so a resim with no correction writes nothing
-   and replays exactly what the unreplayed run computed.
-5. **Exactly `predictionTick - anchor` replay steps** (guard G-04; user ruling Q1: one physics step
+3. `manager.prepareResimulation(physicsStep, anchor)`: the clock's resim cursor goes to the anchor,
+   og-sim state is restored from the correction cache, and then the push: the manager's last statement
+   writes the restored og-sim body states into the physics world (§9). Only the declarations that
+   differ from the restored physics body are written: step 1 already put back the world's own snapshot
+   of the anchor, and for a declaration nobody corrected that snapshot already holds the cached state,
+   so a resim with no correction writes nothing and replays exactly what the unreplayed run computed.
+4. **Exactly `predictionTick - anchor` replay steps** (guard G-04; user ruling Q1: one physics step
    per sim tick, Stall and Skip multiplicity not reproduced). For replayed tick `t`:
    `applyOccupancy(occ[t])`, `onGameSimulation({resim, first})`, `world.step(dt)`,
    `onPostGameSimulation({resim, first})`, `world.saveTick(manager.currentIntegratedTick())`.
@@ -252,7 +250,7 @@ test-only.
 After `prepareResimulation` restored og-sim state from the cache, the physics bodies must carry the
 same state before the first replay step. `SimulationIntegrationExecutor::pushCorrectedBodyStatesAll`
 visits every physics declaration of every simulatable and first compares the declaration's state with
-the adapter's capture of the restored body (`captureBodyState`), exactly: all four fields for a full
+the adapter's read of the restored body (below), exactly: all four fields for a full
 `PhysicsBodyState`, position and linear velocity for a `LinearBodyState`. An equal declaration is
 skipped (the restore skip). Otherwise it writes:
 - position and linear velocity, always;
@@ -276,10 +274,38 @@ matrix path: a full declaration writes one transform built from position and rot
 reads the body's transform, replaces its translation, and writes it back. The matrix path costs a
 quaternion-to-matrix-to-quaternion round trip, which can change rotation bits.
 
+**Which read of the restored body.** Both uses above (the skip's comparison and a linear
+declaration's rotation) take one value per declaration. It must be the state the first replayed step
+will start integrating from. When the adapter models the optional `PhysicsBodyStartOfStepReader`
+capability (`PhysicsBodyAdapter.h`), the push reads it with `captureStartOfStepBodyState`; otherwise
+with `captureBodyState`. The branch is an `if constexpr`, so an adapter without the capability runs
+exactly the code it ran before the capability existed.
+- On the Jolt backend `captureBodyState` is already that state: the world's `restoreTick` put back the
+  snapshot, and the capture reads it.
+- On the Chaos backend it is not. `captureBodyState` reads the solved pose (P/Q), which the
+  post-solve capture needs, while the engine's rewind restores X/R/V/W and leaves P/Q stale; the replay
+  integrates from X/R. Comparing with P/Q could skip a corrected body whose stale P happens to equal
+  the cache, and a linear declaration would get the stale rotation. The Chaos adapter therefore
+  models the capability and reads X/R/V/W.
+
+**The skip runs on every backend.** For an adapter whose writes are exact (Chaos: the same
+centimetres, and float-to-double copies) the skip only saves a write that would change nothing og-sim
+can read back, so no "lossless" flag exists to turn it off. On Chaos it does change something below
+float precision: the engine keeps doubles, so a skipped body keeps its full double state and is not
+woken, where a write would round it to float and wake it.
+
+**The wire shape decides the fields.** The rule that a `LinearBodyState` declaration writes position
+and linear velocity (plus its own restored rotation through `setBodyPose`) and a full
+`PhysicsBodyState` declaration all four fields is the push's
+`if constexpr (std::is_same_v<BodyStateT, PhysicsBodyState>)` branch. No backend restates it.
+
 This is the engine-free port of an engine adapter's direct writes of position, velocity, rotation
 and angular velocity at the first resim step. It goes through the `PhysicsBodyAdapter` seam
 (`setBodyTransform` or `setBodyPose`, `setBodyLinearVelocity`, `setBodyAngularVelocity`), so any backend
-receives it.
+receives it. It has one production caller, `SimulationManager::prepareResimulation`, which calls it
+last, after the cache restore. Both kinds of host reach it there: the step driver (§3, step 3 of a
+granted resim, after it restored its world), and on the Chaos backend the engine host's
+first-resim-step hook, which calls `prepareResimulation` after the engine's own rewind.
 
 ## §10 The physics step handed to the manager
 

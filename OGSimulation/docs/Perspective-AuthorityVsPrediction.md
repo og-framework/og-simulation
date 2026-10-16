@@ -215,7 +215,7 @@ two early returns on `runsPrediction()` in the adapter's own physics callback: t
 whether to ask for a rewind, and the one that runs on the first replayed step.
 (One adapter's binding: `FSimulationManagerAsyncCallback::TriggerRewindIfNeeded_Internal`
 and `FSimulationManagerAsyncCallback::FirstPreResimStep_Internal`, both in
-`Source/OGBrawlerUnreal/SimulationManagerUImpl.cpp`.) There is no second line of defence inside the
+`Source/OGBrawlerUnreal/ChaosBackendUImpl.cpp`.) There is no second line of defence inside the
 sweeps themselves, and that is a deliberate, stated position rather than an oversight: the audit
 that considered adding a capture-side check and **rejected** it is recorded above `postPredictionAll`
 in `<core>SimulationReconciliation.h`.
@@ -277,8 +277,8 @@ disagree. The fence saying so is at both sites.
 
 ## 7. The resim cycle — six phases, all client-side
 
-    checkDivergenceAll → prepareResimAll + firstResimStepAll → replay → postResimulationAll
-      → applyResimAll → consumeResimAnchorsAll
+    checkDivergenceAll → prepareResimAll + firstResimStepAll + pushCorrectedBodyStatesAll → replay
+      → postResimulationAll → applyResimAll → consumeResimAnchorsAll
 
 Every one of those is `⛔` on the authority (§2 rows 16–23). The cycle is driven from the physics
 thread through the adapter's rewind hooks — the callbacks by which a host physics engine asks the
@@ -288,7 +288,7 @@ core whether to rewind and then drives the replay (one adapter binds these to Ch
 | phase | manager entry | reconciliation / executor call |
 |---|---|---|
 | ask | `onCheckIsSimilar` | `checkDivergenceAll(maxAnchorDepthTicks, &deepSkips)` |
-| arm | `prepareResimulation` | `prepareResimAll(simTick)` + `firstResimStepAll(physicsStep)` |
+| arm | `prepareResimulation` | `prepareResimAll(simTick)` + `firstResimStepAll(physicsStep)` + `pushCorrectedBodyStatesAll()` |
 | replay | `onGameSimulationResimulation` (once per replayed tick) | `collectResimInputAll` + `integrateAll` |
 | record | `onPostGameSimulation`, resim branch | `postResimulationAll` |
 | land | `onPostGameSimulation`, catch-up edge | `applyResimAll` |

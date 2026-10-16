@@ -156,8 +156,8 @@ concept SimulationSystemsExecutorConcept = requires(
 //     atomics.
 //     ⭐ ONE ADAPTER'S BINDING FOR THE CALLBACK COLUMN BELOW: it names the
 //     physics-callback ROLE, never an engine type. One adapter binds those
-//     roles on `FSimulationManagerAsyncCallback` (`OGSimulationUnreal`,
-//     `SimulationManagerUImpl.cpp`), where that one adapter's names are
+//     roles on `FSimulationManagerAsyncCallback` (`OGBrawlerUnreal`,
+//     `ChaosBackendUImpl.h/.cpp`), where that one adapter's names are
 //     `OnPreSimulate_Internal` (pre-simulate step), `OnPostSolve_Internal`
 //     (post-solve step),
 //     `TriggerRewindIfNeeded_Internal` (rewind request) and
@@ -169,6 +169,9 @@ concept SimulationSystemsExecutorConcept = requires(
 //       post-solve step              onPostGameSimulation   returns early
 //       rewind request               onCheckIsSimilar       never reached
 //       first resim step             prepareResimulation    never reached
+//
+//     `prepareResimulation` also writes the restored bodies into the host's
+//     already-restored world (the integration executor's push).
 //
 //   * ⛔ THE `TimeConfig` RE-READ RULE, AND ITS SCOPE IS ALL THREE VALUES. This
 //     class is the sole reader-and-hander-down of `TimeConfig` into the peers,
@@ -503,7 +506,10 @@ public:
     // `physicsStep` is the raw physics-engine step; `simTick` is the tick to resim from.
     // ⛔ THE LOG TOKEN `chaosStep=` IS A FROZEN SPELLING — archived greps key on it, so it
     // survived the parameter's rename to `physicsStep`. Do not rename the token. §12
-    // ⛔ Peer members this requires-clause covers: `prepareResimAll`, `firstResimStepAll`. §2
+    // ⛔ Peer members this requires-clause covers: `prepareResimAll`, `firstResimStepAll`,
+    // `pushCorrectedBodyStatesAll`. §2
+    // ⛔ PRECONDITION: the host's physics world already holds `simTick`. This call arms the
+    // clock, restores og-sim state, and then, last, writes the restored bodies into that world. §12
     void prepareResimulation(int32_t physicsStep, uint32_t simTick)
         requires SimulationReconciliationConcept<ReconciliationT> &&
                  SimulationIntegrationExecutorConcept<IntegrationExecT>
@@ -519,6 +525,7 @@ public:
         m_clientClock->startResimulation(simTick);
         m_reconciliation.prepareResimAll(simTick);
         m_integrationLayer.firstResimStepAll(physicsStep);
+        m_integrationLayer.pushCorrectedBodyStatesAll();
     }
 
     // THE RESIM-GATE PROBE — PHYSICS THREAD.

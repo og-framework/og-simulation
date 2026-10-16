@@ -33,7 +33,8 @@ no other repository open. Where a consumer outside this submodule is named it is
 recorded in §R, with the text they replaced, so the trade is visible rather than silent.
 
 <!-- lint-external-ref: SimulatableBrawler.h -- header of the host game that consumes this submodule; provenance only, not distributed with og-simulation -->
-<!-- lint-external-ref: SimulationManagerUImpl.cpp -- engine-integration translation unit of the host game; provenance only, not distributed with og-simulation -->
+<!-- lint-external-ref: JoltBackendUImpl.cpp -- engine-integration translation unit of the host game; provenance only, not distributed with og-simulation -->
+<!-- lint-external-ref: pushBodyState -- retired name: the host game's rollback-push helper, replaced by pushCorrectedBodyStatesAll; quoted verbatim in G-03 -->
 
 ---
 
@@ -189,6 +190,6 @@ nobody later mistakes it for the check.
 
 ⭐ **Why this is not merely a shorter sentence.** The creation fold in the consuming engine
 integration writes **all five** members of `bindings` after it creates the body
-(`SimulationManagerUImpl.cpp`; provenance, not distributed here). A binding that is read-only, or
+(`JoltBackendUImpl.cpp`; provenance, not distributed here). A binding that is read-only, or
 merely convertible, cannot receive those writes — and under the loose spelling the declaration
 compiles, satisfies the concept, and loses every handle the fold produced.

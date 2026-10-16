@@ -44,8 +44,8 @@ wire shape is cheap.
 | Own | a sim's `State`, e.g. `OGBrawler/BrawlerMovementSimulation.h` | `SerializableFields` | **sim author** |
 | Locate | `OGSimulation/PhysicsDeclaration.h` | `bodyStateOf` | **sim author** |
 | Capture | `OGSimulation/SimulationIntegrationExecutor.h` | `captureBodyStatesAll` | nobody |
-| Correct | `SimulationManagerUImpl.cpp` | `pushBodyState`, `writeRestoredBodyState` | nobody |
-| Create | `SimulationManagerUImpl.cpp` | `createPhysicalObject`, `queryVolumes`, `attachmentOffset` | **sim author, in engine code** |
+| Correct | `OGSimulation/SimulationIntegrationExecutor.h` | `pushCorrectedBodyStatesAll` | nobody |
+| Create | `JoltBackendUImpl.cpp` | `createPhysicalObject`, `queryVolumes`, `attachmentOffset` | **sim author, in engine code** |
 | Bindings | `OGSimulation/PhysicsDeclaration.h` | `PhysicsRuntimeBindings` | nobody (was: four copies) |
 | Checksum / similarity | `OGSimulation/SimulationComposite.h` | `isSimilarTo` | nobody |
 
@@ -78,16 +78,20 @@ the second option is only legitimate under a condition — §4.
 
 ### 4.1 The widening is implicit, deliberately, and must stay so
 
-The engine's rewind push is written generically:
+The rewind push is written generically. `SimulationIntegrationExecutor::pushCorrectedBodyStatesAll`
+reads every declaration's state as a full body state:
 
 ```cpp
-pushBodyState(decl.bindings.ownBodyId, D::bodyStateOf(state.template get<S>()));
+const PhysicsBodyState body = static_cast<PhysicsBodyState>(D::bodyStateOf(state.template get<S>()));
 ```
 
-`pushBodyState` takes a `const PhysicsBodyState&`. The implicit conversion **at that call site** is
-the entire reason this design was preferred to explicit per-shape overloads: a sim swapping its
-body-state type edits its own header and nothing else. Mark the operator `explicit` and that call
-site needs a hand edit — at which point there is no bridge left, only a second code path.
+and an engine host's rewind-push probe stashes the same value into a `PhysicsBodyState` by plain
+assignment. The conversion **at such a generic call site** is the entire reason this design was
+preferred to explicit per-shape overloads: a sim swapping its body-state type edits its own header
+and nothing else. `PhysicsDeclaration` requires the const `bodyStateOf` to be
+`std::convertible_to<PhysicsBodyState>`, which only an implicit conversion satisfies. Mark the
+operator `explicit` and every `LinearBodyState` declaration stops modelling the concept — at which
+point there is no bridge left, only a second code path.
 
 This is not left to good intentions. `LinearBodyStateTest.cpp` asserts
 `std::is_convertible_v<LinearBodyState, PhysicsBodyState>`, which is false the moment someone adds
