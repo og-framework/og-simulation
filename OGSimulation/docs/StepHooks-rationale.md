@@ -37,7 +37,7 @@ separate call, so a host takes its step-start time in one place on both roles.
 
 `beforeSimulate` receives the same `UpcomingTick` as `beforeTick` in the same `runTick`, the
 authority's `authorityTick` included. On a client it runs before the scratch save, so a host action
-there that changes the world (for example an occupancy change through `noteOccupancy`) is inside
+there that changes the world (for example an occupancy change through `noteBodySlotOccupancy`) is inside
 the world a Skip backfills (`SimulationStepDriver-rationale.md` §2).
 
 ## §2 The values

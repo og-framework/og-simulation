@@ -21,17 +21,17 @@ struct SnapshotCoverage
 template <typename W>
 concept PhysicsWorldAdapter = requires(W w, const W cw, float dt, SimTick t, const BodySlotOccupancy& occ)
 {
-	{ w.step(dt) }             -> std::same_as<void>;
-	{ w.saveTick(t) }          -> std::same_as<void>;
-	{ w.restoreTick(t) }       -> std::same_as<bool>;
-	{ cw.hasTick(t) }          -> std::same_as<bool>;
-	{ cw.oldestHeldTick() }    -> std::same_as<std::optional<SimTick>>;
-	{ w.invalidateAllTicks() } -> std::same_as<void>;
-	{ w.saveScratch() }        -> std::same_as<void>;
-	{ w.commitScratch(t) }     -> std::same_as<void>;
-	{ w.applyOccupancy(occ) }  -> std::same_as<void>;
-	{ cw.stateHash(t) }        -> std::same_as<std::optional<uint64_t>>;
-	{ W::coverage }            -> std::same_as<const SnapshotCoverage&>;
+	{ w.step(dt) }                    -> std::same_as<void>;
+	{ w.saveTick(t) }                 -> std::same_as<void>;
+	{ w.restoreTick(t) }              -> std::same_as<bool>;
+	{ cw.hasTick(t) }                 -> std::same_as<bool>;
+	{ cw.oldestHeldTick() }           -> std::same_as<std::optional<SimTick>>;
+	{ w.invalidateAllTicks() }        -> std::same_as<void>;
+	{ w.saveScratch() }               -> std::same_as<void>;
+	{ w.commitScratch(t) }            -> std::same_as<void>;
+	{ w.applyBodySlotOccupancy(occ) } -> std::same_as<void>;
+	{ cw.stateHash(t) }               -> std::same_as<std::optional<uint64_t>>;
+	{ W::coverage }                   -> std::same_as<const SnapshotCoverage&>;
 	typename std::integral_constant<bool, W::coverage.bodySetAndIds>;
 };
 
@@ -49,7 +49,7 @@ struct Conforming
 	void invalidateAllTicks();
 	void saveScratch();
 	void commitScratch(SimTick);
-	void applyOccupancy(const BodySlotOccupancy&);
+	void applyBodySlotOccupancy(const BodySlotOccupancy&);
 	std::optional<uint64_t> stateHash(SimTick) const;
 };
 
@@ -64,7 +64,7 @@ struct MissingInvalidateAllTicks
 	std::optional<SimTick> oldestHeldTick() const;
 	void saveScratch();
 	void commitScratch(SimTick);
-	void applyOccupancy(const BodySlotOccupancy&);
+	void applyBodySlotOccupancy(const BodySlotOccupancy&);
 	std::optional<uint64_t> stateHash(SimTick) const;
 };
 

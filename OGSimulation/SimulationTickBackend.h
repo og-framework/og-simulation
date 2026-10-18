@@ -42,7 +42,7 @@ struct WorldLockWaitArchetype
 	void operator()(double waitSeconds) const;
 };
 
-struct PushOccupancyArchetype
+struct PushBodySlotOccupancyArchetype
 {
 	void operator()(uint32_t slot, bool occupied) const;
 };
@@ -53,7 +53,7 @@ concept TickBackendWorldHost = TickDriverWorldHost<H> && requires(H& h, const H&
 	const tickBackendWorldHost::ManagerArchetype& manager, uint64_t key, const char* name, bool isAuthority,
 	std::optional<uint32_t> replicatedSlot, tickBackendWorldHost::PublishSlotArchetype publish, uint32_t slot,
 	unsigned int id, SimulatableT& simulatable, const tickBackendWorldHost::StaticDataArchetype& staticData,
-	tickBackendWorldHost::WorldLockWaitArchetype onWorldLockWait, tickBackendWorldHost::PushOccupancyArchetype pushOccupancy,
+	tickBackendWorldHost::WorldLockWaitArchetype onWorldLockWait, tickBackendWorldHost::PushBodySlotOccupancyArchetype pushBodySlotOccupancy,
 	const QueryVolumeDescriptor& descriptor)
 {
 	typename H::Config;
@@ -61,7 +61,7 @@ concept TickBackendWorldHost = TickDriverWorldHost<H> && requires(H& h, const H&
 	{ ch.rootDeclarationIndex() }                                                        -> std::same_as<uint8_t>;
 	{ h.acquire(key, name, isAuthority, replicatedSlot, publish) }                       -> std::same_as<std::optional<uint32_t>>;
 	{ h.bind(slot, id, simulatable, staticData, onWorldLockWait) }                       -> std::same_as<void>;
-	{ h.release(key, id, pushOccupancy) }                                                -> std::same_as<std::optional<uint32_t>>;
+	{ h.release(key, id, pushBodySlotOccupancy) }                                        -> std::same_as<std::optional<uint32_t>>;
 	{ ch.slotOf(key) }                                                                   -> std::same_as<std::optional<uint32_t>>;
 	h.editVizQuery();
 	ch.getVizReader();
@@ -92,8 +92,8 @@ struct Conforming : tickDriverWorldHostSelfCheck::Conforming
 	std::optional<uint32_t> acquire(uint64_t, const char*, bool, std::optional<uint32_t>, PublishF&&);
 	template <typename StaticDataT, typename OnWorldLockWaitF>
 	void bind(uint32_t, unsigned int, SimulatableArchetype&, const StaticDataT&, OnWorldLockWaitF&&);
-	template <typename PushOccupancyF>
-	std::optional<uint32_t> release(uint64_t, unsigned int, PushOccupancyF&&);
+	template <typename PushBodySlotOccupancyF>
+	std::optional<uint32_t> release(uint64_t, unsigned int, PushBodySlotOccupancyF&&);
 	std::optional<uint32_t> slotOf(uint64_t) const;
 	int& editVizQuery();
 	const int& getVizReader() const;
@@ -103,7 +103,7 @@ struct Conforming : tickDriverWorldHostSelfCheck::Conforming
 	void build(const Config&, const StaticWorldDescription&, const StaticWorldDescription&, std::optional<int>&);
 };
 
-struct ReleaseWithoutOccupancyPush : Conforming
+struct ReleaseWithoutBodySlotOccupancyPush : Conforming
 {
 	std::optional<uint32_t> release(uint64_t, unsigned int);
 };
@@ -127,7 +127,7 @@ struct AcquireWithoutReplicatedSlot : Conforming
 
 static_assert(TickBackendWorldHost<Conforming, SimulatableArchetype>,
 	"TickBackendWorldHost self-check: the reference shape must satisfy the concept");
-static_assert(!TickBackendWorldHost<ReleaseWithoutOccupancyPush, SimulatableArchetype>,
+static_assert(!TickBackendWorldHost<ReleaseWithoutBodySlotOccupancyPush, SimulatableArchetype>,
 	"TickBackendWorldHost self-check: release takes the occupancy push, so a vacated slot reaches the driver's ring");
 static_assert(!TickBackendWorldHost<BindWithoutLockWaitNote, SimulatableArchetype>,
 	"TickBackendWorldHost self-check: bind takes the world-lock wait note, so the window keeps the bind's lock wait");
@@ -239,7 +239,7 @@ public:
 		OG_CHECK(slot.has_value(),
 			"SimulationTickBackend::onRegistered: slotOf(key) has no value: the id is Ready but its owner holds no slot; the "
 			"first pass binds one. Was the engine-hosted backend's registration check");
-		driver().pushOccupancy(*slot, true);
+		driver().pushBodySlotOccupancy(*slot, true);
 		presenter().onRegistered(id, *slot);
 	}
 
@@ -251,7 +251,7 @@ public:
 
 	void releaseSlot(uint64_t key, unsigned int id)
 	{
-		m_worldHost.release(key, id, [this](uint32_t slot, bool occupied) { driver().pushOccupancy(slot, occupied); });
+		m_worldHost.release(key, id, [this](uint32_t slot, bool occupied) { driver().pushBodySlotOccupancy(slot, occupied); });
 	}
 
 	template <typename SinkT>

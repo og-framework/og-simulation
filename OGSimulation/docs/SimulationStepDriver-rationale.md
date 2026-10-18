@@ -43,7 +43,7 @@ manager. The constructor refuses `Always` on the authority and a depth of 0.
 ## §2 The client tick
 
 1. `beforeTick({authority=false, physicsStep})`. The host drains inbound messages and applies
-   lifecycle commands here; a join or leave calls `noteOccupancy` (§6).
+   lifecycle commands here; a join or leave calls `noteBodySlotOccupancy` (§6).
 2. The resim check and, if granted, the replay (§3).
 3. If a replay left the world on an older occupancy than the live one, the live occupancy is
    applied again (§6).
@@ -64,7 +64,7 @@ manager. The constructor refuses `Always` on the authority and a depth of 0.
 
 **Why `beforeSimulate` sits between the replay and the scratch.** Before the replay, its time would
 precede the replay, which is the opposite of "the step starts consuming". After `saveScratch`, a
-world change the host made there (an occupancy change through `noteOccupancy`, say) would be missing
+world change the host made there (an occupancy change through `noteBodySlotOccupancy`, say) would be missing
 from the scratch: on a Skip that scratch is committed as the backfilled tick (step 7), so the ring
 would hold for `tick - 1` a world the live tick did not start from. Before `saveScratch`, the
 scratch captures whatever the hook did. The only work between the hook and `onGameSimulation` is
@@ -88,7 +88,7 @@ tick, exactly as it did when an engine refused a rewind.
 **Granted.**
 1. `world.restoreTick(anchor)`, with an `OG_CHECK` on false: `hasTick` said it was held, so a failed
    restore is a backend defect, never a load condition.
-2. `world.applyOccupancy(occ[anchor])` (§6).
+2. `world.applyBodySlotOccupancy(occ[anchor])` (§6).
 3. `manager.prepareResimulation(physicsStep, anchor)`: the clock's resim cursor goes to the anchor,
    og-sim state is restored from the correction cache, and then the push: the manager's last statement
    writes the restored og-sim body states into the physics world (§9). Only the declarations that
@@ -97,7 +97,7 @@ tick, exactly as it did when an engine refused a rewind.
    so a resim with no correction writes nothing and replays exactly what the unreplayed run computed.
 4. **Exactly `predictionTick - anchor` replay steps** (guard G-04; user ruling Q1: one physics step
    per sim tick, Stall and Skip multiplicity not reproduced). For replayed tick `t`:
-   `applyOccupancy(occ[t])`, `onGameSimulation({resim, first})`, `world.step(dt)`,
+   `applyBodySlotOccupancy(occ[t])`, `onGameSimulation({resim, first})`, `world.step(dt)`,
    `onPostGameSimulation({resim, first})`, `world.saveTick(manager.currentIntegratedTick())`.
    `first` is true on the first replay step only. An `OG_CHECK` requires the integrated tick to be
    `t`.
@@ -168,7 +168,7 @@ slot is parked. That is the same tick at which the cache stops answering `NoSlot
 held tick, retroactively. This reproduces how an engine world that disabled the body before the
 spawn and removed it on leave behaved.
 
-**How the driver gets that boundary without knowing about caches.** `noteOccupancy` updates the live
+**How the driver gets that boundary without knowing about caches.** `noteBodySlotOccupancy` updates the live
 occupancy and applies it to the world at once. The timeline records an occupancy for a tick only
 when the ring saves that tick (`saveTick` or the Skip's `commitScratch`), and it records the
 occupancy the world stepped with. The ring saves under the cache's own predicates (§4), so the first
@@ -189,7 +189,7 @@ because the driver re-applies the live occupancy after a replay when they differ
 the lifecycle command is applied.
 
 A tick missing from the timeline falls back to the live occupancy and is counted
-(`occupancyTimelineMisses`). Every tick between a held anchor and the present is held, so the count
+(`bodySlotOccupancyTimelineMisses`). Every tick between a held anchor and the present is held, so the count
 stays 0 in a healthy run; a nonzero is a defect signal.
 
 ## §7 The authority tick, and the `+ 1` it replaces
@@ -317,13 +317,13 @@ log line and a per-simulatable hook, and wraps after 2³¹ steps (about 414 days
 
 `getDiagnostics()` is a read-only view (`DiagnosticsConventions.md` §1): granted and refused resims,
 replayed ticks, Skip backfills, HardResync invalidations, ignored anchors, timeline misses, and the
-timeline itself (`occupancyAt`, `occupancyTimelineSize`). No production decision reads it. The
+timeline itself (`bodySlotOccupancyAt`, `bodySlotOccupancyTimelineSize`). No production decision reads it. The
 counters are written on the production path, like a probe's `note*` sites.
 
 ## §12 Threading
 
 Every call — the driver's own, the hooks, the manager, the world and the executor — runs on the one
-thread that calls `runTick`, in the order above. `noteOccupancy` must be called on that thread too,
+thread that calls `runTick`, in the order above. `noteBodySlotOccupancy` must be called on that thread too,
 which is why the host calls it from a hook (`beforeTick`, or `beforeSimulate`, whose world changes
 the scratch still captures, §2). Nothing here is synchronised.
 

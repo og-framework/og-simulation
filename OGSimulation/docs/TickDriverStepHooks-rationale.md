@@ -55,7 +55,7 @@ only states its shape:
 
 | door | role |
 |---|---|
-| `applyOccupancyCommands_Step()` | drain the occupancy ring J1 into the step driver's `noteOccupancy` |
+| `applyBodySlotOccupancyCommands_Step()` | drain the occupancy ring J1 into the step driver's `noteBodySlotOccupancy` |
 | `publishTickOffset_Step(int64_t)` | store the tick offset J3 for the driver's owning thread |
 | `pushStepCost_Step(const StepCostSample&)` | push one step-cost sample into the ring J6 |
 | `isStepRunningOnThisThread() const` | a step of this driver is running on the calling thread (its step scope on the world host's thread context is open) |

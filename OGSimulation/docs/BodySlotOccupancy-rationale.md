@@ -19,7 +19,7 @@ means the slot holds a live character at that tick; a clear bit means the slot i
 
 It is **og-simulation state, not physics-engine state.** A physics backend whose snapshot does not
 restore its body set (`PhysicsWorldAdapter.h` :: `SnapshotCoverage`, `bodySetAndIds`) keeps one body
-per slot in its world at all times and is told, through `applyOccupancy`, which of those bodies are
+per slot in its world at all times and is told, through `applyBodySlotOccupancy`, which of those bodies are
 live. The caller (the step driver) is meant to keep the occupancy per sim tick and re-apply it after
 every restore and before every step, so that a rollback across a join or a leave sees the slot as it
 was at that tick. This header does not enforce that; it only defines the record.

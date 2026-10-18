@@ -45,7 +45,7 @@ public:
 			"SimulationStepDriver: ResimPolicy::Always needs a depth of at least one tick");
 		OG_CHECK(config.policy != ResimPolicy::Always || m_isClient,
 			"SimulationStepDriver: ResimPolicy::Always is a client policy; the authority never resims");
-		applyOccupancy(m_occupancy);
+		applyBodySlotOccupancy(m_bodySlotOccupancy);
 		if (m_isClient)
 		{
 			m_resyncCallbackId = m_manager.editClientClock().registerResyncCallback(
@@ -69,22 +69,22 @@ public:
 		return m_isClient ? runClientTick(physicsStep) : runAuthorityTick(physicsStep);
 	}
 
-	void noteOccupancy(uint32_t slot, bool occupied)
+	void noteBodySlotOccupancy(uint32_t slot, bool occupied)
 	{
 		OG_CHECK(slot < kMaxSimulatableSlots, "SimulationStepDriver: occupancy slot out of range");
-		m_occupancy.occupied.set(slot, occupied);
+		m_bodySlotOccupancy.occupied.set(slot, occupied);
 		if (!occupied)
 		{
 			// ⛔G-05  docs/SimulationStepDriver-guards.md
-			for (auto& [tick, held] : m_occupancyTimeline)
+			for (auto& [tick, held] : m_bodySlotOccupancyTimeline)
 			{
 				held.occupied.reset(slot);
 			}
 		}
-		applyOccupancy(m_occupancy);
+		applyBodySlotOccupancy(m_bodySlotOccupancy);
 	}
 
-	const BodySlotOccupancy& occupancy() const { return m_occupancy; }
+	const BodySlotOccupancy& bodySlotOccupancy() const { return m_bodySlotOccupancy; }
 
 	bool savesTicks() const { return m_isClient; }
 
@@ -99,16 +99,16 @@ public:
 		uint64_t skipBackfills() const { return m_driver.m_skipBackfills; }
 		uint64_t hardResyncInvalidations() const { return m_driver.m_hardResyncInvalidations; }
 		uint64_t ignoredAnchors() const { return m_driver.m_ignoredAnchors; }
-		uint64_t occupancyTimelineMisses() const { return m_driver.m_occupancyTimelineMisses; }
+		uint64_t bodySlotOccupancyTimelineMisses() const { return m_driver.m_bodySlotOccupancyTimelineMisses; }
 
-		std::optional<BodySlotOccupancy> occupancyAt(SimTick tick) const
+		std::optional<BodySlotOccupancy> bodySlotOccupancyAt(SimTick tick) const
 		{
-			const auto it = m_driver.m_occupancyTimeline.find(tick);
-			return it != m_driver.m_occupancyTimeline.end() ? std::optional<BodySlotOccupancy>(it->second)
+			const auto it = m_driver.m_bodySlotOccupancyTimeline.find(tick);
+			return it != m_driver.m_bodySlotOccupancyTimeline.end() ? std::optional<BodySlotOccupancy>(it->second)
 			                                                : std::nullopt;
 		}
 
-		std::size_t occupancyTimelineSize() const { return m_driver.m_occupancyTimeline.size(); }
+		std::size_t bodySlotOccupancyTimelineSize() const { return m_driver.m_bodySlotOccupancyTimeline.size(); }
 
 	private:
 		const SimulationStepDriver& m_driver;
@@ -128,7 +128,7 @@ private:
 
 		resimulateIfRequested(physicsStep, outcome);
 
-		syncLiveOccupancy();
+		syncLiveBodySlotOccupancy();
 		// ⛔G-07  docs/SimulationStepDriver-guards.md
 		m_hooks.beforeSimulate(upcoming);
 		m_world.saveScratch();
@@ -143,7 +143,7 @@ private:
 		{
 			// ⛔G-02  docs/SimulationStepDriver-guards.md
 			m_world.commitScratch(tick - 1u);
-			recordOccupancy(tick - 1u, m_appliedOccupancy);
+			recordBodySlotOccupancy(tick - 1u, m_appliedBodySlotOccupancy);
 			++m_skipBackfills;
 		}
 
@@ -155,7 +155,7 @@ private:
 		if (stepAllocatesFrontierSlot(kind))
 		{
 			m_world.saveTick(tick);
-			recordOccupancy(tick, m_appliedOccupancy);
+			recordBodySlotOccupancy(tick, m_appliedBodySlotOccupancy);
 		}
 
 		outcome.tick = tick;
@@ -213,7 +213,7 @@ private:
 
 		const bool restored = m_world.restoreTick(*anchor);
 		OG_CHECK(restored, "SimulationStepDriver: restoreTick failed for a tick hasTick reported held");
-		applyOccupancy(occupancyAt(*anchor));
+		applyBodySlotOccupancy(bodySlotOccupancyAt(*anchor));
 		m_manager.prepareResimulation(static_cast<int32_t>(physicsStep), *anchor);
 
 		// ⛔G-04  docs/SimulationStepDriver-guards.md
@@ -222,8 +222,8 @@ private:
 		{
 			const SimTick replayTick = *anchor + 1u + index;
 			const bool first = index == 0u;
-			const BodySlotOccupancy replayOccupancy = occupancyAt(replayTick);
-			applyOccupancy(replayOccupancy);
+			const BodySlotOccupancy replayOccupancy = bodySlotOccupancyAt(replayTick);
+			applyBodySlotOccupancy(replayOccupancy);
 			m_manager.onGameSimulation(SimulationUpdateInfo(true, first));
 			m_world.step(m_config.dtSeconds);
 			m_manager.onPostGameSimulation(SimulationUpdateInfo(true, first));
@@ -232,7 +232,7 @@ private:
 				"SimulationStepDriver: a replay step must integrate exactly the next tick (one physics step per sim tick)");
 			m_world.saveTick(savedTick);
 			// ⛔G-06  docs/SimulationStepDriver-guards.md
-			recordOccupancy(savedTick, replayOccupancy);
+			recordBodySlotOccupancy(savedTick, replayOccupancy);
 		}
 
 		outcome.replayedTicks = replayTicks;
@@ -267,46 +267,46 @@ private:
 	void onHardResync()
 	{
 		m_world.invalidateAllTicks();
-		m_occupancyTimeline.clear();
+		m_bodySlotOccupancyTimeline.clear();
 		m_hardResyncThisTick = true;
 		++m_hardResyncInvalidations;
 	}
 
-	void applyOccupancy(const BodySlotOccupancy& occupancy)
+	void applyBodySlotOccupancy(const BodySlotOccupancy& occupancy)
 	{
-		m_world.applyOccupancy(occupancy);
-		m_appliedOccupancy = occupancy;
+		m_world.applyBodySlotOccupancy(occupancy);
+		m_appliedBodySlotOccupancy = occupancy;
 	}
 
-	void syncLiveOccupancy()
+	void syncLiveBodySlotOccupancy()
 	{
-		if (m_appliedOccupancy != m_occupancy)
+		if (m_appliedBodySlotOccupancy != m_bodySlotOccupancy)
 		{
-			applyOccupancy(m_occupancy);
+			applyBodySlotOccupancy(m_bodySlotOccupancy);
 		}
 	}
 
-	BodySlotOccupancy occupancyAt(SimTick tick)
+	BodySlotOccupancy bodySlotOccupancyAt(SimTick tick)
 	{
-		const auto it = m_occupancyTimeline.find(tick);
-		if (it != m_occupancyTimeline.end())
+		const auto it = m_bodySlotOccupancyTimeline.find(tick);
+		if (it != m_bodySlotOccupancyTimeline.end())
 		{
 			return it->second;
 		}
-		++m_occupancyTimelineMisses;
-		return m_occupancy;
+		++m_bodySlotOccupancyTimelineMisses;
+		return m_bodySlotOccupancy;
 	}
 
-	void recordOccupancy(SimTick tick, const BodySlotOccupancy& occupancy)
+	void recordBodySlotOccupancy(SimTick tick, const BodySlotOccupancy& occupancy)
 	{
-		m_occupancyTimeline[tick] = occupancy;
+		m_bodySlotOccupancyTimeline[tick] = occupancy;
 		const std::optional<SimTick> oldest = m_world.oldestHeldTick();
 		if (!oldest.has_value())
 		{
-			m_occupancyTimeline.clear();
+			m_bodySlotOccupancyTimeline.clear();
 			return;
 		}
-		m_occupancyTimeline.erase(m_occupancyTimeline.begin(), m_occupancyTimeline.lower_bound(*oldest));
+		m_bodySlotOccupancyTimeline.erase(m_bodySlotOccupancyTimeline.begin(), m_bodySlotOccupancyTimeline.lower_bound(*oldest));
 	}
 
 	ManagerT& m_manager;
@@ -316,9 +316,9 @@ private:
 	const bool m_isClient;
 	unsigned int m_resyncCallbackId = ClientPredictionClock::InvalidCallbackId;
 
-	BodySlotOccupancy m_occupancy;
-	BodySlotOccupancy m_appliedOccupancy;
-	std::map<SimTick, BodySlotOccupancy> m_occupancyTimeline;
+	BodySlotOccupancy m_bodySlotOccupancy;
+	BodySlotOccupancy m_appliedBodySlotOccupancy;
+	std::map<SimTick, BodySlotOccupancy> m_bodySlotOccupancyTimeline;
 	bool m_hardResyncThisTick = false;
 
 	uint64_t m_grantedResims = 0u;
@@ -327,5 +327,5 @@ private:
 	uint64_t m_skipBackfills = 0u;
 	uint64_t m_hardResyncInvalidations = 0u;
 	uint64_t m_ignoredAnchors = 0u;
-	uint64_t m_occupancyTimelineMisses = 0u;
+	uint64_t m_bodySlotOccupancyTimelineMisses = 0u;
 };

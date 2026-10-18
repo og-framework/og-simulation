@@ -56,12 +56,12 @@ only free choice the presenter has, and the game already names it.
 | `rootDeclarationIndex()` (const) | `start`, into the presenter's configuration |
 | `acquire(key, name, isAuthority, replicatedSlot, publish)` | `acquireAndBind` |
 | `bind(slot, id, simulatable, staticData, onWorldLockWait)` | `acquireAndBind`, with a slot |
-| `release(key, id, pushOccupancy)` | `releaseSlot` |
+| `release(key, id, pushBodySlotOccupancy)` | `releaseSlot` |
 | `slotOf(key)` (const) | `onRegistered`, `forgetPresenterTarget` |
 | `editVizQuery()`, `getVizReader()` (const), `registerVizVolume(...)` | the three visualization doors |
 
 The callables and the manager and static data in the requirement are archetypes in `tickBackendWorldHost`
-(`PublishSlotArchetype`, `WorldLockWaitArchetype`, `PushOccupancyArchetype`, `ManagerArchetype`,
+(`PublishSlotArchetype`, `WorldLockWaitArchetype`, `PushBodySlotOccupancyArchetype`, `ManagerArchetype`,
 `StaticDataArchetype`), so a world host whose members are templates over them satisfies the concept by its
 declarations. That is a declaration-level check: a body that does not compile for the real types fails where the
 backend is instantiated, which is the adapter's own build. `SimulatableArchetype` lets a world host library assert the
@@ -106,11 +106,11 @@ unchanged.
   `acquire`; no slot (a client waiting for the authority's) returns `false` and binds nothing; a slot is bound with the
   driver's `noteWorldLockWait` as the lock-wait note, so the bind's J2 wait reaches the window.
 * **`onRegistered(id, key)`**: the slot of `key` (an `OG_CHECK` that there is one: the first pass bound it), the
-  driver's `pushOccupancy(slot, true)` (an Occupy command on J1, applied by the next step), then the presenter's
+  driver's `pushBodySlotOccupancy(slot, true)` (an Occupy command on J1, applied by the next step), then the presenter's
   `onRegistered(id, slot)`.
 * **The unregister is two calls**, so an adapter keeps its own work between them:
   * **`forgetPresenterTarget(id, key)`**: the presenter's `onUnregistered(id, slot or 0)`, when the presenter exists;
-  * **`releaseSlot(key, id)`**: the world host's `release`, with the driver's `pushOccupancy` as the occupancy door, so
+  * **`releaseSlot(key, id)`**: the world host's `release`, with the driver's `pushBodySlotOccupancy` as the occupancy door, so
     the vacated slot reaches the step as a Vacate command (J1) and is never applied on this thread.
 * **`present(controls, sink)`**: the presenter's `present_GameThread` with the **driver as the clock**. A world host
   with a shadow world restores it first and passes the presenter a restore note, which the presenter forwards to the

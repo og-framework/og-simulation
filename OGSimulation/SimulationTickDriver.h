@@ -20,7 +20,7 @@
 #include "OGSimulation/TickDriverThreadContext.h"
 #include "OGSimulation/TickDriverWindow.h"
 
-struct OccupancyCommand
+struct BodySlotOccupancyCommand
 {
 	uint32_t slot     = 0u;
 	bool     occupied = false;
@@ -28,9 +28,9 @@ struct OccupancyCommand
 
 namespace simulationTickDriver
 {
-inline constexpr uint32_t kMaxStepsPerFrame         = 240u;
-inline constexpr size_t   kOccupancyCommandCapacity = 64u;
-inline constexpr size_t   kStepCostSampleCapacity   = 256u;
+inline constexpr uint32_t kMaxStepsPerFrame                 = 240u;
+inline constexpr size_t   kBodySlotOccupancyCommandCapacity = 64u;
+inline constexpr size_t   kStepCostSampleCapacity           = 256u;
 } // namespace simulationTickDriver
 
 template <TickDriverGame GameT, TickDriverWorldHost WorldHostT, TickDriverPresenterSteps PresenterT, TickDriverEngine EngineT>
@@ -61,8 +61,8 @@ public:
 	{
 		static_assert(__builtin_offsetof(SimulationTickDriver, m_config) < __builtin_offsetof(SimulationTickDriver, m_scheduler)
 			&& __builtin_offsetof(SimulationTickDriver, m_scheduler) < __builtin_offsetof(SimulationTickDriver, m_window)
-			&& __builtin_offsetof(SimulationTickDriver, m_window) < __builtin_offsetof(SimulationTickDriver, m_occupancyCommands)
-			&& __builtin_offsetof(SimulationTickDriver, m_occupancyCommands) < __builtin_offsetof(SimulationTickDriver, m_stepCosts)
+			&& __builtin_offsetof(SimulationTickDriver, m_window) < __builtin_offsetof(SimulationTickDriver, m_bodySlotOccupancyCommands)
+			&& __builtin_offsetof(SimulationTickDriver, m_bodySlotOccupancyCommands) < __builtin_offsetof(SimulationTickDriver, m_stepCosts)
 			&& __builtin_offsetof(SimulationTickDriver, m_stepCosts) < __builtin_offsetof(SimulationTickDriver, m_tickOffset)
 			&& __builtin_offsetof(SimulationTickDriver, m_tickOffset) < __builtin_offsetof(SimulationTickDriver, m_pendingSteps)
 			&& __builtin_offsetof(SimulationTickDriver, m_pendingSteps) < __builtin_offsetof(SimulationTickDriver, m_blockingSteps),
@@ -147,11 +147,11 @@ public:
 		waitForOutstandingSteps();
 	}
 
-	void pushOccupancy(uint32_t slot, bool occupied)
+	void pushBodySlotOccupancy(uint32_t slot, bool occupied)
 	{
-		[[maybe_unused]] const bool pushed = m_occupancyCommands.tryPush(OccupancyCommand{ slot, occupied });
+		[[maybe_unused]] const bool pushed = m_bodySlotOccupancyCommands.tryPush(BodySlotOccupancyCommand{ slot, occupied });
 		OG_CHECK(pushed,
-			"SimulationTickDriver::pushOccupancy: the occupancy ring (J1) is full; the command would be lost and the step "
+			"SimulationTickDriver::pushBodySlotOccupancy: the occupancy ring (J1) is full; the command would be lost and the step "
 			"world would keep the wrong body set. No step has drained it");
 	}
 
@@ -211,7 +211,7 @@ private:
 	public:
 		explicit DriverDoors(SimulationTickDriver& driver) : m_driver(&driver) {}
 
-		void applyOccupancyCommands_Step() { m_driver->applyOccupancyCommands_Step(); }
+		void applyBodySlotOccupancyCommands_Step() { m_driver->applyBodySlotOccupancyCommands_Step(); }
 		void publishTickOffset_Step(int64_t offset) { m_driver->m_tickOffset.store(offset, std::memory_order_relaxed); }
 		void pushStepCost_Step(const StepCostSample& sample) { m_driver->m_stepCosts.tryPush(sample); }
 		bool isStepRunningOnThisThread() const { return m_driver->m_worldHost->threadContext().isStepRunningOnThisThread(); }
@@ -357,7 +357,7 @@ private:
 	TickDriverWindowTotals windowTotals()
 	{
 		const SimulationScheduler& scheduler = schedulerOnOwningThread();
-		return TickDriverWindowTotals{ scheduler.lostTime(), scheduler.ignoredTimeSamples(), m_occupancyCommands.drops(),
+		return TickDriverWindowTotals{ scheduler.lostTime(), scheduler.ignoredTimeSamples(), m_bodySlotOccupancyCommands.drops(),
 			m_stepCosts.drops() };
 	}
 
@@ -381,15 +381,15 @@ private:
 		m_blockingSteps.reset();
 	}
 
-	void applyOccupancyCommands_Step()
+	void applyBodySlotOccupancyCommands_Step()
 	{
 		OG_CHECK(m_worldHost->threadContext().isStepRunningOnThisThread(),
 			"SimulationTickDriver: the occupancy door was called outside a step of this driver. Only the step (under the "
 			"world lock and the step scope) may touch the step driver: from anywhere else it races the running step, and "
 			"the occupancy timeline no longer records the body set the world stepped with. Was the occupancy-door check "
 			"of the engine-hosted frame host");
-		while (std::optional<OccupancyCommand> command = m_occupancyCommands.tryPop())
-			m_stepDriver->noteOccupancy(command->slot, command->occupied);
+		while (std::optional<BodySlotOccupancyCommand> command = m_bodySlotOccupancyCommands.tryPop())
+			m_stepDriver->noteBodySlotOccupancy(command->slot, command->occupied);
 	}
 
 	SimulationScheduler& schedulerOnOwningThread()
@@ -420,7 +420,7 @@ private:
 	std::optional<SimulationScheduler>                                         m_scheduler;
 	TickDriverWindow                                                           m_window;
 	TickDriverFirstStepLine                                                    m_firstStepLine;
-	SpscRing<OccupancyCommand, simulationTickDriver::kOccupancyCommandCapacity> m_occupancyCommands;
+	SpscRing<BodySlotOccupancyCommand, simulationTickDriver::kBodySlotOccupancyCommandCapacity> m_bodySlotOccupancyCommands;
 	SpscRing<StepCostSample, simulationTickDriver::kStepCostSampleCapacity>     m_stepCosts;
 	std::atomic<int64_t>                                                       m_tickOffset{ 0 };
 	std::optional<Handle>                                                      m_pendingSteps;

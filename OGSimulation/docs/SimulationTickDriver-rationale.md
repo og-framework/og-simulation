@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: MPL-2.0 -->
 # `SimulationTickDriver.h` — rationale
 
-The narrative behind `OccupancyCommand`, the `simulationTickDriver` constants and `SimulationTickDriver`,
+The narrative behind `BodySlotOccupancyCommand`, the `simulationTickDriver` constants and `SimulationTickDriver`,
 the engine- and game-agnostic frame pipeline that pumps the scheduler, runs or dispatches each frame's
 batch of steps, waits for it at the end of the frame, and closes the host's telemetry window. The header
 keeps its licence, its docs pointer, its code, its `OG_CHECK`s, two member-order `static_assert`s and six
@@ -49,7 +49,7 @@ The driver holds raw pointers to its four borrowed collaborators, then, in this 
 | `m_running`, `m_loggedFirstStep`, `m_hostTimeSeconds`, `m_lastFrameStartSeconds` | the running flag, the first-step flag, the host time and the previous frame's start |
 | `m_scheduler` | `std::optional<SimulationScheduler>`, built in the constructor after the step driver |
 | `m_window`, `m_firstStepLine` | the telemetry window and the first-step line (`TickDriverWindow.h`) |
-| `m_occupancyCommands` | J1 |
+| `m_bodySlotOccupancyCommands` | J1 |
 | `m_stepCosts` | J6 |
 | `m_tickOffset` | J3 |
 | `m_pendingSteps`, `m_blockingSteps` | the executor handles (§4) |
@@ -161,10 +161,10 @@ the same module.
 
 ## §5 The mailboxes and the doors
 
-* **J1, occupancy commands** (owning thread → step): `SpscRing<OccupancyCommand, 64>`.
-  `pushOccupancy(slot, occupied)` pushes one; a full ring is an `OG_CHECK` (a lost command leaves the world
+* **J1, occupancy commands** (owning thread → step): `SpscRing<BodySlotOccupancyCommand, 64>`.
+  `pushBodySlotOccupancy(slot, occupied)` pushes one; a full ring is an `OG_CHECK` (a lost command leaves the world
   stepping the wrong body set). The hooks drain it first thing in `beforeTick`, through the doors'
-  `applyOccupancyCommands_Step`, into the step driver's `noteOccupancy`; the door `OG_CHECK`s it runs inside
+  `applyBodySlotOccupancyCommands_Step`, into the step driver's `noteBodySlotOccupancy`; the door `OG_CHECK`s it runs inside
   a step.
 * **J3, the published tick offset** (step → owning thread): `std::atomic<int64_t>`, relaxed. The hooks'
   `afterTick` stores `outcome.tick − outcome.physicsStep`; `pumpAndRunSteps` adds it to `batch.first`, with

@@ -112,8 +112,8 @@ the real-manager test requires the clock to end caught up with exactly one apply
 
 ## G-05 — A vacated slot is cleared in EVERY held tick of the occupancy timeline.
 
-**Tag site:** `SimulationStepDriver.h`, `noteOccupancy`, immediately above the loop over
-`m_occupancyTimeline` that resets the slot.
+**Tag site:** `SimulationStepDriver.h`, `noteBodySlotOccupancy`, immediately above the loop over
+`m_bodySlotOccupancyTimeline` that resets the slot.
 
 **The prohibition.** Do not delete this sweep, and do not limit it to ticks at or after the leave.
 
@@ -131,9 +131,9 @@ cleared in every held tick and parked in every replayed step.
 ## G-06 — A replayed tick records the occupancy it REPLAYED with, never the live one.
 
 **Tag site:** `SimulationStepDriver.h`, `resimulateIfRequested`, immediately above
-`recordOccupancy(savedTick, replayOccupancy);`.
+`recordBodySlotOccupancy(savedTick, replayOccupancy);`.
 
-**The prohibition.** Do not record `m_occupancy` (or `m_appliedOccupancy` after it has moved)
+**The prohibition.** Do not record `m_bodySlotOccupancy` (or `m_appliedBodySlotOccupancy` after it has moved)
 for a replayed tick.
 
 **The consequence.** The live occupancy can already include a character that joined in this tick's
@@ -161,7 +161,7 @@ per tick.
 the normal step starts consuming input. Above `resimulateIfRequested`, that time precedes the whole
 replay, and every latency measured from it is early by the replay's cost; it would be the same
 instant `beforeTick` already offers. Below `saveScratch`, a world change the host makes in the hook
-(an occupancy change through `noteOccupancy`) escapes the scratch: on a Skip the scratch is
+(an occupancy change through `noteBodySlotOccupancy`) escapes the scratch: on a Skip the scratch is
 committed as the backfilled tick (G-02), so the ring would hold for `tick - 1` a world the live
 tick did not start from. A later resim anchored there restores a world without the change: only
 the occupancy part is put back, by the timeline (which records the applied occupancy either way),

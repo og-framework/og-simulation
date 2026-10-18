@@ -48,7 +48,7 @@ the physics snapshot for tick T and the correction-cache slot for tick T describ
 | `invalidateAllTicks()` | drop every held tick. It exists for the clock's HardResync path, so that no snapshot from before the jump can be restored |
 | `saveScratch()` | snapshot the live world into one extra slot outside the ring |
 | `commitScratch(t)` | store the scratch snapshot under `t`, with the same overwrite and eviction rules as `saveTick` |
-| `applyOccupancy(occ)` | set which character slots are live (`BodySlotOccupancy.h`). The caller is meant to re-apply it after every restore and before every step |
+| `applyBodySlotOccupancy(occ)` | set which character slots are live (`BodySlotOccupancy.h`). The caller is meant to re-apply it after every restore and before every step |
 | `stateHash(t)` | a 64-bit hash of the held tick `t`, or empty if `t` is not held. `const` |
 | `coverage` | a `static constexpr SnapshotCoverage` (§5) |
 
@@ -95,7 +95,7 @@ backend from quietly doing work (such as a lazy rebuild) inside what callers tre
 
 | flag | `true` means the snapshot restores… | when it is `false`, the system above compensates by… |
 |---|---|---|
-| `bodySetAndIds` | the set of bodies and their ids | keeping a **fixed body set** (slot bodies always present) and re-applying occupancy from a per-tick sidecar after every restore (`applyOccupancy`) |
+| `bodySetAndIds` | the set of bodies and their ids | keeping a **fixed body set** (slot bodies always present) and re-applying occupancy from a per-tick sidecar after every restore (`applyBodySlotOccupancy`) |
 | `broadphase` | the broadphase structure | treating query hit order as history-dependent: every query result is **sorted by a peer-stable key** before use |
 | `staticShapes` | static geometry | building statics **once** (`StaticGeometry.h`) and never putting them in the ring |
 

@@ -22,18 +22,18 @@ struct StepCostSample
 template <typename D>
 concept DriverStepDoors = requires(D& d, const D& cd, int64_t offset, const StepCostSample& sample)
 {
-	{ d.applyOccupancyCommands_Step() }  -> std::same_as<void>;
-	{ d.publishTickOffset_Step(offset) } -> std::same_as<void>;
-	{ d.pushStepCost_Step(sample) }      -> std::same_as<void>;
-	{ cd.isStepRunningOnThisThread() }   -> std::same_as<bool>;
-	{ cd.isOwnerThread() }               -> std::same_as<bool>;
+	{ d.applyBodySlotOccupancyCommands_Step() } -> std::same_as<void>;
+	{ d.publishTickOffset_Step(offset) }        -> std::same_as<void>;
+	{ d.pushStepCost_Step(sample) }             -> std::same_as<void>;
+	{ cd.isStepRunningOnThisThread() }          -> std::same_as<bool>;
+	{ cd.isOwnerThread() }                      -> std::same_as<bool>;
 };
 
 namespace driverStepDoorsSelfCheck
 {
 struct Conforming
 {
-	void applyOccupancyCommands_Step();
+	void applyBodySlotOccupancyCommands_Step();
 	void publishTickOffset_Step(int64_t);
 	void pushStepCost_Step(const StepCostSample&);
 	bool isStepRunningOnThisThread() const;
@@ -42,7 +42,7 @@ struct Conforming
 
 struct MissingPushStepCost
 {
-	void applyOccupancyCommands_Step();
+	void applyBodySlotOccupancyCommands_Step();
 	void publishTickOffset_Step(int64_t);
 	bool isStepRunningOnThisThread() const;
 	bool isOwnerThread() const;
@@ -50,7 +50,7 @@ struct MissingPushStepCost
 
 struct MissingOwnerThreadTest
 {
-	void applyOccupancyCommands_Step();
+	void applyBodySlotOccupancyCommands_Step();
 	void publishTickOffset_Step(int64_t);
 	void pushStepCost_Step(const StepCostSample&);
 	bool isStepRunningOnThisThread() const;
@@ -58,7 +58,7 @@ struct MissingOwnerThreadTest
 
 struct MutatingStepContextTest
 {
-	void applyOccupancyCommands_Step();
+	void applyBodySlotOccupancyCommands_Step();
 	void publishTickOffset_Step(int64_t);
 	void pushStepCost_Step(const StepCostSample&);
 	bool isStepRunningOnThisThread();
@@ -67,7 +67,7 @@ struct MutatingStepContextTest
 
 struct PushTakesMutableSample
 {
-	void applyOccupancyCommands_Step();
+	void applyBodySlotOccupancyCommands_Step();
 	void publishTickOffset_Step(int64_t);
 	void pushStepCost_Step(StepCostSample&);
 	bool isStepRunningOnThisThread() const;
@@ -117,7 +117,7 @@ public:
 	{
 		m_tickStartSeconds = m_doors.engine.nowSeconds();
 		checkInStep();
-		m_doors.driver.applyOccupancyCommands_Step();
+		m_doors.driver.applyBodySlotOccupancyCommands_Step();
 		if (!upcoming.authority)
 			return;
 
