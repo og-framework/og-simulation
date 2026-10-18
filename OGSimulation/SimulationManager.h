@@ -156,8 +156,8 @@ concept SimulationSystemsExecutorConcept = requires(
 //     atomics.
 //     ⭐ ONE ADAPTER'S BINDING FOR THE CALLBACK COLUMN BELOW: it names the
 //     physics-callback ROLE, never an engine type. One adapter binds those
-//     roles on `FSimulationManagerAsyncCallback` (`OGBrawlerUnreal`,
-//     `ChaosBackendUImpl.h/.cpp`), where that one adapter's names are
+//     roles on the async callback of the Chaos-scheduled host (a game's
+//     engine adapter, outside this library), where that one adapter's names are
 //     `OnPreSimulate_Internal` (pre-simulate step), `OnPostSolve_Internal`
 //     (post-solve step),
 //     `TriggerRewindIfNeeded_Internal` (rewind request) and

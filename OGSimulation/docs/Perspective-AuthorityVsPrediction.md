@@ -215,7 +215,7 @@ two early returns on `runsPrediction()` in the adapter's own physics callback: t
 whether to ask for a rewind, and the one that runs on the first replayed step.
 (One adapter's binding: `FSimulationManagerAsyncCallback::TriggerRewindIfNeeded_Internal`
 and `FSimulationManagerAsyncCallback::FirstPreResimStep_Internal`, both in
-`Source/OGBrawlerUnreal/ChaosBackendUImpl.cpp`.) There is no second line of defence inside the
+`Source/OGBrawlerUnreal/ChaosTickBackendUImpl.cpp`.) There is no second line of defence inside the
 sweeps themselves, and that is a deliberate, stated position rather than an oversight: the audit
 that considered adding a capture-side check and **rejected** it is recorded above `postPredictionAll`
 in `<core>SimulationReconciliation.h`.

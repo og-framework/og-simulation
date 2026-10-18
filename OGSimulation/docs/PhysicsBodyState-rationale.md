@@ -45,7 +45,7 @@ wire shape is cheap.
 | Locate | `OGSimulation/PhysicsDeclaration.h` | `bodyStateOf` | **sim author** |
 | Capture | `OGSimulation/SimulationIntegrationExecutor.h` | `captureBodyStatesAll` | nobody |
 | Correct | `OGSimulation/SimulationIntegrationExecutor.h` | `pushCorrectedBodyStatesAll` | nobody |
-| Create | `JoltBackendUImpl.cpp` | `createPhysicalObject`, `queryVolumes`, `attachmentOffset` | **sim author, in engine code** |
+| Create | `OGSimulationJolt/JoltTickWorldHost.h` | `createPhysicalObject`, `queryVolumes`, `attachmentOffset` | **sim author, in engine code** |
 | Bindings | `OGSimulation/PhysicsDeclaration.h` | `PhysicsRuntimeBindings` | nobody (was: four copies) |
 | Checksum / similarity | `OGSimulation/SimulationComposite.h` | `isSimilarTo` | nobody |
 
