@@ -61,8 +61,9 @@ struct SerializableFields<PhysicsBodyState>
 // Slim wire shape for a body whose rotation is locked at the descriptor
 // (BodyDescriptor's lockRotation flag): position + linear velocity only, 24 B.
 // Bridges to PhysicsBodyState by conversion so the executor's capture loop
-// (`bodyStateOf(state) = adapter.captureBodyState(id)`) and the engine's rewind
-// push (`pushBodyState(id, const PhysicsBodyState&)`) compile UNCHANGED — every
+// (`bodyStateOf(state) = adapter.captureBodyState(id)`) and the rewind push
+// (`pushCorrectedBodyStatesAll`, reading `bodyStateOf(state)` as a
+// PhysicsBodyState) compile UNCHANGED — every
 // adapter, Chaos and Jolt alike, keeps its `captureBodyState(id) ->
 // PhysicsBodyState` contract and needs no per-body-state-type code.
 struct LinearBodyState
@@ -99,11 +100,13 @@ struct LinearBodyState
 	// its orientation and spin die silently — carry PhysicsBodyState for such a
 	// body instead (see the CHOICE RULE at the top of this file).
 	//
-	// DELIBERATELY IMPLICIT, and it must stay that way: the engine's rewind push
-	// `pushBodyState(ownBodyId, D::bodyStateOf(state))` takes a
-	// `const PhysicsBodyState&` at a GENERIC call site. The implicit conversion
-	// there is the zero-edit property this bridge exists for; marking this
-	// `explicit` forces a hand edit at that call site and defeats the design.
+	// DELIBERATELY IMPLICIT, and it must stay that way: the rewind push reads
+	// `D::bodyStateOf(state)` as a `PhysicsBodyState` at GENERIC call sites
+	// (SimulationIntegrationExecutor::pushCorrectedBodyStatesAll, and an engine
+	// host's push probe that stashes it), and PhysicsDeclaration requires that
+	// overload to be `std::convertible_to<PhysicsBodyState>`. The implicit
+	// conversion is the zero-edit property this bridge exists for; marking this
+	// `explicit` fails that requirement for every LinearBodyState declaration.
 	operator PhysicsBodyState() const
 	{
 		return PhysicsBodyState{

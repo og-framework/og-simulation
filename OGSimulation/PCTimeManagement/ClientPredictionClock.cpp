@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: MPL-2.0
 #include "ClientPredictionClock.h"
 
+#include <algorithm>
 #include <cstdio>
+
+#include "OGSimulation/OGAssert.h"
 
 #include "OGSimulation/CompilerControl.h"
 
@@ -347,20 +350,26 @@ ClientPredictionClock::DriftAction ClientPredictionClock::evaluateDrift() const
 
 unsigned int ClientPredictionClock::registerResyncCallback(ResyncCallback cb)
 {
-    m_resyncCallbacks.push_back(std::move(cb));
-    return static_cast<uint32>(m_resyncCallbacks.size() - 1);
+    OG_CHECK(m_nextResyncCallbackId != InvalidCallbackId,
+        "ClientPredictionClock: resync callback ids exhausted");
+    const unsigned int id = m_nextResyncCallbackId++;
+    m_resyncCallbacks.push_back(RegisteredResyncCallback{id, std::move(cb)});
+    return id;
 }
 
 void ClientPredictionClock::unregisterResyncCallback(unsigned int id)
 {
-    std::swap(m_resyncCallbacks[id], m_resyncCallbacks.back());
-    m_resyncCallbacks.pop_back();
+    // Erase, not swap-with-back: the survivors keep their ids and their firing order.
+    const auto it = std::find_if(m_resyncCallbacks.begin(), m_resyncCallbacks.end(),
+        [id](const RegisteredResyncCallback& registered) { return registered.id == id; });
+    if (it != m_resyncCallbacks.end())
+        m_resyncCallbacks.erase(it);
 }
 
 void ClientPredictionClock::fireResyncCallbacks(unsigned int newTick)
 {
-    for (auto& cb : m_resyncCallbacks)
-        cb(newTick);
+    for (auto& registered : m_resyncCallbacks)
+        registered.callback(newTick);
 }
 
 OGSIM_OPTIMIZE_ON

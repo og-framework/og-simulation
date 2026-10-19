@@ -60,8 +60,10 @@ OGSIM_OPTIMIZE_OFF
 //     hold; the fences below defend the individual gates that keep it.
 //
 //       helper                           steady state   rare / on window close
-//       emitRelayArrival                 NOTHING        Verbose when gap > 1,
-//                                                       Warning per window
+//       emitRelayArrival                 1 Verbose      Verbose when gap > 1,
+//                                        `Ingest` per   Warning per window
+//                                        arrival that
+//                                        added a tick
 //       emitCorrectionArrival            1 Verbose per  Warning per class,
 //                                        ARRIVING       per window
 //                                        correction
@@ -72,7 +74,8 @@ OGSIM_OPTIMIZE_OFF
 //
 //     ⇒ ONE line per ARRIVING CORRECTION is this class's entire per-event cost
 //       on a steady client, and a relay arrival at the healthy depth-1 cadence
-//       costs NOTHING at all.
+//       costs one Verbose `[RelayProbe.Ingest]` line — about 60 per second per
+//       remote, Verbose only, so it does not exist at the shipped `Warning`. §13
 //
 //   * SEVERITY, AND WHY `Log` IS NOT AN OPTION HERE. Every per-window summary
 //     in this file ships at Warning. The adapter routes on the tag prefix and
@@ -184,6 +187,16 @@ public:
                 static_cast<std::uint32_t>(report.newCaptureTicksIngested),
                 arrival,
                 &gapCaptureTicks);
+
+            // ⛔ ONE VERBOSE LINE PER ARRIVAL THAT ADDED COVERAGE (~60/s per remote) — never promote it: at any shipped severity it is a per-tick line. §13
+            // ⛔ `new=` is `newCaptureTicksIngested`, the same count `delivered=` sums before clamping, so the per-arrival lines re-derive the window. §13
+            if (report.newCaptureTicksIngested > 0u)
+            {
+                SIMLOG(m_logger,
+                    "[Verbose][RelayProbe.Ingest] id=%u newest=%u new=%u",
+                    id, report.newestCaptureTick,
+                    static_cast<unsigned int>(report.newCaptureTicksIngested));
+            }
 
             // ⛔ VERBOSE ONLY WHEN THE CADENCE HICCUPED — a gap of exactly 1 is the healthy depth-1 steady state, and logging it would make this a per-tick line. §5
             if (gapCaptureTicks > 1u)

@@ -51,7 +51,8 @@ OGSIM_OPTIMIZE_OFF
 //       forgetOwner                                 forgetOwner, lifecycle
 //
 //     `emitMissClassLine` / `emitDeltaLine` are private and reached only from
-//     `emitRelayReadWindowIfDue`.
+//     `emitRelayReadWindowIfDue`. `emitReadTickLine` is private and reached
+//     only from `emitPredictionInputRead` and `emitResimScheduledRead`.
 //
 //   * THE READ SEAM IS NOT ON THIS CLASS.
 //     `SimulationInputResolution::Diagnostics` exposes ONE const probe,
@@ -65,12 +66,14 @@ OGSIM_OPTIMIZE_OFF
 //       helper                     steady state             rare / on close
 //       emitLocalInputRead         1 line PER TICK          —
 //       emitRemoteQueueRead        1 line PER TICK          —
-//       emitPredictionInputRead    1 line PER TICK          +1 Verbose on
-//                                                           VerifyFail or
-//                                                           BelowOldest
+//       emitPredictionInputRead    1 line PER TICK, plus    +1 Verbose on
+//                                  1 Verbose `ReadTick`     VerifyFail or
+//                                  per read with a store    BelowOldest
 //       the six emitResim*         1 line per RESIM tick    +1 Verbose on
 //                                  (resim only — not the    VerifyFail
-//                                  steady state at all)
+//                                  steady state at all);
+//                                  the ScheduledRead rung
+//                                  adds 1 Verbose `ReadTick`
 //       emitRelayReadWindowIfDue   NOTHING                  2 Warning, plus up
 //                                                           to 4 gated Warning,
 //                                                           plus 1 if stale
@@ -80,10 +83,12 @@ OGSIM_OPTIMIZE_OFF
 //                                                           construction
 //       forgetOwner                NOTHING                  never logs
 //
-//     ⇒ The three `[CollectInput]` classification lines are the ONLY per-tick
-//       output of this class; every `[RelayProbe.*]` line it emits is a
-//       per-WINDOW or a rare-event line, and the fourth `[CollectInput]` line
-//       (`NOCACHE`) is a rare-event line too — rate-limited to one per tick and
+//     ⇒ The three `[CollectInput]` classification lines and the Verbose
+//       `[RelayProbe.ReadTick]` line are the ONLY per-tick output of this
+//       class; every other `[RelayProbe.*]` line it emits is a per-WINDOW or a
+//       rare-event line (`ReadTick` and why it is the exception: §13), and the
+//       fourth `[CollectInput]` line (`NOCACHE`) is a rare-event line too —
+//       rate-limited to one per tick and
 //       emitted only in a state nothing in the tree can produce. That asymmetry
 //       is the whole point, and the per-method fences below are what hold it in
 //       place.
@@ -209,6 +214,9 @@ public:
             // ⛔ The WHOLE report, not just the outcome — the miss class and the signed probe-to-newest delta are tallied here too. §10
             m_relayReadProbe.notePredictionRead(id, readReport);
 
+            // ⛔ PER READ, VERBOSE ONLY, AND ONLY WITH A STORE — one per `[CollectInput]` line with a store, the exact join the window rates cannot give. §13
+            emitReadTickLine(id, tick, readReport, "Prediction");
+
             // ⛔ VERBOSE ONLY FOR THE OUTCOME THAT IS SILENT IN THE STEADY STATE — a verify-fail means the delay regime moved under this reader, which does not happen while the schedule is stable. §9
             // ⛔ Hits and misses are RATES and are reported by the per-window summary, never per event. §9
             if (readReport.outcome == ScheduledRelayedReadOutcome::VerifyFail)
@@ -270,6 +278,9 @@ public:
     {
         // ⛔ The whole report — same contract as the prediction site. §10
         m_relayReadProbe.noteResimRead(readReport);
+
+        // ⛔ The same per-read line as the prediction site, `src=Resim`; the Ref, NoStore and local rungs ran no scheduled read and print none. §13
+        emitReadTickLine(id, tick, readReport, "Resim");
 
         if (readReport.outcome == ScheduledRelayedReadOutcome::VerifyFail)
         {
@@ -369,6 +380,71 @@ private:
             delta.samples, delta.p10, delta.p50, delta.p90,
             delta.minDelta, delta.maxDelta,
             delta.saturatedLow, delta.saturatedHigh);
+    }
+
+    // ⛔ PRIVATE; the two callers are `emitPredictionInputRead` and `emitResimScheduledRead`, in this class. §13
+    // ⛔ `served` IS `probe` ON A HIT AND `newest` ON EVERY OTHER RUNG — the ladder serves `fallback()`, the store's newest arrival, whenever it does not hit. §13
+    // ⛔ `deltaToNewestValid` IS THE "A PROBE TICK WAS FORMED" BIT — false on rung 0 and on the `tick < dA` guard, where `probe`, `served` and `newest` print `-` rather than a meaningless 0. §13
+    void emitReadTickLine(unsigned int id, uint32 tick,
+                          const ScheduledRelayedReadReport& readReport, const char* site)
+    {
+        const bool probeFormed = readReport.deltaToNewestValid;
+        const uint32 served = (readReport.outcome == ScheduledRelayedReadOutcome::Hit)
+            ? readReport.probeTick
+            : readReport.newestResident;
+
+        char probeText[12];
+        char servedText[12];
+        char newestText[12];
+        formatTickOrDash(probeText,  probeFormed, readReport.probeTick);
+        formatTickOrDash(servedText, probeFormed, served);
+        formatTickOrDash(newestText, probeFormed, readReport.newestResident);
+
+        SIMLOG(m_logger,
+            "[Verbose][RelayProbe.ReadTick] id=%u tick=%u src=%s outcome=%s miss=%s "
+            "probe=%s served=%s newest=%s",
+            id, tick, site,
+            readOutcomeName(readReport.outcome),
+            readMissClassName(readReport.missClass),
+            probeText, servedText, newestText);
+    }
+
+    static void formatTickOrDash(char (&out)[12], bool valid, uint32 value)
+    {
+        if (valid)
+        {
+            std::snprintf(out, sizeof(out), "%u", value);
+        }
+        else
+        {
+            std::snprintf(out, sizeof(out), "-");
+        }
+    }
+
+    static const char* readOutcomeName(ScheduledRelayedReadOutcome outcome)
+    {
+        switch (outcome)
+        {
+        case ScheduledRelayedReadOutcome::NoProbe:    return "NoProbe";
+        case ScheduledRelayedReadOutcome::Hit:        return "Hit";
+        case ScheduledRelayedReadOutcome::Miss:       return "Miss";
+        case ScheduledRelayedReadOutcome::VerifyFail: return "VerifyFail";
+        }
+        return "?";
+    }
+
+    // ⛔ `NotAMiss` PRINTS `-`, so `miss=` names a class only on a Miss. §13
+    static const char* readMissClassName(ScheduledRelayedReadMissClass missClass)
+    {
+        switch (missClass)
+        {
+        case ScheduledRelayedReadMissClass::NotAMiss:    return "-";
+        case ScheduledRelayedReadMissClass::InSpan:      return "InSpan";
+        case ScheduledRelayedReadMissClass::AboveNewest: return "AboveNewest";
+        case ScheduledRelayedReadMissClass::BelowOldest: return "BelowOldest";
+        case ScheduledRelayedReadMissClass::NoProbeTick: return "NoProbeTick";
+        }
+        return "?";
     }
 
     std::function<void(const char*)> m_logger;

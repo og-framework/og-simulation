@@ -81,8 +81,8 @@ struct ResimSweepDiagnostics
 //   * ⭐ ONE ADAPTER'S BINDING FOR THE CALLBACK COLUMN OF BOTH TABLES BELOW.
 //     That column names the physics-callback ROLE a phase is driven from, never
 //     an engine type. One adapter binds those roles on
-//     `FSimulationManagerAsyncCallback` (`OGSimulationUnreal`,
-//     `SimulationManagerUImpl.cpp`), where that one adapter's names are
+//     the async callback of the Chaos-scheduled host (a game's engine
+//     adapter, outside this library), where that one adapter's names are
 //     `OnPreSimulate_Internal` (pre-simulate step), `OnPostSolve_Internal`
 //     (post-solve step), `TriggerRewindIfNeeded_Internal` (rewind request) and
 //     `FirstPreResimStep_Internal` (first resim step). Another adapter

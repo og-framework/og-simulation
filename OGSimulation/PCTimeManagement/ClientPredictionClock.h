@@ -152,8 +152,13 @@ using PCClockLoggerFn = std::function<void(const char*)>;
 
     // -----------------------------------------------------------------------
     // Resync callbacks
-    // Called with the new predictionTick when a hard resync fires.
-    // Same swap-with-back pattern as the existing system.
+    // Called with the new predictionTick when a hard resync fires, in
+    // registration order.
+    // Ids are STABLE: each registration gets the next value of a monotonic
+    // counter, and unregistering one id leaves every other id valid. (Ids used
+    // to be vector indices with a swap-with-back unregister, which silently
+    // re-indexed the moved callback, so a later unregister of that id removed
+    // the wrong one.) Unregistering an unknown id is a no-op.
     // -----------------------------------------------------------------------
 
     using ResyncCallback = std::function<void(unsigned int newTick)>;
@@ -230,7 +235,13 @@ private:
     // advancePrediction() call (as a Stall), cleared by a hard resync.
     unsigned int m_requiredInputDelayIncreaseStallTicks = 0;
 
-    std::vector<ResyncCallback> m_resyncCallbacks;
+    struct RegisteredResyncCallback
+    {
+        unsigned int   id;
+        ResyncCallback callback;
+    };
+    std::vector<RegisteredResyncCallback> m_resyncCallbacks;
+    unsigned int                          m_nextResyncCallbackId = 0;
     PCClockLoggerFn m_logger;
 
     // ⛔ THE EVENT SEAM, whole and behind its own type; the contract is at `EventSeamDiagnostics`.

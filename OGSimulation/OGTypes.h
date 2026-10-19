@@ -4,6 +4,7 @@
   #include <cstdint>
   using int32  = int32_t;
   using uint32 = uint32_t;
+  using uint8  = uint8_t;
   // UE defines PI as a float constant — match it here.
   #ifndef PI
     #define PI 3.1415926535897932f

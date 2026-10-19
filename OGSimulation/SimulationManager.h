@@ -156,8 +156,8 @@ concept SimulationSystemsExecutorConcept = requires(
 //     atomics.
 //     ⭐ ONE ADAPTER'S BINDING FOR THE CALLBACK COLUMN BELOW: it names the
 //     physics-callback ROLE, never an engine type. One adapter binds those
-//     roles on `FSimulationManagerAsyncCallback` (`OGSimulationUnreal`,
-//     `SimulationManagerUImpl.cpp`), where that one adapter's names are
+//     roles on the async callback of the Chaos-scheduled host (a game's
+//     engine adapter, outside this library), where that one adapter's names are
 //     `OnPreSimulate_Internal` (pre-simulate step), `OnPostSolve_Internal`
 //     (post-solve step),
 //     `TriggerRewindIfNeeded_Internal` (rewind request) and
@@ -169,6 +169,9 @@ concept SimulationSystemsExecutorConcept = requires(
 //       post-solve step              onPostGameSimulation   returns early
 //       rewind request               onCheckIsSimilar       never reached
 //       first resim step             prepareResimulation    never reached
+//
+//     `prepareResimulation` also writes the restored bodies into the host's
+//     already-restored world (the integration executor's push).
 //
 //   * ⛔ THE `TimeConfig` RE-READ RULE, AND ITS SCOPE IS ALL THREE VALUES. This
 //     class is the sole reader-and-hander-down of `TimeConfig` into the peers,
@@ -500,11 +503,14 @@ public:
         return correctionTick;
     }
 
-    // `chaosStep` is the raw physics-engine step; `simTick` is the tick to resim
-    // from. The parameter name spells one adapter's engine: read "chaos step" as
-    // PHYSICS STEP here and at every call site.
-    // ⛔ Peer members this requires-clause covers: `prepareResimAll`, `firstResimStepAll`. §2
-    void prepareResimulation(int32_t chaosStep, uint32_t simTick)
+    // `physicsStep` is the raw physics-engine step; `simTick` is the tick to resim from.
+    // ⛔ THE LOG TOKEN `chaosStep=` IS A FROZEN SPELLING — archived greps key on it, so it
+    // survived the parameter's rename to `physicsStep`. Do not rename the token. §12
+    // ⛔ Peer members this requires-clause covers: `prepareResimAll`, `firstResimStepAll`,
+    // `pushCorrectedBodyStatesAll`. §2
+    // ⛔ PRECONDITION: the host's physics world already holds `simTick`. This call arms the
+    // clock, restores og-sim state, and then, last, writes the restored bodies into that world. §12
+    void prepareResimulation(int32_t physicsStep, uint32_t simTick)
         requires SimulationReconciliationConcept<ReconciliationT> &&
                  SimulationIntegrationExecutorConcept<IntegrationExecT>
     {
@@ -513,12 +519,13 @@ public:
             OG_CHECK(false, "prepareResimulation called on authority — not expected");
             return;
         }
-        SIMLOG(m_logger, "[Resim.Prepare] chaosStep=%d simTick=%u", chaosStep, simTick);
+        SIMLOG(m_logger, "[Resim.Prepare] chaosStep=%d simTick=%u", physicsStep, simTick);
         // ⛔ `prepares` EQUALS the `[Resim.Prepare]` occurrence count by construction. §6
         m_resimGateProbe.notePrepare(simTick);
         m_clientClock->startResimulation(simTick);
         m_reconciliation.prepareResimAll(simTick);
-        m_integrationLayer.firstResimStepAll(chaosStep);
+        m_integrationLayer.firstResimStepAll(physicsStep);
+        m_integrationLayer.pushCorrectedBodyStatesAll();
     }
 
     // THE RESIM-GATE PROBE — PHYSICS THREAD.
@@ -568,6 +575,15 @@ public:
     uint32_t currentIntegratedTick() const
     {
         return m_lastStep.has_value() ? m_lastStep->getTick() : 0u;
+    }
+
+    // The step the most recent `integrateAll` ran — tick AND kind; empty before the first.
+    // The step driver reads the kind here to key its physics ring on the same predicate as the
+    // correction cache. ⛔ `getStepKind()` collapses `HardResync` to `Normal`; a caller that needs
+    // HardResync learns it from a `ClientPredictionClock` resync callback. §12
+    const std::optional<SimulationTimeStep>& lastIntegratedStep() const
+    {
+        return m_lastStep;
     }
 
     // ⛔ Peer members this requires-clause covers: `sendCorrectionAll` +
@@ -874,6 +890,7 @@ namespace simulationManagerConceptProof
     {
         void firstResimStepAll(int32 /*physicsStep*/) {}
         void captureBodyStatesAll() {}
+        void pushCorrectedBodyStatesAll() {}
     };
 
     // The storage / static-data stand-ins the systems-executor concept needs as its second

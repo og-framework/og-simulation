@@ -91,6 +91,88 @@ public:
         });
     }
 
+    // Writes each declaration's body state from og-sim state into the physics world, after a
+    // rollback restored og-sim state from the correction cache. Called once per resim by
+    // `SimulationManager::prepareResimulation`, after the host restored its physics world to the
+    // anchor and after og-sim state was restored from the correction cache. Position and linear
+    // velocity always; rotation and angular velocity only for a full `PhysicsBodyState`
+    // declaration, because a `LinearBodyState` carries neither and its widening would write
+    // identity and zero.
+    //
+    // THE RESTORED BODY is read with `captureStartOfStepBodyState` when the adapter models
+    // `PhysicsBodyStartOfStepReader` (`if constexpr`), and with `captureBodyState` otherwise. It
+    // must be the state the first replayed step starts from. On Jolt that is `captureBodyState`
+    // after `restoreTick`. On Chaos `captureBodyState` reads the solved P/Q, which a rewind leaves
+    // stale while it restores X/R/V/W, so the Chaos adapter supplies the start-of-step read. Both
+    // reads below (the skip and a linear declaration's rotation) use this one value.
+    //
+    // RESTORE SKIP. A declaration whose state equals the adapter's capture of the restored body
+    // (exact `operator==`: all four fields for `PhysicsBodyState`, position and linear velocity for
+    // `LinearBodyState`) is NOT written. For a declaration nobody corrected, the cached anchor state
+    // IS the capture the snapshot was saved with, so the skip fires exactly when there is nothing
+    // to restore; an adopted correction still differs and is still written. Load-bearing: a seam
+    // write is lossy on Jolt (cm -> m, centre-of-mass offset), so writing an unchanged body moves
+    // it by an ULP, the next correction compares exactly and disagrees, and a torque-driven body
+    // (the weapon) keeps that error and starts a resim storm. Removing the skip re-opens those
+    // storms. The guard lives HERE, not in the adapter setters: the sims rewrite bodies from seam
+    // state every tick, and that quantization must stay identical on every peer. The skip runs on
+    // every backend: for an adapter whose writes are exact it only saves a write that would change
+    // nothing og-sim can read, so no "lossless" flag exists to turn it off.
+    //
+    // POSE PATH. When the adapter models `PhysicsBodyPoseWriter`, the pose goes through
+    // `setBodyPose` (position + quaternion), and a `LinearBodyState` declaration passes back the
+    // body's own captured rotation. Otherwise the matrix path below is kept. Load-bearing: the
+    // matrix path (`mat4_cast`, then the adapter's matrix -> quaternion) loses rotation bits, so an
+    // adopted rotation would not restore exactly.
+    void pushCorrectedBodyStatesAll()
+    {
+        m_storage.forEachSimulatable([&](unsigned int /*id*/, auto& sim) {
+            const auto& state = sim.getAllState().getState();
+            sim.getPhysicsComposite().forEach([&](const auto& decl) {
+                using D = std::decay_t<decltype(decl)>;
+                using S = typename D::StateType;
+                using BodyStateT = std::remove_cvref_t<decltype(D::bodyStateOf(state.template get<S>()))>;
+                const PhysicsBodyState body = static_cast<PhysicsBodyState>(D::bodyStateOf(state.template get<S>()));
+                const BodyId bodyId = decl.bindings.ownBodyId;
+                const PhysicsBodyState restored = captureRestoredBodyState(bodyId);
+                // Temporary restore skip: the seam write is lossy (cm<->m, centre of mass). Remove it when JoltSuite.Tripwire.TheSeamWriteIsLossyUntilTheSimulationsUseMetres fails (og-simulation-jolt docs/JoltUnits-rationale.md §5).
+                if (bodyStateEqualsRestored<BodyStateT>(body, restored))
+                {
+                    return;
+                }
+                if constexpr (std::is_same_v<BodyStateT, PhysicsBodyState>)
+                {
+                    if constexpr (PhysicsBodyPoseWriter<PhysAdapterT>)
+                    {
+                        m_physicsAdapter.setBodyPose(bodyId, body.position, body.rotation);
+                    }
+                    else
+                    {
+                        glm::mat4 transform = glm::mat4_cast(body.rotation);
+                        transform[3] = glm::vec4(body.position, 1.f);
+                        m_physicsAdapter.setBodyTransform(bodyId, transform);
+                    }
+                    m_physicsAdapter.setBodyLinearVelocity(bodyId, body.linearVelocity);
+                    m_physicsAdapter.setBodyAngularVelocity(bodyId, body.angularVelocity);
+                }
+                else
+                {
+                    if constexpr (PhysicsBodyPoseWriter<PhysAdapterT>)
+                    {
+                        m_physicsAdapter.setBodyPose(bodyId, body.position, restored.rotation);
+                    }
+                    else
+                    {
+                        glm::mat4 transform = m_physicsAdapter.getBodyTransform(bodyId);
+                        transform[3] = glm::vec4(body.position, 1.f);
+                        m_physicsAdapter.setBodyTransform(bodyId, transform);
+                    }
+                    m_physicsAdapter.setBodyLinearVelocity(bodyId, body.linearVelocity);
+                }
+            });
+        });
+    }
+
     void captureBodyStatesAll()
     {
         m_storage.forEachSimulatable([&](unsigned int /*id*/, auto& sim) {
@@ -108,6 +190,37 @@ public:
     }
 
 private:
+    // The restored body the push compares with and takes a linear declaration's rotation from (see
+    // pushCorrectedBodyStatesAll).
+    PhysicsBodyState captureRestoredBodyState(BodyId bodyId) const
+    {
+        if constexpr (PhysicsBodyStartOfStepReader<PhysAdapterT>)
+        {
+            return m_physicsAdapter.captureStartOfStepBodyState(bodyId);
+        }
+        else
+        {
+            return m_physicsAdapter.captureBodyState(bodyId);
+        }
+    }
+
+    // The restore skip's comparison (see pushCorrectedBodyStatesAll). Exact float equality on the
+    // fields the declaration's wire shape carries: a `LinearBodyState` has no rotation or angular
+    // velocity, so the body's own values for those never decide.
+    template <typename BodyStateT>
+    static bool bodyStateEqualsRestored(const PhysicsBodyState& body, const PhysicsBodyState& restored)
+    {
+        if constexpr (std::is_same_v<BodyStateT, PhysicsBodyState>)
+        {
+            return body.position == restored.position && body.rotation == restored.rotation
+                && body.linearVelocity == restored.linearVelocity && body.angularVelocity == restored.angularVelocity;
+        }
+        else
+        {
+            return body.position == restored.position && body.linearVelocity == restored.linearVelocity;
+        }
+    }
+
     // Externally-owned references (see class + ctor doc-comments). Declaration
     // order matches the ctor init-list to keep -Wreorder clean.
     SimulationObjectStorage<SimulatableTs...>& m_storage;
@@ -126,6 +239,7 @@ concept SimulationIntegrationExecutorConcept = requires(
 {
     { t.firstResimStepAll(physStep) };
     { t.captureBodyStatesAll() };
+    { t.pushCorrectedBodyStatesAll() };
 };
 
 OGSIM_OPTIMIZE_ON

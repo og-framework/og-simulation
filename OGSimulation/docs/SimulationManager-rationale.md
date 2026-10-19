@@ -1416,3 +1416,60 @@ Not quoted (3), each with the reason it needs no archive:
 - `:1252` — NARRATIVE (carried to the shipped file UNCHANGED — there is nothing removed to archive)
 - `:1331` — KEEP-VERBATIM (carried to the shipped file UNCHANGED — there is nothing removed to archive)
 
+## 12. Additions after the archive (step-driver task, 2026-10-06)
+
+These are not archived prose. They were written with the code they describe, and the header's
+`§12` pointers land here.
+
+### The `chaosStep=` log token is a frozen spelling
+
+`prepareResimulation`'s first parameter is `physicsStep`: it is the raw step of whichever physics
+engine the host runs, and the core names no engine. It was called `chaosStep` until the engine-free
+step driver (`SimulationStepDriver.h`) became its second caller. **The `[Resim.Prepare]` line keeps
+the token `chaosStep=`**, because archived log greps key on that spelling. The value printed is the
+same one under either name: the physics step the replay was armed at. Renaming the token would
+make every archived grep silently match nothing on new logs.
+
+### `lastIntegratedStep()`
+
+It returns `m_lastStep`: the step the most recent `integrateAll` ran, tick and kind, and empty
+before the first. `currentIntegratedTick()` returns only the tick, and `currentStep()` is private,
+so before this accessor a caller outside the class could not learn the step **kind**.
+
+The step driver needs the kind. It keys its physics snapshot ring on the same predicate the
+correction cache keys its frontier on (`stepAllocatesFrontierSlot(kind)`), and on a `Skip` it
+commits the pre-step world under the skipped tick. It reads the kind after `onGameSimulation`
+returns, which is the only point at which `advancePrediction` has decided it.
+
+`getStepKind()` collapses `HardResync` to `Normal` (`onGameSimulationPrediction` keeps the base step
+for a `HardResync`). A caller that must react to a HardResync learns of it from a
+`ClientPredictionClock` resync callback, which fires inside `advancePrediction`; the step driver
+does exactly that.
+
+### `prepareResimulation` pushes
+
+`prepareResimulation` ends with the integration executor's push, `pushCorrectedBodyStatesAll`: after
+the probe note, the clock's resim cursor (`startResimulation`), the cache restore (`prepareResimAll`)
+and the first-resim-step hook (`firstResimStepAll`), it writes each declaration's restored body state
+into the host's physics world. Its requires-clause already named `SimulationIntegrationExecutorConcept`,
+so the call needed no new constraint, and the function stays `void`.
+
+**Why the push lives here.** This is the push's only production caller. A host that runs a rollback
+therefore depends on the manager and on its own physics world, and never on the integration executor:
+the step driver holds no executor, and an engine-scheduled host holds no forwarder to one.
+
+**The precondition.** The host's physics world already holds `simTick` when this is called; the
+fence above the function says so, and nothing checks it. Each kind of host meets it in its own way:
+* a step-driving host (`SimulationStepDriver`) restores its world's snapshot of the anchor, and applies
+  that tick's slot occupancy, before it calls `prepareResimulation`;
+* an engine-scheduled host calls `prepareResimulation` from the engine's first-resim-step hook, which
+  the engine runs after its own rewind of the physics world.
+
+**Why the push runs last.** It reads the og-sim state `prepareResimAll` has just restored from the
+correction cache, and compares each declaration with the restored body (`SimulationStepDriver-rationale.md`
+§9). Above the restore it would write the present-tick state into the anchor's world.
+
+**The known limitation.** `prepareResimAll` restores a simulatable only when its cache holds a slot
+for `simTick` (`[ResimCheck.PrepareRestore] found=1`). A simulatable whose anchor slot is missing
+(`found=0`, for example one that joined after the anchor) keeps its present-tick state, and the push
+writes that state into the anchor's world as it is.

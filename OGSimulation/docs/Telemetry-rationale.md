@@ -1018,3 +1018,90 @@ disagreeing correction has already overwritten the cache slot, so the predicted 
 `StateCorrectionCache::tryInsertingCorrectState` walks it, under its own gate;
 `SimulationNetSync::decideCorrectionArrival` carries the result without touching it. The cost
 gate and its measurements are in `docs/SimulationComparison-rationale.md`.
+
+---
+
+## 13. The per-read and per-arrival Verbose lines — task 61
+
+Two Verbose lines join single reads and single arrivals, where the per-window summaries above
+report only rates:
+
+```
+[Verbose][RelayProbe.ReadTick] id=7 tick=110 src=Prediction outcome=Miss miss=AboveNewest probe=106 served=104 newest=104
+[Verbose][RelayProbe.Ingest] id=5 newest=102 new=3
+```
+
+**Why they exist.** No window line can say whether ONE prediction read hit, which capture it
+served, or when ONE capture became resident. An attribution of a disagreement to a late input
+therefore had to be estimated: by joining wall-clock timestamps across three processes, and
+checking the estimate against the per-window miss counts. These two lines make that join exact.
+For every read, the reader logs what it asked for and what it got. For every arrival, it logs
+what became resident and when.
+
+**`[RelayProbe.ReadTick]`**, from `emitReadTickLine`, called by `emitPredictionInputRead` (only
+when the character has a relay store) and by `emitResimScheduledRead`:
+
+| Field | Value |
+|---|---|
+| `src` | `Prediction` or `Resim`, the call site |
+| `outcome` | `Hit`, `Miss`, `VerifyFail` or `NoProbe`, the ladder rung that replied |
+| `miss` | `AboveNewest`, `InSpan`, `BelowOldest`, `NoProbeTick`, or `-` when the read did not miss |
+| `probe` | the probe tick, `tick - dLatest` |
+| `served` | the capture tick behind the served input: `probe` on a hit, otherwise `newest` |
+| `newest` | the store's newest resident capture tick at the read |
+
+- ⛔ **`served` is derived, not carried.** `decideScheduledRelayedRead` serves the candidate only on
+  a hit. Every other rung serves `fallback()`, the store's newest arrival. `findLatest()`,
+  `fallback()` and `residentSpan()` all pick the maximum capture tick, so on a miss `newest` and
+  the served capture are the same number.
+- ⛔ **`-` when no probe tick was formed.** That is rung 0 (nothing ever arrived) and the
+  `tick < dA` guard. The report's `deltaToNewestValid` is set exactly when the ladder formed a
+  probe tick, so it is the flag. On those rungs the report's `probeTick` and `newestResident`
+  are 0 and mean nothing, and printing a 0 would read as a real tick. On the `tick < dA` guard
+  the ladder still serves the newest arrival, but the line prints a dash for `served`, as the task
+  specified. It does not invent a capture tick the report does not carry.
+- ⛔ **Only reads that ran the scheduled ladder.** The prediction site prints none without a
+  store. In a resim, the Ref, NoStore, local, NoSlot and Sentinel rungs ran no scheduled read,
+  so only the ScheduledRead rung prints one. So per client, the count of `src=Prediction` lines
+  equals the count of `[CollectInput]` lines that read `source=RemoteInputCache` with a store
+  (hasStore=1).
+- **The existing lines are unchanged.** The VERIFY-FAIL and BELOW-OLDEST detail lines, the
+  `[CollectInput]` line and the window lines keep their text and their gates.
+
+**`[RelayProbe.Ingest]`**, from `emitRelayArrival`, once for every arrival whose
+`newCaptureTicksIngested` is above 0:
+
+- `newest` is the report's `newestCaptureTick`: the newest tick this ring carried, not the newest
+  the store holds (§5).
+- `new` is `newCaptureTicksIngested`, the new coverage. Re-delivered entries are not counted.
+- ⛔ **It sits inside the `newestCaptureTickValid` block.** `populateRemoteInputCache` counts a new
+  tick only for an entry it accepted, and that same acceptance sets the valid flag. So an arrival
+  that added a tick always has a valid `newest`.
+- **The window check.** `RelayArrivalProbe::noteArrival` adds the same `new` count, clamped to the
+  gap, into `deliveredCaptureTicks`. Over a session, the sum of `new=` on these lines therefore
+  matches the sum of `delivered=` on the `[RelayProbe.Arrival]` window lines, give or take one
+  window edge. The difference is the first arrival per id, which only seeds the probe;
+  discontinuities, which the probe discards; clamping; and the window that has not closed yet.
+- **The gap above 1 `[RelayProbe.Arrival]` line and its guard are unchanged.**
+
+**Volume, and why both are Verbose only.**
+
+- `ReadTick`: one line per remote per prediction tick, about 60 per second per remote, plus one
+  per remote per replayed tick during a resim.
+- `Ingest`: one line per arrival that added a tick. At the depth-1 cadence that is also about 60
+  per second per remote.
+- Both are per-tick lines, the volume class the window summaries exist to avoid. So both are
+  Verbose, and the host's log category for the `[RelayProbe` family stays at Warning in the
+  shipped configuration. At that level neither line exists. Turning them on is a per-session
+  choice: raise that category, LogOGRelayProbe, to Verbose.
+- ⛔ **Never promote either line to Warning or Log.** At any shipped level it becomes a per-tick
+  line in every log.
+- **Cost when the category is off.** A Verbose line is still formatted into the 256-byte buffer
+  and handed to the logger, which drops it. That is the same cost the per-tick `[CollectInput]`
+  line already pays.
+
+**The "Verbose gate" in the tests.** The core has no severity filter: a line's leading `[Verbose]`
+token is the whole contract, and the host routes on it. So the tests pin the exact text, prefix
+included, and run every case through a sink that drops `[Verbose]` lines when its gate is closed,
+as the host does. The `[CollectInput]` lines still reach that sink, which proves it was called.
+The cases are tagged RelayProbeTickLines in og-simulation-tests.

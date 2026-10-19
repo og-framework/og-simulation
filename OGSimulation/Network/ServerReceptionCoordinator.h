@@ -42,12 +42,13 @@
 //
 //       noteRttSample         per arriving BUNDLE   the RPC receive path
 //       receiveInputBundle    per arriving BUNDLE   the same path, after it
-//       releaseDelayedInputs  per PHYSICS FRAME     the pre-step drain hook
-//       reapConnections       per PHYSICS FRAME     the same hook, after it
+//       releaseDelayedInputs  per SIM TICK          the authority's pre-step hook
+//       reapConnections       per PHYSICS FRAME     the host, after the frame's steps
 //
-//     A frame simulates `numSteps` sim ticks, so the last two run per FRAME and
-//     not per tick. That is load-bearing for the dwell gate - see
-//     `reapConnections`. §5
+//     The drain runs once per simulated tick, for that tick (a host may also
+//     drain a whole frame's ticks in one call). A frame simulates `numSteps` sim
+//     ticks, so the reap runs per FRAME and not per tick. That is load-bearing
+//     for the receipt gate and the dwell gate - see `reapConnections`. §5
 //
 //   * THREE SINKS, all compile-time CONCEPTS, so no declaration here names an
 //     engine type: `ConnectionTierSink` (a tier out to the owning client),
@@ -194,6 +195,8 @@ public:
     // ⛔ FAIL-OPEN UNTIL ARMED - failing CLOSED unset would discard every input. §5
     // ⛔ `m_serverTickKnown` KEEPS "never armed" DISTINCT FROM "armed at tick 0". §5
     // ⚠ PUBLIC, BUT NO EXTERNAL CALLER TODAY - both arm through `reapConnections`. §5
+    // ⛔ WHICH IS WHY THE REAP STAYS ONCE PER FRAME: per step, this reference would
+    // be the frame's LAST tick when the next frame's receipts are judged. §5
     // ⚠ Unarmed until the first physics frame, where warm-up ticks are in-domain. §5
     void noteServerTick(int32_t serverTick)
     {
@@ -450,6 +453,8 @@ public:
 
             // [DelayShift] is keyed on the WIRE, so it fires at most once per wire
             // per drain rather than once per slot. §8
+            // ⚠ `tick=` is this drain's first tick: under a per-step drain, the step
+            // that first sees the change - in practice still the frame's first. §8
             noteDelayShift(key.address, delay, firstUpcomingSimTick);
 
             bool ownerAlive = true;
