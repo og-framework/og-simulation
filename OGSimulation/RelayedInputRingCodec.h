@@ -52,7 +52,7 @@
 //
 // The ring's write/evict/scan logic is pure byte manipulation over the
 // og-simulation serialization free functions — no Unreal dependency. The UE-side
-// wrapper FRelayedInputRing (Source/OGSimulationUnreal/RelayedInputRing.h) is a
+// wrapper FRelayedInputRing (Plugins/OGSimulation/Source/OGSimulationUnreal/RelayedInputRing.h) is a
 // USTRUCT that owns a UPROPERTY TArray<uint8> for replication and DELEGATES every
 // operation here. Hoisting the algorithm into core is what lets the pure-C++
 // Low-Level-Tests exercise the REAL production code path

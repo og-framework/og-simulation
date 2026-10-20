@@ -63,7 +63,7 @@
 // RelayedInputRingCodec.h).
 //
 // The UE-side wrapper FSimulationStateSyncBuffer
-// (Source/OGSimulationUnreal/SyncedSimulationStateBuffer.h) is a USTRUCT owning a
+// (Plugins/OGSimulation/Source/OGSimulationUnreal/SyncedSimulationStateBuffer.h) is a USTRUCT owning a
 // UPROPERTY TArray<uint8> plus NetSerialize; it DELEGATES the payload layout
 // here. Hoisting the layout into core is what lets the pure-C++ Low-Level-Tests
 // round-trip the REAL production framing (WireFormat/CorrectionStateBufferCodecTest.cpp)

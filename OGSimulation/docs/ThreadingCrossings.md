@@ -152,7 +152,8 @@ owns one.
 - **`ChaosTickMapper` (`m_offset`, an `std::atomic<int32_t>`)** is a real, *wired* GT/PT-shaped
   crossing (production call sites in `ChaosTickBackendUImpl.cpp`/`.h`; `SimmableUpdateComponent.h` only
   forward-declares it) — but it lives in `OGSimulationUnreal`, which is a different module in
-  the outer game repository (`Source/OGSimulationUnreal/`), not inside the `og-simulation` submodule
+  the og-simulation-ue plugin repository (`Plugins/OGSimulation/Source/OGSimulationUnreal/`; the outer game repository's
+  until og-tickdriver task 16), not inside the `og-simulation` submodule
   this doc's own path (`OGSimulation/docs/ThreadingCrossings.md`) lives in and scopes itself to ("the
   one place every ... crossing in `og-simulation` is enumerated," line 4 above). Out of this doc's
   declared scope on a repo boundary, not an oversight — flagged here rather than silently passed over

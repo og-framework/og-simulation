@@ -20,7 +20,7 @@
 // WHY THIS LIVES IN CORE: the bundle's append/dedup/iteration logic is
 // pure byte manipulation over the og-simulation serialization free functions —
 // it has no Unreal dependency. The UE-side wrapper FInputRedundancyBundle
-// (Source/OGSimulationUnreal/SyncedSimulationStateBuffer.h) is a USTRUCT that
+// (Plugins/OGSimulation/Source/OGSimulationUnreal/SyncedSimulationStateBuffer.h) is a USTRUCT that
 // owns a UPROPERTY TArray<uint8> for replication and *delegates* every operation
 // to the templates here. Hoisting the algorithm into core lets the pure-C++
 // Low-Level-Tests exercise the REAL code path (WireFormat_Bundle.cpp) without
