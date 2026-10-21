@@ -84,7 +84,7 @@ connection's staged inputs once per replication poll.
 | 10 | Per slot: domain gate, dedup watermark, park | S · GT | `<core>Network/ServerReceptionCoordinator.h` | `receiveRemoteInput` |
 | 11 | The input is parked for `effectiveDelay` ticks | S · GT | `<core>Network/ServerInputDelayQueue.h` | `ServerInputDelayQueue::enqueue` |
 | 12 | **The relay tap** — the same delay becomes the schedule stamp `dA` | S · GT | `<core>Network/ServerReceptionCoordinator.h` | `stampFromDelay` |
-| 13 | The tap resolves `id` → owning component and stages the entry | S · GT | `Source/OGBrawlerUnreal/SimulationManagerUImpl.cpp` | `ASimulationManagerUImpl::relayRemoteInput` |
+| 13 | The tap resolves `id` → owning component and stages the entry | S · GT | `Plugins/OGSimulation/Source/OGSimulationUnreal/UESimulationSession.h` | `UESimulationSession::relayRemoteInput` |
 | 14 | The entry lands in the **staging** ring, not the replicated one | S · GT | `Plugins/OGSimulation/Source/OGSimulationUnreal/UESimulatableOwnerBinding.h` | `stageRelayedInput` |
 | 15 | …via the ring type's staging entry point | S · GT | `Plugins/OGSimulation/Source/OGSimulationUnreal/RelayedInputRing.h` | `stageArrival` |
 | 16 | The whole staged burst is published once per replication poll | S · GT | `Plugins/OGSimulation/Source/OGSimulationUnreal/SimulationInputRelay.cpp` | `ASimulationInputRelay::PreReplication` |
@@ -109,10 +109,10 @@ input the authority is still holding. That held copy travels its own short path.
 
 | # | hop | machine · thread | file | symbol |
 |---:|---|---|---|---|
-| A1 | Once per physics frame, the drain runs for the tick(s) about to be simulated | S · GT | `Source/OGBrawlerUnreal/SimulationManagerUImpl.cpp` | `releaseDelayedInputsForStep` |
+| A1 | Once per physics frame, the drain runs for the tick(s) about to be simulated | S · GT | `Plugins/OGSimulation/Source/OGSimulationUnreal/UESimulationSession.h` | `releaseDelayedInputsForStep` |
 | A2 | Every claimed slot releases what is due, or overdue | S · GT | `<core>Network/ServerReceptionCoordinator.h` | `releaseDelayedInputs` |
 | A3 | …surfacing the entry's **stored** capture tick, not a reconstructed one | S · GT | `<core>Network/ServerInputDelayQueue.h` | `tryDequeueForTick` |
-| A4 | Delivery routes id → component → core | S · GT | `Source/OGBrawlerUnreal/SimulationManagerUImpl.cpp` | `deliverRemoteInput` |
+| A4 | Delivery routes id → component → core | S · GT | `Plugins/OGSimulation/Source/OGSimulationUnreal/UESimulationSession.h` | `deliverRemoteInput` |
 | A5 | …into the SPSC ring the physics thread drains | S · GT (producer) | `<core>SimulationInputResolution.h` | `queueRemoteMove` |
 | A6 | The authority's collect dequeues it on the remote branch | S · PT | `<core>SimulationQueues.h` | `dequeueMove` |
 | A7 | The tick is integrated | S · PT | `<core>SimulationManager.h` | `onGameSimulationAuthority` |
@@ -330,7 +330,7 @@ Grouped, because the pattern matters more than the per-row answer:
   sentence is TRUE of `LocalInputCache` and FALSE of `RemoteInputCache`; the fence forbidding the copy
   lives in `Network/RemoteInputCache.h`.
 - **A, GT:** hops 6–8. The send sweep runs from `onPostSimulationGameThread`, reached from the
-  adapter's `OnPostPhysicsStep` — a game-thread hook, which is what makes the RPC legal to fire.
+  adapter session's `onPostPhysicsStep` — a game-thread hook, which is what makes the RPC legal to fire.
 - **A, PT→GT crossing:** hop 5 → hop 6. `PendingInputQueue` is a Lamport SPSC ring — physics-thread
   producer, game-thread consumer. This is the shape `ThreadingCrossings.md`'s standing rule points
   every *new* crossing at.
