@@ -1394,7 +1394,7 @@ what is actually true and where the header now says it.
 
 **The header said:** "`[Resim.` inherits `LogOGSim=Verbose` (T19's 10 MB defect)"
 
-**The tree says:** the shipped configuration sets `LogOGSim=Warning` — one adapter's binding for that is the `LogOGSim` entry in `Config/DefaultEngine.ini`. `Verbose` was the value T19 MEASURED against; it is not the shipped value. The fence's payload — do not name the tag `[Resim.` — survives on knob-independence alone, which is verified: `[Resim.` routes to `LogOGSim` and `[ResimCheck.` splits across `LogOGSim` and `LogOGSimTick` (`SimulationManagerUImpl.cpp:155-164`).
+**The tree says:** the shipped configuration sets `LogOGSim=Warning` — one adapter's binding for that is the `LogOGSim` entry in `Config/DefaultEngine.ini`. `Verbose` was the value T19 MEASURED against; it is not the shipped value. The fence's payload — do not name the tag `[Resim.` — survives on knob-independence alone, which is verified: `[Resim.` routes to `LogOGSim` and `[ResimCheck.` splits across `LogOGSim` and `LogOGSimTick` (`SimulationLogRoutes.h` :: `kSimulationLogRoutes`; the UE adapter emits its `Sim` and `SimTick` routes on those two categories).
 
 **Disposition:** The header now states the routing without the stale level.
 

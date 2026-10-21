@@ -40,7 +40,7 @@ through it.
 |---|---|---|
 | `FRelayedInputRing` | one adapter's **wire type for the relay ring** — the replicated carrier that moves a connection's relayed inputs to observing peers | the core sees only the accessor/callback pair; §-numbered blocks below say so explicitly |
 | `FInputRedundancyBundle` | one adapter's **wire type for the local-input RPC**, carrying the most-recent `redundancyDepth` ticks in one unreliable send | the core handles only its decoded contents |
-| `USimmableUpdateComponent` | one adapter's **per-character component**: it registers the character with the core and owns the replicated buffers the core's callbacks are bound to | |
+| `USimmableUpdateComponent` | one adapter's **per-character component**: it registers the character with the core and is the owner the core's callbacks are bound to | since og-ue-simulationcomponentandmanagersplit task 20a the replicated correction-state buffer behind those callbacks is held by a sibling component, `USimulatableNetSyncComponent`, which this one forwards to; since task 20b the relayed-ring link behind the relayed-input callbacks is held there too |
 | `Iris` | that engine's **replication system** — the party that batches, drops and rolls back property writes | role words: *the replication system* / *the replication poll* |
 | `Config/DefaultEngine.ini` | one adapter's **host-application configuration surface**, where shipped policy and log values are set | another adapter supplies the same values under its own keys |
 

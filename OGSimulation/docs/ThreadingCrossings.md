@@ -222,6 +222,8 @@ such by its own comment (not a new row); or a genuinely uninventoried crossing.
   pattern family. Filed as rows 9 and 10.
 - **Adapter boundary**, per the dispatch's explicit instruction to check it: `SimmableUpdateComponent.h`
   (confirms the GT attribution row 8 depends on — `ServerReceiveRemoteMove` is a
+  `UFUNCTION(Server,...)`, declared on the replicated sibling `SimulatableNetSyncComponent.h` since
+  og-ue-simulationcomponentandmanagersplit task 20a and still a GAME-thread RPC; at the time it was a
   `UFUNCTION(Server,...)`, `deliverDelayedRemoteInput` stated "Called on the GAME THREAD" inline; since the outer repository's
   2026-09-26 comment conversion that statement lives in its component rationale doc) and
   `PCTimeManagement/ChaosTickMapper.h` (a real, wired atomic crossing — excluded on the repo-boundary

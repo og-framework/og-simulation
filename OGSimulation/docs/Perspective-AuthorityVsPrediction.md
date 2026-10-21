@@ -97,7 +97,7 @@ identical is the point — the common mistake is to imagine a separate "proxy pa
 | 27 | `setAuthorityGuardContext` | ✅ | ⛔ | ⛔ | `<core>SimulationNetSync.h` :: `setAuthorityGuardContext` |
 | 28 | `createCacheFor` — a correction cache is allocated | ⛔ | ✅ | ✅ | `<core>SimulationReconciliation.h` :: `createCacheFor` |
 | 29 | `injectCorrectionState` — a correction is applied | ⛔ | ✅ | ✅ | `<core>SimulationReconciliation.h` :: `injectCorrectionState` |
-| 30 | `onCorrectionReceived` — **bound** on both, **fires** only on a client | ∅ | ✅ | ✅ | `<core>SimulationNetSync.h` :: `onCorrectionReceived`; `Source/OGBrawlerUnreal/SimmableUpdateComponent.h` :: `OnRep_CorrectionState` |
+| 30 | `onCorrectionReceived` — **bound** on both, **fires** only on a client | ∅ | ✅ | ✅ | `<core>SimulationNetSync.h` :: `onCorrectionReceived`; `Plugins/OGSimulation/Source/OGSimulationUnreal/SimulatableNetSyncComponent.h` :: `OnRep_CorrectionState` |
 | 31 | `queueRemoteMove` — inbound RPC lands in the authority queue | ✅ | ⛔ | ⛔ | `<core>SimulationInputResolution.h` :: `queueRemoteMove` |
 | 32 | `wipeAllForResync` (resolution peer) | ⛔ | ✅ | ✅ | `<core>SimulationInputResolution.h` :: `wipeAllForResync` |
 | 33 | `wipeAllForResync` (reconciliation peer) | ⛔ | ✅ | ✅ | `<core>SimulationReconciliation.h` :: `wipeAllForResync` |
@@ -149,7 +149,8 @@ drives it is a **replicated property whose change notification fires on the rece
 and the authority is the *writer* of that buffer, in `sendCorrectionAll`, so its own write never
 notifies it. One adapter's binding for that property is
 `UPROPERTY(ReplicatedUsing = OnRep_CorrectionState)` on
-`Source/OGBrawlerUnreal/SimmableUpdateComponent.h`, whose `OnRep` the engine raises only where the
+`Plugins/OGSimulation/Source/OGSimulationUnreal/SimulatableNetSyncComponent.h` (the per-character
+component's replicated sibling since og-ue-simulationcomponentandmanagersplit task 20a), whose `OnRep` the engine raises only where the
 value arrived; an adapter without receive-side notifications has to establish this differently or
 gate the callback itself. The core states the
 same property in its own words for the sibling relay-ring callback, in the provider-absent branch of
