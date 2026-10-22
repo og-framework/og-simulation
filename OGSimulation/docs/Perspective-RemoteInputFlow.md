@@ -65,7 +65,7 @@ authority) or B (an observing peer). Paths are relative to the repository root; 
 adapter's binding rather than the binding.** The engine-free core owns only the `<core>` rows; the
 `Source/` rows are how *this project's* adapter happens to reach them, and an adapter on another
 engine substitutes its own. Two carry a whole hop rather than illustrating it, so their roles are
-named here. `ASimulationManagerUImpl` — one adapter's **composition root**: the object that owns
+named here. `AOGBrawlerSimulationManager` — one adapter's **composition root**: the object that owns
 the per-role manager and routes an arriving input to the component owning that character.
 `ASimulationInputRelay` — one adapter's **per-connection transport actor**: it publishes a
 connection's staged inputs once per replication poll.

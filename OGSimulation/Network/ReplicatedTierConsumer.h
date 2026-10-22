@@ -12,7 +12,7 @@
 // OPTION A, locked 2026-07-19 (backlog C1). The RTT tier is derived exactly
 // once, by the SERVER, from the server's own per-connection round-trip estimate,
 // in the adapter's composition root — one adapter binds that to
-// `ASimulationManagerUImpl::sampleAndDeriveConnectionTier` — and the resulting
+// `AOGBrawlerSimulationManager::sampleAndDeriveConnectionTier` — and the resulting
 // index reaches the OWNING CLIENT ONLY. This class is the
 // client's entire share of the tier system:
 //

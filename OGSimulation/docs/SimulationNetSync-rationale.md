@@ -40,7 +40,7 @@ through it.
 |---|---|---|
 | `FRelayedInputRing` | one adapter's **wire type for the relay ring** — the replicated carrier that moves a connection's relayed inputs to observing peers | the core sees only the accessor/callback pair; §-numbered blocks below say so explicitly |
 | `FInputRedundancyBundle` | one adapter's **wire type for the local-input RPC**, carrying the most-recent `redundancyDepth` ticks in one unreliable send | the core handles only its decoded contents |
-| `USimmableUpdateComponent` | one adapter's **per-character component**: it registers the character with the core and is the owner the core's callbacks are bound to | since og-ue-simulationcomponentandmanagersplit task 20a the replicated correction-state buffer behind those callbacks is held by a sibling component, `USimulatableNetSyncComponent`, which this one forwards to; since task 20b the relayed-ring link behind the relayed-input callbacks is held there too |
+| `USimmableUpdateComponent` | one adapter's **per-character component**: it registers the character with the core and is the owner the core's callbacks are bound to | since og-ue-simulationcomponentandmanagersplit task 20a the replicated correction-state buffer behind those callbacks is held by a sibling component, `USimulatableNetSyncComponent`, which this one forwards to; since task 20b the relayed-ring link behind the relayed-input callbacks is held there too; since task 29 its registration loop is the generic skeleton of its binding base, `UESimulatableOwnerBinding` |
 | `Iris` | that engine's **replication system** — the party that batches, drops and rolls back property writes | role words: *the replication system* / *the replication poll* |
 | `Config/DefaultEngine.ini` | one adapter's **host-application configuration surface**, where shipped policy and log values are set | another adapter supplies the same values under its own keys |
 
@@ -81,6 +81,7 @@ which is exactly why the count was wrong for two items and nothing reported it.
 <!-- lint-external-ref: allocateFrontierSlotForCharacter -- RETIRED at item 94; frontier allocation is storage-driven on reconciliation's own cache population -->
 <!-- lint-external-ref: findInputCache -- RENAMED at item 39 to findCorrectionCache; quoted verbatim in an archived block under its old spelling -->
 <!-- lint-external-ref: SyncedRemoteInputBufferType -- RETIRED at og-syncedInput-rework task 9 (2026-10-03) with the client->server input buffer requirement of PredictionSyncedBufferOwnerConcept; quoted verbatim in an archived block -->
+<!-- lint-external-ref: USimmableUpdateComponent -- RENAMED by og-ue-simulationcomponentandmanagersplit task 21a to UOGBrawlerSimulatableComponent (one adapter's per-character component); §0.0 and the archived blocks keep the old name -->
 
 ---
 

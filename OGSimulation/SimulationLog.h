@@ -12,7 +12,7 @@
 // and SimulationReconciliation. Expands to a cheap null-pointer test when the
 // logger is unset (tests, constructors before the manager wires loggers). At
 // the adapter's instantiation site the logger routes messages into the host's
-// logging macro — one adapter's binding: `ASimulationManagerUImpl::BeginPlay`,
+// logging macro — one adapter's binding: `AOGBrawlerSimulationManager::BeginPlay`,
 // routing through `UE_LOG(LogPCTM, ...)`. Prefix a message with "[Verbose]" or
 // "[Warning]" to pick a non-default verbosity.
 #define SIMLOG(logger, fmt, ...) \

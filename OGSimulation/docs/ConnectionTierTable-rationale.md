@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: MPL-2.0 -->
+<!-- lint-external-ref: SimulationManagerUImpl.cpp -- RENAMED by og-ue-simulationcomponentandmanagersplit task 30 to OGBrawlerSimulationManager.cpp (one adapter's composition root); kept in F-38-6's verbatim quote -->
 # `ConnectionTierTable.h` — rationale
 
 This is the narrative, the derivations and the deferral history for `ConnectionTierTable`, the
@@ -66,7 +67,7 @@ put a breakpoint:
 
 ```
   the per-character adapter component        (GAME thread; one adapter's binding is
-                                              USimmableUpdateComponent)
+                                              UOGBrawlerSimulatableComponent)
     -> ServerReceptionCoordinator::noteRttSample
     -> ConnectionTierTable::onRttSample
 ```

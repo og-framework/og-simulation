@@ -20,7 +20,7 @@ a quoted sentence as fact.
 <!-- lint-external-ref: COND_OwnerOnly -- ENGINE REPLICATION CONDITION of ONE adapter, named in Sec 9 as the mechanism that was removed; it has no counterpart in this repository -->
 <!-- lint-external-ref: GetPlayerSlotForActor -- ENGINE-SIDE ADAPTER HELPER of ONE adapter, named in Sec 2 as the source of the playerSlot primitive the core cannot derive -->
 <!-- lint-external-ref: FInputRedundancyBundle -- ENGINE-SIDE WIRE TYPE of ONE adapter, named in Sec 4 as the production Buffer binding beside the suite's; the core never names it -->
-<!-- lint-external-ref: ASimulationManagerUImpl -- ENGINE-SIDE COMPOSITION ROOT of ONE adapter, named in Sec 1 as that adapter's owner of this type and again in Sec 9 -->
+<!-- lint-external-ref: ASimulationManagerUImpl -- ENGINE-SIDE COMPOSITION ROOT of ONE adapter, named in Sec 9's quoted finding F-37-2 (history); RENAMED by og-ue-simulationcomponentandmanagersplit task 30 to AOGBrawlerSimulationManager, the name Sec 1 uses for that adapter's owner of this type -->
 <!-- lint-external-ref: USimmableUpdateComponent -- ENGINE-SIDE PER-CHARACTER COMPONENT of ONE adapter, named in Sec 9 (F-37-1, F-37-2) as that adapter's ConnectionTierSink binding before og-ue-simulationcomponentandmanagersplit task 20b -->
 <!-- lint-external-ref: FUEConnectionHandle -- ENGINE-SIDE Address BINDING of ONE adapter, named in Sec 7 beside the suite's FStandaloneTestHandle -->
 <!-- lint-external-ref: Unreal -- ENGINE VENDOR NAME, quoted in Sec 9 as one of the three literal grep TOKENS the falsified sentence promised would return nothing; it names no symbol in this repository -->
@@ -55,7 +55,7 @@ members on the adapter's manager before. The queue borrows the tier table by ref
   why the rule is fenced twice in the header — once at the constructor, once at the members.
 
 Both borrow `const TimeConfig&`, so the coordinator must not outlive the config. In the one adapter
-that exists today — `ASimulationManagerUImpl`, that engine's composition root — the whole coordinator
+that exists today — `AOGBrawlerSimulationManager`, that engine's composition root — the whole coordinator
 is a `std::optional` emplaced inside `BeginPlay`'s authority branch, after the core manager whose
 `TimeConfig` it borrows, and reset in `EndPlay` **before** that manager. The adapter's own comments
 state the borrow rule at both ends. A second engine binds its own root and this name means nothing

@@ -15,7 +15,7 @@ concept SyncedTimingBufferConcept = requires(BufferT& b, const ServerTickClock& 
 };
 
 // Owner-layer concept for the composition root that owns a SimulationManager.
-// One adapter's binding: `ASimulationManagerUImpl`, whose replicated timing-info
+// One adapter's binding: `AOGBrawlerSimulationManager`, whose replicated timing-info
 // arrival callback is `OnRep_TimingInfo`.
 // Server side: getSyncedTimingBuffer() is writable; SimulationManager writes the server
 // clock into it each tick via write(). Client side: setOnTimingInfoReceivedCallback

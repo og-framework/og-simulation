@@ -79,7 +79,7 @@ struct ConnectionSlotKey
 
     // WHICH local player on that wire. 0 = the primary/parent connection's
     // player, 1..N = additional local players. See the UE binding
-    // (SimulationManagerUImpl::derivePlayerSlot) for how this is produced from
+    // (OGBrawlerSimulationManager::derivePlayerSlot) for how this is produced from
     // the engine's own child-connection id, and why that source rather than the
     // Children array index.
     uint8_t playerSlot{ 0 };

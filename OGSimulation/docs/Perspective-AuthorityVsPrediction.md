@@ -41,8 +41,8 @@ sentence is the root of almost every asymmetry below.**
 ⚠ **A listen server is two managers, not one hybrid.** The composition root resolves a *different
 instance* per role, and a locally-hosted player's character is registered into both — once through
 each overload of `registerSimulatable`. (One adapter's binding for that root:
-`ASimulationManagerUImpl::instanceFor(bool isAuthority)`,
-`Source/OGBrawlerUnreal/SimulationManagerUImpl.h`.) Nothing in this document describes a manager
+`AOGBrawlerSimulationManager::instanceFor(bool isAuthority)`,
+`Source/OGBrawlerUnreal/OGBrawlerSimulationManager.h`.) Nothing in this document describes a manager
 that is both roles at once, because no such object exists.
 
 ---
@@ -318,11 +318,16 @@ Registration is not a role difference so much as the place where the role differ
 and it is where the two most recent production defects in this area lived.
 
 The composition root picks the overload from the machine's net mode: `record.isAuthority`, decided
-at the component from whether this machine is a client. (One adapter's binding:
-`ASimulationManagerUImpl::tryRegister`, deriving it from `GetNetMode() != NM_Client`.)
+at the component from whether this machine is a client. (One adapter's binding: the component's registration
+skeleton, `UESimulatableOwnerBinding::tryRegisterWithNewFramework` in OGSimulationUnreal (the brawler component's own
+loop before og-ue-simulationcomponentandmanagersplit task 29), derives it from `GetNetMode() != NM_Client` and passes it
+to `tryRegister`, which records it; that is OGSimulationUnreal's `UESimulationSession::tryRegister` since
+og-ue-simulationcomponentandmanagersplit task 28, the brawler's `AOGBrawlerSimulationManager::tryRegister` before.)
 On a client, the input provider is built only for a character this machine actually controls —
 in one adapter's vocabulary, an actor whose local role is `ROLE_AutonomousProxy`
-(`const bool isLocallyPredicted`, `Source/OGBrawlerUnreal/SimmableUpdateComponent.cpp`) — that is the
+(`const bool isLocallyPredicted`, `Plugins/OGSimulation/Source/OGSimulationUnreal/UESimulatableOwnerBinding.h`, the
+component's registration skeleton since og-ue-simulationcomponentandmanagersplit task 29; the brawler component's own
+`.cpp` before) — that is the
 one place the local-vs-proxy distinction of §2's last two columns is decided.
 
 **The invariant, in one line: registration publishes LAST; unregistration unpublishes FIRST.**

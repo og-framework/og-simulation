@@ -26,7 +26,7 @@ OGSIM_OPTIMIZE_OFF
 //   Game thread (GT)  — writes via: updateRTT(), recordAuthorityTick()
 //                       Called from the adapter's timing-buffer arrival callback,
 //                       on the thread replication delivers on. One adapter binds
-//                       that to `ASimulationManagerUImpl::onTimingInfoReceived`,
+//                       that to `AOGBrawlerSimulationManager::onTimingInfoReceived`,
 //                       fed from `ASimulationTimingRelay::OnRep_Buffer`.
 //
 //   Physics thread (PT) — reads via: getTargetPredictionTick(), getLastAuthorityTick(),
