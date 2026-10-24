@@ -322,7 +322,8 @@ at the component from whether this machine is a client. (One adapter's binding: 
 skeleton, `UESimulatableOwnerBinding::tryRegisterWithNewFramework` in OGSimulationUnreal (the brawler component's own
 loop before og-ue-simulationcomponentandmanagersplit task 29), derives it from `GetNetMode() != NM_Client` and passes it
 to `tryRegister`, which records it; that is OGSimulationUnreal's `UESimulationSession::tryRegister` since
-og-ue-simulationcomponentandmanagersplit task 28, the brawler's `AOGBrawlerSimulationManager::tryRegister` before.)
+og-ue-simulationcomponentandmanagersplit task 28, the brawler manager's own `tryRegister` before; that wrapper had no
+caller after task 29 and task 36 removed it.)
 On a client, the input provider is built only for a character this machine actually controls —
 in one adapter's vocabulary, an actor whose local role is `ROLE_AutonomousProxy`
 (`const bool isLocallyPredicted`, `Plugins/OGSimulation/Source/OGSimulationUnreal/UESimulatableOwnerBinding.h`, the

@@ -42,6 +42,16 @@ struct apply<F, SimulatableList<Ts...>>
     using type = F<Ts...>;
 };
 
+// SystemList<...> marker: a game's systems pack, in firing order; apply_t<F, SystemList<Ts...>> = F<Ts...>.
+template <typename... Ts>
+struct SystemList {};
+
+template <template <typename...> class F, typename... Ts>
+struct apply<F, SystemList<Ts...>>
+{
+    using type = F<Ts...>;
+};
+
 template <template <typename...> class F, typename List>
 using apply_t = typename apply<F, List>::type;
 
@@ -85,6 +95,10 @@ struct is_simulatable_list<SimulatableList<Ts...>> : std::true_type {};
 
 template <typename T>
 concept IsSimulatableList = is_simulatable_list<T>::value;
+
+static_assert(!IsSimulatableList<SystemList<>> && !IsSimulatableList<SystemList<int>>,
+    "SystemList is the systems pack's marker, never a SimulatableList: a system's RequiredSimulatables must stay "
+    "rejected by the IsSimulatableList gate when it is wrapped in SystemList<> by mistake.");
 
 OGSIM_OPTIMIZE_ON
 // pragma optimize on.
