@@ -42,7 +42,7 @@ A reader with no engine can read every quoted block through it.
 | `…::FirstPreResimStep_Internal` | its **first-replayed-step hook**: runs once at the start of a granted replay | |
 | `…::OnPostSolve_Internal` | its **post-solve hook**: after this sub-step's physics is integrated and solved | |
 | `Chaos` | that adapter's **physics engine** — the party that accepts or refuses a rewind request and owns the resim loop | role words: *the physics engine* / *a physics rewind* |
-| `ASimulationManagerUImpl` | one adapter's **composition root**: constructs the per-role manager and exposes the two narrow passthroughs the callback reaches it through | |
+| `AOGBrawlerSimulationManager` | one adapter's **composition root**: constructs the per-role manager and exposes the two narrow passthroughs the callback reaches it through | |
 | `UObject` | that engine's **base object type**; "a game-thread `UObject` callback" means a replication notification delivered on the game thread | |
 | `FMath::Min` | that engine's **math utility**, here the engine-side merge that can only DEEPEN a requested rewind | the directional argument is the fact; the utility is not |
 | `Config/DefaultEngine.ini` | one adapter's **host-application configuration surface**, where the shipped log level and policy values are set | another adapter supplies the same values under its own keys |
@@ -1394,7 +1394,7 @@ what is actually true and where the header now says it.
 
 **The header said:** "`[Resim.` inherits `LogOGSim=Verbose` (T19's 10 MB defect)"
 
-**The tree says:** the shipped configuration sets `LogOGSim=Warning` — one adapter's binding for that is the `LogOGSim` entry in `Config/DefaultEngine.ini`. `Verbose` was the value T19 MEASURED against; it is not the shipped value. The fence's payload — do not name the tag `[Resim.` — survives on knob-independence alone, which is verified: `[Resim.` routes to `LogOGSim` and `[ResimCheck.` splits across `LogOGSim` and `LogOGSimTick` (`SimulationManagerUImpl.cpp:155-164`).
+**The tree says:** the shipped configuration sets `LogOGSim=Warning` — one adapter's binding for that is the `LogOGSim` entry in `Config/DefaultEngine.ini`. `Verbose` was the value T19 MEASURED against; it is not the shipped value. The fence's payload — do not name the tag `[Resim.` — survives on knob-independence alone, which is verified: `[Resim.` routes to `LogOGSim` and `[ResimCheck.` splits across `LogOGSim` and `LogOGSimTick` (`SimulationLogRoutes.h` :: `kSimulationLogRoutes`; the UE adapter emits its `Sim` and `SimTick` routes on those two categories).
 
 **Disposition:** The header now states the routing without the stale level.
 

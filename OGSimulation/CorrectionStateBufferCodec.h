@@ -89,7 +89,7 @@
 // The version BYTE itself is emitted by the UE buffer's NetSerialize (it
 // is transport framing, not payload), and the refusal path lives in the
 // adapter's correction-state arrival callback (one adapter binds it to
-// `USimmableUpdateComponent::OnRep_CorrectionState`), which compares the
+// `UOGBrawlerSimulatableComponent::OnRep_CorrectionState`), which compares the
 // received byte against this constant symbolically — so a mismatched build still
 // fails loudly with no edit at the fence site. The relay ring's own version byte
 // (relayedInputRing::kWireFormatVersion) is a NEW property's first format and is

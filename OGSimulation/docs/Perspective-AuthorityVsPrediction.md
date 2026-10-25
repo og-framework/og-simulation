@@ -41,8 +41,8 @@ sentence is the root of almost every asymmetry below.**
 ⚠ **A listen server is two managers, not one hybrid.** The composition root resolves a *different
 instance* per role, and a locally-hosted player's character is registered into both — once through
 each overload of `registerSimulatable`. (One adapter's binding for that root:
-`ASimulationManagerUImpl::instanceFor(bool isAuthority)`,
-`Source/OGBrawlerUnreal/SimulationManagerUImpl.h`.) Nothing in this document describes a manager
+`AOGBrawlerSimulationManager::instanceFor(bool isAuthority)`,
+`Source/OGBrawlerUnreal/OGBrawlerSimulationManager.h`.) Nothing in this document describes a manager
 that is both roles at once, because no such object exists.
 
 ---
@@ -97,7 +97,7 @@ identical is the point — the common mistake is to imagine a separate "proxy pa
 | 27 | `setAuthorityGuardContext` | ✅ | ⛔ | ⛔ | `<core>SimulationNetSync.h` :: `setAuthorityGuardContext` |
 | 28 | `createCacheFor` — a correction cache is allocated | ⛔ | ✅ | ✅ | `<core>SimulationReconciliation.h` :: `createCacheFor` |
 | 29 | `injectCorrectionState` — a correction is applied | ⛔ | ✅ | ✅ | `<core>SimulationReconciliation.h` :: `injectCorrectionState` |
-| 30 | `onCorrectionReceived` — **bound** on both, **fires** only on a client | ∅ | ✅ | ✅ | `<core>SimulationNetSync.h` :: `onCorrectionReceived`; `Source/OGBrawlerUnreal/SimmableUpdateComponent.h` :: `OnRep_CorrectionState` |
+| 30 | `onCorrectionReceived` — **bound** on both, **fires** only on a client | ∅ | ✅ | ✅ | `<core>SimulationNetSync.h` :: `onCorrectionReceived`; `Plugins/OGSimulation/Source/OGSimulationUnreal/SimulatableNetSyncComponent.h` :: `OnRep_CorrectionState` |
 | 31 | `queueRemoteMove` — inbound RPC lands in the authority queue | ✅ | ⛔ | ⛔ | `<core>SimulationInputResolution.h` :: `queueRemoteMove` |
 | 32 | `wipeAllForResync` (resolution peer) | ⛔ | ✅ | ✅ | `<core>SimulationInputResolution.h` :: `wipeAllForResync` |
 | 33 | `wipeAllForResync` (reconciliation peer) | ⛔ | ✅ | ✅ | `<core>SimulationReconciliation.h` :: `wipeAllForResync` |
@@ -149,7 +149,8 @@ drives it is a **replicated property whose change notification fires on the rece
 and the authority is the *writer* of that buffer, in `sendCorrectionAll`, so its own write never
 notifies it. One adapter's binding for that property is
 `UPROPERTY(ReplicatedUsing = OnRep_CorrectionState)` on
-`Source/OGBrawlerUnreal/SimmableUpdateComponent.h`, whose `OnRep` the engine raises only where the
+`Plugins/OGSimulation/Source/OGSimulationUnreal/SimulatableNetSyncComponent.h` (the per-character
+component's replicated sibling since og-ue-simulationcomponentandmanagersplit task 20a), whose `OnRep` the engine raises only where the
 value arrived; an adapter without receive-side notifications has to establish this differently or
 gate the callback itself. The core states the
 same property in its own words for the sibling relay-ring callback, in the provider-absent branch of
@@ -317,11 +318,17 @@ Registration is not a role difference so much as the place where the role differ
 and it is where the two most recent production defects in this area lived.
 
 The composition root picks the overload from the machine's net mode: `record.isAuthority`, decided
-at the component from whether this machine is a client. (One adapter's binding:
-`ASimulationManagerUImpl::tryRegister`, deriving it from `GetNetMode() != NM_Client`.)
+at the component from whether this machine is a client. (One adapter's binding: the component's registration
+skeleton, `UESimulatableOwnerBinding::tryRegisterWithNewFramework` in OGSimulationUnreal (the brawler component's own
+loop before og-ue-simulationcomponentandmanagersplit task 29), derives it from `GetNetMode() != NM_Client` and passes it
+to `tryRegister`, which records it; that is OGSimulationUnreal's `UESimulationSession::tryRegister` since
+og-ue-simulationcomponentandmanagersplit task 28, the brawler manager's own `tryRegister` before; that wrapper had no
+caller after task 29 and task 36 removed it.)
 On a client, the input provider is built only for a character this machine actually controls —
 in one adapter's vocabulary, an actor whose local role is `ROLE_AutonomousProxy`
-(`const bool isLocallyPredicted`, `Source/OGBrawlerUnreal/SimmableUpdateComponent.cpp`) — that is the
+(`const bool isLocallyPredicted`, `Plugins/OGSimulation/Source/OGSimulationUnreal/UESimulatableOwnerBinding.h`, the
+component's registration skeleton since og-ue-simulationcomponentandmanagersplit task 29; the brawler component's own
+`.cpp` before) — that is the
 one place the local-vs-proxy distinction of §2's last two columns is decided.
 
 **The invariant, in one line: registration publishes LAST; unregistration unpublishes FIRST.**

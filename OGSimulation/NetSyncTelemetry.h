@@ -81,7 +81,7 @@ OGSIM_OPTIMIZE_OFF
 //     in this file ships at Warning. The adapter routes on the tag prefix and
 //     the host project's log configuration sets every category it can route to
 //     at Warning, so a `Log`-severity line DOES NOT EXIST in a shipped build.
-//     One adapter's binding: `RouteOGMessage` (`SimulationManagerUImpl.cpp`)
+//     One adapter's binding: `RouteOGMessage` (`OGBrawlerSimulationManager.cpp`)
 //     reading `Config/DefaultEngine.ini`:
 //
 //       [RelayProbe.*]       LogOGRelayProbe=Warning

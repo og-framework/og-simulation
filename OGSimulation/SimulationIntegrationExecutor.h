@@ -232,7 +232,7 @@ private:
 // Concept for types that implement the SimulationIntegrationExecutor interface.
 // Lives here, beside the class, so the composition root that owns an executor as a
 // member can static_assert that member against it. One adapter does exactly that,
-// in `SimulationManagerUImplConceptTest.cpp`.
+// in `OGBrawlerSimulationManagerConceptTest.cpp`.
 template <typename T>
 concept SimulationIntegrationExecutorConcept = requires(
     T& t, const SimulationTimeStep& step, int32_t physStep)

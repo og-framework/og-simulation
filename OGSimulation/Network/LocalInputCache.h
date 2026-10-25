@@ -97,7 +97,7 @@
 // builds forward vectors of (0,0,1); a value-initialised PlayerInput would carry
 // a (0,0,0) forward vector into normalisation. The composition root injects the
 // game's real zero input at start-up; one adapter's binding for that injection is
-// `ASimulationManagerUImpl::BeginPlay`. The default is `InputT{}` purely so an
+// `AOGBrawlerSimulationManager::BeginPlay`. The default is `InputT{}` purely so an
 // engine-free unit test can construct the line without a game type.
 //
 // ---------------------------------------------------------------------------
