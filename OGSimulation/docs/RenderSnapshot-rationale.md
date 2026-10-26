@@ -109,7 +109,7 @@ where the check does not stop the process, the snapshot then holds the first `Ma
 the walk, sorted).
 
 Measured on Win64 (MSVC): `RenderBody` is 36 bytes, and a snapshot of 48 bodies is 1,760 bytes. The two
-bytes of §5 after `hasRotation` took what was padding before `positionCm`, so the size did not change.
+bytes of §5 after `hasRotation` took what was padding before `position`, so the size did not change.
 
 A fill rewrites only the first `bodyCount` entries; entries beyond it keep whatever an earlier, larger
 fill left there. A consumer reads `bodies[0 .. bodyCount)` only.

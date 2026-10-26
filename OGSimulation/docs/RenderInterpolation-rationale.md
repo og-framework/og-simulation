@@ -92,7 +92,7 @@ The frame keeps the alpha as a `double`; the blend uses it as a `float`, the pre
 
 ## §4 The blend and the pose set
 
-`blendRenderPoses(prev, next, alpha, snapDistanceCm, poses)` writes a copy of *next* into `poses`
+`blendRenderPoses(prev, next, alpha, snapDistance, poses)` writes a copy of *next* into `poses`
 and blends each of its bodies from the body with the same key in *prev* (the key and the key order are
 `RenderSnapshot-rationale.md` §3; `findRenderBody` is a binary search over that order):
 - the position by linear interpolation, `prev + (next − prev) × alpha`;
@@ -118,7 +118,7 @@ the same pose. An `OG_CHECK` refuses a pose set that is the *prev* snapshot itse
 
 ## §5 The snap threshold
 
-A body whose *prev* and *next* positions are more than `snapDistanceCm` apart takes *next*'s pose
+A body whose *prev* and *next* positions are more than `snapDistance` apart takes *next*'s pose
 unblended and counts as a snap. The threshold is the caller's, because what counts as a jump that is
 not motion depends on the game: a pooled object parked far outside the world and brought back, a
 teleport. The default is infinity, which never snaps. A respawn or a correction within the threshold

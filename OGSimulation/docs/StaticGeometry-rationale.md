@@ -9,7 +9,8 @@ licence, a docs pointer, the code and a compile-time self-check; this file carri
 stale.** Fix this file; do not soften the header to match it.
 
 ⚠ **This header is `og-simulation` core and ships standalone under MPL-2.0.** It names no physics
-engine and no game engine. Units are centimetres, Z up, as in `QueryGeometry.h`.
+engine and no game engine. Lengths and axes are og-sim's, as `SimulationFrame.h` defines them: metres, with +Y
+up (`simFrame::kUp`), the same frame as og-sim's other descriptors (`QueryGeometry.h`, `PhysicsBodyState.h`).
 
 ---
 
@@ -31,7 +32,7 @@ Exactly five shapes, the set the first host importer emits:
 |---|---|---|
 | `StaticBox` | `halfExtents` | half the edge length on each local axis |
 | `StaticSphere` | `radius` | |
-| `StaticCapsuleZ` | `radius`, `totalHalfHeight` | the capsule's axis is local **Z** |
+| `StaticCapsule` | `radius`, `totalHalfHeight` | the capsule's axis is along the frame's local up (`simFrame::kUp` in the shape's local space, local **+Y**). |
 | `StaticConvexHull` | `points` | the hull of the points; the backend computes the hull |
 | `StaticTriangleMesh` | `vertices`, `indices` | three indices per triangle, into `vertices` |
 
@@ -41,7 +42,7 @@ refuses to compile until it gets an arm for the new shape.
 
 ### 2.1 `totalHalfHeight` includes the hemispheres
 
-`StaticCapsuleZ::totalHalfHeight` is measured from the centre to the tip of either hemisphere, so it
+`StaticCapsule::totalHalfHeight` is measured from the centre to the tip of either hemisphere, so it
 is never less than `radius`. That is the convention of `QueryGeometry.h` :: `CapsuleGeometry`,
 `halfHeight`, and of the host engine's capsule component that feeds it, so a host can copy the value
 through unchanged. Some physics backends describe a capsule by the half-height of its **cylinder**

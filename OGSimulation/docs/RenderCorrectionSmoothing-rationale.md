@@ -59,9 +59,11 @@ So corrected position + error is the shown position and corrected rotation × er
 rotation: adding the whole error to the corrected pose redraws exactly what was shown.
 
 A body is recorded only when its error is not negligible: some position component beyond
-`kRenderCorrectionMinErrorCm` (0.1 cm), or some quaternion component beyond `kRenderCorrectionMinRotationError`
-(0.02) of the identity, either sign. Both are the reference engine's thresholds, compared per component as it compares
-them. A body in only one snapshot (it joined or left during the replay) carries no error: there is nothing it was
+`kRenderCorrectionMinError` (0.001 m, the reference engine's 0.1 cm), or some quaternion component beyond
+`kRenderCorrectionMinRotationError` (0.02) of the identity, either sign. Both are the reference engine's thresholds,
+compared per component as it compares them. The position threshold is a length in metres; the rotation threshold is a
+quaternion component. A `static_assert` after the struct definitions pins the position threshold and the default
+`maxCorrection` (§6) bit for bit. A body in only one snapshot (it joined or left during the replay) carries no error: there is nothing it was
 shown at.
 
 `recordRenderCorrectionSpeeds(correction, storage)` then writes each recorded body's speed, the length of its linear
@@ -106,7 +108,7 @@ replication error:
 - the decay window is reset to start at this frame's *next* step: lastStep = next − 1,
   endDecayStep = lastStep + steps, where steps is the configured duration (§5), or 0 for a snap (§6);
 - if the window is open (lastStep < endDecayStep), the new error is **added** to whatever error the body still
-  carries (errorCm += error, errorRotation = errorRotation × error rotation) and the previous-step error is set to
+  carries (errorPosition += error, errorRotation = errorRotation × error rotation) and the previous-step error is set to
   the same value; otherwise the body's error is reset to zero.
 
 A second correction during a decay therefore adds to the remainder and restarts the full window from the sum
@@ -140,9 +142,10 @@ hitch), and the error still reaches zero at the window's end.
 
 A body's correction is not blended, and the body's whole error (including what remains of earlier corrections) is
 dropped, unless **either**:
-- its size is strictly below `RenderCorrectionParams::maxCorrectionCm` (250 cm, the reference default), or
+- its size is strictly below `RenderCorrectionParams::maxCorrection` (2.5 m, the reference default of 250 cm; §2),
+  or
 - `desyncSeconds` is positive and its size is strictly below the distance the body covers in `desyncSeconds` at its
-  corrected speed (`RenderCorrectionBody::speedCmPerSecond`; 0.6 s, the reference default). A fast body (a projectile)
+  corrected speed (`RenderCorrectionBody::speed`; 0.6 s, the reference default). A fast body (a projectile)
   may therefore be corrected by more than the maximum and still be blended.
 
 A snapped body is drawn at the plain interpolated pose, which crosses the correction in one step: the pop. With
@@ -154,7 +157,7 @@ correctionSeconds = 0 every correction snaps, which is how a caller turns the sm
 
 After the update, and after the root-frame pass of §14, every body whose window is still open has its error added to
 its pose in the pose set:
-- position: pose + lerp(fromError, errorCm, alpha);
+- position: pose + lerp(fromError, errorPosition, alpha);
 - rotation (a body that carries one): pose × slerp(fromRotation, errorRotation, alpha), in the body's local frame
   as captured (§2). A body without a rotation keeps the rotation the pose set gives it.
 
@@ -223,11 +226,11 @@ outside a straddle.
 | `pendingDrops` | corrections dropped because the pending list was full (§3) |
 | `finished`, `finishedSteps`, `maxFinishedSteps` | windows that closed this frame, and their length in steps from the accumulation |
 | `active` | bodies whose error was added to the pose set this frame |
-| `maxErrorCm` | the largest error accumulated this frame, snapped ones (§6) included, `SnapInRootFrame` bodies (§14) not |
-| `maxAppliedCm` | the largest offset added to a pose this frame by the apply loop (§7); the root-frame pass (§14) does not add to it |
+| `maxError` | the largest error accumulated this frame, snapped ones (§6) included, `SnapInRootFrame` bodies (§14) not |
+| `maxApplied` | the largest offset added to a pose this frame by the apply loop (§7); the root-frame pass (§14) does not add to it |
 | `policySnaps` | correction bodies not accumulated because their pose body is `SnapInRootFrame` (§14) |
 | `rootFramed` | `SnapInRootFrame` bodies moved by their root's applied offset this frame (§14) |
-| `maxPolicySnapCm`, `maxPolicySnapDeg` | the largest position error and rotation error angle among the bodies counted in `policySnaps` |
+| `maxPolicySnap`, `maxPolicySnapDeg` | the largest position error and rotation error angle among the bodies counted in `policySnaps` |
 | `straddleSnaps` | `SnapInRootFrame` bodies given *next*'s rotation this frame because the bracket straddles their carrier step (§15) |
 
 ## §11 What stays with the caller
@@ -243,7 +246,7 @@ outside a straddle.
   it returns;
 - passing `correctPoses` the bracket's *next* snapshot, the copy `interpolateRenderPoses` writes through its
   `nextCopy` argument, on every frame (§15); without it a `SnapInRootFrame` body is blended across the straddle;
-- logging and diagnostics; `appliedErrorCm` reads the offset a body received on the current frame, for a trace. It
+- logging and diagnostics; `appliedErrorPosition` reads the offset a body received on the current frame, for a trace. It
   returns 0 for a `SnapInRootFrame` body (§14): that body has no error of its own and is drawn with its root's offset.
 
 ## §12 Tests
@@ -363,16 +366,16 @@ and its corrected place relative to the root, from the first frame that draws th
 
 **Accumulate.** For a correction body whose pose body is `SnapInRootFrame`, no `BodyError` is created or
 changed: there is no window, and `smoothedBodies` and `snappedBodies` do not count it. It is counted in
-`policySnaps`, its position error length is folded into `maxPolicySnapCm` and its rotation error angle,
+`policySnaps`, its position error length is folded into `maxPolicySnap` and its rotation error angle,
 2·acos(min(1, |w|)) in degrees, into `maxPolicySnapDeg`. `corrections` still counts the correction it
-came in. `maxErrorCm` does not include it.
+came in. `maxError` does not include it.
 
 **The root-frame pass.** After the update and before the apply loop of §7, with the same alpha, every
 pose body in `SnapInRootFrame` is moved by its root's applied offset:
 - the root is the pose body with `isRoot` and the same `simulatableId`, found within that simulatable's
   key range of the sorted pose set;
 - if the root has an error in use whose window is open, the body's position becomes
-  pose + `appliedErrorCm` of the root's error, the same function and the same expression the apply loop
+  pose + `appliedErrorPosition` of the root's error, the same function and the same expression the apply loop
   then uses to move the root itself, and `rootFramed` counts the body;
 - the rotation is the pose's, untouched.
 
@@ -393,8 +396,8 @@ fails an `OG_CHECK` too. A root that declares `SnapInRootFrame` fails one in `fi
 
 **Everything else is unchanged.** A body without the mode takes exactly the path of §4–§8, bit for bit,
 whether or not a snapped body of the same simulatable is present: the snapped body never takes an error
-slot, never feeds `maxErrorCm`, and the root-frame pass writes only snapped bodies.
-`appliedErrorCm(frame, simulatableId, declarationIndex)` returns 0 for a snapped body: it has no
+slot, never feeds `maxError`, and the root-frame pass writes only snapped bodies.
+`appliedErrorPosition(frame, simulatableId, declarationIndex)` returns 0 for a snapped body: it has no
 `BodyError`, and the offset it is drawn with is its root's.
 
 **The capture is unchanged.** `captureRenderCorrection` and `RenderCorrectionCapture` still record a

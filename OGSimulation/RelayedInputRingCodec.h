@@ -139,6 +139,7 @@
 
 #include "OGSimulation/SimulationSerialization.h"
 #include "OGSimulation/SimulationComposite.h"
+#include "OGSimulation/SimulationFrame.h"
 
 #include <cstdint>
 
@@ -147,7 +148,15 @@ namespace relayedInputRing
 	// Wire-format version of the relay ring payload. Bumped when the on-wire
 	// layout changes so a mismatched peer can be detected. Independent of the
 	// sync buffers' fences (see the WIRE VERSION note above).
-	inline constexpr std::uint8_t kWireFormatVersion = 2;
+	inline constexpr std::uint8_t kLegacyFrameWireFormatVersion = 2;
+
+	constexpr std::uint8_t wireFormatVersionFor(AxisFrame axisFrame, [[maybe_unused]] float unitsPerMetre)
+	{
+		return axisFrame == AxisFrame::UeZUpLeftHanded ? kLegacyFrameWireFormatVersion
+		                                               : static_cast<std::uint8_t>(kLegacyFrameWireFormatVersion + 1);
+	}
+
+	inline constexpr std::uint8_t kWireFormatVersion = wireFormatVersionFor(kAxisFrame, kUnitsPerMetre);
 
 	// Hard upper bound on resident entries, for wire safety, and — since item 34
 	// — the ONLY bound: `writeLatest`'s runtime depth is `min(requested, kMaxDepth)`

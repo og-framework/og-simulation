@@ -26,7 +26,7 @@ struct RenderBody
 	uint8_t hasRotation = 0;
 	uint8_t renderCorrection = 0;
 	uint8_t isRoot = 0;
-	glm::vec3 positionCm{ 0.f };
+	glm::vec3 position{ 0.f };
 	glm::quat rotation{ 1.f, 0.f, 0.f, 0.f };
 };
 
@@ -110,7 +110,7 @@ void fillRenderSnapshot(RenderSnapshotT<MaxBodies>& snapshot,
 			}
 			OG_CHECK(!(out.isRoot != 0u && renderCorrectionModeOf<D>() == RenderCorrectionMode::SnapInRootFrame),
 				"fillRenderSnapshot: a root body declares RenderCorrectionMode::SnapInRootFrame; a root has no root frame to be drawn in, and the bodies drawn in its frame need its own error");
-			out.positionCm = body.position;
+			out.position = body.position;
 			out.rotation = hasRotation ? body.rotation : glm::quat(1.f, 0.f, 0.f, 0.f);
 		});
 	});

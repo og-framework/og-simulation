@@ -24,7 +24,7 @@ struct StaticSphere
 	float radius = 0.f;
 };
 
-struct StaticCapsuleZ
+struct StaticCapsule
 {
 	float radius = 0.f;
 	float totalHalfHeight = 0.f;
@@ -41,7 +41,7 @@ struct StaticTriangleMesh
 	std::vector<uint32_t> indices;
 };
 
-using StaticShape = std::variant<StaticBox, StaticSphere, StaticCapsuleZ, StaticConvexHull, StaticTriangleMesh>;
+using StaticShape = std::variant<StaticBox, StaticSphere, StaticCapsule, StaticConvexHull, StaticTriangleMesh>;
 
 inline constexpr std::size_t kStaticShapeTypeCount = std::variant_size_v<StaticShape>;
 

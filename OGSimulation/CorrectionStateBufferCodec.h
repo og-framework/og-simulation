@@ -98,6 +98,7 @@
 
 #include "OGSimulation/SimulationSerialization.h"
 #include "OGSimulation/SimulationComposite.h"
+#include "OGSimulation/SimulationFrame.h"
 
 #include <cstdint>
 #include <limits>
@@ -191,7 +192,18 @@ namespace correctionStateBuffer
 	// correctly and 9 trailing bytes were simply never read. It is now fenced too
 	// — a loud refusal, not a silent capability gap where a stale client watches
 	// characters teleport with no local explanation for the respawn.
-	inline constexpr std::uint8_t kWireFormatVersion = 6;
+	inline constexpr std::uint8_t kLegacyFrameWireFormatVersion = 6;
+
+	constexpr std::uint8_t wireFormatVersionFor(AxisFrame axisFrame, float unitsPerMetre)
+	{
+		const bool centimetres = unitsPerMetre == 100.f;
+		if (axisFrame == AxisFrame::UeZUpLeftHanded)
+			return centimetres ? kLegacyFrameWireFormatVersion : static_cast<std::uint8_t>(kLegacyFrameWireFormatVersion + 1);
+		return centimetres ? static_cast<std::uint8_t>(kLegacyFrameWireFormatVersion + 3)
+		                   : static_cast<std::uint8_t>(kLegacyFrameWireFormatVersion + 2);
+	}
+
+	inline constexpr std::uint8_t kWireFormatVersion = wireFormatVersionFor(kAxisFrame, kUnitsPerMetre);
 
 	// Payload layout.
 	inline constexpr std::uint32_t kTickOffset               = 0;

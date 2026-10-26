@@ -43,12 +43,12 @@ transcribed path reads the host-time render time.
 **What breaks if it moves.** The statement must stay after the delay is clamped (it uses the clamped
 `delaySteps`) and before `interpolateRenderPoses`, which reads `params`.
 
-## G-02 — The held check's tolerance stays 1e-6. Do not raise it to the applied check's tolerance.
+## G-02 — The held check's tolerance stays 1e-8 m (1e-6 cm). Do not raise it to the applied check's tolerance.
 
 **Tag site:** `TickDriverPresenter.h`, in namespace `tickDriverPresenter`, immediately above the declaration
 of `kHeldTolerance`.
 
-**The prohibition.** Do not raise `kHeldTolerance` to `kAppliedTolerance` (1e-4) or to any other larger
+**The prohibition.** Do not raise `kHeldTolerance` to `kAppliedTolerance` (about 1e-6 m, 1e-4 cm) or to any other larger
 value, and do not make the held check compare with `kAppliedTolerance`.
 
 **The consequence.** The two checks ask different questions. The applied check (after the apply) compares
@@ -56,8 +56,8 @@ the anchor with the pose that was requested, and must tolerate an engine that ig
 its own no-move threshold. The held check (before the next apply) compares the anchor with the position the
 apply *returned*, which already includes that threshold; any drift larger than one rounding is something
 else moving the anchor between two applies, and the anchor is what the game reads in between (for the
-brawler, the aim plane point). Raised to 1e-4, moves below 1e-4 per frame go unreported.
-`TickDriverPresenter.Differential.ChecksMovedMismatchAndShadow` nudges an anchor by 5e-5 between two frames;
-with the tolerance at 1e-4 its `[SimHost.RenderApply] MOVED` Warning is missing and the case fails.
+brawler, the aim plane point). Raised to about 1e-6 m (1e-4 cm), moves below that per frame go unreported.
+`TickDriverPresenter.Differential.ChecksMovedMismatchAndShadow` nudges an anchor by 5e-7 m (5e-5 cm) between two
+frames; with the tolerance at about 1e-6 m its `[SimHost.RenderApply] MOVED` Warning is missing and the case fails.
 
 **What breaks if it moves.** Only `checkRenderTargetsHeld` reads it. The value is an og-sim length.

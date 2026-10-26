@@ -18,7 +18,7 @@
 struct RenderInterpolationParams
 {
 	double renderTimeSeconds = 0.0;
-	float snapDistanceCm = std::numeric_limits<float>::infinity();
+	float snapDistance = std::numeric_limits<float>::infinity();
 	bool newestOnly = false;
 };
 
@@ -81,7 +81,7 @@ namespace renderInterpolationDetail
 
 template <size_t MaxBodies>
 uint32_t blendRenderPoses(const RenderSnapshotT<MaxBodies>& prev, const RenderSnapshotT<MaxBodies>& next, double alpha,
-	float snapDistanceCm, RenderSnapshotT<MaxBodies>& poses)
+	float snapDistance, RenderSnapshotT<MaxBodies>& poses)
 {
 	OG_CHECK(&poses != &prev, "blendRenderPoses: the pose set is the prev snapshot; the copy of next would overwrite the poses it blends from");
 	poses = next;
@@ -96,12 +96,12 @@ uint32_t blendRenderPoses(const RenderSnapshotT<MaxBodies>& prev, const RenderSn
 		{
 			continue;
 		}
-		if (glm::distance(from->positionCm, body.positionCm) > snapDistanceCm)
+		if (glm::distance(from->position, body.position) > snapDistance)
 		{
 			++snaps;
 			continue;
 		}
-		body.positionCm = renderInterpolationDetail::blendPosition(from->positionCm, body.positionCm, bodyAlpha);
+		body.position = renderInterpolationDetail::blendPosition(from->position, body.position, bodyAlpha);
 		if (body.hasRotation != 0u)
 		{
 			body.rotation = renderInterpolationDetail::blendRotation(from->rotation, body.rotation, bodyAlpha);
@@ -176,7 +176,7 @@ bool interpolateRenderPoses(Channel& channel, const RenderInterpolationParams& p
 		result.hasPrev = true;
 		result.prevStep = prev->physicsStep;
 		result.prevKind = prev->kind;
-		result.snaps = blendRenderPoses(*prev, *next, result.alpha, params.snapDistanceCm, poses);
+		result.snaps = blendRenderPoses(*prev, *next, result.alpha, params.snapDistance, poses);
 		channel.release(prev);
 	}
 	else

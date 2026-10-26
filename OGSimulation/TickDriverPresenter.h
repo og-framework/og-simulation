@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cmath>
 #include <concepts>
 #include <cstddef>
@@ -30,6 +31,7 @@
 #include "OGSimulation/RenderInterpolation.h"
 #include "OGSimulation/RenderSnapshot.h"
 #include "OGSimulation/SimulationComposite.h"
+#include "OGSimulation/SimulationFrame.h"
 #include "OGSimulation/SimulationObjectStorage.h"
 #include "OGSimulation/SimulationTimeContext.h"
 #include "OGSimulation/StepHooks.h"
@@ -41,7 +43,7 @@ struct PresentControls
 	float  delaySteps        = 2.f;
 	bool   newestOnly        = false;
 	float  correctionSeconds = 0.3f;
-	float  maxCorrection     = 250.f;
+	float  maxCorrection     = 2.5f;
 	float  desyncSeconds     = 0.6f;
 	bool   traceFrames       = false;
 	float  parkSnap          = std::numeric_limits<float>::infinity();
@@ -61,13 +63,21 @@ inline constexpr size_t   kSnapshotChannelSlots       = 4u;
 inline constexpr size_t   kCorrectionRingSlots        = 16u;
 inline constexpr double   kMaxInterpolationDelaySteps = 2.0;
 // ⛔G-02  docs/TickDriverPresenter-guards.md
-inline constexpr double   kHeldTolerance              = 1.0e-6;
-inline constexpr double   kAppliedTolerance           = static_cast<double>(1.e-4f);
-inline constexpr double   kShadowPoseTolerance        = 1.0e-3;
+inline constexpr double   kHeldTolerance              = 1e-8;
+inline constexpr double   kAppliedTolerance           = 9.999999747378752e-7;
+inline constexpr double   kShadowPoseTolerance        = 1e-5;
 inline constexpr double   kShadowPoseToleranceRadians = 1.0e-4;
 inline constexpr uint32_t kWindowFrames               = 600u;
 inline constexpr size_t   kLineReserve                = 1024u;
 inline constexpr size_t   kDisplacementFieldReserve   = 128u;
+
+static_assert(std::bit_cast<uint64_t>(kHeldTolerance) == 0x3E45798EE2308C3Aull
+		&& std::bit_cast<uint64_t>(kAppliedTolerance) == 0x3EB0C6F79999999Aull
+		&& std::bit_cast<uint64_t>(kShadowPoseTolerance) == 0x3EE4F8B588E368F1ull
+		&& std::bit_cast<uint32_t>(PresentControls{}.maxCorrection) == 0x40200000u,
+	"TickDriverPresenter: the held, applied and shadow tolerances are exactly 1e-8, double(1e-4f) / 100 and 1e-5 m, and the "
+	"default maxCorrection is exactly 2.5 m, the metre values flip U gave the presenter. Was task 3's pin of the centimetre "
+	"values 1e-6, double(1e-4f), 1e-3 and 250");
 
 template <typename Composite>
 struct declarationCountOf;
@@ -510,7 +520,7 @@ public:
 					return;
 
 				auto& bodyState = D::bodyStateOf(vizState.template edit<S>());
-				bodyState.position = pose->positionCm;
+				bodyState.position = pose->position;
 				if constexpr (std::is_same_v<std::remove_cvref_t<decltype(bodyState)>, PhysicsBodyState>)
 					bodyState.rotation = pose->rotation;
 			});
@@ -608,7 +618,7 @@ private:
 	{
 		RenderInterpolationParams params;
 		params.newestOnly = controls.newestOnly;
-		params.snapDistanceCm = controls.parkSnap;
+		params.snapDistance = controls.parkSnap;
 		const double delaySteps = tickDriverPresenter::clampedDelaySteps(controls);
 		// ⛔G-01  docs/TickDriverPresenter-guards.md
 		params.renderTimeSeconds = clock.hostNowSeconds() - delaySteps * clock.stepIntervalSeconds();
@@ -618,7 +628,7 @@ private:
 
 		RenderCorrectionParams correction;
 		correction.correctionSeconds = controls.correctionSeconds;
-		correction.maxCorrectionCm   = controls.maxCorrection;
+		correction.maxCorrection     = controls.maxCorrection;
 		correction.desyncSeconds     = controls.desyncSeconds;
 		correction.stepSeconds       = m_config.stepSeconds;
 		m_smoother.correctPoses(m_corrections, m_renderFrame, correction, m_renderPoses, m_correctionFrame, &m_renderNext);
@@ -636,11 +646,11 @@ private:
 			window.finishedSteps    += corrected.finishedSteps;
 			window.maxFinishedSteps  = maxOf(window.maxFinishedSteps, corrected.maxFinishedSteps);
 			window.activeFrames     += corrected.active > 0u ? 1u : 0u;
-			window.maxError          = maxOf(window.maxError, corrected.maxErrorCm);
-			window.maxApplied        = maxOf(window.maxApplied, corrected.maxAppliedCm);
+			window.maxError          = maxOf(window.maxError, corrected.maxError);
+			window.maxApplied        = maxOf(window.maxApplied, corrected.maxApplied);
 			window.policySnaps      += corrected.policySnaps;
 			window.rootFramedFrames += corrected.rootFramed > 0u ? 1u : 0u;
-			window.maxPolicySnap     = maxOf(window.maxPolicySnap, corrected.maxPolicySnapCm);
+			window.maxPolicySnap     = maxOf(window.maxPolicySnap, corrected.maxPolicySnap);
 			window.maxPolicySnapDeg  = maxOf(window.maxPolicySnapDeg, corrected.maxPolicySnapDeg);
 			window.straddleSnaps    += corrected.straddleSnaps;
 			if (corrected.late > 0u && window.late == 0u && logEnabled(HostLogLevel::Warning))
@@ -656,11 +666,11 @@ private:
 			{
 				m_engine.log(HostLogLevel::Log, formatHostLine(m_line,
 					"[SimHost.RenderCorrection] event frame=%llu prev=%llu next=%llu alpha=%.4f corrections=%u smoothed=%u "
-					"snapped=%u maxErrorCm=%.4f durationSteps=%d policySnaps=%u rootFramed=%u",
+					"snapped=%u maxError%s=%.*f durationSteps=%d policySnaps=%u rootFramed=%u",
 					static_cast<unsigned long long>(m_engine.frameNumber()), static_cast<unsigned long long>(m_renderFrame.prevStep),
 					static_cast<unsigned long long>(m_renderFrame.nextStep), m_renderFrame.alpha, corrected.corrections,
-					corrected.smoothedBodies, corrected.snappedBodies,
-					tickDriverPresenter::reportedLength(controls, corrected.maxErrorCm),
+					corrected.smoothedBodies, corrected.snappedBodies, simFrame::kLengthFieldSuffix, simFrame::lengthDecimals(4),
+					tickDriverPresenter::reportedLength(controls, corrected.maxError),
 					renderCorrectionDurationSteps(correction.correctionSeconds, correction.stepSeconds), corrected.policySnaps,
 					corrected.rootFramed));
 			}
@@ -691,7 +701,7 @@ private:
 				const std::optional<glm::quat> rotation =
 					body->hasRotation != 0u ? std::optional<glm::quat>(body->rotation) : std::nullopt;
 				const std::optional<glm::dvec3> applied =
-					tickDriverPresenter::positionOf(sink.applyRootPose(static_cast<uint32_t>(id), body->positionCm, rotation));
+					tickDriverPresenter::positionOf(sink.applyRootPose(static_cast<uint32_t>(id), body->position, rotation));
 				if (!applied.has_value())
 					continue;
 
@@ -706,10 +716,13 @@ private:
 					else if (logEnabled(HostLogLevel::Log))
 					{
 						m_engine.log(HostLogLevel::Log, formatHostLine(m_line,
-							"[SimHost.RenderApply] first role=%s id=%u from=(%.3f,%.3f,%.3f) to=(%.3f,%.3f,%.3f) physicsStep=%llu tick=%u",
-							tickDriverPresenter::roleText(m_config.runsPrediction), id, before->x, before->y, before->z,
-							static_cast<double>(body->positionCm.x), static_cast<double>(body->positionCm.y),
-							static_cast<double>(body->positionCm.z), static_cast<unsigned long long>(m_renderPoses.physicsStep),
+							"[SimHost.RenderApply] first role=%s id=%u from=(%.*f,%.*f,%.*f) to=(%.*f,%.*f,%.*f) physicsStep=%llu tick=%u",
+							tickDriverPresenter::roleText(m_config.runsPrediction), id, simFrame::lengthDecimals(3), before->x,
+							simFrame::lengthDecimals(3), before->y, simFrame::lengthDecimals(3), before->z,
+							simFrame::lengthDecimals(3), static_cast<double>(body->position.x),
+							simFrame::lengthDecimals(3), static_cast<double>(body->position.y),
+							simFrame::lengthDecimals(3), static_cast<double>(body->position.z),
+							static_cast<unsigned long long>(m_renderPoses.physicsStep),
 							static_cast<uint32_t>(m_renderPoses.tick)));
 					}
 				}
@@ -755,7 +768,7 @@ private:
 					using tickDriverPresenter::maxOf;
 					ApplyWindow& window = m_applyWindow;
 					const glm::mat4 queried = readBack();
-					const double error = glm::distance(glm::vec3(queried[3]), pose.positionCm);
+					const double error = glm::distance(glm::vec3(queried[3]), pose.position);
 					double angleRad = 0.0;
 					if (pose.hasRotation != 0u)
 					{
@@ -772,11 +785,15 @@ private:
 						&& window.shadowOutOfTolerance++ == 0u && logEnabled(HostLogLevel::Warning))
 					{
 						m_engine.log(HostLogLevel::Warning, formatHostLine(m_line,
-							"[SimHost.RenderSync] SHADOW id=%u declaration=%u queried=(%.6f,%.6f,%.6f) rendered=(%.6f,%.6f,%.6f) "
-							"errorCm=%.9f angleRad=%.9f: the shadow world the visualizations query is not at the rendered pose",
-							id, declarationIndex, static_cast<double>(queried[3].x), static_cast<double>(queried[3].y),
-							static_cast<double>(queried[3].z), static_cast<double>(pose.positionCm.x),
-							static_cast<double>(pose.positionCm.y), static_cast<double>(pose.positionCm.z),
+							"[SimHost.RenderSync] SHADOW id=%u declaration=%u queried=(%.*f,%.*f,%.*f) rendered=(%.*f,%.*f,%.*f) "
+							"error%s=%.*f angleRad=%.9f: the shadow world the visualizations query is not at the rendered pose",
+							id, declarationIndex, simFrame::lengthDecimals(6), static_cast<double>(queried[3].x),
+							simFrame::lengthDecimals(6), static_cast<double>(queried[3].y),
+							simFrame::lengthDecimals(6), static_cast<double>(queried[3].z),
+							simFrame::lengthDecimals(6), static_cast<double>(pose.position.x),
+							simFrame::lengthDecimals(6), static_cast<double>(pose.position.y),
+							simFrame::lengthDecimals(6), static_cast<double>(pose.position.z),
+							simFrame::kLengthFieldSuffix, simFrame::lengthDecimals(9),
 							tickDriverPresenter::reportedLength(controls, error), angleRad));
 					}
 				}
@@ -801,10 +818,13 @@ private:
 			if (drift > tickDriverPresenter::kHeldTolerance && m_applyWindow.moved++ == 0u && logEnabled(HostLogLevel::Warning))
 			{
 				m_engine.log(HostLogLevel::Warning, formatHostLine(m_line,
-					"[SimHost.RenderApply] MOVED role=%s id=%u capsule=(%.6f,%.6f,%.6f) applied=(%.6f,%.6f,%.6f) driftCm=%.9f: "
+					"[SimHost.RenderApply] MOVED role=%s id=%u capsule=(%.*f,%.*f,%.*f) applied=(%.*f,%.*f,%.*f) drift%s=%.*f: "
 					"something moved the capsule between the last render apply and this one",
-					tickDriverPresenter::roleText(m_config.runsPrediction), id, planePoint->x, planePoint->y, planePoint->z,
-					target.position.x, target.position.y, target.position.z, tickDriverPresenter::reportedLength(controls, drift)));
+					tickDriverPresenter::roleText(m_config.runsPrediction), id, simFrame::lengthDecimals(6), planePoint->x,
+					simFrame::lengthDecimals(6), planePoint->y, simFrame::lengthDecimals(6), planePoint->z,
+					simFrame::lengthDecimals(6), target.position.x, simFrame::lengthDecimals(6), target.position.y,
+					simFrame::lengthDecimals(6), target.position.z, simFrame::kLengthFieldSuffix, simFrame::lengthDecimals(9),
+					tickDriverPresenter::reportedLength(controls, drift)));
 			}
 		}
 	}
@@ -835,7 +855,7 @@ private:
 				continue;
 			}
 
-			const glm::dvec3 pose(body->positionCm);
+			const glm::dvec3 pose(body->position);
 			const double error = tickDriverPresenter::distanceOf(*planePoint, pose);
 			++window.applied;
 			window.exact += tickDriverPresenter::exactlyEqual(*planePoint, pose) ? 1u : 0u;
@@ -844,9 +864,11 @@ private:
 				&& window.outOfTolerance++ == 0u && logEnabled(HostLogLevel::Warning))
 			{
 				m_engine.log(HostLogLevel::Warning, formatHostLine(m_line,
-					"[SimHost.RenderApply] MISMATCH role=%s id=%u capsule=(%.6f,%.6f,%.6f) rendered=(%.6f,%.6f,%.6f) errorCm=%.9f physicsStep=%llu",
-					tickDriverPresenter::roleText(m_config.runsPrediction), id, planePoint->x, planePoint->y, planePoint->z,
-					pose.x, pose.y, pose.z, tickDriverPresenter::reportedLength(controls, error),
+					"[SimHost.RenderApply] MISMATCH role=%s id=%u capsule=(%.*f,%.*f,%.*f) rendered=(%.*f,%.*f,%.*f) error%s=%.*f physicsStep=%llu",
+					tickDriverPresenter::roleText(m_config.runsPrediction), id, simFrame::lengthDecimals(6), planePoint->x,
+					simFrame::lengthDecimals(6), planePoint->y, simFrame::lengthDecimals(6), planePoint->z,
+					simFrame::lengthDecimals(6), pose.x, simFrame::lengthDecimals(6), pose.y, simFrame::lengthDecimals(6), pose.z,
+					simFrame::kLengthFieldSuffix, simFrame::lengthDecimals(9), tickDriverPresenter::reportedLength(controls, error),
 					static_cast<unsigned long long>(m_renderPoses.physicsStep)));
 			}
 		}
@@ -864,20 +886,23 @@ private:
 			const RenderBody* const nextBody = findRenderBody(m_renderNext, static_cast<uint32_t>(id), m_config.rootDeclarationIndex);
 			if (!target.applied || nextBody == nullptr)
 				continue;
-			const glm::dvec3 error = m_smoother.appliedErrorCm(bracket, static_cast<uint32_t>(id), m_config.rootDeclarationIndex);
+			const glm::dvec3 error = m_smoother.appliedErrorPosition(bracket, static_cast<uint32_t>(id), m_config.rootDeclarationIndex);
 			if (!logEnabled(HostLogLevel::Log))
 				continue;
 			m_engine.log(HostLogLevel::Log, formatHostLine(m_line,
-				"[SimHost.RenderTrace] role=%s frame=%llu id=%u pos=(%.4f,%.4f,%.4f) nextPos=(%.4f,%.4f,%.4f) host=%.6f "
-				"render=%.6f mode=%s prev=%llu/%s next=%llu/%s back=%u alpha=%.4f newest=%llu err=(%.4f,%.4f,%.4f)",
+				"[SimHost.RenderTrace] role=%s frame=%llu id=%u pos=(%.*f,%.*f,%.*f) nextPos=(%.*f,%.*f,%.*f) host=%.6f "
+				"render=%.6f mode=%s prev=%llu/%s next=%llu/%s back=%u alpha=%.4f newest=%llu err=(%.*f,%.*f,%.*f)",
 				tickDriverPresenter::roleText(m_config.runsPrediction), static_cast<unsigned long long>(m_engine.frameNumber()), id,
-				target.position.x, target.position.y, target.position.z,
-				static_cast<double>(nextBody->positionCm.x), static_cast<double>(nextBody->positionCm.y),
-				static_cast<double>(nextBody->positionCm.z), clock.hostNowSeconds(), bracket.renderTimeSeconds,
-				bracket.newestOnly ? "newest" : "interp",
+				simFrame::lengthDecimals(4), target.position.x, simFrame::lengthDecimals(4), target.position.y,
+				simFrame::lengthDecimals(4), target.position.z,
+				simFrame::lengthDecimals(4), static_cast<double>(nextBody->position.x),
+				simFrame::lengthDecimals(4), static_cast<double>(nextBody->position.y),
+				simFrame::lengthDecimals(4), static_cast<double>(nextBody->position.z),
+				clock.hostNowSeconds(), bracket.renderTimeSeconds, bracket.newestOnly ? "newest" : "interp",
 				static_cast<unsigned long long>(bracket.prevStep), bracket.hasPrev ? tickDriverPresenter::stepKindText(bracket.prevKind) : "-",
 				static_cast<unsigned long long>(bracket.nextStep), tickDriverPresenter::stepKindText(bracket.nextKind), bracket.nextBack,
-				bracket.alpha, static_cast<unsigned long long>(bracket.newestStep), error.x, error.y, error.z));
+				bracket.alpha, static_cast<unsigned long long>(bracket.newestStep), simFrame::lengthDecimals(4), error.x,
+				simFrame::lengthDecimals(4), error.y, simFrame::lengthDecimals(4), error.z));
 		}
 	}
 
@@ -890,35 +915,41 @@ private:
 		{
 			std::sort(m_frameDisplacement.begin(), m_frameDisplacement.end());
 			const uint32_t n = static_cast<uint32_t>(m_frameDisplacement.size());
-			displacement = formatHostLine(m_displacementField, "%.4f/%.4f/%.4f",
+			displacement = formatHostLine(m_displacementField, "%.*f/%.*f/%.*f",
+				simFrame::lengthDecimals(4),
 				tickDriverPresenter::reportedLength(controls, m_frameDisplacement[latencyBudget::nearestRankIndex(n, 500u)]),
+				simFrame::lengthDecimals(4),
 				tickDriverPresenter::reportedLength(controls, m_frameDisplacement[latencyBudget::nearestRankIndex(n, 990u)]),
-				tickDriverPresenter::reportedLength(controls, m_frameDisplacement.back()));
+				simFrame::lengthDecimals(4), tickDriverPresenter::reportedLength(controls, m_frameDisplacement.back()));
 		}
 
 		if (logEnabled(HostLogLevel::Log))
 		{
 			m_engine.log(HostLogLevel::Log, formatHostLine(m_line,
 				"[SimHost.RenderApply] role=%s frames=%u appliedFrames=%u characters=%d applied=%u missing=%u exact=%u "
-				"outOfTolerance=%u maxErrorCm=%.9f held=%u moved=%u maxHeldDriftCm=%.9f pathCm=%.3f steps=[%llu,%llu] drops=%llu "
-				"mode=%s delaySteps=%.2f interpolated=%u atNewest=%u beyondOldest=%u snaps=%u maxNextBack=%u dispCm=%s",
+				"outOfTolerance=%u maxError%s=%.*f held=%u moved=%u maxHeldDrift%s=%.*f path%s=%.*f steps=[%llu,%llu] drops=%llu "
+				"mode=%s delaySteps=%.2f interpolated=%u atNewest=%u beyondOldest=%u snaps=%u maxNextBack=%u disp%s=%s",
 				tickDriverPresenter::roleText(m_config.runsPrediction), window.frames, window.appliedFrames,
 				static_cast<int32_t>(m_targets.size()), window.applied, window.missing, window.exact,
-				window.outOfTolerance, tickDriverPresenter::reportedLength(controls, window.maxError), window.held, window.moved,
-				tickDriverPresenter::reportedLength(controls, window.maxHeldDrift), tickDriverPresenter::reportedLength(controls, window.path),
+				window.outOfTolerance, simFrame::kLengthFieldSuffix, simFrame::lengthDecimals(9),
+				tickDriverPresenter::reportedLength(controls, window.maxError), window.held, window.moved,
+				simFrame::kLengthFieldSuffix, simFrame::lengthDecimals(9), tickDriverPresenter::reportedLength(controls, window.maxHeldDrift),
+				simFrame::kLengthFieldSuffix, simFrame::lengthDecimals(3), tickDriverPresenter::reportedLength(controls, window.path),
 				static_cast<unsigned long long>(window.firstAppliedStep), static_cast<unsigned long long>(window.lastAppliedStep),
 				static_cast<unsigned long long>(m_snapshots.drops()),
 				window.newestMode > 0u ? "newest" : "interp",
 				tickDriverPresenter::clampedDelaySteps(controls),
-				window.interpolated, window.atNewest, window.beyondOldest, window.snaps, window.maxNextBack, displacement));
+				window.interpolated, window.atNewest, window.beyondOldest, window.snaps, window.maxNextBack,
+				simFrame::kLengthFieldSuffix, displacement));
 		}
 
 		if (worldHost.hasShadowWorld() && logEnabled(HostLogLevel::Log))
 		{
 			m_engine.log(HostLogLevel::Log, formatHostLine(m_line,
 				"[SimHost.RenderSync] role=Client frames=%u shadowBodies=%u shadowExact=%u shadowOutOfTolerance=%u "
-				"shadowMaxErrorCm=%.6f shadowMaxAngleRad=%.6f",
+				"shadowMaxError%s=%.*f shadowMaxAngleRad=%.6f",
 				window.frames, window.shadowBodies, window.shadowExact, window.shadowOutOfTolerance,
+				simFrame::kLengthFieldSuffix, simFrame::lengthDecimals(6),
 				tickDriverPresenter::reportedLength(controls, window.shadowMaxError), window.shadowMaxAngleRad));
 		}
 
@@ -946,21 +977,24 @@ private:
 		{
 			m_engine.log(HostLogLevel::Log, formatHostLine(m_line,
 				"[SimHost.RenderCorrection] role=Client frames=%u resims=%llu captured=%llu withoutError=%llu tickMismatches=%llu "
-				"ringDrops=%llu corrections=%u smoothedBodies=%u snappedBodies=%u maxErrorCm=%.3f maxAppliedCm=%.3f decays=%u "
+				"ringDrops=%llu corrections=%u smoothedBodies=%u snappedBodies=%u maxError%s=%.*f maxApplied%s=%.*f decays=%u "
 				"decayMeanS=%.3f decayMaxS=%.3f activeFrames=%u late=%u pendingDrops=%u seconds=%.3f durationSteps=%d "
-				"maxCm=%.1f desyncS=%.2f policySnaps=%u maxPolicySnapCm=%.3f maxPolicySnapDeg=%.1f rootFramedFrames=%u "
+				"max%s=%.*f desyncS=%.2f policySnaps=%u maxPolicySnap%s=%.*f maxPolicySnapDeg=%.1f rootFramedFrames=%u "
 				"straddleSnaps=%u",
 				m_applyWindow.frames, static_cast<unsigned long long>(resims - window.resimsAtStart),
 				static_cast<unsigned long long>(captured - window.capturedAtStart),
 				static_cast<unsigned long long>(withoutError - window.withoutErrorAtStart),
 				static_cast<unsigned long long>(tickMismatch - window.tickMismatchAtStart),
 				static_cast<unsigned long long>(ringDrops - window.ringDropsAtStart), window.corrections, window.smoothedBodies,
-				window.snappedBodies, tickDriverPresenter::reportedLength(controls, window.maxError),
-				tickDriverPresenter::reportedLength(controls, window.maxApplied), window.finished, decayMeanS,
-				static_cast<double>(window.maxFinishedSteps) * stepSeconds, window.activeFrames, window.late, window.pendingDrops,
-				static_cast<double>(seconds), renderCorrectionDurationSteps(seconds, m_config.stepSeconds),
+				window.snappedBodies, simFrame::kLengthFieldSuffix, simFrame::lengthDecimals(3),
+				tickDriverPresenter::reportedLength(controls, window.maxError), simFrame::kLengthFieldSuffix,
+				simFrame::lengthDecimals(3), tickDriverPresenter::reportedLength(controls, window.maxApplied), window.finished,
+				decayMeanS, static_cast<double>(window.maxFinishedSteps) * stepSeconds, window.activeFrames, window.late,
+				window.pendingDrops, static_cast<double>(seconds), renderCorrectionDurationSteps(seconds, m_config.stepSeconds),
+				simFrame::kLengthFieldSuffix, simFrame::lengthDecimals(1),
 				tickDriverPresenter::reportedLength(controls, controls.maxCorrection), static_cast<double>(controls.desyncSeconds),
-				window.policySnaps, tickDriverPresenter::reportedLength(controls, window.maxPolicySnap), window.maxPolicySnapDeg,
+				window.policySnaps, simFrame::kLengthFieldSuffix, simFrame::lengthDecimals(3),
+				tickDriverPresenter::reportedLength(controls, window.maxPolicySnap), window.maxPolicySnapDeg,
 				window.rootFramedFrames, window.straddleSnaps));
 		}
 

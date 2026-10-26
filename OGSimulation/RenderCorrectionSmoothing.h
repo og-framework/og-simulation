@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -23,7 +24,7 @@
 #include "OGSimulation/SimulationTimeContext.h"
 #include "OGSimulation/StepHooks.h"
 
-constexpr double kRenderCorrectionMinErrorCm = 0.1;
+constexpr double kRenderCorrectionMinError = 0.001;
 constexpr double kRenderCorrectionMinRotationError = 0.02;
 
 struct RenderCorrectionBody
@@ -31,8 +32,8 @@ struct RenderCorrectionBody
 	uint32_t simulatableId = 0;
 	uint8_t declarationIndex = 0;
 	uint8_t hasRotation = 0;
-	float speedCmPerSecond = 0.f;
-	glm::dvec3 errorCm{ 0.0 };
+	float speed = 0.f;
+	glm::dvec3 errorPosition{ 0.0 };
 	glm::dquat errorRotation{ 1.0, 0.0, 0.0, 0.0 };
 };
 
@@ -50,7 +51,7 @@ struct RenderCorrectionT
 struct RenderCorrectionParams
 {
 	float correctionSeconds = 0.3f;
-	float maxCorrectionCm = 250.f;
+	float maxCorrection = 2.5f;
 	float desyncSeconds = 0.6f;
 	float stepSeconds = 0.f;
 };
@@ -66,11 +67,11 @@ struct RenderCorrectionFrame
 	uint64_t finishedSteps = 0;
 	uint32_t maxFinishedSteps = 0;
 	uint32_t active = 0;
-	double maxErrorCm = 0.0;
-	double maxAppliedCm = 0.0;
+	double maxError = 0.0;
+	double maxApplied = 0.0;
 	uint32_t policySnaps = 0;
 	uint32_t rootFramed = 0;
-	double maxPolicySnapCm = 0.0;
+	double maxPolicySnap = 0.0;
 	double maxPolicySnapDeg = 0.0;
 	uint32_t straddleSnaps = 0;
 };
@@ -80,6 +81,10 @@ static_assert(std::is_trivially_copyable_v<RenderCorrectionBody> && std::is_triv
 	"The render correction types must stay flat values with no heap-owning member: a correction is copied through a "
 	"lock-free ring once per resimulation and the smoothing runs once per rendered frame, allocating nothing. Was "
 	"task 19's allocation-free render path, extended by task 57.");
+static_assert(std::bit_cast<uint64_t>(kRenderCorrectionMinError) == 0x3F50624DD2F1A9FCull
+		&& std::bit_cast<uint32_t>(RenderCorrectionParams{}.maxCorrection) == 0x40200000u,
+	"RenderCorrectionSmoothing: the minimum position error is exactly 0.001 m and the default maxCorrection exactly 2.5 m, "
+	"the metre values flip U gave the smoothing. Was task 3's pin of the centimetre values 0.1 and 250");
 
 namespace renderCorrectionDetail
 {
@@ -179,7 +184,7 @@ uint16_t captureRenderCorrection(const RenderSnapshotT<MaxBodies>& shown, const 
 			continue;
 		}
 
-		const glm::dvec3 errorCm = glm::dvec3(before->positionCm) - glm::dvec3(after.positionCm);
+		const glm::dvec3 errorPosition = glm::dvec3(before->position) - glm::dvec3(after.position);
 		glm::dquat errorRotation(1.0, 0.0, 0.0, 0.0);
 		if (after.hasRotation != 0u)
 		{
@@ -191,7 +196,7 @@ uint16_t captureRenderCorrection(const RenderSnapshotT<MaxBodies>& shown, const 
 			errorRotation = renderCorrectionDetail::normalized(errorRotation);
 		}
 
-		if (renderCorrectionDetail::isNearlyZero(errorCm, kRenderCorrectionMinErrorCm)
+		if (renderCorrectionDetail::isNearlyZero(errorPosition, kRenderCorrectionMinError)
 			&& renderCorrectionDetail::isIdentity(errorRotation, kRenderCorrectionMinRotationError))
 		{
 			continue;
@@ -201,8 +206,8 @@ uint16_t captureRenderCorrection(const RenderSnapshotT<MaxBodies>& shown, const 
 		out.simulatableId = after.simulatableId;
 		out.declarationIndex = after.declarationIndex;
 		out.hasRotation = after.hasRotation;
-		out.speedCmPerSecond = 0.f;
-		out.errorCm = errorCm;
+		out.speed = 0.f;
+		out.errorPosition = errorPosition;
 		out.errorRotation = errorRotation;
 	}
 	correction.bodyCount = count;
@@ -232,7 +237,7 @@ void recordRenderCorrectionSpeeds(RenderCorrectionT<MaxBodies>& correction, cons
 				return;
 			}
 			const PhysicsBodyState body = static_cast<PhysicsBodyState>(D::bodyStateOf(state.template get<S>()));
-			found->speedCmPerSecond = glm::length(body.linearVelocity);
+			found->speed = glm::length(body.linearVelocity);
 		});
 	});
 }
@@ -329,12 +334,12 @@ public:
 		int64_t lastStep = 0;
 		int64_t stepsSinceUpdate = 0;
 		int64_t endDecayStep = 0;
-		glm::dvec3 errorCm{ 0.0 };
-		glm::dvec3 errorCmPrev{ 0.0 };
+		glm::dvec3 errorPosition{ 0.0 };
+		glm::dvec3 errorPositionPrev{ 0.0 };
 		glm::dquat errorRotation{ 1.0, 0.0, 0.0, 0.0 };
 		glm::dquat errorRotationPrev{ 1.0, 0.0, 0.0, 0.0 };
 		uint64_t correctionStep = 0;
-		glm::dvec3 errorCmBeforeCorrection{ 0.0 };
+		glm::dvec3 errorPositionBeforeCorrection{ 0.0 };
 		glm::dquat errorRotationBeforeCorrection{ 1.0, 0.0, 0.0, 0.0 };
 		int64_t smoothingStartStep = 0;
 
@@ -420,25 +425,25 @@ public:
 				continue;
 			}
 			++result.active;
-			const glm::dvec3 offset = appliedErrorCm(error, frame, alpha);
-			body->positionCm = glm::vec3(glm::dvec3(body->positionCm) + offset);
+			const glm::dvec3 offset = appliedErrorPosition(error, frame, alpha);
+			body->position = glm::vec3(glm::dvec3(body->position) + offset);
 			if (body->hasRotation != 0u)
 			{
 				body->rotation = glm::quat(glm::dquat(body->rotation) * appliedErrorRotation(error, frame, alpha));
 			}
-			result.maxAppliedCm = std::max(result.maxAppliedCm, glm::length(offset));
+			result.maxApplied = std::max(result.maxApplied, glm::length(offset));
 		}
 		summary = result;
 	}
 
-	glm::dvec3 appliedErrorCm(const RenderInterpolationFrame& frame, uint32_t simulatableId, uint8_t declarationIndex) const
+	glm::dvec3 appliedErrorPosition(const RenderInterpolationFrame& frame, uint32_t simulatableId, uint8_t declarationIndex) const
 	{
 		const BodyError* const error = findError(simulatableId, declarationIndex);
 		if (error == nullptr || !error->isSmoothing())
 		{
 			return glm::dvec3(0.0);
 		}
-		return appliedErrorCm(*error, frame, static_cast<double>(static_cast<float>(frame.alpha)));
+		return appliedErrorPosition(*error, frame, static_cast<double>(static_cast<float>(frame.alpha)));
 	}
 
 	const BodyError* findError(uint32_t simulatableId, uint8_t declarationIndex) const
@@ -505,7 +510,7 @@ private:
 			const BodyError* const rootError = findError(root->simulatableId, root->declarationIndex);
 			if (rootError != nullptr && rootError->isSmoothing())
 			{
-				body.positionCm = glm::vec3(glm::dvec3(body.positionCm) + appliedErrorCm(*rootError, frame, alpha));
+				body.position = glm::vec3(glm::dvec3(body.position) + appliedErrorPosition(*rootError, frame, alpha));
 				++result.rootFramed;
 			}
 		}
@@ -545,10 +550,10 @@ private:
 		return frame.hasPrev && frame.prevStep < error.correctionStep;
 	}
 
-	static glm::dvec3 appliedErrorCm(const BodyError& error, const RenderInterpolationFrame& frame, double alpha)
+	static glm::dvec3 appliedErrorPosition(const BodyError& error, const RenderInterpolationFrame& frame, double alpha)
 	{
-		const glm::dvec3& from = straddlesCorrection(error, frame) ? error.errorCmBeforeCorrection : error.errorCmPrev;
-		return renderCorrectionDetail::lerp(from, error.errorCm, alpha);
+		const glm::dvec3& from = straddlesCorrection(error, frame) ? error.errorPositionBeforeCorrection : error.errorPositionPrev;
+		return renderCorrectionDetail::lerp(from, error.errorPosition, alpha);
 	}
 
 	static glm::dquat appliedErrorRotation(const BodyError& error, const RenderInterpolationFrame& frame, double alpha)
@@ -631,7 +636,7 @@ private:
 		const Snapshot& poses, RenderCorrectionFrame& result)
 	{
 		++result.corrections;
-		const double maxCorrectionSquared = static_cast<double>(params.maxCorrectionCm) * static_cast<double>(params.maxCorrectionCm);
+		const double maxCorrectionSquared = static_cast<double>(params.maxCorrection) * static_cast<double>(params.maxCorrection);
 		for (uint16_t index = 0; index < correction.bodyCount; ++index)
 		{
 			const RenderCorrectionBody& body = correction.bodies[index];
@@ -643,7 +648,7 @@ private:
 			if (renderCorrectionDetail::snapsInRootFrame(*poseBody))
 			{
 				++result.policySnaps;
-				result.maxPolicySnapCm = std::max(result.maxPolicySnapCm, glm::length(body.errorCm));
+				result.maxPolicySnap = std::max(result.maxPolicySnap, glm::length(body.errorPosition));
 				result.maxPolicySnapDeg = std::max(result.maxPolicySnapDeg, renderCorrectionDetail::rotationDegrees(body.errorRotation));
 				recordPolicyCarrier(body.simulatableId, body.declarationIndex, correction.physicsStep);
 				continue;
@@ -654,14 +659,14 @@ private:
 				continue;
 			}
 
-			const double errorSquared = glm::dot(body.errorCm, body.errorCm);
-			const double desyncCm = static_cast<double>(body.speedCmPerSecond) * static_cast<double>(params.desyncSeconds);
-			const bool withinDesync = params.desyncSeconds > 0.f && errorSquared < desyncCm * desyncCm;
+			const double errorSquared = glm::dot(body.errorPosition, body.errorPosition);
+			const double desyncDistance = static_cast<double>(body.speed) * static_cast<double>(params.desyncSeconds);
+			const bool withinDesync = params.desyncSeconds > 0.f && errorSquared < desyncDistance * desyncDistance;
 			const int32_t steps = errorSquared < maxCorrectionSquared || withinDesync ? durationSteps : 0;
-			result.maxErrorCm = std::max(result.maxErrorCm, std::sqrt(errorSquared));
+			result.maxError = std::max(result.maxError, std::sqrt(errorSquared));
 
 			const bool wasSmoothing = error->isSmoothing();
-			error->errorCmBeforeCorrection = wasSmoothing ? error->errorCm : glm::dvec3(0.0);
+			error->errorPositionBeforeCorrection = wasSmoothing ? error->errorPosition : glm::dvec3(0.0);
 			error->errorRotationBeforeCorrection = wasSmoothing ? error->errorRotation : glm::dquat(1.0, 0.0, 0.0, 0.0);
 			error->correctionStep = correction.physicsStep;
 			error->smoothingStartStep = currentStep;
@@ -672,8 +677,8 @@ private:
 			error->stepsSinceUpdate = 0;
 			if (error->isSmoothing())
 			{
-				error->errorCm += body.errorCm;
-				error->errorCmPrev = error->errorCm;
+				error->errorPosition += body.errorPosition;
+				error->errorPositionPrev = error->errorPosition;
 				error->errorRotation = error->errorRotation * body.errorRotation;
 				error->errorRotationPrev = error->errorRotation;
 				error->decaying = true;
@@ -689,8 +694,8 @@ private:
 
 	static void resetError(BodyError& error)
 	{
-		error.errorCm = glm::dvec3(0.0);
-		error.errorCmPrev = glm::dvec3(0.0);
+		error.errorPosition = glm::dvec3(0.0);
+		error.errorPositionPrev = glm::dvec3(0.0);
 		error.errorRotation = glm::dquat(1.0, 0.0, 0.0, 0.0);
 		error.errorRotationPrev = glm::dquat(1.0, 0.0, 0.0, 0.0);
 		error.endDecayStep = 0;
@@ -727,8 +732,8 @@ private:
 			float alpha = static_cast<float>(smoothingCount - 1) / static_cast<float>(smoothingCount);
 			alpha = std::clamp(alpha, 0.f, 1.f);
 
-			error.errorCmPrev = error.errorCm;
-			error.errorCm *= static_cast<double>(alpha);
+			error.errorPositionPrev = error.errorPosition;
+			error.errorPosition *= static_cast<double>(alpha);
 			error.errorRotationPrev = error.errorRotation;
 			error.errorRotation = renderCorrectionDetail::slerp(glm::dquat(1.0, 0.0, 0.0, 0.0), error.errorRotation, static_cast<double>(alpha));
 		}
