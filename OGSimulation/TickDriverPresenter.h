@@ -47,7 +47,6 @@ struct PresentControls
 	float  desyncSeconds     = 0.6f;
 	bool   traceFrames       = false;
 	float  parkSnap          = std::numeric_limits<float>::infinity();
-	double lengthReportScale = 1.0;
 };
 
 struct TickDriverPresenterConfig
@@ -156,12 +155,6 @@ std::optional<glm::dvec3> positionOf(const T& value)
 	{
 		return glm::dvec3(value);
 	}
-}
-
-template <typename T>
-double reportedLength(const PresentControls& controls, T length)
-{
-	return static_cast<double>(length) * controls.lengthReportScale;
 }
 
 inline double clampedDelaySteps(const PresentControls& controls)
@@ -666,11 +659,11 @@ private:
 			{
 				m_engine.log(HostLogLevel::Log, formatHostLine(m_line,
 					"[SimHost.RenderCorrection] event frame=%llu prev=%llu next=%llu alpha=%.4f corrections=%u smoothed=%u "
-					"snapped=%u maxError%s=%.*f durationSteps=%d policySnaps=%u rootFramed=%u",
+					"snapped=%u maxErrorM=%.6f durationSteps=%d policySnaps=%u rootFramed=%u",
 					static_cast<unsigned long long>(m_engine.frameNumber()), static_cast<unsigned long long>(m_renderFrame.prevStep),
 					static_cast<unsigned long long>(m_renderFrame.nextStep), m_renderFrame.alpha, corrected.corrections,
-					corrected.smoothedBodies, corrected.snappedBodies, simFrame::kLengthFieldSuffix, simFrame::lengthDecimals(4),
-					tickDriverPresenter::reportedLength(controls, corrected.maxError),
+					corrected.smoothedBodies, corrected.snappedBodies,
+					static_cast<double>(corrected.maxError),
 					renderCorrectionDurationSteps(correction.correctionSeconds, correction.stepSeconds), corrected.policySnaps,
 					corrected.rootFramed));
 			}
@@ -716,12 +709,12 @@ private:
 					else if (logEnabled(HostLogLevel::Log))
 					{
 						m_engine.log(HostLogLevel::Log, formatHostLine(m_line,
-							"[SimHost.RenderApply] first role=%s id=%u from=(%.*f,%.*f,%.*f) to=(%.*f,%.*f,%.*f) physicsStep=%llu tick=%u",
-							tickDriverPresenter::roleText(m_config.runsPrediction), id, simFrame::lengthDecimals(3), before->x,
-							simFrame::lengthDecimals(3), before->y, simFrame::lengthDecimals(3), before->z,
-							simFrame::lengthDecimals(3), static_cast<double>(body->position.x),
-							simFrame::lengthDecimals(3), static_cast<double>(body->position.y),
-							simFrame::lengthDecimals(3), static_cast<double>(body->position.z),
+							"[SimHost.RenderApply] first role=%s id=%u from=(%.5f,%.5f,%.5f) to=(%.5f,%.5f,%.5f) physicsStep=%llu tick=%u",
+							tickDriverPresenter::roleText(m_config.runsPrediction), id, before->x,
+							before->y, before->z,
+							static_cast<double>(body->position.x),
+							static_cast<double>(body->position.y),
+							static_cast<double>(body->position.z),
 							static_cast<unsigned long long>(m_renderPoses.physicsStep),
 							static_cast<uint32_t>(m_renderPoses.tick)));
 					}
@@ -785,16 +778,15 @@ private:
 						&& window.shadowOutOfTolerance++ == 0u && logEnabled(HostLogLevel::Warning))
 					{
 						m_engine.log(HostLogLevel::Warning, formatHostLine(m_line,
-							"[SimHost.RenderSync] SHADOW id=%u declaration=%u queried=(%.*f,%.*f,%.*f) rendered=(%.*f,%.*f,%.*f) "
-							"error%s=%.*f angleRad=%.9f: the shadow world the visualizations query is not at the rendered pose",
-							id, declarationIndex, simFrame::lengthDecimals(6), static_cast<double>(queried[3].x),
-							simFrame::lengthDecimals(6), static_cast<double>(queried[3].y),
-							simFrame::lengthDecimals(6), static_cast<double>(queried[3].z),
-							simFrame::lengthDecimals(6), static_cast<double>(pose.position.x),
-							simFrame::lengthDecimals(6), static_cast<double>(pose.position.y),
-							simFrame::lengthDecimals(6), static_cast<double>(pose.position.z),
-							simFrame::kLengthFieldSuffix, simFrame::lengthDecimals(9),
-							tickDriverPresenter::reportedLength(controls, error), angleRad));
+							"[SimHost.RenderSync] SHADOW id=%u declaration=%u queried=(%.8f,%.8f,%.8f) rendered=(%.8f,%.8f,%.8f) "
+							"errorM=%.11f angleRad=%.9f: the shadow world the visualizations query is not at the rendered pose",
+							id, declarationIndex, static_cast<double>(queried[3].x),
+							static_cast<double>(queried[3].y),
+							static_cast<double>(queried[3].z),
+							static_cast<double>(pose.position.x),
+							static_cast<double>(pose.position.y),
+							static_cast<double>(pose.position.z),
+							static_cast<double>(error), angleRad));
 					}
 				}
 			});
@@ -818,13 +810,13 @@ private:
 			if (drift > tickDriverPresenter::kHeldTolerance && m_applyWindow.moved++ == 0u && logEnabled(HostLogLevel::Warning))
 			{
 				m_engine.log(HostLogLevel::Warning, formatHostLine(m_line,
-					"[SimHost.RenderApply] MOVED role=%s id=%u capsule=(%.*f,%.*f,%.*f) applied=(%.*f,%.*f,%.*f) drift%s=%.*f: "
+					"[SimHost.RenderApply] MOVED role=%s id=%u capsule=(%.8f,%.8f,%.8f) applied=(%.8f,%.8f,%.8f) driftM=%.11f: "
 					"something moved the capsule between the last render apply and this one",
-					tickDriverPresenter::roleText(m_config.runsPrediction), id, simFrame::lengthDecimals(6), planePoint->x,
-					simFrame::lengthDecimals(6), planePoint->y, simFrame::lengthDecimals(6), planePoint->z,
-					simFrame::lengthDecimals(6), target.position.x, simFrame::lengthDecimals(6), target.position.y,
-					simFrame::lengthDecimals(6), target.position.z, simFrame::kLengthFieldSuffix, simFrame::lengthDecimals(9),
-					tickDriverPresenter::reportedLength(controls, drift)));
+					tickDriverPresenter::roleText(m_config.runsPrediction), id, planePoint->x,
+					planePoint->y, planePoint->z,
+					target.position.x, target.position.y,
+					target.position.z,
+					static_cast<double>(drift)));
 			}
 		}
 	}
@@ -864,11 +856,11 @@ private:
 				&& window.outOfTolerance++ == 0u && logEnabled(HostLogLevel::Warning))
 			{
 				m_engine.log(HostLogLevel::Warning, formatHostLine(m_line,
-					"[SimHost.RenderApply] MISMATCH role=%s id=%u capsule=(%.*f,%.*f,%.*f) rendered=(%.*f,%.*f,%.*f) error%s=%.*f physicsStep=%llu",
-					tickDriverPresenter::roleText(m_config.runsPrediction), id, simFrame::lengthDecimals(6), planePoint->x,
-					simFrame::lengthDecimals(6), planePoint->y, simFrame::lengthDecimals(6), planePoint->z,
-					simFrame::lengthDecimals(6), pose.x, simFrame::lengthDecimals(6), pose.y, simFrame::lengthDecimals(6), pose.z,
-					simFrame::kLengthFieldSuffix, simFrame::lengthDecimals(9), tickDriverPresenter::reportedLength(controls, error),
+					"[SimHost.RenderApply] MISMATCH role=%s id=%u capsule=(%.8f,%.8f,%.8f) rendered=(%.8f,%.8f,%.8f) errorM=%.11f physicsStep=%llu",
+					tickDriverPresenter::roleText(m_config.runsPrediction), id, planePoint->x,
+					planePoint->y, planePoint->z,
+					pose.x, pose.y, pose.z,
+					static_cast<double>(error),
 					static_cast<unsigned long long>(m_renderPoses.physicsStep)));
 			}
 		}
@@ -890,19 +882,19 @@ private:
 			if (!logEnabled(HostLogLevel::Log))
 				continue;
 			m_engine.log(HostLogLevel::Log, formatHostLine(m_line,
-				"[SimHost.RenderTrace] role=%s frame=%llu id=%u pos=(%.*f,%.*f,%.*f) nextPos=(%.*f,%.*f,%.*f) host=%.6f "
-				"render=%.6f mode=%s prev=%llu/%s next=%llu/%s back=%u alpha=%.4f newest=%llu err=(%.*f,%.*f,%.*f)",
+				"[SimHost.RenderTrace] role=%s frame=%llu id=%u pos=(%.6f,%.6f,%.6f) nextPos=(%.6f,%.6f,%.6f) host=%.6f "
+				"render=%.6f mode=%s prev=%llu/%s next=%llu/%s back=%u alpha=%.4f newest=%llu err=(%.6f,%.6f,%.6f)",
 				tickDriverPresenter::roleText(m_config.runsPrediction), static_cast<unsigned long long>(m_engine.frameNumber()), id,
-				simFrame::lengthDecimals(4), target.position.x, simFrame::lengthDecimals(4), target.position.y,
-				simFrame::lengthDecimals(4), target.position.z,
-				simFrame::lengthDecimals(4), static_cast<double>(nextBody->position.x),
-				simFrame::lengthDecimals(4), static_cast<double>(nextBody->position.y),
-				simFrame::lengthDecimals(4), static_cast<double>(nextBody->position.z),
+				target.position.x, target.position.y,
+				target.position.z,
+				static_cast<double>(nextBody->position.x),
+				static_cast<double>(nextBody->position.y),
+				static_cast<double>(nextBody->position.z),
 				clock.hostNowSeconds(), bracket.renderTimeSeconds, bracket.newestOnly ? "newest" : "interp",
 				static_cast<unsigned long long>(bracket.prevStep), bracket.hasPrev ? tickDriverPresenter::stepKindText(bracket.prevKind) : "-",
 				static_cast<unsigned long long>(bracket.nextStep), tickDriverPresenter::stepKindText(bracket.nextKind), bracket.nextBack,
-				bracket.alpha, static_cast<unsigned long long>(bracket.newestStep), simFrame::lengthDecimals(4), error.x,
-				simFrame::lengthDecimals(4), error.y, simFrame::lengthDecimals(4), error.z));
+				bracket.alpha, static_cast<unsigned long long>(bracket.newestStep), error.x,
+				error.y, error.z));
 		}
 	}
 
@@ -915,42 +907,39 @@ private:
 		{
 			std::sort(m_frameDisplacement.begin(), m_frameDisplacement.end());
 			const uint32_t n = static_cast<uint32_t>(m_frameDisplacement.size());
-			displacement = formatHostLine(m_displacementField, "%.*f/%.*f/%.*f",
-				simFrame::lengthDecimals(4),
-				tickDriverPresenter::reportedLength(controls, m_frameDisplacement[latencyBudget::nearestRankIndex(n, 500u)]),
-				simFrame::lengthDecimals(4),
-				tickDriverPresenter::reportedLength(controls, m_frameDisplacement[latencyBudget::nearestRankIndex(n, 990u)]),
-				simFrame::lengthDecimals(4), tickDriverPresenter::reportedLength(controls, m_frameDisplacement.back()));
+			displacement = formatHostLine(m_displacementField, "%.6f/%.6f/%.6f",
+				static_cast<double>(m_frameDisplacement[latencyBudget::nearestRankIndex(n, 500u)]),
+				static_cast<double>(m_frameDisplacement[latencyBudget::nearestRankIndex(n, 990u)]),
+				static_cast<double>(m_frameDisplacement.back()));
 		}
 
 		if (logEnabled(HostLogLevel::Log))
 		{
 			m_engine.log(HostLogLevel::Log, formatHostLine(m_line,
 				"[SimHost.RenderApply] role=%s frames=%u appliedFrames=%u characters=%d applied=%u missing=%u exact=%u "
-				"outOfTolerance=%u maxError%s=%.*f held=%u moved=%u maxHeldDrift%s=%.*f path%s=%.*f steps=[%llu,%llu] drops=%llu "
-				"mode=%s delaySteps=%.2f interpolated=%u atNewest=%u beyondOldest=%u snaps=%u maxNextBack=%u disp%s=%s",
+				"outOfTolerance=%u maxErrorM=%.11f held=%u moved=%u maxHeldDriftM=%.11f pathM=%.5f steps=[%llu,%llu] drops=%llu "
+				"mode=%s delaySteps=%.2f interpolated=%u atNewest=%u beyondOldest=%u snaps=%u maxNextBack=%u dispM=%s",
 				tickDriverPresenter::roleText(m_config.runsPrediction), window.frames, window.appliedFrames,
 				static_cast<int32_t>(m_targets.size()), window.applied, window.missing, window.exact,
-				window.outOfTolerance, simFrame::kLengthFieldSuffix, simFrame::lengthDecimals(9),
-				tickDriverPresenter::reportedLength(controls, window.maxError), window.held, window.moved,
-				simFrame::kLengthFieldSuffix, simFrame::lengthDecimals(9), tickDriverPresenter::reportedLength(controls, window.maxHeldDrift),
-				simFrame::kLengthFieldSuffix, simFrame::lengthDecimals(3), tickDriverPresenter::reportedLength(controls, window.path),
+				window.outOfTolerance,
+				static_cast<double>(window.maxError), window.held, window.moved,
+				static_cast<double>(window.maxHeldDrift),
+				static_cast<double>(window.path),
 				static_cast<unsigned long long>(window.firstAppliedStep), static_cast<unsigned long long>(window.lastAppliedStep),
 				static_cast<unsigned long long>(m_snapshots.drops()),
 				window.newestMode > 0u ? "newest" : "interp",
 				tickDriverPresenter::clampedDelaySteps(controls),
 				window.interpolated, window.atNewest, window.beyondOldest, window.snaps, window.maxNextBack,
-				simFrame::kLengthFieldSuffix, displacement));
+				displacement));
 		}
 
 		if (worldHost.hasShadowWorld() && logEnabled(HostLogLevel::Log))
 		{
 			m_engine.log(HostLogLevel::Log, formatHostLine(m_line,
 				"[SimHost.RenderSync] role=Client frames=%u shadowBodies=%u shadowExact=%u shadowOutOfTolerance=%u "
-				"shadowMaxError%s=%.*f shadowMaxAngleRad=%.6f",
+				"shadowMaxErrorM=%.8f shadowMaxAngleRad=%.6f",
 				window.frames, window.shadowBodies, window.shadowExact, window.shadowOutOfTolerance,
-				simFrame::kLengthFieldSuffix, simFrame::lengthDecimals(6),
-				tickDriverPresenter::reportedLength(controls, window.shadowMaxError), window.shadowMaxAngleRad));
+				static_cast<double>(window.shadowMaxError), window.shadowMaxAngleRad));
 		}
 
 		if (m_config.runsPrediction)
@@ -977,24 +966,23 @@ private:
 		{
 			m_engine.log(HostLogLevel::Log, formatHostLine(m_line,
 				"[SimHost.RenderCorrection] role=Client frames=%u resims=%llu captured=%llu withoutError=%llu tickMismatches=%llu "
-				"ringDrops=%llu corrections=%u smoothedBodies=%u snappedBodies=%u maxError%s=%.*f maxApplied%s=%.*f decays=%u "
+				"ringDrops=%llu corrections=%u smoothedBodies=%u snappedBodies=%u maxErrorM=%.5f maxAppliedM=%.5f decays=%u "
 				"decayMeanS=%.3f decayMaxS=%.3f activeFrames=%u late=%u pendingDrops=%u seconds=%.3f durationSteps=%d "
-				"max%s=%.*f desyncS=%.2f policySnaps=%u maxPolicySnap%s=%.*f maxPolicySnapDeg=%.1f rootFramedFrames=%u "
+				"maxM=%.3f desyncS=%.2f policySnaps=%u maxPolicySnapM=%.5f maxPolicySnapDeg=%.1f rootFramedFrames=%u "
 				"straddleSnaps=%u",
 				m_applyWindow.frames, static_cast<unsigned long long>(resims - window.resimsAtStart),
 				static_cast<unsigned long long>(captured - window.capturedAtStart),
 				static_cast<unsigned long long>(withoutError - window.withoutErrorAtStart),
 				static_cast<unsigned long long>(tickMismatch - window.tickMismatchAtStart),
 				static_cast<unsigned long long>(ringDrops - window.ringDropsAtStart), window.corrections, window.smoothedBodies,
-				window.snappedBodies, simFrame::kLengthFieldSuffix, simFrame::lengthDecimals(3),
-				tickDriverPresenter::reportedLength(controls, window.maxError), simFrame::kLengthFieldSuffix,
-				simFrame::lengthDecimals(3), tickDriverPresenter::reportedLength(controls, window.maxApplied), window.finished,
+				window.snappedBodies,
+				static_cast<double>(window.maxError),
+				static_cast<double>(window.maxApplied), window.finished,
 				decayMeanS, static_cast<double>(window.maxFinishedSteps) * stepSeconds, window.activeFrames, window.late,
 				window.pendingDrops, static_cast<double>(seconds), renderCorrectionDurationSteps(seconds, m_config.stepSeconds),
-				simFrame::kLengthFieldSuffix, simFrame::lengthDecimals(1),
-				tickDriverPresenter::reportedLength(controls, controls.maxCorrection), static_cast<double>(controls.desyncSeconds),
-				window.policySnaps, simFrame::kLengthFieldSuffix, simFrame::lengthDecimals(3),
-				tickDriverPresenter::reportedLength(controls, window.maxPolicySnap), window.maxPolicySnapDeg,
+				static_cast<double>(controls.maxCorrection), static_cast<double>(controls.desyncSeconds),
+				window.policySnaps,
+				static_cast<double>(window.maxPolicySnap), window.maxPolicySnapDeg,
 				window.rootFramedFrames, window.straddleSnaps));
 		}
 

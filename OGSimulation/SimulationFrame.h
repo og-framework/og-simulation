@@ -11,18 +11,6 @@
 #include "glm/vec2.hpp"
 #include "glm/vec3.hpp"
 
-enum class AxisFrame : uint8_t
-{
-    UeZUpLeftHanded = 0,
-    YUpRightHanded = 1,
-};
-
-inline constexpr AxisFrame kAxisFrame = AxisFrame::YUpRightHanded;
-inline constexpr float kUnitsPerMetre = 1.f;
-
-static_assert(kUnitsPerMetre == 100.f || kUnitsPerMetre == 1.f,
-    "SimulationFrame: kUnitsPerMetre is 100 (centimetres) or 1 (metres); the legacy wrappers know no other unit");
-
 namespace simFrameDetail
 {
     constexpr glm::length_t axisIndex(const glm::vec3& axis)
@@ -107,28 +95,19 @@ namespace simFrameDetail
     }
 } // namespace simFrameDetail
 
-template <AxisFrame A, float U>
-struct BasicSimFrame
+struct simFrame
 {
-    static_assert(A == AxisFrame::UeZUpLeftHanded || A == AxisFrame::YUpRightHanded,
-        "SimulationFrame: BasicSimFrame knows exactly two axis frames");
-    static_assert(U == 100.f || U == 1.f, "SimulationFrame: BasicSimFrame knows exactly two units, 100 or 1 per metre");
-
-    static constexpr glm::vec3 kUp = A == AxisFrame::UeZUpLeftHanded ? glm::vec3(0.f, 0.f, 1.f) : glm::vec3(0.f, 1.f, 0.f);
-    static constexpr glm::vec3 kForward = A == AxisFrame::UeZUpLeftHanded ? glm::vec3(1.f, 0.f, 0.f) : glm::vec3(0.f, 0.f, -1.f);
-    static constexpr glm::vec3 kRight = A == AxisFrame::UeZUpLeftHanded ? glm::vec3(0.f, 1.f, 0.f) : glm::vec3(1.f, 0.f, 0.f);
-    static constexpr glm::vec3 kTurnAxis = A == AxisFrame::UeZUpLeftHanded ? glm::vec3(0.f, 0.f, 1.f) : glm::vec3(0.f, -1.f, 0.f);
-    static constexpr glm::vec3 kVerticalTurnAxis = A == AxisFrame::UeZUpLeftHanded ? glm::vec3(0.f, 1.f, 0.f) : glm::vec3(-1.f, 0.f, 0.f);
-    static constexpr float kChartOrientation = A == AxisFrame::UeZUpLeftHanded ? 1.f : -1.f;
+    static constexpr glm::vec3 kUp = glm::vec3(0.f, 1.f, 0.f);
+    static constexpr glm::vec3 kForward = glm::vec3(0.f, 0.f, -1.f);
+    static constexpr glm::vec3 kRight = glm::vec3(1.f, 0.f, 0.f);
+    static constexpr glm::vec3 kTurnAxis = glm::vec3(0.f, -1.f, 0.f);
+    static constexpr glm::vec3 kVerticalTurnAxis = glm::vec3(-1.f, 0.f, 0.f);
+    static constexpr float kChartOrientation = -1.f;
     static constexpr glm::length_t kUpIndex = simFrameDetail::axisIndex(kUp);
 
-    static constexpr float kUnitsPerCentimetre = U / 100.f;
-    static constexpr float kUeCentimetresPerUnit = 100.f / U;
-
-    static constexpr const char* kLengthFieldSuffix = U == 100.f ? "Cm" : "M";
+    static constexpr float kUeCentimetresPerUnit = 100.f;
 
 private:
-    static constexpr bool kIsCentimetres = U == 100.f;
     static constexpr glm::length_t kForwardIndex = simFrameDetail::axisIndex(kForward);
     static constexpr glm::length_t kRightIndex = simFrameDetail::axisIndex(kRight);
     static constexpr glm::length_t kTurnIndex = simFrameDetail::axisIndex(kTurnAxis);
@@ -136,7 +115,6 @@ private:
     static constexpr bool kRightNegative = simFrameDetail::axisIsNegative(kRight);
     static constexpr bool kUpNegative = simFrameDetail::axisIsNegative(kUp);
     static constexpr bool kTurnNegative = simFrameDetail::axisIsNegative(kTurnAxis);
-    static constexpr bool kChartNegative = kChartOrientation < 0.f;
 
     static_assert(kTurnAxis == glm::cross(kForward, kRight), "SimulationFrame: kTurnAxis must be cross(kForward, kRight)");
     static_assert(kVerticalTurnAxis == glm::cross(kUp, kForward),
@@ -150,11 +128,6 @@ private:
         "SimulationFrame: forward, right and up are three different components");
 
 public:
-    static constexpr int lengthDecimals(int n)
-    {
-        return kIsCentimetres ? n : n + 2;
-    }
-
     static constexpr float height(const glm::vec3& v)
     {
         return signedPick<kUpIndex, kUpNegative>(v);
@@ -211,152 +184,7 @@ public:
             signedPick<2, kForwardNegative>(column));
     }
 
-    static constexpr float legacyCm(float cm)
-    {
-        if constexpr (kIsCentimetres)
-        {
-            return cm;
-        }
-        else
-        {
-            return narrowToFloat(double(cm) / 100.0);
-        }
-    }
-
-    static constexpr double legacyCm(double cm)
-    {
-        if constexpr (kIsCentimetres)
-        {
-            return cm;
-        }
-        else
-        {
-            return cm / 100.0;
-        }
-    }
-
-    static constexpr float legacyCm2(float cm2)
-    {
-        if constexpr (kIsCentimetres)
-        {
-            return cm2;
-        }
-        else
-        {
-            return narrowToFloat(double(cm2) / 10000.0);
-        }
-    }
-
-    static constexpr float legacyPerCm3(float perCm3)
-    {
-        if constexpr (kIsCentimetres)
-        {
-            return perCm3;
-        }
-        else
-        {
-            return narrowToFloat(double(perCm3) * 1000000.0);
-        }
-    }
-
-    static constexpr glm::vec2 legacyPlanarCm(float x, float y)
-    {
-        return glm::vec2(legacyCm(x), legacyCm(y));
-    }
-
-    static constexpr glm::vec3 legacyAxes(float x, float y, float z)
-    {
-        return place<kForwardNegative, kRightNegative, kUpNegative>(x, y, z);
-    }
-
-    static constexpr glm::vec3 legacyAxesUnsigned(float x, float y, float z)
-    {
-        return place<false, false, false>(x, y, z);
-    }
-
-    static constexpr glm::vec3 legacyAxial(float x, float y, float z)
-    {
-        return place<kForwardNegative != kChartNegative, kRightNegative != kChartNegative, kUpNegative != kChartNegative>(x, y, z);
-    }
-
-    static constexpr glm::vec3 legacyPosition(float x, float y, float z)
-    {
-        return legacyAxes(legacyCm(x), legacyCm(y), legacyCm(z));
-    }
-
-    static constexpr glm::vec3 legacyExtents(float x, float y, float z)
-    {
-        return legacyAxesUnsigned(legacyCm(x), legacyCm(y), legacyCm(z));
-    }
-
-    static constexpr glm::vec3 legacyTorque(float x, float y, float z)
-    {
-        return legacyAxial(legacyCm2(x), legacyCm2(y), legacyCm2(z));
-    }
-
-    static constexpr glm::vec3 legacyInertia(float ixx, float iyy, float izz)
-    {
-        return legacyAxesUnsigned(legacyCm2(ixx), legacyCm2(iyy), legacyCm2(izz));
-    }
-
-    static constexpr glm::quat legacyRotation(float w, float x, float y, float z)
-    {
-        const glm::vec3 axial = legacyAxial(x, y, z);
-        return glm::quat(w, axial.x, axial.y, axial.z);
-    }
-
-    static constexpr double toLegacyCm(double units)
-    {
-        if constexpr (kIsCentimetres)
-        {
-            return units;
-        }
-        else
-        {
-            return units * 100.0;
-        }
-    }
-
-    static constexpr double toLegacyCm(float units)
-    {
-        return toLegacyCm(double(units));
-    }
-
-    static constexpr glm::dvec3 toLegacyAxes(const glm::vec3& v)
-    {
-        return glm::dvec3(signedPick<kForwardIndex, kForwardNegative>(v), signedPick<kRightIndex, kRightNegative>(v),
-            signedPick<kUpIndex, kUpNegative>(v));
-    }
-
-    static constexpr glm::dvec3 toLegacyAxial(const glm::vec3& v)
-    {
-        return glm::dvec3(signedPick<kForwardIndex, kForwardNegative != kChartNegative>(v),
-            signedPick<kRightIndex, kRightNegative != kChartNegative>(v), signedPick<kUpIndex, kUpNegative != kChartNegative>(v));
-    }
-
-    static constexpr glm::dvec3 toLegacyPosition(const glm::vec3& p)
-    {
-        const glm::dvec3 axes = toLegacyAxes(p);
-        return glm::dvec3(toLegacyCm(axes.x), toLegacyCm(axes.y), toLegacyCm(axes.z));
-    }
-
-    static constexpr glm::dquat toLegacyRotation(const glm::quat& q)
-    {
-        const glm::dvec3 axial = toLegacyAxial(glm::vec3(q.x, q.y, q.z));
-        return glm::dquat(double(q.w), axial.x, axial.y, axial.z);
-    }
-
-    static constexpr glm::dvec2 toLegacyPlanar(const glm::vec2& p)
-    {
-        return glm::dvec2(double(p.x), double(p.y));
-    }
-
 private:
-    static constexpr float narrowToFloat(double value)
-    {
-        return std::bit_cast<float>(std::bit_cast<std::uint32_t>(static_cast<float>(value)));
-    }
-
     template <glm::length_t Index, bool Negate>
     static constexpr float signedPick(const glm::vec3& v)
     {
@@ -395,10 +223,18 @@ private:
     }
 };
 
-using simFrame = BasicSimFrame<kAxisFrame, kUnitsPerMetre>;
-
 static_assert(simFrameDetail::picksKeepTheSignOfZero<simFrame>(-0.f) && simFrameDetail::picksKeepTheSignOfZero<simFrame>(0.f),
     "SimulationFrame G-01: every pick is a signed index pick, never a dot product, so the sign of zero survives");
 
-static_assert(BasicSimFrame<kAxisFrame, 1.f>::legacyCm(30.f) == 0.3f && BasicSimFrame<kAxisFrame, 1.f>::legacyCm(42.f) == 0.42f,
-    "SimulationFrame: a metre wrapper narrows through narrowToFloat, so constant evaluation and run time agree on its float");
+static_assert(simFrameDetail::sameBits(simFrame::kUp, glm::vec3(0.f, 1.f, 0.f))
+        && simFrameDetail::sameBits(simFrame::kForward, glm::vec3(0.f, 0.f, -1.f))
+        && simFrameDetail::sameBits(simFrame::kRight, glm::vec3(1.f, 0.f, 0.f))
+        && simFrameDetail::sameBits(simFrame::kTurnAxis, glm::vec3(0.f, -1.f, 0.f))
+        && simFrameDetail::sameBits(simFrame::kVerticalTurnAxis, glm::vec3(-1.f, 0.f, 0.f))
+        && simFrameDetail::sameBits(simFrame::kChartOrientation, -1.f) && simFrame::kUpIndex == 1,
+    "SimulationFrame: the simulation's frame is fixed: right-handed, +Y up, -Z forward, +X right, chart P. "
+    "Was the axis-frame knob at YUpRightHanded, removed together with the Unreal frame it selected against");
+
+static_assert(simFrameDetail::sameBits(simFrame::kUeCentimetresPerUnit, 100.f),
+    "SimulationFrame: the simulation's length unit is fixed: the metre, 100 Unreal centimetres. "
+    "Was the units-per-metre knob at 1, removed together with the centimetre unit it selected against");

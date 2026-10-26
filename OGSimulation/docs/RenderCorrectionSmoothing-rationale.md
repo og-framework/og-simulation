@@ -284,14 +284,14 @@ off by one or more, and a small ring that overflows. It compares the outcome, th
 leaves the ring, bit for bit, and counts each outcome, so a run that stops reaching one fails.
 
 `RenderCorrectionBodyPolicyTest.cpp` (tag `[RenderInterpolation]`), the per-body mode of §14:
-- `RenderCorrection.BodyPolicy.ASnappedBodyCarriesNoErrorAndItsRootStillSmooths`: a root with a 2 cm error and a
-  `SnapInRootFrame` body with 117° and 2 cm, at the carrier frame with no *prev*: the body has no error, its rotation
+- `RenderCorrection.BodyPolicy.ASnappedBodyCarriesNoErrorAndItsRootStillSmooths`: a root with a 0.02 m (2 cm) error and a
+  `SnapInRootFrame` body with 117° and 0.02 m, at the carrier frame with no *prev*: the body has no error, its rotation
   is the pose's, its position is the pose's plus the root's applied offset, the counters read one snap of 117°, and the
   root's error and pose are byte-equal to a run without the body.
 - `RenderCorrection.BodyPolicy.TheSnappedBodyKeepsItsOffsetFromItsRootOnEveryFrame`: two simulatables, each with a
   snapped body, a smoothed body and a root, over 5,000 random frames (steps advancing by −1 to 3, straddles, roots
   snapped above the maximum, three parameter sets), with a *next* snapshot whose poses differ from the supplied ones:
-  the §14 invariant to 1e-3 cm on every frame, and the exact rotation, which is *next*'s on the frames an
+  the §14 invariant to 1e-5 m (1e-3 cm) on every frame, and the exact rotation, which is *next*'s on the frames an
   independent model of §15's carrier records says straddle a carrier step and the supplied one on every other frame;
   `straddleSnaps` equals the model's count every frame. It counts root-framed frames, straddled root frames, frames
   given the carrier rotation and root snaps, so a run that stops reaching one fails.
@@ -301,11 +301,11 @@ leaves the ring, bit for bit, and counts each outcome, so a run that stops reach
   transcription of the smoother as it was before §14. The transcription is compared by value, not by bytes: the compiler may fold the
   shared identity slerp differently in the two copies and give a zero of the other sign. The two smoothers are passed
   their *next* snapshots (§15); the transcription has none.
-- `RenderCorrection.BodyPolicy.OnTheStraddleASnappedBodyTakesTheCarrierPose`: a root with a 2 cm error and a
+- `RenderCorrection.BodyPolicy.OnTheStraddleASnappedBodyTakesTheCarrierPose`: a root with a 0.02 m error and a
   `SnapInRootFrame` body whose rotation differs between the old step and the carrier step, drawn through the real
   `blendRenderPoses`. On the straddle at alpha 0.3 and 0.8 the body's rotation is *next*'s, byte for byte, and
   `straddleSnaps` is 1; its position is the blended one plus the root's applied offset, so the §14 offset holds to
-  1e-3 cm and the body is not at *next*'s position. On the four brackets after it (both steps corrected) the rotation
+  1e-5 m and the body is not at *next*'s position. On the four brackets after it (both steps corrected) the rotation
   is the plain blend, byte for byte, and `straddleSnaps` is 0. Every frame checks that the blend differs from *next*'s
   rotation, so the comparison can fail.
 

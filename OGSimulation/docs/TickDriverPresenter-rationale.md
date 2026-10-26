@@ -188,13 +188,13 @@ root keeps the newest tick, because the render sink already moved the engine's r
 ## §8 The checks, the windows and the lines
 
 All of this is diagnostics (§9). Every line is formatted with `formatHostLine` into `m_line` and sent to the
-engine only when `logEnabled` accepts its level. At 100 units per metre the format strings print exactly the
-engine-hosted lines (§13); their lengths go through the frame (§10). Levels: the four checks' lines and LATE are Warnings; the window lines, `first`, the correction
+engine only when `logEnabled` accepts its level. The format strings are the engine-hosted lines (§13), with
+their lengths in metres (§10). Levels: the four checks' lines and LATE are Warnings; the window lines, `first`, the correction
 event and the trace are Log.
 
 **The held check** (`checkRenderTargetsHeld`, before the pose build). For every target that was applied and
-is live: the anchor against the applied position. Above `kHeldTolerance` (1e-6 cm) the first one of a window is a
-`[SimHost.RenderApply] MOVED` Warning. 1e-6 cm tolerates one rounding of the sink's write (a sink can land a
+is live: the anchor against the applied position. Above `kHeldTolerance` (1e-8 m, 1e-6 cm) the first one of a window is a
+`[SimHost.RenderApply] MOVED` Warning. That tolerates one rounding of the sink's write (a sink can land a
 single-precision pose through a double-precision move from the old position), and anything larger is
 something else moving the anchor between two applies (guard G-02).
 
@@ -203,7 +203,7 @@ no root body; else the anchor against the requested pose. Exact matches are coun
 `kAppliedTolerance` on any axis of a window is a `MISMATCH` Warning. `kAppliedTolerance` is the no-move
 threshold of the engine this presenter was moved from: that engine ignores a move that stays within 1e-4 cm on
 every axis (with the rotation unchanged), and its threshold is a single-precision constant, so the presenter
-holds it as `static_cast<double>(1.e-4f)` centimetres. A blended idle pose that moves less
+holds `static_cast<double>(1.e-4f)` centimetres, in metres (§10). A blended idle pose that moves less
 than that leaves the anchor where it was, and must not count as a mismatch.
 `TickDriverPresenter.Differential.ChecksMovedMismatchAndShadow` provokes all three Warnings.
 
@@ -213,7 +213,7 @@ squared differences in x, y, z order before one square root, `maxOf` returns its
 `atan2Of` returns 0 for two zero arguments. They are not `std::max` or `std::clamp`, which differ on a NaN and on the sign of
 a zero.
 
-**The shadow check** (§6): out of tolerance above `kShadowPoseTolerance` (1e-3 cm) or
+**The shadow check** (§6): out of tolerance above `kShadowPoseTolerance` (1e-5 m, 1e-3 cm) or
 `kShadowPoseToleranceRadians` (1e-4 rad). The world host's physics may hold poses in other units and in
 single precision, so a read-back differs from the written pose by that rounding.
 
@@ -244,9 +244,8 @@ write is not diagnostics: it is the liveness test (§5).
 
 ## §10 Units
 
-Every length the presenter takes or passes is an og-sim length, in the unit `SimulationFrame.h` sets
-(`kUnitsPerMetre`: centimetres at 100, metres at 1): the poses, the sink's positions, `maxCorrection`,
-`parkSnap` and the tolerance constants. No name carries a unit.
+Every length the presenter takes or passes is an og-sim length, in metres (`SimulationFrame.h`): the poses,
+the sink's positions, `maxCorrection`, `parkSnap` and the tolerance constants. No name carries a unit.
 
 **The length constants** are metre literals with the physical size of the centimetre values they shipped with:
 the default `maxCorrection` (2.5 m, shipped as 250 cm), `kHeldTolerance` (1e-8 m, 1e-6 cm), `kAppliedTolerance`
@@ -255,25 +254,27 @@ single-precision value widened to double) and `kShadowPoseTolerance` (1e-5 m, 1e
 the unit flip gave the constant. A `static_assert` beside the constants pins all four bit for bit.
 `kShadowPoseToleranceRadians` is an angle.
 
-**The log lines report og-sim state**, so every length prints in og-sim units and in og-sim axes: the
-printed components are the poses' and the sink's own. Each field whose name ends in the length suffix prints
-the suffix through `%s` with `simFrame::kLengthFieldSuffix` (`Cm` at 100 units per metre, `M` at 1), so a
-name always matches its unit, and its value through `%.*f` with `simFrame::lengthDecimals(n)`, where n is the
-decimals the field printed in centimetres (n + 2 in metres, the same resolution). The positions in
-parentheses (`from`, `to`, `queried`, `rendered`, `capsule`, `applied`, `pos`, `nextPos`) and the trace's
-`err=` offset print their components through `lengthDecimals` as well, with no suffix. Times, angles,
-`alpha` and `delaySteps` are not lengths and keep fixed decimals. At 100 units per metre every line is
-byte for byte the line it was before the routing.
+**The log lines report og-sim state**, so every length prints in metres and in og-sim axes: the printed
+components are the poses' and the sink's own. Each length field's name ends in `M`, so a name always matches
+its unit, and each length prints with a fixed `%.<n>f`, where n is two more than the decimals the field printed
+in centimetres (the same resolution). The positions in parentheses (`from`, `to`, `queried`, `rendered`,
+`capsule`, `applied`, `pos`, `nextPos`) and the trace's `err=` offset print their components the same way, with
+no suffix. Times, angles, `alpha` and `delaySteps` are not lengths and keep their decimals.
 
-The suffixed fields are: in the `[SimHost.RenderApply]` window `maxError`, `maxHeldDrift`, `path` and the three
+The length fields are: in the `[SimHost.RenderApply]` window `maxError`, `maxHeldDrift`, `path` and the three
 `disp` values (one suffix for the `p50/p99/max` field); in the `[SimHost.RenderSync]` window `shadowMaxError`; in
 the `[SimHost.RenderCorrection]` window `maxError`, `maxApplied`, `max` and `maxPolicySnap`; `drift` (MOVED),
 `error` (MISMATCH and SHADOW) and the event line's `maxError`: 13 fields on 9 format strings.
 
-Each suffixed field also prints its length times the controls' `lengthReportScale`, through `reportedLength`.
-The scale is 1, since every line reports og-sim lengths; the positions and offsets are not scaled.
-`TickDriverPresenter.Units.LengthReportScaleMultipliesEveryCmFieldOnce` sees each suffixed field and requires the
-value at scale 2 to be twice the value at scale 1, and every other byte of every line to be equal.
+`TickDriverPresenter.Units.EveryLengthFieldIsNamedInMetres` runs the differential rig with frame tracing on
+and requires the length fields it sees to be exactly these 13, each named with `M`, and to carry values.
+
+**History.** While the simulation's unit could still change (og-sim-metres-yup, 2026-10), the suffix printed
+through `%s` and a suffix helper of `SimulationFrame.h` (Cm in centimetres, M in metres), each length's
+decimals through `%.*f` and a decimals helper (n in centimetres, n + 2 in metres), and each suffixed value was
+multiplied by a report-scale control that was always 1. In centimetres every line was byte for byte the line it
+was before the routing. When the unit became fixed the helpers were frozen into the format strings (the literal
+`M`, `%.<n + 2>f`) and the control was deleted, with the text unchanged in metres.
 
 ## §11 Allocation and the target table
 
@@ -334,8 +335,9 @@ What changed, and why each change keeps the behaviour:
 - the delay clamp, written twice in the old code (in the pose build and in the window line), became one
   `clampedDelaySteps`;
 - later, the length constants, the length field names and the length decimals were routed through
-  `SimulationFrame.h` (§10). At 100 units per metre every constant and every line is unchanged. After the
-  flip to metres, the length constants became metre literals with the same bits (§10).
+  `SimulationFrame.h` (§10), with every constant and every line unchanged in centimetres. After the flip to
+  metres, the length constants became metre literals with the same bits, and the names and decimals literals in
+  the format strings (§10).
 
 The guards G-01 and G-02 have no predecessor: the old backend explained the render time and the two
 tolerances only in its rationale.

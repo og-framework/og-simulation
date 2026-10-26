@@ -258,10 +258,11 @@ skipped (the restore skip). Otherwise it writes:
 
 The skip is exact because the cache entry at the anchor of a declaration nobody corrected is the capture
 taken right before the world saved that tick, so it equals the restored body bit for bit; an adopted
-correction differs and is written. It exists because a seam write is not always exact: on the Jolt
-backend the centre-of-mass offset (Jolt stores the centre of mass, the seam carries the origin) can move
-an unchanged body by an ULP, and the next exact comparison then disagrees and triggers another resim.
-og-simulation-jolt's JoltPhysicsBodyAdapter-rationale.md §9 records why the skip is kept. The skip lives in the push, not in the adapter
+correction differs and is written. It was added because a seam write was not always exact: writing an
+unchanged body could move it by an ULP, and the next exact comparison then disagreed and triggered
+another resim. On an adapter whose write is not exact it still prevents that; on Jolt, whose write of a
+shipped body is now exact, it saves the write and Jolt's broadphase update for every body nobody
+corrected. og-simulation-jolt's JoltPhysicsBodyAdapter-rationale.md §9 records why the skip is kept. The skip lives in the push, not in the adapter
 setters, because the simulations rewrite bodies from seam state every tick and that rewrite must keep
 quantizing identically on every peer.
 

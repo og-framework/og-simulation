@@ -98,7 +98,6 @@
 
 #include "OGSimulation/SimulationSerialization.h"
 #include "OGSimulation/SimulationComposite.h"
-#include "OGSimulation/SimulationFrame.h"
 
 #include <cstdint>
 #include <limits>
@@ -140,8 +139,11 @@ namespace correctionStateBuffer
 	// 338 -> 326 B); 6 = the same again for og-netcode-v2-field-defects task 27 (the
 	// radial's two slices: the dead InitialConditions `activeRootBodyId`, 4 B, removed
 	// from the composite's FIRST slice, and a 3 B per-swing hit ledger added to the
-	// radial State, the second; composite 326 -> 325 B), so every later offset moved.
-	// See THE WIRE FENCE above.
+	// radial State, the second; composite 326 -> 325 B), so every later offset moved;
+	// 7 = the same layout in metres (og-sim-metres-yup flip U: every length on the
+	// wire is 1/100 of what a 6 peer reads); 8 = the same again in the right-handed
+	// Y-up frame (og-sim-metres-yup flip X: every vector's components are permuted
+	// and a pseudovector's negated). See THE WIRE FENCE above.
 	//
 	// ⛔ [task 9] 3 -> 4 IS THE PLAIN CASE this fence exists for, not the ring-out
 	// one: the LAYOUT moved. A peer on 3 reading a 4 payload decodes every field
@@ -192,18 +194,7 @@ namespace correctionStateBuffer
 	// correctly and 9 trailing bytes were simply never read. It is now fenced too
 	// — a loud refusal, not a silent capability gap where a stale client watches
 	// characters teleport with no local explanation for the respawn.
-	inline constexpr std::uint8_t kLegacyFrameWireFormatVersion = 6;
-
-	constexpr std::uint8_t wireFormatVersionFor(AxisFrame axisFrame, float unitsPerMetre)
-	{
-		const bool centimetres = unitsPerMetre == 100.f;
-		if (axisFrame == AxisFrame::UeZUpLeftHanded)
-			return centimetres ? kLegacyFrameWireFormatVersion : static_cast<std::uint8_t>(kLegacyFrameWireFormatVersion + 1);
-		return centimetres ? static_cast<std::uint8_t>(kLegacyFrameWireFormatVersion + 3)
-		                   : static_cast<std::uint8_t>(kLegacyFrameWireFormatVersion + 2);
-	}
-
-	inline constexpr std::uint8_t kWireFormatVersion = wireFormatVersionFor(kAxisFrame, kUnitsPerMetre);
+	inline constexpr std::uint8_t kWireFormatVersion = 8;
 
 	// Payload layout.
 	inline constexpr std::uint32_t kTickOffset               = 0;

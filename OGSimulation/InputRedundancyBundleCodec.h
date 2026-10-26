@@ -87,7 +87,6 @@
 #include "OGSimulation/SimulationSerialization.h"
 #include "OGSimulation/SimulationComposite.h"
 #include "OGSimulation/OGAssert.h"
-#include "OGSimulation/SimulationFrame.h"
 
 #include <cstdint>
 #include <utility>
@@ -95,16 +94,11 @@
 namespace inputRedundancyBundle
 {
 	// Wire-format version. Bumped when the on-wire layout changes so a
-	// mismatched peer is detected and rejected (compat fence).
-	inline constexpr std::uint8_t  kLegacyFrameWireFormatVersion = 2;
-
-	constexpr std::uint8_t wireFormatVersionFor(AxisFrame axisFrame, [[maybe_unused]] float unitsPerMetre)
-	{
-		return axisFrame == AxisFrame::UeZUpLeftHanded ? kLegacyFrameWireFormatVersion
-		                                               : static_cast<std::uint8_t>(kLegacyFrameWireFormatVersion + 1);
-	}
-
-	inline constexpr std::uint8_t  kWireFormatVersion = wireFormatVersionFor(kAxisFrame, kUnitsPerMetre);
+	// mismatched peer is detected and rejected (compat fence). 3 = the layout of
+	// 2 in the right-handed Y-up frame (og-sim-metres-yup flip X: an input
+	// composite's world vectors, such as a brawler's move and aim directions, are
+	// in that frame); flip U left it at 2.
+	inline constexpr std::uint8_t  kWireFormatVersion = 3;
 	// Hard upper bound on slots for wire safety; the runtime depth is
 	// min(TimeConfig::redundancyDepthTicks, kMaxSlots).
 	inline constexpr std::uint8_t  kMaxSlots          = 8;

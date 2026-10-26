@@ -110,14 +110,14 @@ public:
     // (exact `operator==`: all four fields for `PhysicsBodyState`, position and linear velocity for
     // `LinearBodyState`) is NOT written. For a declaration nobody corrected, the cached anchor state
     // IS the capture the snapshot was saved with, so the skip fires exactly when there is nothing
-    // to restore; an adopted correction still differs and is still written. Load-bearing: a seam
-    // write is lossy on Jolt (cm -> m, centre-of-mass offset), so writing an unchanged body moves
-    // it by an ULP, the next correction compares exactly and disagrees, and a torque-driven body
-    // (the weapon) keeps that error and starts a resim storm. Removing the skip re-opens those
-    // storms. The guard lives HERE, not in the adapter setters: the sims rewrite bodies from seam
-    // state every tick, and that quantization must stay identical on every peer. The skip runs on
-    // every backend: for an adapter whose writes are exact it only saves a write that would change
-    // nothing og-sim can read, so no "lossless" flag exists to turn it off.
+    // to restore; an adopted correction still differs and is still written. Load-bearing for an
+    // adapter whose seam write is lossy (Jolt's was, while the simulation ran in centimetres):
+    // writing an unchanged body would move it by an ULP, the next correction would disagree, and
+    // a torque-driven body (the weapon) would keep that error and start a resim storm. Jolt's write
+    // of a shipped body is exact since the metre move and the origin-at-COM check. The guard lives
+    // HERE, not in the adapter setters: the sims rewrite bodies from seam state every tick, and any
+    // quantization must stay identical on every peer. The skip runs on every backend: for an exact
+    // adapter it saves a write that changes nothing og-sim reads, so no "lossless" flag exists.
     //
     // POSE PATH. When the adapter models `PhysicsBodyPoseWriter`, the pose goes through
     // `setBodyPose` (position + quaternion), and a `LinearBodyState` declaration passes back the
@@ -135,7 +135,7 @@ public:
                 const PhysicsBodyState body = static_cast<PhysicsBodyState>(D::bodyStateOf(state.template get<S>()));
                 const BodyId bodyId = decl.bindings.ownBodyId;
                 const PhysicsBodyState restored = captureRestoredBodyState(bodyId);
-                // Temporary restore skip: the seam write is lossy (cm<->m, centre of mass). Remove it when JoltSuite.Tripwire.TheSeamWriteIsLossyUntilTheSimulationsUseMetres fails (og-simulation-jolt docs/JoltUnits-rationale.md §5).
+                // Restore skip, kept by the 2026-10-25 ruling (og-sim-metres-yup Q3): it saves a pose write, and on Jolt a broadphase update, for every body nobody corrected (og-simulation-jolt docs/JoltPhysicsBodyAdapter-rationale.md §9).
                 if (bodyStateEqualsRestored<BodyStateT>(body, restored))
                 {
                     return;
