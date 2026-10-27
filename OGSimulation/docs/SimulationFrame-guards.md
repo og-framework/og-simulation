@@ -54,7 +54,7 @@ guard.
 
 **None.**
 
-The axis identities (`kTurnAxis`, `kVerticalTurnAxis` and `kChartOrientation` against the cross and
+The axis identities (`kLeft` against `kRight`, and `kTurnAxis`, `kVerticalTurnAxis` and `kChartOrientation` against the cross and
 dot products of the frame axes), the signed-basis and distinct-component checks and the pinned axis
 table were never guards: each is a `static_assert` in the header (rationale §4). The two allowed knob
 values and the metre wrappers' narrowing were `static_assert`s too, and were deleted with the knobs and

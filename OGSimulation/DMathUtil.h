@@ -14,15 +14,19 @@ namespace dMathUtil
 {
 	//void getRotationMatrix(glm::vec3 fromDirection, glm::vec3 toDirection, glm::mat4& outTransform);
 
-	FORCEINLINE void getRotationMatrix(glm::vec3 fromDirection, glm::vec3 toDirection, glm::mat4& outTransform)
+	FORCEINLINE void getRotationMatrix(
+		glm::vec3 fromDirection, glm::vec3 toDirection, const glm::vec3& antiparallelAxis, glm::mat4& outTransform)
 	{
 		const float dot = glm::dot(fromDirection, toDirection);
-		const bool fromEqualsTo = abs(abs(dot) - 1.f) < 0.0001f;
-		if (fromEqualsTo)
-			outTransform = glm::mat4(1.0f);
+		const glm::vec3 cross = glm::cross(fromDirection, toDirection);
+		if (glm::dot(cross, cross) == 0.f)
+		{
+			outTransform = dot > 0.f ? glm::mat4(1.f) : glm::rotate(glm::mat4(1.f), glm::pi<float>(), antiparallelAxis);
+			return;
+		}
 
 		const float angle = glm::acos(dot);
-		const glm::vec3 rotationAxis = glm::normalize(glm::cross(fromDirection, toDirection));
+		const glm::vec3 rotationAxis = glm::normalize(cross);
 		outTransform = glm::rotate(glm::mat4(1.f), angle, rotationAxis);
 	}
 

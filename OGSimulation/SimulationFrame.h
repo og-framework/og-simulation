@@ -70,6 +70,7 @@ namespace simFrameDetail
     {
         const glm::vec3 alongForward = zeroProbe(Frame::kForward, zero);
         const glm::vec3 alongRight = zeroProbe(Frame::kRight, zero);
+        const glm::vec3 alongLeft = zeroProbe(Frame::kLeft, zero);
         const glm::vec3 alongUp = zeroProbe(Frame::kUp, zero);
         const glm::vec2 zeroFirst(zero, 1.f);
         const glm::vec2 zeroSecond(1.f, zero);
@@ -77,7 +78,7 @@ namespace simFrameDetail
         return sameBits(Frame::height(alongUp), expectedPick(Frame::kUp, zero))
             && sameBits(Frame::forwardColumn(zeroForwardColumnProbe<Frame>(zero)), glm::vec3(forwardZero, forwardZero, forwardZero))
             && sameBits(Frame::planar(alongForward).x, expectedPick(Frame::kForward, zero))
-            && sameBits(Frame::planar(alongRight).y, expectedPick(Frame::kRight, zero))
+            && sameBits(Frame::planar(alongLeft).y, expectedPick(Frame::kLeft, zero))
             && sameBits(Frame::forwardRight(alongForward).x, expectedPick(Frame::kForward, zero))
             && sameBits(Frame::forwardRight(alongRight).y, expectedPick(Frame::kRight, zero))
             && sameBits(Frame::turnComponent(zeroProbe(Frame::kTurnAxis, zero)), expectedPick(Frame::kTurnAxis, zero))
@@ -90,7 +91,7 @@ namespace simFrameDetail
             && sameBits(Frame::forwardRight(Frame::fromForwardRight(zeroSecond, 1.f)), zeroSecond)
             && sameBits(Frame::height(Frame::fromForwardRight(glm::vec2(1.f, 1.f), zero)), zero)
             && sameBits(Frame::planar(Frame::flatten(alongForward)), Frame::planar(alongForward))
-            && sameBits(Frame::planar(Frame::flatten(alongRight)), Frame::planar(alongRight))
+            && sameBits(Frame::planar(Frame::flatten(alongLeft)), Frame::planar(alongLeft))
             && sameBits(Frame::height(Frame::flatten(alongUp)), 0.f);
     }
 } // namespace simFrameDetail
@@ -100,9 +101,10 @@ struct simFrame
     static constexpr glm::vec3 kUp = glm::vec3(0.f, 1.f, 0.f);
     static constexpr glm::vec3 kForward = glm::vec3(0.f, 0.f, -1.f);
     static constexpr glm::vec3 kRight = glm::vec3(1.f, 0.f, 0.f);
-    static constexpr glm::vec3 kTurnAxis = glm::vec3(0.f, -1.f, 0.f);
-    static constexpr glm::vec3 kVerticalTurnAxis = glm::vec3(-1.f, 0.f, 0.f);
-    static constexpr float kChartOrientation = -1.f;
+    static constexpr glm::vec3 kLeft = glm::vec3(-1.f, 0.f, 0.f);
+    static constexpr glm::vec3 kTurnAxis = glm::vec3(0.f, 1.f, 0.f);
+    static constexpr glm::vec3 kVerticalTurnAxis = glm::vec3(1.f, 0.f, 0.f);
+    static constexpr float kChartOrientation = 1.f;
     static constexpr glm::length_t kUpIndex = simFrameDetail::axisIndex(kUp);
 
     static constexpr float kUeCentimetresPerUnit = 100.f;
@@ -110,22 +112,32 @@ struct simFrame
 private:
     static constexpr glm::length_t kForwardIndex = simFrameDetail::axisIndex(kForward);
     static constexpr glm::length_t kRightIndex = simFrameDetail::axisIndex(kRight);
+    static constexpr glm::length_t kLeftIndex = simFrameDetail::axisIndex(kLeft);
     static constexpr glm::length_t kTurnIndex = simFrameDetail::axisIndex(kTurnAxis);
     static constexpr bool kForwardNegative = simFrameDetail::axisIsNegative(kForward);
     static constexpr bool kRightNegative = simFrameDetail::axisIsNegative(kRight);
+    static constexpr bool kLeftNegative = simFrameDetail::axisIsNegative(kLeft);
     static constexpr bool kUpNegative = simFrameDetail::axisIsNegative(kUp);
     static constexpr bool kTurnNegative = simFrameDetail::axisIsNegative(kTurnAxis);
 
-    static_assert(kTurnAxis == glm::cross(kForward, kRight), "SimulationFrame: kTurnAxis must be cross(kForward, kRight)");
-    static_assert(kVerticalTurnAxis == glm::cross(kUp, kForward),
-        "SimulationFrame: kVerticalTurnAxis must be cross(kUp, kForward)");
-    static_assert(kChartOrientation == glm::dot(glm::cross(kForward, kRight), kUp),
-        "SimulationFrame: kChartOrientation must be dot(cross(kForward, kRight), kUp)");
+    static_assert(kLeft == -kRight, "SimulationFrame: kLeft must be -kRight");
+    static_assert(kTurnAxis == glm::cross(kForward, kLeft) && kTurnAxis == kUp,
+        "SimulationFrame: kTurnAxis must be cross(kForward, kLeft), which is kUp: the chart is (forward, left) and a positive "
+        "planar angle turns counter-clockwise about +Y. Was cross(kForward, kRight), -Y, under chart P "
+        "(og-sim-metres-yup task 26)");
+    static_assert(kVerticalTurnAxis == glm::cross(kForward, kUp) && kVerticalTurnAxis == kRight,
+        "SimulationFrame: kVerticalTurnAxis must be cross(kForward, kUp), which is kRight. Was cross(kUp, kForward), -X, "
+        "under chart P (og-sim-metres-yup task 26)");
+    static_assert(kChartOrientation == glm::dot(glm::cross(kForward, kLeft), kUp) && kChartOrientation == 1.f,
+        "SimulationFrame: kChartOrientation must be dot(cross(kForward, kLeft), kUp), which is +1 for the native chart. "
+        "Was -1, dot(cross(kForward, kRight), kUp), under chart P (og-sim-metres-yup task 26)");
     static_assert(simFrameDetail::isSignedBasisAxis(kUp) && simFrameDetail::isSignedBasisAxis(kForward)
-            && simFrameDetail::isSignedBasisAxis(kRight) && simFrameDetail::isSignedBasisAxis(kTurnAxis),
+            && simFrameDetail::isSignedBasisAxis(kRight) && simFrameDetail::isSignedBasisAxis(kLeft)
+            && simFrameDetail::isSignedBasisAxis(kTurnAxis),
         "SimulationFrame: every axis is a signed basis vector, so every pick is a signed index pick");
-    static_assert(kForwardIndex != kRightIndex && kForwardIndex != kUpIndex && kRightIndex != kUpIndex,
-        "SimulationFrame: forward, right and up are three different components");
+    static_assert(kForwardIndex != kRightIndex && kForwardIndex != kUpIndex && kRightIndex != kUpIndex
+            && kLeftIndex == kRightIndex,
+        "SimulationFrame: forward, right and up are three different components, and left is right's component");
 
 public:
     static constexpr float height(const glm::vec3& v)
@@ -142,12 +154,12 @@ public:
 
     static constexpr glm::vec2 planar(const glm::vec3& v)
     {
-        return glm::vec2(signedPick<kForwardIndex, kForwardNegative>(v), signedPick<kRightIndex, kRightNegative>(v));
+        return glm::vec2(signedPick<kForwardIndex, kForwardNegative>(v), signedPick<kLeftIndex, kLeftNegative>(v));
     }
 
     static constexpr glm::vec3 compose(const glm::vec2& p, float h)
     {
-        return place<kForwardNegative, kRightNegative, kUpNegative>(p.x, p.y, h);
+        return place<kLeftIndex, kForwardNegative, kLeftNegative, kUpNegative>(p.x, p.y, h);
     }
 
     static constexpr glm::vec3 flatten(const glm::vec3& v)
@@ -169,7 +181,7 @@ public:
 
     static constexpr glm::vec3 fromForwardRight(const glm::vec2& p, float h)
     {
-        return place<kForwardNegative, kRightNegative, kUpNegative>(p.x, p.y, h);
+        return place<kRightIndex, kForwardNegative, kRightNegative, kUpNegative>(p.x, p.y, h);
     }
 
     static constexpr float alongUp(const glm::vec3& diagonal)
@@ -212,12 +224,12 @@ private:
         }
     }
 
-    template <bool NegateForward, bool NegateRight, bool NegateUp>
-    static constexpr glm::vec3 place(float forward, float right, float up)
+    template <glm::length_t SideIndex, bool NegateForward, bool NegateSide, bool NegateUp>
+    static constexpr glm::vec3 place(float forward, float side, float up)
     {
         glm::vec3 out(0.f, 0.f, 0.f);
         signedPlace<kForwardIndex, NegateForward>(out, forward);
-        signedPlace<kRightIndex, NegateRight>(out, right);
+        signedPlace<SideIndex, NegateSide>(out, side);
         signedPlace<kUpIndex, NegateUp>(out, up);
         return out;
     }
@@ -229,11 +241,13 @@ static_assert(simFrameDetail::picksKeepTheSignOfZero<simFrame>(-0.f) && simFrame
 static_assert(simFrameDetail::sameBits(simFrame::kUp, glm::vec3(0.f, 1.f, 0.f))
         && simFrameDetail::sameBits(simFrame::kForward, glm::vec3(0.f, 0.f, -1.f))
         && simFrameDetail::sameBits(simFrame::kRight, glm::vec3(1.f, 0.f, 0.f))
-        && simFrameDetail::sameBits(simFrame::kTurnAxis, glm::vec3(0.f, -1.f, 0.f))
-        && simFrameDetail::sameBits(simFrame::kVerticalTurnAxis, glm::vec3(-1.f, 0.f, 0.f))
-        && simFrameDetail::sameBits(simFrame::kChartOrientation, -1.f) && simFrame::kUpIndex == 1,
-    "SimulationFrame: the simulation's frame is fixed: right-handed, +Y up, -Z forward, +X right, chart P. "
-    "Was the axis-frame knob at YUpRightHanded, removed together with the Unreal frame it selected against");
+        && simFrameDetail::sameBits(simFrame::kLeft, glm::vec3(-1.f, 0.f, 0.f))
+        && simFrameDetail::sameBits(simFrame::kTurnAxis, glm::vec3(0.f, 1.f, 0.f))
+        && simFrameDetail::sameBits(simFrame::kVerticalTurnAxis, glm::vec3(1.f, 0.f, 0.f))
+        && simFrameDetail::sameBits(simFrame::kChartOrientation, 1.f) && simFrame::kUpIndex == 1,
+    "SimulationFrame: the simulation's frame is fixed: right-handed, +Y up, -Z forward, +X right, the native chart "
+    "(forward, left; turns counter-clockwise about +Y). Was the axis-frame knob at YUpRightHanded, removed together with "
+    "the Unreal frame it selected against, and chart P (turns about -Y) until og-sim-metres-yup task 26");
 
 static_assert(simFrameDetail::sameBits(simFrame::kUeCentimetresPerUnit, 100.f),
     "SimulationFrame: the simulation's length unit is fixed: the metre, 100 Unreal centimetres. "

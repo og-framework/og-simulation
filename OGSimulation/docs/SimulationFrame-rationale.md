@@ -55,55 +55,66 @@ formula code needed no edit when the simulation moved; only the four classes of 
 
 ---
 
-## §3 The planar chart and the turn sign (D3): P now, N later
+## §3 The planar chart and the turn sign (D3): N, the native chart
 
 Many quantities are two-dimensional: a ground-plane direction, a stick input, a planar angle. They
 are stored in a **chart**, a choice of two axes in the ground plane.
 
-- **P (now).** The chart is (forward, right). A positive turn goes from forward towards right, as
-  Unreal's yaw does ("Turning around (0=Forward, +Right, -Left)"). The turn axis is
-  `cross(kForward, kRight)`, which is −Y. P kept every planar value, angle and turn component
-  unchanged while the 3-D frame moved; only 3-D vectors moved.
-- **N (a planned later change).** The chart becomes (forward, left), turns go counter-clockwise about
-  `kUp`, and the vertical swing pitches about `kRight`. Every authored planar angle is negated and
-  every stored planar vector mirrored. Doing that at the same time as the unit or axis change would
-  have made a mirror indistinguishable from a frame bug, which is why P came first.
+- **N (shipped).** The chart is (forward, left). A positive planar angle turns counter-clockwise
+  about `kUp` seen from above, from forward towards left, so the turn axis is `kUp`, which is
+  `cross(kForward, kLeft)`, and the vertical swing pitches about `kRight`. This is the frame's own
+  right-handed sense: forward, the chart's second axis and up form a right-handed triple, as the 3-D
+  frame does (`kChartOrientation` is +1, §4).
+- **P (before, provenance).** While the simulation moved from Unreal's frame (§7) the chart was
+  (forward, right), and a positive turn went from forward towards right, as Unreal's yaw does
+  ("Turning around (0=Forward, +Right, -Left)"). The turn axis was `cross(kForward, kRight)`, −Y, the
+  vertical turn axis `cross(kUp, kForward)`, −X, and `kChartOrientation` was −1. P kept every planar
+  value, angle and turn component unchanged while the 3-D frame moved; only 3-D vectors moved. Moving
+  to N at the same time as the unit or axis change would have made a mirror indistinguishable from a
+  frame bug, which is why P came first.
 
-Under N three members change: `kTurnAxis` becomes `kUp`, `kVerticalTurnAxis` becomes `kRight` and
-`kChartOrientation` becomes +1, and the `static_assert`s that check and pin them change with them.
-`planar` and `compose` change; `forwardRight` and `fromForwardRight` do not (§5).
+The change from P to N (og-sim-metres-yup task 26) changed three members, `kTurnAxis`,
+`kVerticalTurnAxis` and `kChartOrientation`, added `kLeft`, and changed `planar` and `compose` to the
+(forward, left) pair; `forwardRight` and `fromForwardRight` did not change (§5). The 3-D frame did not
+change. Every authored planar angle was negated and every stored planar vector mirrored, which is
+exact, so a game's behaviour is unchanged by it: a turn by −θ about `+Y` is the turn by θ about −Y.
 
 ---
 
 ## §4 The axis table and the three identities
 
-The table is the `static constexpr` members `kUp`, `kForward`, `kRight`, `kTurnAxis`,
+The table is the `static constexpr` members `kUp`, `kForward`, `kRight`, `kLeft`, `kTurnAxis`,
 `kVerticalTurnAxis`, `kChartOrientation` and `kUpIndex`:
 
 | member | value |
 |---|---|
 | `kForward` | (0, 0, −1) |
 | `kRight` | (1, 0, 0) |
+| `kLeft` | (−1, 0, 0) |
 | `kUp` | (0, 1, 0) |
-| `kTurnAxis` | (0, −1, 0) |
-| `kVerticalTurnAxis` | (−1, 0, 0) |
-| `kChartOrientation` | −1 |
+| `kTurnAxis` | (0, 1, 0) |
+| `kVerticalTurnAxis` | (1, 0, 0) |
+| `kChartOrientation` | +1 |
 | `kUpIndex` | 1 |
 
-The pseudovector members are written as literals and **checked** against the frame axes by
+The derived members are written as literals and **checked** against the frame axes by
 `static_assert`s inside the struct:
-- `kTurnAxis == cross(kForward, kRight)`;
-- `kVerticalTurnAxis == cross(kUp, kForward)`;
-- `kChartOrientation == dot(cross(kForward, kRight), kUp)`.
+- `kLeft == -kRight`;
+- `kTurnAxis == cross(kForward, kLeft)`, which is `kUp`;
+- `kVerticalTurnAxis == cross(kForward, kUp)`, which is `kRight`;
+- `kChartOrientation == dot(cross(kForward, kLeft), kUp)`, which is +1.
+
+Each message names the chart-P value the assertion replaced (§3), so an edit back to it is a visible,
+deliberate change.
 
 Writing a pseudovector constant as a cross product of frame axes is what makes it right in any frame
-(rule 3 of §6). `kChartOrientation` is the determinant of the matrix whose columns are forward, right
-and up: −1 here, because (forward, right, up) = (−Z, +X, +Y) is a left-handed triple in a right-handed
-frame.
+(rule 3 of §6). `kChartOrientation` is the determinant of the matrix whose columns are forward, the
+chart's second axis (left) and up: +1, because (forward, left, up) = (−Z, −X, +Y) is a right-handed
+triple. Under chart P the second axis was right, and (−Z, +X, +Y) gave −1.
 
 Two more `static_assert`s make the picks of §5 sound: every axis is a signed basis vector (one
-component ±1, the others 0), and forward, right and up name three different components. A last one,
-after the struct, pins every value of the table bit for bit (§1).
+component ±1, the others 0), and forward, right and up name three different components, with left on
+right's component. A last one, after the struct, pins every value of the table bit for bit (§1).
 
 ---
 
@@ -119,21 +130,22 @@ table is the only place the frame is spelled. That is also why a pick is never a
 |---|---|---|
 | `height(v)` | the signed pick along `kUp` | `v.y` |
 | `withHeight(v, h)` | `v` with its up component replaced by `h` | (x, h, z) |
-| `planar(v)` | (forward, right) | (−z, x) |
-| `compose(p, h)` | the inverse of (`planar`, `height`) | (p.y, h, −p.x) |
+| `planar(v)` | (forward, left), the chart (§3) | (−z, −x) |
+| `compose(p, h)` | the inverse of (`planar`, `height`) | (−p.y, h, −p.x) |
 | `flatten(v)` | zeroes the up component only | (x, 0, z) |
-| `turnComponent(a)` | the signed pick along `kTurnAxis` | `−a.y` |
+| `turnComponent(a)` | the signed pick along `kTurnAxis` | `a.y` |
 | `forwardRight(v)` | (forward, right), input space | (−z, x) |
 | `fromForwardRight(p, h)` | the inverse of (`forwardRight`, `height`) | (p.y, h, −p.x) |
 | `alongUp(diagonal)` | the **unsigned** component at `kUpIndex` | `d.y` |
 | `forwardColumn(m)` | the signed column of a transform along `kForward` | `−m[2].xyz` |
 
 **Two kinds of 2-D pick.** The *chart* picks (`planar`, `compose`, `turnComponent`) follow the chart
-of §3 and change under N. The *input-space* picks (`forwardRight`, `fromForwardRight`) never change:
-they serve code whose 2-D values are defined relative to the viewer or the character rather than to
-the chart (the stick-to-world mapping, motion matching on stick input, spawn sort keys). Under P the
-two kinds have identical bodies, so each call site was classified once, when it was routed, and the N
-change touches only the chart kind.
+of §3, and they changed when the chart went from P to N. The *input-space* picks (`forwardRight`,
+`fromForwardRight`) never change: they serve code whose 2-D values are defined relative to the viewer
+or the character rather than to the chart (the stick-to-world mapping, motion matching on stick input,
+spawn sort keys). Under P the two kinds had identical bodies, so each call site was classified once,
+when it was routed, and the change to N touched only the chart kind. Under N they differ in the sign
+of the second component: `planar(v).y` is `-forwardRight(v).y`.
 
 `alongUp` is unsigned because it serves inertia diagonals: a diagonal entry is a moment about an
 axis, and it does not change sign when the axis does.
@@ -156,11 +168,14 @@ When a site is written against the header:
    - **2b.** A pick in **input space** (the stick-to-world mapping, the motion matcher, the spawn sort
      keys) uses `forwardRight` / `fromForwardRight` instead. Those never change under N.
 3. **A pseudovector constant** becomes a cross product of frame axes (`kTurnAxis` is
-   `cross(kForward, kRight)`, `kVerticalTurnAxis` is `cross(kUp, kForward)`; an idle-pose axis is
+   `cross(kForward, kLeft)`, `kVerticalTurnAxis` is `cross(kForward, kUp)`; an idle-pose axis is
    `cross(kForward, kUp)`), and a pseudovector pick becomes `turnComponent`.
-4. **A cross product used as a true direction** (for example the second axis of a tangent frame,
-   cross(n, u)) is multiplied by `kChartOrientation`. Without the factor the reflection of §2 would
-   have mirrored it when the frame moved, and every value built on it with it.
+4. **A cross product used as the chart's second axis** (for example the second axis of a tangent
+   frame, cross(n, u), whose coefficients are chart values) is multiplied by `kChartOrientation`.
+   Without the factor the reflection of §2 would have mirrored it when the frame moved, and every value
+   built on it with it. The factor is a property of the chart, so it changed when the chart did. A
+   cross product that only fixes a 3-D direction, with no chart value built on it (a drawing's
+   perpendicular, say), does not take it: it takes the fixed sign of the direction it means.
 
 Formula code (dot products, cross products, a rotation about a routed axis, quaternions) needs no
 edit. A vocabulary constant that enters arithmetic is used directly, or through a `constexpr` local,
@@ -190,6 +205,11 @@ og-sim-metres-yup initiative, 2026-10):
    template, the wrappers and their inverses were deleted, leaving the vocabulary of §4 and §5 with
    the values of the Y-up frame in metres. The inverses (from this frame back to Unreal centimetres)
    survive only in a game's recorded-trace test, which stores its trace in the old frame.
+
+5. **The native chart.** Then the chart went from P to N (§3): the three chart members, `kLeft`,
+   `planar` and `compose` changed, every authored planar angle was negated and every stored planar
+   vector mirrored. The 3-D frame and the unit did not change, and a recorded game trace compared
+   exactly through its planar converter's mirror.
 
 Three findings from that work are still true of the toolchain:
 - **A float made from a double in a constant expression.** With MSVC (`/std:c++20 /fp:fast`), in a
@@ -236,7 +256,8 @@ identity) are not simulation state and keep the engine's units.
 `SimulationFrameTest.cpp` (tag `[SimulationFrame]`) checks:
 - every pick and place returns the exact bits of its input over a set of edge floats (±0, ±1,
   denormals, ±infinity, large and seeded values), and `std::signbit` of `-0` through each one;
-- the axis table and the three identities of §4 at run time, and the unit factor;
+- the axis table and the identities of §4 at run time (`kLeft` and the three chart members), and the
+  unit factor;
 - the picks against the table of §5;
 - `planar` / `compose` / `flatten` / `withHeight` and `forwardRight` / `fromForwardRight` round-trip
   exactly;
