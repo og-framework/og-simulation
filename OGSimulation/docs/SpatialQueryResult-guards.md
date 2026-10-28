@@ -29,7 +29,7 @@ provenance and marked as not distributed here.
 
 ---
 
-## G-01 — Read the two flags FIRST; six of the nine fields are conditional on them
+## G-01 — Read the two flags FIRST; the other eight fields are conditional on them
 
 **Tag site:** `SpatialQueryResult.h`, immediately above `struct SweepHit`.
 **Taxonomy clause:** F5a + F6 (must-never-move **T2e-1**).
@@ -41,12 +41,19 @@ pre-conversion file):**
 // Field validity — read the two flags FIRST; the rest are conditional on them:
 ```
 
-**What breaks if it moves.** `SweepHit` is a **flat aggregate of nine public fields with plausible
-defaults** — `fraction = 1.f`, `normal{0.f}`, `penetrationDepth = 0.f`. Every field reads as
-unconditionally valid and the identifiers actively argue that they are. This is the only thing at
-the declaration saying six of the nine are gated on two `bool`s. Moved away, a consumer reads
-`impactPoint` off a miss and gets `(0,0,0)` — a plausible world position, silently wrong, with no
-crash and no test failure.
+**What breaks if it moves.** `SweepHit` is a **flat aggregate of ten public fields with plausible
+defaults** — `fraction = 1.f`, `normal{0.f}`, `penetrationDepth = 0.f`, `surfaceNormal{0.f}`. Every
+field reads as unconditionally valid and the identifiers actively argue that they are. This is the
+only thing at the declaration saying the other eight are gated on two `bool`s. Moved away, a
+consumer reads `impactPoint` off a miss and gets `(0,0,0)` — a plausible world position, silently
+wrong, with no crash and no test failure.
+
+⚠ **Counts restated 2026-10-28** when `surfaceNormal` was appended as the last member: ten
+fields, two flags, and every one of the other eight gated. `fraction`, `normal`, `impactPoint`
+(on `blocked`) and `penetrationDepth` (on `startPenetrating`) by the fence text; `bodyId`,
+`rootBodyId`, `objectCategories` on `blocked`; `surfaceNormal` on `blocked` and on its producer
+(**G-04**). The earlier "six of the nine" did not add up (it was seven of nine). The fence's
+verbatim bytes above are unchanged.
 
 ⭐ **This guard has a measured in-tree audience: three sites outside this submodule cite it by
 name** as *"`SpatialQueryResult.h`'s field-validity rule"* and reason from it rather than
@@ -113,19 +120,48 @@ has something to correct and so that the defect is not laundered by the move.
 
 ---
 
+## G-04 — A zero `surfaceNormal` means NOT PROVIDED; read it only with the fallback to `normal`
+
+**Tag site:** `SpatialQueryResult.h`, immediately above `glm::vec3 surfaceNormal{0.f};`.
+**Origin:** written with the field on 2026-10-28, not extracted from a comment, so there are no
+shipped bytes to quote.
+
+**The prohibition.** Never use `surfaceNormal` as a direction without first testing it against
+zero and, on zero, using `normal` instead. `blocked` does not imply that it was provided.
+
+**What breaks if it is ignored.** A producer with no exact face normal leaves the field at its
+default `(0, 0, 0)`: every adapter that assigns `SweepHit` fields by name and does not fill it, and
+every test double that returns `SweepHit{}` or a hand-filled hit. A consumer that normalises the
+zero gets NaN. A consumer that hands it to `surfaceFrame::isFlat` (`SurfaceFrame.h`) gets **true**,
+because the horizontal part of a zero vector is zero: a hit on a 30° slope then reads as flat
+ground, with no crash, and with no test failure in any scene that is flat.
+
+**What breaks if it moves.** The default `{0.f}` reads like "no tilt" and the identifier says
+"surface normal". The tag at the declaration is the only thing on that line saying the zero is a
+sentinel. ⭐ The default itself cannot drift: a `static_assert` after the struct pins
+`SweepHit{}.surfaceNormal == glm::vec3(0.f)` (see §R).
+
+---
+
 ## §R Retired ids
 
 **None.** No fence in this header became a compile-time check.
 
 ⭐ **That verdict is backed by a compile, not by reasoning.** A default-constructed `SweepHit` IS
 usable as a `constexpr` object in this tree, and every one of its defaults is readable in a
-constant expression — the two
-`glm::vec3` members and glm's `operator==` included. A `static_assert` pinning those defaults
+constant expression — the `glm::vec3` members (two when this was measured, three since
+2026-10-28) and glm's `operator==` included. A `static_assert` pinning those defaults
 compiles green, and the same assertion with one wrong value fails with `C2338`. So the compile-time
 check was **available**, and it was declined on **narrowness**: all three fences forbid a *reading*
 discipline exercised by a consumer, and an assertion over the struct's default values would have
 pinned one true fact while licensing every wrong read it does not cover. ⛔ **An assertion that
 looks like enforcement and is not is worse than the sentence it replaced.**
+
+⭐ **One default IS pinned, on purpose: `surfaceNormal`'s zero** (added 2026-10-28). There the
+default value is the contract itself: zero is what every non-providing producer reports by leaving
+the field alone, so a non-zero default would make each of them claim a face normal it never
+computed. The `static_assert` after `struct SweepHit` covers exactly that one fact; the reading
+discipline (fall back to `normal` on zero) stays a guard, **G-04**. No id was retired by it.
 
 ---
 
@@ -137,3 +173,6 @@ material and is NOT distributed with this submodule.** It is mentioned so that a
 knows the defect is recorded rather than ignored; nothing in this file depends on being able to
 open it, and every claim above is anchored to `SpatialQueryResult.h` in this repository and to
 nothing else.
+
+**G-04** was written on 2026-10-28 together with the `surfaceNormal` field it governs; it was
+never a comment in the header.

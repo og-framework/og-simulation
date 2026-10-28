@@ -85,14 +85,16 @@ Produced by SpatialQueryAdapter::sweep.
 ### §3.1 Field validity — the summary, NOT the rule
 
 ⛔ **The rule itself is a guard and lives in `SpatialQueryResult-guards.md`:** **G-01** (read the
-two flags first), **G-02** (a miss is `!blocked`) and **G-03** (`penetrationDepth` is a push-out).
+two flags first), **G-02** (a miss is `!blocked`), **G-03** (`penetrationDepth` is a push-out) and
+**G-04** (a zero `surfaceNormal` is "not provided").
 ⚠ **Read G-03 before acting on anything about `fraction` and penetration** — it carries a claim
 this repository does not enforce, and backlog task 69 owns the correction. This section exists to
-orient, and it defers to those three entries wherever they disagree with it.
+orient, and it defers to those four entries wherever they disagree with it.
 
-In outline: `blocked` and `startPenetrating` are the two flags, and six of the remaining seven
-fields are conditional on them. `bodyId`, `rootBodyId` and `objectCategories` are the exception —
-they are meaningful whenever `blocked`.
+In outline: `blocked` and `startPenetrating` are the two flags, and every one of the remaining
+eight fields is conditional on them. `bodyId`, `rootBodyId` and `objectCategories` depend on
+`blocked` alone — they are meaningful whenever `blocked`. `surfaceNormal` is conditional twice: it is zero on a miss,
+and zero on a hit whose producer does not provide it (§3.4).
 
 ### §3.2 Two-level identity, exactly as `SpatialQueryHit` (§1.1)
 
@@ -120,6 +122,7 @@ reference names its target: **§1.1 of this document**.
 | `bodyId` | SHAPE body hit |
 | `rootBodyId` | root of the body hierarchy (== bodyId for standalone) |
 | `objectCategories` | which collision categories the hit object belongs to |
+| `surfaceNormal` | exact face normal of the hit shape at the contact (world), or zero = not provided (§3.4) |
 
 ⚠ `penetrationDepth`'s label is the short form of **G-03**; read the guard, not the label.
 
@@ -130,11 +133,37 @@ guaranteed here. The label above says so. ⚠ This is the same class of defect a
 claim in **G-03** and is deliberately **not** bundled with it: this one is a wording nuance, that
 one is a contract defect with an owner, and merging them would bury the one that matters.
 
+### §3.4 `surfaceNormal` — the exact face normal, or zero (added 2026-10-28)
+
+The field is appended as the **last** member, so every producer that default-constructs a
+`SweepHit` and assigns fields by name keeps compiling unchanged and reports "not provided".
+
+**The contract.**
+
+* **Non-zero:** the outward normal of the face of the hit shape that contains the contact, in world
+  space, as the producer's backend computes it from the shape and the contact point. ⚠ Unit-ness is
+  the producer's, as for `normal` (§3.3).
+* **Piecewise constant per face.** Two contacts on the same flat face give the same vector,
+  wherever on the face they lie. It is a property of the face, not of the query.
+* **Zero = not provided** — on a miss, and on a hit from a producer that does not compute it.
+  ⛔ The reading rule is **G-04**: fall back to `normal` on zero. The zero default is pinned by
+  the `static_assert` after `struct SweepHit`.
+
+**Why a second normal, and why `normal` keeps its meaning.** `normal` is what the sweep's own
+narrow phase reports: for a convex cast that is the separating axis it converged on (the contact
+normal of a time-of-impact solve, or the push-out axis of an initial overlap, **G-03**). On a flat
+face it agrees with the face normal up to the solver's tolerance, and that tolerance shows: a
+consumer that freezes a direction from it (an attack plane, a launch direction) inherits a small
+error that two machines need not reproduce identically. `surfaceNormal` has no such error inside a
+face. ⚠ It is **not** a replacement for `normal`: at an edge or a corner the push-out axis and the
+face normal differ, and a consumer that resolves penetration along `surfaceNormal` pushes the
+volume out in the wrong direction. Consumers that move a body keep reading `normal`.
+
 ---
 
 ## §4 What is NOT in this file
 
-* **The prohibitions.** `SpatialQueryResult-guards.md`, three entries, one tag each in the header.
+* **The prohibitions.** `SpatialQueryResult-guards.md`, four entries, one tag each in the header.
 * **How the fields are populated.** That is the query adapter's business, and the adapter is
   engine-specific and lives outside this submodule by design. This header is the contract; the
   adapter is one implementation of it.

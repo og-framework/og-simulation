@@ -42,4 +42,10 @@ struct SweepHit
 	BodyId bodyId;
 	BodyId rootBodyId;
 	CollisionCategories objectCategories;
+	// ⛔G-04  docs/SpatialQueryResult-guards.md
+	glm::vec3 surfaceNormal{0.f};
 };
+
+static_assert(SweepHit{}.surfaceNormal == glm::vec3(0.f),
+	"SweepHit::surfaceNormal - a default-constructed hit must say NOT PROVIDED (zero): every adapter that has no exact face normal "
+	"(and every test mock) leaves the field at its default, and a consumer falls back to `normal` on zero.");
