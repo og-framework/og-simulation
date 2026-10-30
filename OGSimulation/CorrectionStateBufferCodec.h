@@ -146,7 +146,10 @@ namespace correctionStateBuffer
 	// and a pseudovector's negated); 9 = the same layout in the native planar chart
 	// (og-sim-metres-yup task 26: planar vectors are (forward, left) and angles turn
 	// counter-clockwise about +Y, so the brawler movement's `committedStepDir` is
-	// mirrored, (x, y) -> (x, -y), against what an 8 peer reads). See THE WIRE FENCE above.
+	// mirrored, (x, y) -> (x, -y), against what an 8 peer reads); 10 = the same layout with
+	// ground-aligned attacks (og-ground-aligned-attacks task 10: on sloped ground the brawler's
+	// radial and projectile initial conditions follow its ground normal, so a 9 peer predicts
+	// different ones for the same input). See THE WIRE FENCE above.
 	//
 	// ⛔ [task 9] 3 -> 4 IS THE PLAIN CASE this fence exists for, not the ring-out
 	// one: the LAYOUT moved. A peer on 3 reading a 4 payload decodes every field
@@ -197,7 +200,7 @@ namespace correctionStateBuffer
 	// correctly and 9 trailing bytes were simply never read. It is now fenced too
 	// — a loud refusal, not a silent capability gap where a stale client watches
 	// characters teleport with no local explanation for the respawn.
-	inline constexpr std::uint8_t kWireFormatVersion = 9;
+	inline constexpr std::uint8_t kWireFormatVersion = 10;
 
 	// Payload layout.
 	inline constexpr std::uint32_t kTickOffset               = 0;
