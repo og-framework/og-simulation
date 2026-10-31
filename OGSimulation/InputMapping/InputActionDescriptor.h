@@ -57,6 +57,7 @@ enum class KeyId : uint16_t
 	Gamepad_RightTriggerAxis, // RT (analog)
 	Gamepad_LeftShoulder,     // LB
 	Gamepad_RightShoulder,    // RB
+	Gamepad_Special_Left,     // View / Back
 };
 
 enum class KeyModifier : uint8_t
