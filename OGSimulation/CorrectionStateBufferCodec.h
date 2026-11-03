@@ -152,8 +152,11 @@ namespace correctionStateBuffer
 	// different ones for the same input); 11 = the same layout with the exact velocity
 	// decomposition (og-ground-aligned-attacks task 30: on ground whose tangent frame is not
 	// horizontal across the slope, the brawler movement splits its velocity with an exact
-	// dual-basis solve, so a 10 peer predicts a different velocity for the same input). See
-	// THE WIRE FENCE above.
+	// dual-basis solve, so a 10 peer predicts a different velocity for the same input); 12 = the
+	// same layout with the flat swing frame through the general expression (og-ground-aligned-attacks
+	// task 14b: on flat ground the radial initial conditions take the quaternion round trip the
+	// slope path takes, so an 11 peer's angle and axis differ by rounding, and on an exact +/-forward
+	// aim by the axis's sign). See THE WIRE FENCE above.
 	//
 	// ⛔ [task 9] 3 -> 4 IS THE PLAIN CASE this fence exists for, not the ring-out
 	// one: the LAYOUT moved. A peer on 3 reading a 4 payload decodes every field
@@ -204,7 +207,7 @@ namespace correctionStateBuffer
 	// correctly and 9 trailing bytes were simply never read. It is now fenced too
 	// — a loud refusal, not a silent capability gap where a stale client watches
 	// characters teleport with no local explanation for the respawn.
-	inline constexpr std::uint8_t kWireFormatVersion = 11;
+	inline constexpr std::uint8_t kWireFormatVersion = 12;
 
 	// Payload layout.
 	inline constexpr std::uint32_t kTickOffset               = 0;
