@@ -156,7 +156,18 @@ namespace correctionStateBuffer
 	// same layout with the flat swing frame through the general expression (og-ground-aligned-attacks
 	// task 14b: on flat ground the radial initial conditions take the quaternion round trip the
 	// slope path takes, so an 11 peer's angle and axis differ by rounding, and on an exact +/-forward
-	// aim by the axis's sign). See THE WIRE FENCE above.
+	// aim by the axis's sign); 13 = the same layout with the capsule hit test (og-ground-aligned-attacks
+	// task 20: a melee swing hits when its attack band overlaps the target's movement capsule, not only
+	// when the capsule centre is inside the band, so a 12 peer and a 13 peer disagree on which swings hit);
+	// 14 = the same layout with the projectile guard rule (og-ground-aligned-attacks task 20b: the struck
+	// character's guard entry decides a shot even when its body entry is listed first, and every guard
+	// measures the shot in its own plane, so a 13 peer and a 14 peer disagree on which shots are blocked);
+	// 15 = the same layout with the brawler movement's support law v2 as the default (og-ground-aligned-attacks
+	// task 36: the movement takes its ground from the exact face, an edge contact and a centre probe, changes
+	// support only on events, writes a knockback once and redirects a velocity into a face along it, so a 14
+	// peer and a 15 peer predict different movement for the same input wherever a body stands on a slope, a rim
+	// or a crease, or is knocked back).
+	// See THE WIRE FENCE above.
 	//
 	// ⛔ [task 9] 3 -> 4 IS THE PLAIN CASE this fence exists for, not the ring-out
 	// one: the LAYOUT moved. A peer on 3 reading a 4 payload decodes every field
@@ -207,7 +218,7 @@ namespace correctionStateBuffer
 	// correctly and 9 trailing bytes were simply never read. It is now fenced too
 	// — a loud refusal, not a silent capability gap where a stale client watches
 	// characters teleport with no local explanation for the respawn.
-	inline constexpr std::uint8_t kWireFormatVersion = 12;
+	inline constexpr std::uint8_t kWireFormatVersion = 15;
 
 	// Payload layout.
 	inline constexpr std::uint32_t kTickOffset               = 0;
