@@ -2,7 +2,11 @@
 // SPDX-License-Identifier: MPL-2.0
 
 #ifdef OG_STANDALONE_BUILD
-  #define FORCEINLINE __forceinline
+  #if defined(_MSC_VER)
+    #define FORCEINLINE __forceinline
+  #else
+    #define FORCEINLINE inline __attribute__((always_inline))
+  #endif
 #endif
 
 #include <vector>

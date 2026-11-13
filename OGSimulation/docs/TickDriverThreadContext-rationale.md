@@ -2,7 +2,7 @@
 # `TickDriverThreadContext.h` — rationale
 
 The narrative behind `BasicLockable`, the `tickDriverThread` role bits, thread-local masks, counters and
-predicates, `TickDriverThreadContext`, `NoAccessScope`, `WorldLockScope` and `StepScope`. The header
+predicates, `StepThreading`, `TickDriverThreadContext`, `NoAccessScope`, `WorldLockScope` and `StepScope`. The header
 keeps its licence, its docs pointer, its code, one guard tag and its `static_assert` and `OG_CHECK`
 messages; everything that explains it lives here. Prohibitions are in `TickDriverThreadContext-guards.md`.
 
@@ -28,7 +28,7 @@ them:
 - a **thread-local owner count** per role: "how many live contexts of the role were configured on this
   thread" (`OwnerThreadCounts`, §3);
 - the **predicates** built from them (§4) and `TickDriverThreadContext`, which picks the predicates for a
-  role and a stepping mode;
+  role and a stepping mode (`StepThreading`: `Inline`, `FrameBounded` or `FreeRunning`, §8);
 - `WorldLockScope` and `StepScope`, the RAII scopes that set the first two masks (§5);
 - two diagnostic **counters** (§6).
 
@@ -52,7 +52,7 @@ takes only its own role's lock.
 
 ## §3 The owner count (guards G-01 and G-02)
 
-`TickDriverThreadContext::configure(role, inlineSteps)` records the role, the stepping mode and the
+`TickDriverThreadContext::configure(role, threading)` records the role, the stepping mode and the
 calling thread, adds one to the role's owner count **for the calling thread**, and fixes the context's
 two predicates (`stepWorldPredicate` and `shadowPredicate`). `tickDriverThread::isOwnerThread<Bit>()`
 is "the role's count on this thread is above zero". It stands where an engine host would ask "is this
@@ -93,6 +93,9 @@ neither subtracts nor checks.
   behaviour this count replaced. The world-lock and step masks are not affected.
 - An unconfigured context added nothing, so it subtracts nothing. `m_configured` says so directly; its
   default `std::thread::id` matches no thread as well.
+- In `FreeRunning` the host contract of §8 has the context configured on the runner thread and destroyed
+  on the frame thread. There the destructor does nothing, and the runner's count ends with the runner
+  thread, whose thread-locals end when it exits.
 
 A test process that reuses one thread for many cases destroys each context on the thread that
 configured it, so one case's count does not leak into the next
@@ -119,8 +122,12 @@ predicate:
 | client, inline | `accessFromStepWorldLockOrInlineOwnerThread` | a running step, the role's lock, or the owner thread |
 | client, on a worker | `workerClientStepWorldAccess` | a running step or the role's lock; counts owner-thread calls outside the lock (§6) |
 
+`configure(role, threading)` passes `inlineSteps = (threading != StepThreading::FrameBounded)`: `Inline`
+and `FreeRunning` get the inline rows, `FrameBounded` gets the others (§8).
+
 An inline host steps on the owner thread and queries the world between steps on the same thread, so
-its predicate accepts the owner thread. A worker client steps on another thread, so its step world
+its predicate accepts the owner thread. A `FreeRunning` host does both on its runner thread, which is
+its owner thread. A worker client steps on another thread, so its step world
 refuses the owner thread outside the lock; the owner thread reaches it only under the lock (a world
 write such as a bind) and otherwise reads a second world of its own.
 `shadowPredicateFor<HostDiagnostics>(role)` is that second world's predicate,
@@ -178,7 +185,67 @@ function of another.
 The owner counts are thread-locals too (a `static inline thread_local` member of `OwnerThreadCounts`), and
 the same one-library rule holds for every `configure`, destructor and owner query of a context.
 
-## §8 Provenance
+## §8 `StepThreading` and the `FreeRunning` mode
+
+`StepThreading` names the three ways a host runs its steps: `Inline` (on the owner thread, the thread
+that pumps), `FrameBounded` (on an engine task that the owner thread waits for within its frame) and
+`FreeRunning` (on a runner thread of its own, which pumps and steps). It is declared here, above the
+context, because the context is configured with it. `TickDriverConcepts.h` includes this header, so every
+user of the tick-driver concepts sees it too.
+
+**What `configure(role, threading)` fixes, per mode:**
+
+| `threading` | `stepsInline()` | step-world predicate (§4) | `entryCheck()` |
+|---|---|---|---|
+| `Inline` | true | an inline row | `nullptr` |
+| `FrameBounded` | false | a row that is not inline | `nullptr` |
+| `FreeRunning` | false | the authority's inline row, owned by the runner | the step-world predicate |
+
+`threading()` returns the mode. `stepsInline()` keeps its meaning, `threading() == Inline`, so a
+`FreeRunning` context reports false. An unconfigured context reads `FrameBounded`: `stepsInline()` is
+false, and `entryCheck()` and both predicates are `nullptr`.
+
+**The bool overload.** `configure(role, inlineSteps)` forwards to `configure(role, threading)`: `true` is
+`Inline` and `false` is `FrameBounded`. It cannot select `FreeRunning`, so a host that passes a bool gets
+the two modes it had before `StepThreading` reached the context.
+`TickDriverThreadContext.Configure.TheBoolOverloadSelectsInlineOrFrameBounded` checks the mode and both
+predicates for each role and each value.
+
+**The owner is the runner.** `configure` marks the calling thread as the owner (§3), and a `FreeRunning`
+host calls it on its runner thread. The predicate is the inline one, so the runner passes it outside the
+lock, as an inline host's owner thread does. Any other thread, the host's frame thread included, passes
+only inside a step of the role or under the role's world lock.
+`TickDriverThreadContext.FreeRunning.TheConfiguringThreadIsTheOwnerAndAnotherThreadIsRefused` configures a
+context on a `std::thread` and checks both threads, the second one bare, under a `WorldLockScope` and
+inside a `StepScope`.
+
+**The authority's only.** `configure` refuses a `FreeRunning` client with an `OG_CHECK`. The free-running
+loop is the authority's; a client stays `FrameBounded` or `Inline`, and the client half of a free-running
+simulation thread was dropped. The hidden case `TickDriverThreadContext.FreeRunning.AClientIsRefused` (tag
+`[TickDriverFreeRunningClientRefused]`) makes that call and is expected to stop on the check.
+
+**`entryCheck()`.** The predicate a physics backend may install as its world's entry check: an assertion
+at each entry point of the world itself. It is the step-world predicate in `FreeRunning` and `nullptr`
+otherwise. In `FreeRunning`, no thread but the runner may reach the world outside a step or the lock, so
+every entry is worth checking. `nullptr` means no entry check, so a backend handed it adds no assertion,
+and `Inline` and `FrameBounded` hosts keep exactly the checks they have.
+`TickDriverThreadContext.EntryCheck.IsNullUnlessFreeRunning` checks both modes for both roles, an
+unconfigured context, and a `FreeRunning` authority as the positive control.
+
+**The runner thread is dedicated (host contract).** A `FreeRunning` host starts one runner thread per
+loop. That thread configures the context, runs the loop and exits when the loop returns, and the host
+destroys the context on the frame thread after joining it.
+- The owner count is a thread-local of the runner, and the destructor lowers it only on the configuring
+  thread (G-02). Destroyed on the frame thread, the context leaves the runner's count raised. The count
+  ends when the runner thread exits, because a thread's thread-locals end with it.
+- A pooled or reused runner thread would keep that count after its loop. Every later task on it would pass
+  the authority's owner query, so the inline step-world predicate and the shadow predicate would accept
+  it outside the lock, for the next world of the role too.
+- Destroy the context on the frame thread or on the runner, never on a thread started after the runner
+  ended. A `std::thread::id` can be reused once its thread has ended: a new thread with the runner's id
+  would pass the destructor's thread condition and subtract from its own count, which wraps (§3).
+
+## §9 Provenance
 
 Transcribed on 2026-10-16 from the anonymous namespace of the brawler's Jolt backend host
 (JoltBackendUImpl.cpp at commit a47b6f9, the historical name of TickDriverBackendUImpl.cpp, whose code is the
@@ -192,5 +259,9 @@ four predicate functions, the predicate chooser (joltWorldAccessCheckFor), the h
 - the shadow predicate is instantiated on the context's role bit;
 - the context reads the held and running masks for its role, which the backend host did in two
   member functions.
+
+`StepThreading` moved here from `TickDriverConcepts.h` on 2026-11-12, together with the `StepThreading`
+overload of `configure`, the `FreeRunning` refusal for a client, `threading()` and `entryCheck()`. The
+bool overload kept every caller unchanged.
 
 Nothing in this file depends on any document outside this submodule.

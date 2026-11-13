@@ -502,6 +502,13 @@ only one of them is completely inert:
 `effectiveRollbackCeiling` in `Network/ReplicatedTierConsumer.h`), `muteEchoOnDegradedTier` (via `tierShouldMuteEcho` and the two `shouldMuteEcho` members), `hashMismatchTickThreshold` (via `shouldEscalateToLayer2`) |
 | **read in production** | everything else in the header | — |
 
+`redundancyFrames` and `relayResendEntries` (§12) are in the last row, not the first. The client send reads
+`redundancyFrames` (`SimulationManager::onPostSimulationGameThread` passes it to
+`SimulationNetSync::sendLocalInputToAuthorityAll`). `relayResendEntries` has no reader in this repository, only its
+setter: the host that owns the relay flush reads it and passes the count to `relayedInputRing::flushStagedInto`
+(og-input-latency task 8). `backDateM0P50ThresholdTicks` (§13) is in the last row too, since og-input-latency P3-6:
+`ServerReceptionCoordinator`'s constructor passes it to its `InputArrivalMargin`.
+
 ⛔ **The middle row is the one that has caused trouble.** A field in it looks alive to a grep and dead
 to a debugger, and the header used to describe two of them wrongly in opposite directions — see §11.
 State which of the three shapes applies; do not write "no consumer" unqualified.
@@ -549,3 +556,87 @@ deliberately no dedicated no-tier-baseline field*. Their entire load-bearing pow
 reader about to re-introduce one of those knobs has no symbol to grep for and no document to be sent
 to, because they are about to *add* the line, not read it. They stay verbatim at the site, and this
 file deliberately does not paraphrase them.
+
+## 12. The latency knobs: redundancy in frames, and the relay re-send
+
+Two fields added by og-input-latency task 4, 2026-11-11. **Both compile to today's behaviour.** `redundancyFrames`
+is read by the client send since og-input-latency task 7 (`SimulationManager::onPostSimulationGameThread` hands it to
+`SimulationNetSync::sendLocalInputToAuthorityAll`; the arithmetic is in `SimulationNetSync-rationale.md` §17).
+`relayResendEntries` is read by the server's relay flush since og-input-latency task 8: the host that owns the
+flush reads it, so neither field is in §10's "no reader at all" row.
+
+**`redundancyFrames`: the redundancy window counted in frames.** `redundancyDepthTicks` counts the window in
+*ticks*. A client that steps several ticks per frame then re-sends fewer of its frames than a client that steps one,
+so a single lost send can lose more than one tick of input. The consumer sizes the bundle as about
+`redundancyFrames` frames' worth of ticks, never fewer than `redundancyDepthTicks` slots (or `kMaxSlots`, when the
+depth is larger) and never more than the bundle's wire bound `inputRedundancyBundle::kMaxSlots`. **0 is "today", not "off":** at 0 the bundle keeps exactly
+`redundancyDepthTicks` slots, so the compiled default changes nothing.
+
+**`relayResendEntries`: already-flushed relay entries re-included in each flush.** This is the successor the relay
+ring's retirement block (in the header, above the field) names: "already-sent ticks re-included in a flush", a
+different quantity from "entries retained by a write path", under a different name. ⛔ **It is not a depth.** The
+flush stage's capacity stays `relayedInputRing::kMaxDepth`, and `relayedInputRing::stageArrival` takes no depth
+parameter. Wiring this field (or any knob) into that capacity is the trap the retirement block records. At 0 the
+flush is today's: nothing already flushed is sent again.
+
+**The clamps.** Each is clamped by ONE shared idempotent function, `latencyKnobs::clampRedundancyFrames` and
+`latencyKnobs::clampRelayResendEntries`, called at the configuration intake and again at the manager's setter
+(`SimulationManager::setRedundancyFrames`, `SimulationManager::setRelayResendEntries`): the shape
+`correctionRotation::clampK` set for `correctionRotationK` (§8). Negatives clamp up to 0, which is today in both.
+* `redundancyFrames` is clamped to [0, `latencyKnobs::kMaxRedundancyFrames`], and that ceiling equals
+  `inputRedundancyBundle::kMaxSlots`. The consumer counts every frame as at least one tick, so a frame count
+  above the slot bound can only ask for more slots than the bundle holds, and the consumer's own slot ceiling would
+  cut it back. The ceiling therefore loses nothing. `TimeConfigDefaultsTest.cpp` asserts the equality at compile
+  time, so a change to the bundle's bound fails the test build until the ceiling is revisited.
+* `relayResendEntries` is clamped to [0, `latencyKnobs::kMaxRelayResendEntries`], which is 2: og-input-latency's
+  design (§6.10) states that range, and its task 8 keeps a "last flushed" tail of at most two entries.
+
+Two `static_assert`s below the struct check that each compiled default lies inside its own clamp, so the setter can
+never move a value nobody configured.
+
+**The configuration intake.** The composition root reads `RedundancyFrames` and `RelayResendEntries` under
+`[OGNetcode]` **on both roles**, once per session, and pushes them through the two setters. That follows the
+orientation rule that both roles carry the same struct: `redundancyFrames` is read only by a client's send and
+`relayResendEntries` only by the authority's flush, and each simply has no reader on the other role. Its start-up
+proof line is `[LatencyKnobs] redundancyFrames=… relayResendEntries=… (ini|compiled)`, at `Warning`, with the values
+read back from the session's `TimeConfig`. The trailing token is `ini` when either key was present in the ini and
+`compiled` when neither was. (One adapter's binding: `UESimulationSession`'s `readSessionKnobs` and
+`applyLatencyKnobs`, and the commented-out keys in the brawler's `Config/DefaultEngine.ini`.)
+
+## 13. Back-dating detection: the m0 p50 threshold
+
+One field added by og-input-latency P3-1, 2026-11-12: `backDateM0P50ThresholdTicks`. Its reader is the back-dating
+detector, og-input-latency P3-6: `ServerReceptionCoordinator`'s constructor passes it to its `InputArrivalMargin`,
+which compares each wire's window m0 p50 with it at each `[InputArrival.Window]` close (`InputArrivalMargin-rationale.md`
+§14). It changes only what is logged and counted. It has no configuration key: the composition root does not
+override it.
+
+**What it detects.** A client could stamp its captures older than they are, so they seem to arrive earlier and dodge
+the input delay. Rewriting a tick it has already sent gains nothing, because the server's queue keeps the first copy of
+a tick (`ServerInputDelayQueue::enqueue` returns false on a duplicate capture tick). A gain therefore needs a constant
+shift, holding every input back k ticks. That lowers m0, the arrival margin without the delay
+(`ArrivalMarginSignal::m0P50Ticks`; `InputArrivalMargin-rationale.md` §9 defines it), by k.
+
+**The honest band.** All measured on one PC, with in-order emulation and D = 6:
+- an own-input-margin measurement taken before m0 was logged gave m0 p5 of 0 to 2;
+- the first real-host run of the m0 line (2026-11-12, a 2-minute headless session, two clients at a time, one replaced mid-session) gave m0 p05 −1
+  and p50 0 in steady state, and p50 values of −3 and −2 in a wire's first windows after a join;
+- the clock's dead band (`softDriftThresholdTicks`) lets a client's lead sit up to 3 ticks below its target with no
+  correction, so an honest m0 can reach about −3. This is inferred, not measured;
+- with a static delay floor, the only delay change in a session is the join's stall from the no-tier fallback up to
+  the floor, and it falls inside the join grace below.
+
+**The rule P3-6 built.** Per wire, from its 6th window on (the first five, 10 s at the 2 s window, are join
+grace): a window with at least 60 samples and an m0 p50 below the threshold counts. Five such windows in a row open an
+episode, logged once as `[InputArrival.BackDate]` (the `Net` route; `SimulationLogRoutes-rationale.md` §5) and counted.
+The first window with samples at or above the threshold closes it. Nothing is refused, delayed or flagged to the
+client.
+
+**The trade.** −5 sits 2 ticks below the lowest honest value above (−3), so an honest session should not open an
+episode. The cost is that a shift of 5 ticks or less goes unseen: an honest p50 near 0, shifted by 5, is still not
+below −5. Because the detector only reports, a false positive costs one log line and a count. The threshold can be
+tightened only once the clock holds m0 close to its target, which is time-dilation work; that needs a new decision.
+
+**The `static_assert` below the struct** checks that the compiled default is below 0. An honest m0 p50 sits at about 0
+in steady state, and the dead band lets it fall a few ticks below, so a threshold at or above 0 would flag honest
+sessions. The check replaces a comment; no tag is needed.

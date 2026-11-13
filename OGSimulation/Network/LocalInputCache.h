@@ -71,8 +71,10 @@
 // applied-capture-tick REF, and redeeming that ref means coming here.
 //
 // PendingInputQueue cannot serve as the delay line either: it retains only
-// `redundancyDepthTicks` (3) entries while the worst tier delay is 4, and
-// wipeAllForResync clears it outright.
+// the redundancy slot count — `redundancyDepthTicks` (3) at
+// `redundancyFrames = 0`, else SimulationNetSync::redundancySlots — while the
+// worst tier delay is 4, so its depth follows a network knob rather than the
+// delay, and wipeAllForResync clears it outright.
 //
 // ---------------------------------------------------------------------------
 // WHAT THE OUTBOUND RPC CARRIES — DO NOT "SIMPLIFY" THIS.

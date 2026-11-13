@@ -2350,3 +2350,20 @@ says so.
 
 The design, the rejected alternatives, the cost-gate measurements and the field-naming mechanism
 live in `docs/SimulationComparison-rationale.md`; they are not re-derived here.
+
+## 14. The verdict margin — og-input-latency task 2h
+
+`CorrectionInsertVerdict` carries a fifth field, `verdictMargin`, and `tryInsertingCorrectState` has a second gated
+call, `measureVerdictMargin`, right below the field diff's. Both are additive: `isSimilarTo`, the slot overwrite, the
+provenance write, the landing stamp and the resim-anchor decision are unchanged.
+
+**Two conditions, not three.** The call runs when `outDiagnosticVerdict != nullptr && correctionVerdictMargin::enabled()`.
+It has no `!predictionWasCorrect` test, unlike §13's diff, because the margin of an AGREEING verdict is the quantity it
+exists to measure. The cost gate and its measurement are `docs/SimulationComparison-rationale.md` §8.
+
+**Ordering-bound, like `fieldDivergence`.** The walk reads the slot, the PREDICTION, and the arriving `state`, the
+AUTHORITY, so it runs before a disagreeing verdict's `std::move` replaces the slot. Its result goes out with the other
+fields on the hit path only. A discard returns before the call, so a discarded correction is never walked.
+
+⛔ **Reporting only**, under the same rule as §13: nothing in the cache, the gate policy or the resim path may branch on
+`verdictMargin`.

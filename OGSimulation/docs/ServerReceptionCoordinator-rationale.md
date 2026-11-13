@@ -423,7 +423,8 @@ figures live in the integrating project's own initiative notes and are not distr
 submodule; everything needed to judge the fix is restated here.
 
 `ServerInputDelayQueue::enqueue` de-duplicated against one memory only: what is parked *right now*.
-Each client packet re-sends the previous `redundancyDepthTicks` captures. When a packet landed after
+Each client packet re-sends the previous `redundancyDepthTicks` captures (that count holds at the default
+`redundancyFrames = 0`; otherwise it is `SimulationNetSync::redundancySlots`). When a packet landed after
 the server tick on which its **oldest** re-send had been released, that re-send was no longer in the
 deque, passed the duplicate scan as new, was parked a second time, and — being the oldest due entry
 — was released again on the next tick. Release and the downstream FIFO's consumption are both
@@ -484,10 +485,10 @@ The design corpus writes `ogsim::`; no such namespace exists in this tree.
 
 ---
 
-## §8 — The diagnostics: ten tags, one sink, one window
+## §8 — The diagnostics: twelve tags, one sink, one window
 
-Every line this file emits goes through the optional `setLogger` sink — eleven `SIMLOG` call sites
-across ten tags. A leading `[Warning]` or `[Verbose]` token selects the severity; an unprefixed line
+Every line this file emits goes through the optional `setLogger` sink — thirteen `SIMLOG` call sites
+across twelve tags. A leading `[Warning]` or `[Verbose]` token selects the severity; an unprefixed line
 stays at Log, which is hidden under the shipped `LogOGNet=Warning`.
 
 | tag | severity | fires | notes |
@@ -502,6 +503,8 @@ stays at Log, which is hidden under the shipped `LogOGNet=Warning`.
 | `[InputDomain]` | Warning | per ~2 s window | one line per rejection burst, naming the last offender |
 | `[RelaySkip]` | Verbose / Warning | per event / per window | Verbose per skipped tick, Warning for the window totals of the OOO-older and the late classes |
 | `[InputDelay]` | Warning | once per `(id, slot)` ever | the malformed-slot fence |
+| `[InputArrival.Window]` | Warning | per ~2 s window, per connection | the arrival margin of each wire, from `InputArrivalMargin`, then the late split, the D-free m0 and the steps per bundle (og-input-latency P3-5, appended); silent for a wire that carried nothing |
+| `[InputArrival.BackDate]` | Warning | once per back-dating episode, per connection | a wire's m0 p50 stayed below `TimeConfig::backDateM0P50ThresholdTicks` for five qualifying windows (og-input-latency P3-6); detect only, silent on an honest session |
 
 ### The window, and why there is only one
 
@@ -548,6 +551,53 @@ it. `[InputDrop]` carries the per-line attributable record instead.
 `m_relayOooSkipTotal` is not reset in `forgetOwner`, unlike the per-owner watermarks beside it: it is
 a session-scoped diagnostic, not per-owner state.
 
+### The arrival margin, and the line it writes
+
+The coordinator owns one `InputArrivalMargin` (`InputArrivalMargin-rationale.md`) and is its only
+feed. `receiveRemoteInput` feeds it three times:
+
+- For every capture that passed the receipt gate and has a valid slot, before `enqueue`,
+  `noteSighting(id, captureTick)` answers whether this owner's capture tick is seen for the first time:
+  the per-owner seen mask of `InputArrivalMargin-rationale.md` §8, keyed by owner id (guard G-04).
+- Whenever `enqueue` parked a new entry (`queuedNewEntry`), before the split into the `[Park]` arm
+  and the out-of-order arm, `noteArrival` records `captureTick + delay - lateGate` for the wire, and
+  on a first sighting the D-free `captureTick - lateGate` (`InputArrivalMargin-rationale.md` §9): the
+  queue's effective delay, the same value `[Park]` reports, and the late gate's own reference
+  (guards G-03 and G-01 of `InputArrivalMargin-guards.md`). Both arms are sampled, so a capture that
+  arrives after a newer one is not left out (`InputArrivalMargin-rationale.md` §3).
+- When the queue's late count moved across the `enqueue` call, `noteLateRefused` counts a late
+  refusal for the wire (guard G-02 there). The late count belongs to the queue, as above; this only
+  attributes each refusal to a wire. On the sighting's answer it is then filed as a late first sight
+  (`noteLateFirstSight`, with its m0) or a late re-send (`noteLateResent`) (guard G-05), so
+  `lateRefused == lateFirstSight + lateResent`.
+
+`receiveInputBundle` feeds it once per bundle: the newest capture tick among the slots the core
+handled, for the owner's steps per bundle (`InputArrivalMargin-rationale.md` §10). `forgetOwner` drops
+the owner's mask and step mark with the owner's other id-keyed state.
+
+The constructor passes the tick frequency for the m0 EWMA and `TimeConfig::backDateM0P50ThresholdTicks`
+for the back-dating detector, and checks the receipt gate's span against the mask's width: a `static_assert` on `TimeConfig{}` and an `OG_CHECK` on the configuration it
+borrows (`rollbackWindowHardCap + hardResyncThresholdTicks < kSeenMaskTicks`).
+
+`reapConnections` closes its window right after `maybeEmitInputStats`, before the dwell gate, and
+writes one `[InputArrival.Window]` line per wire that carried a sample or a late refusal. The window
+length comes from the same helper as `[InputStats]`'s, so the two close on the same frames, and the
+`lateRefused` fields of one window sum to that window's `late=`. `conn=` is the wire's hash, the same
+number `[DelayShift]` prints as `addr=`. The fields after `lateRefused=` (`lateFirstSight`,
+`lateResent`, `m0P05`, `m0P50`, `stepsPerBundle`) are appended; the ones before keep their meaning
+and position. Dead wires are forgotten on the dwell-gated reap, next to the `[DelayShift]` memo.
+Read-only access for other consumers is `arrivalMargin()`. `editArrivalMarginForFenceTest()` is the
+one mutable door, for `ArrivalMarginFenceTest.cpp` only (guard G-06): it proves that no decision here
+reads the margin (`InputArrivalMargin-rationale.md` §13).
+
+The same close can open a wire's back-dating episode (`InputArrivalMargin-rationale.md` §14). The
+`WindowLine` then carries an `ArrivalBackDateOpening`, and right after that wire's
+`[InputArrival.Window]` line the coordinator writes one
+`[Warning][InputArrival.BackDate] conn=%zu m0P50=%d windows=%u threshold=%d D=%d`, with the same `conn=`.
+That line is the detector's only effect here: nothing is refused, delayed or flagged to the client, and
+no decision reads the episode state (guard G-07 of `InputArrivalMargin-guards.md`). The fence scribbles
+the episode state too.
+
 ---
 
 ## §9 — What was found FALSE, stale or over-stated here, and the evidence
@@ -566,7 +616,7 @@ statement of fact.**
 | **F-37-4** | `noteServerTick`: *"It is PUBLIC so an adapter (or the Catch2 suite) can arm it explicitly."* | **OVER-STATED.** No adapter and no test calls it; both arm through `reapConnections`. The sentence is true as a statement about the seam and false as an implication about use, and combined with F-37-3 it is what made the two-feeds claim read as plausible. Restated as *"public, but no external caller today"*. |
 | **F-37-5** | `reapConnections`: *"The Catch2 suite cannot model that in-place transition … so that path is proven in the PIE smoke test, not by unit tests."* | **OVER-STATED.** The `!isAlive()` **branch** *is* unit-tested: a case reaps a dead wire from all three containers using a handle constructed dead, and its own comment says it *"drives the !isAlive branch"*. What cannot be staged is the **in-place** transition, because `FStandaloneTestHandle`'s `aliveBit` is part of its identity — flipping it produces a *different key* rather than a stale one. The header now claims only that. (The half of the original sentence that asserts smoke-test coverage is unverifiable from this tree and was dropped rather than repeated.) |
 | **F-37-6** | `reapConnections`: *"the adapter calls it once per tick"*, and `maybeEmitInputStats`: *"Called once per tick from reapConnections"* | **IMPRECISE, with a behavioural consequence the file never stated.** Both are once per physics **frame**; the adapter's own call site says so. A frame simulates `numSteps` ticks, so the `serverTick % tierMinDwellTicks` gate is sampled at frame granularity and a dwell boundary can be **stepped straight over** on a substepping frame. Nothing breaks — the reap deadline is eight dwell periods — but "once per tick" actively conceals it. |
-| **F-37-7** | `setLogger`: *"routes the one-shot malformed-slot warning."* | **STALE.** It routes every line this file emits: eleven `SIMLOG` sites across ten tags. It was true when there was one. |
+| **F-37-7** | `setLogger`: *"routes the one-shot malformed-slot warning."* | **STALE.** It routes every line this file emits: eleven `SIMLOG` sites across ten tags at the time of this finding, twelve across eleven since `[InputArrival.Window]`, thirteen across twelve since `[InputArrival.BackDate]` (og-input-latency P3-6). It was true when there was one. |
 | **F-37-8** | the stamp: *"floored at most to the LocalInputCache's residency ceiling"* / *"capped at 44 by the client ring's residency limit"* | **HALF-RIGHT, in two places.** The cap is `relayDelayFloorHardCapTicks`, which takes the **smaller of the local and remote input-cache capacities** minus `rollbackWindowHardCap`. Both capacities are 64 today and the hard cap is 20, so the number 44 is correct and the attribution to the local cache alone is not. The header now names the function rather than restating a derivation that can drift. |
 
 ### Two things checked and found TRUE, recorded because they look like the ones above
@@ -574,6 +624,11 @@ statement of fact.**
 * **The `LogOGNet` claims are correct.** Every tag this file emits is routed to `LogOGNet` by the
   adapter's tag router, and the shipped configuration does set `LogOGNet=Warning` — so an unprefixed
   `[Park]` line really is invisible by default. Verified at the key, not at a line number.
+  ⚠ **Amended 2026-11-11 (og-input-latency task 5b): "every tag" is not true.** `[InputDelay]` has a
+  row in neither `kSimulationLogRoutes` (`SimulationLogRoutes.h`) nor the host's own table, so a host
+  prints it on its fallback channel, not on its `Net` channel. `[InputArrival.Window]` had no row
+  either from task 5, which added it, until task 5b added its row. Every other tag here has a row: the
+  core table's `Net` rows, and the host's own row for `[ServerReceive]`.
 * **`hardResyncThresholdTicks > rollbackWindowHardCap` is genuinely asserted**, by
   `TimeConfigOrderingTest.cpp`, and the numbers behind the header's bound arithmetic hold at the
   compiled defaults.

@@ -118,6 +118,13 @@ bool accessFromStepWorldLockOrInlineOwnerThread()
 }
 } // namespace tickDriverThread
 
+enum class StepThreading : uint8_t
+{
+	Inline,
+	FrameBounded,
+	FreeRunning,
+};
+
 class TickDriverThreadContext
 {
 public:
@@ -157,26 +164,38 @@ public:
 	}
 
 	template <bool HostDiagnostics>
-	void configure(uint8_t role, bool inlineSteps)
+	void configure(uint8_t role, StepThreading threading)
 	{
 		OG_CHECK(role == tickDriverThread::kAuthorityRoleBit || role == tickDriverThread::kClientRoleBit,
 			"TickDriverThreadContext::configure: the role bit is the authority's (1) or the client's (2)");
 		OG_CHECK(!m_configured,
 			"TickDriverThreadContext::configure: a context is configured once; a second call would count its owner thread twice");
+		OG_CHECK(threading != StepThreading::FreeRunning || role == tickDriverThread::kAuthorityRoleBit,
+			"TickDriverThreadContext::configure: FreeRunning is the authority's only; a client stays FrameBounded or Inline "
+			"(EQ11). Was the client half of the free-running sim thread, dropped");
 		m_roleBit           = role;
-		m_stepsInline       = inlineSteps;
+		m_threading         = threading;
+		m_stepsInline       = (threading == StepThreading::Inline);
 		m_configured        = true;
 		m_configuringThread = std::this_thread::get_id();
 		// ⛔G-01  docs/TickDriverThreadContext-guards.md
 		++tickDriverThread::OwnerThreadCounts::t_counts[role];
-		m_stepWorldPredicate = predicateFor<HostDiagnostics>(role, inlineSteps);
+		m_stepWorldPredicate = predicateFor<HostDiagnostics>(role, threading != StepThreading::FrameBounded);
 		m_shadowPredicate    = shadowPredicateFor<HostDiagnostics>(role);
+	}
+
+	template <bool HostDiagnostics>
+	void configure(uint8_t role, bool inlineSteps)
+	{
+		configure<HostDiagnostics>(role, inlineSteps ? StepThreading::Inline : StepThreading::FrameBounded);
 	}
 
 	uint8_t roleBit() const { return m_roleBit; }
 	bool stepsInline() const { return m_stepsInline; }
+	StepThreading threading() const { return m_threading; }
 	AccessPredicate stepWorldPredicate() const { return m_stepWorldPredicate; }
 	AccessPredicate shadowPredicate() const { return m_shadowPredicate; }
+	AccessPredicate entryCheck() const { return m_threading == StepThreading::FreeRunning ? m_stepWorldPredicate : nullptr; }
 
 	bool isWorldLockHeldOnThisThread() const { return (tickDriverThread::t_worldLockHeldRoles & m_roleBit) != 0u; }
 	bool isStepRunningOnThisThread() const { return (tickDriverThread::t_stepRunningRoles & m_roleBit) != 0u; }
@@ -187,6 +206,7 @@ public:
 
 private:
 	uint8_t         m_roleBit            = 0u;
+	StepThreading   m_threading          = StepThreading::FrameBounded;
 	bool            m_stepsInline        = false;
 	bool            m_configured         = false;
 	std::thread::id m_configuringThread;

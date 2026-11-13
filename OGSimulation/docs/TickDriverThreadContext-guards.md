@@ -60,6 +60,13 @@ predicate and the shadow predicate accept it outside the lock).
 condition. With an assertion in its place, a teardown that runs on another thread stops a checked build,
 although leaving the count behind is harmless (rationale §3).
 
+In `FreeRunning` the context is configured on the runner thread and destroyed on the frame thread
+(rationale §8), so every `FreeRunning` teardown runs this destructor on a thread that did not configure
+the context, and it must not decrement there. Without the condition, the frame thread's count, zero until
+then, wraps, and the frame thread passes the authority's owner query from then on: it is the one thread a
+`FreeRunning` context must refuse outside the lock. The runner's own count is not lowered by the
+destructor; it ends with the runner thread, whose thread-locals end when it exits.
+
 **What breaks if it moves.** The condition must stay on the decrement it guards, in the destructor: it
 compares the thread that runs the destructor with the thread `configure` recorded, so it means nothing
 anywhere else.

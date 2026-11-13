@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: MPL-2.0
 
 #include "OGTypes.h"
+#include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <functional>
 #include <unordered_map>
 
@@ -69,6 +72,8 @@ OGSIM_OPTIMIZE_OFF
 //                                        correction
 //       emitCorrectionVerdictClassLine   NOTHING        1 Warning, non-empty class
 //       emitCorrectionLandingClassLine   NOTHING        1 Warning, non-empty class
+//       emitVerdictMarginClassLine       NOTHING        1 Log, non-empty class, only
+//                                                       while the margin gate is on
 //       shouldLogVersionMismatchOnce     NOTHING        1 Warning per id, ever
 //       forgetOwner                      NOTHING        never logs
 //
@@ -81,6 +86,8 @@ OGSIM_OPTIMIZE_OFF
 //     in this file ships at Warning. The adapter routes on the tag prefix and
 //     the host project's log configuration sets every category it can route to
 //     at Warning, so a `Log`-severity line DOES NOT EXIST in a shipped build.
+//     The one deliberate exception is `[DivergenceProbe.Margin]` (task 2h): a
+//     Log line BECAUSE it must not exist at the shipped Warning. §15
 //     One adapter's binding: `RouteOGMessage` (`OGBrawlerSimulationManager.cpp`)
 //     reading `Config/DefaultEngine.ini`:
 //
@@ -144,7 +151,71 @@ struct CorrectionArrivalDecision
     // ⛔ `evaluated == false` IS THE STEADY STATE, not a fault: at the shipped
     // `LogOGDivergenceProbe=Warning` nothing walked, so nothing here may be printed. §12
     FieldDivergence fieldDivergence;
+
+    // THE VERDICT MARGIN — carried from `CorrectionInsertVerdict`, unmodified, for
+    // the same reason as `fieldDivergence`. `evaluated == false` is the steady state
+    // at the shipped verbosity. §15
+    VerdictMargin verdictMargin;
 };
+
+// THE `[DivergenceProbe.Margin]` BUCKETS, in line order: b0 r = 0, b1 r <= 1e-5,
+// b2 r <= 1e-3, b3 r <= 1e-1, b4 r < 1, b5 r >= 1. §15
+inline constexpr std::size_t kVerdictMarginBuckets = 6u;
+
+inline std::size_t verdictMarginBucketOf(double ratio)
+{
+    if (ratio == 0.0)
+        return 0u;
+    if (ratio <= 1e-5)
+        return 1u;
+    if (ratio <= 1e-3)
+        return 2u;
+    if (ratio <= 1e-1)
+        return 3u;
+    if (ratio < 1.0)
+        return 4u;
+    return 5u;
+}
+
+// ONE CLASS'S MARGIN WINDOW. ⛔ It closes when the verdict probe's window closes,
+// never on its own count, so `verdicts` equals the `[DivergenceProbe.Window]`
+// line's `corrections` whenever the gate was on for the whole window. §15
+struct VerdictMarginClassWindow
+{
+    std::uint32_t verdicts = 0u;
+    std::uint32_t exactFail = 0u;
+    std::uint32_t buckets[kVerdictMarginBuckets] = {};
+    std::uint32_t discrete = 0u;
+    double maxRatio = 0.0;
+    char maxField[kFieldPathCapacity] = {};
+    // The largest `r` among AGREEING verdicts only, and its leaf: what a window's b5 hides in `maxField`. §15
+    double maxAgreeRatio = 0.0;
+    char maxAgreeField[kFieldPathCapacity] = {};
+
+    void note(const VerdictMargin& margin, bool agreed)
+    {
+        ++verdicts;
+        if (margin.maxRatio > 0.0)
+            ++exactFail;
+        ++buckets[verdictMarginBucketOf(margin.maxRatio)];
+        if (margin.discrete)
+            ++discrete;
+        if (margin.maxRatio > maxRatio)
+        {
+            maxRatio = margin.maxRatio;
+            std::memcpy(maxField, margin.maxField, sizeof(maxField));
+        }
+        if (agreed && margin.maxRatio > maxAgreeRatio)
+        {
+            maxAgreeRatio = margin.maxRatio;
+            std::memcpy(maxAgreeField, margin.maxField, sizeof(maxAgreeField));
+        }
+    }
+};
+
+// The Margin line's buffer: 24 + 23 + 20 + 21 + 6 x 14 + 20 + 22 + 105 + 27 + 110 = 456
+// characters at maximum widths and two full paths, over SIMLOG's 256. §15
+inline constexpr std::size_t kVerdictMarginLineCapacity = 512u;
 
 class NetSyncTelemetry
 {
@@ -296,6 +367,10 @@ public:
             decision.predictionWasCorrect ? 1u : 0u,
             fieldTail);
 
+        // ⛔ NOTED BEFORE `noteCorrection`, which counts the window's closing correction in the window it closes. §15
+        if (decision.verdictMargin.evaluated)
+            verdictMarginWindowFor(decision.characterClass).note(decision.verdictMargin, decision.predictionWasCorrect);
+
         CorrectionVerdictWindowSummary window;
         if (!m_correctionVerdictProbe.noteCorrection(
                 decision.characterClass, decision.predictionWasCorrect, window))
@@ -307,6 +382,37 @@ public:
             PredictedCharacterClass::LocallyPredicted, window.local, window.samples);
         emitCorrectionVerdictClassLine(
             PredictedCharacterClass::RemoteProxy, window.remote, window.samples);
+
+        emitVerdictMarginClassLine(PredictedCharacterClass::LocallyPredicted, m_verdictMarginLocal);
+        emitVerdictMarginClassLine(PredictedCharacterClass::RemoteProxy, m_verdictMarginRemote);
+        m_verdictMarginLocal = VerdictMarginClassWindow{};
+        m_verdictMarginRemote = VerdictMarginClassWindow{};
+    }
+
+    // ⛔ ONE per closed verdict window and class, from `emitCorrectionArrival` only; SILENT ON AN EMPTY CLASS, which is every class while the margin gate is off. §15
+    // ⛔ NO SEVERITY TOKEN: the `[DivergenceProbe` route's plain level is `Log`, so the line is off at the shipped `Warning`. A `[Log]` token would not match the route's prefix. §15
+    void emitVerdictMarginClassLine(PredictedCharacterClass characterClass,
+                                    const VerdictMarginClassWindow& classWindow)
+    {
+        if (classWindow.verdicts == 0u || !m_logger)
+        {
+            return;
+        }
+
+        char line[kVerdictMarginLineCapacity];
+        std::snprintf(line, sizeof(line),
+            "[DivergenceProbe.Margin] class=%s verdicts=%u exactFail=%u "
+            "b0=%u b1=%u b2=%u b3=%u b4=%u b5=%u discrete=%u maxRatio=%g maxField=%s "
+            "maxAgreeRatio=%g maxAgreeField=%s",
+            predictedCharacterClassName(characterClass),
+            classWindow.verdicts, classWindow.exactFail,
+            classWindow.buckets[0], classWindow.buckets[1], classWindow.buckets[2],
+            classWindow.buckets[3], classWindow.buckets[4], classWindow.buckets[5],
+            classWindow.discrete, classWindow.maxRatio,
+            classWindow.maxField[0] != '\0' ? classWindow.maxField : "-",
+            classWindow.maxAgreeRatio,
+            classWindow.maxAgreeField[0] != '\0' ? classWindow.maxAgreeField : "-");
+        m_logger(line);
     }
 
     // ⛔ ONE per-window class block; called twice, once per class, from `emitCorrectionArrival`, and ONLY when a window closed. §6
@@ -371,6 +477,15 @@ private:
 
     // See `shouldLogVersionMismatchOnce`.
     std::unordered_map<unsigned int, bool> m_versionMismatchLogged;
+
+    VerdictMarginClassWindow& verdictMarginWindowFor(PredictedCharacterClass characterClass)
+    {
+        return characterClass == PredictedCharacterClass::RemoteProxy ? m_verdictMarginRemote : m_verdictMarginLocal;
+    }
+
+    // ⛔ GAME THREAD ONLY, no per-id state (so `forgetOwner` has nothing to forget), and reset only when the verdict window closes. §15
+    VerdictMarginClassWindow m_verdictMarginLocal;
+    VerdictMarginClassWindow m_verdictMarginRemote;
 };
 
 OGSIM_OPTIMIZE_ON

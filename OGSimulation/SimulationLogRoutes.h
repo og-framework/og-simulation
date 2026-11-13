@@ -43,6 +43,8 @@ inline constexpr SimulationLogRouteEntry kSimulationLogRoutes[] = {
 	{ "[InputDrop]",                    SimulationLogRoute::Net,             HostLogLevel::Log },
 	{ "[DelayShift]",                   SimulationLogRoute::Net,             HostLogLevel::Log },
 	{ "[InputStats]",                   SimulationLogRoute::Net,             HostLogLevel::Log },
+	{ "[InputArrival.Window]",          SimulationLogRoute::Net,             HostLogLevel::Log },
+	{ "[InputArrival.BackDate]",        SimulationLogRoute::Net,             HostLogLevel::Log },
 	{ "[Park]",                         SimulationLogRoute::Net,             HostLogLevel::Verbose },
 	{ "[Release]",                      SimulationLogRoute::Net,             HostLogLevel::Verbose },
 	{ "[InputDomain]",                  SimulationLogRoute::Net,             HostLogLevel::Log },

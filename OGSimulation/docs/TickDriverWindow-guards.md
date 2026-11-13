@@ -19,12 +19,16 @@ true and actionable to a reader with no game engine and no other repository.
 ---
 
 **There are no live guards.** Each rule this file's code carries is enforced without a tag:
-- the eight series are pinned by a `static_assert` in `tickDriverWindow`;
+- the ten series (eight on every window line, two more on the `FreeRunning` suffix) are pinned by a
+  `static_assert` in `tickDriverWindow`;
 - the first-step line, the only text a step thread formats, is a separate class with no reference to a
   window, so it cannot reach window state (rationale §6);
 - the format strings, the decimals of each field, the `-` for an empty series, the pre-step role rule,
   the window deltas, the nearest-rank percentiles, the overflow count and the reservations are pinned by
-  the `[TickDriverWindow]` cases, each seen failing under a deliberate break (rationale §3–§5).
+  the `[TickDriverWindow]` cases, each seen failing under a deliberate break (rationale §3–§5);
+- the `FreeRunning` suffix, absent from the `Inline` and `FrameBounded` lines, and the `FreeRunning`
+  frame, first-step and window lines are pinned by the three `FreeRunning` cases tagged
+  `[TickDriverWindow]`, each seen failing under a deliberate break (rationale §8).
 
 No id has been issued or retired yet. The first guard this file ever needs is G-01. No guard of another
 file names this file as its successor.

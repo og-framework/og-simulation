@@ -312,7 +312,9 @@ public:
     // session in impl/bugreport_authority_late_resend_double_apply.md.)
     //
     // The duplicate scan above consults ONE memory: what is parked right now. A
-    // redundancy bundle re-sends the previous `redundancyDepthTicks` captures, so
+    // redundancy bundle re-sends the previous slot-count captures
+    // (`redundancyDepthTicks` at `redundancyFrames = 0`, else
+    // SimulationNetSync::redundancySlots), so
     // if the bundle lands after the tick on which its OLDEST re-send was released,
     // that re-send is no longer parked, passes the scan as "new", is parked a
     // second time, and — being the oldest due entry — is released again on the

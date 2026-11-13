@@ -1,10 +1,12 @@
 #pragma once
 // SPDX-License-Identifier: MPL-2.0
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <unordered_map>
+#include <vector>
 
 // ---------------------------------------------------------------------------
 // RelayReadProbe / RelayArrivalProbe / FrameHealthProbe -- the CLIENT-side relay
@@ -306,6 +308,16 @@ struct RelayReadCounters
     // `probeTick - newestResident` over every read that formed a probe tick. §4
     RelaySignedDeltaHistogram delta;
 
+    std::uint32_t lateReads = 0u;
+
+    std::uint32_t lateShareX1000() const
+    {
+        const std::uint32_t formed = delta.sampleCount();
+        return (formed == 0u)
+            ? 0u
+            : static_cast<std::uint32_t>((static_cast<std::uint64_t>(lateReads) * 1000u) / formed);
+    }
+
     std::uint32_t total() const
     {
         return noProbe + hit + miss + verifyFail;
@@ -346,6 +358,10 @@ struct RelayReadCounters
         if (report.deltaToNewestValid)
         {
             delta.note(report.deltaToNewest);
+            if (report.outcome != ScheduledRelayedReadOutcome::Hit)
+            {
+                ++lateReads;
+            }
         }
     }
 
@@ -353,6 +369,12 @@ struct RelayReadCounters
     {
         *this = RelayReadCounters{};
     }
+};
+
+struct RelaySenderReadCounters
+{
+    unsigned int      sender = 0u;
+    RelayReadCounters counters;
 };
 
 struct RelayReadWindowSummary
@@ -369,6 +391,8 @@ struct RelayReadWindowSummary
 
     std::uint32_t windowStartTick = 0u;
     std::uint32_t windowEndTick   = 0u;
+
+    std::vector<RelaySenderReadCounters> predictionBySender;
 };
 
 // ~2 s at 60 Hz, matching the cadence ServerReceptionCoordinator::maybeEmitInputStats
@@ -398,6 +422,7 @@ public:
     void notePredictionRead(unsigned int id, const ScheduledRelayedReadReport& report)
     {
         m_prediction.note(report);
+        m_predictionBySender[id].note(report);
         noteRun(id, report.outcome);
     }
 
@@ -409,6 +434,7 @@ public:
     void notePredictionRead(unsigned int id, ScheduledRelayedReadOutcome outcome)
     {
         m_prediction.note(outcome);
+        m_predictionBySender[id].note(outcome);
         noteRun(id, outcome);
     }
 
@@ -452,6 +478,17 @@ public:
         out.maxConsecutiveFallbackId  = m_windowMaxRunId;
         out.windowStartTick           = m_windowStartTick;
         out.windowEndTick             = predictionTick;
+        out.predictionBySender.clear();
+        for (auto& [sender, counters] : m_predictionBySender)
+        {
+            if (counters.total() > 0u)
+            {
+                out.predictionBySender.push_back(RelaySenderReadCounters{ sender, counters });
+            }
+            counters.reset();
+        }
+        std::sort(out.predictionBySender.begin(), out.predictionBySender.end(),
+            [](const RelaySenderReadCounters& a, const RelaySenderReadCounters& b) { return a.sender < b.sender; });
 
         m_prediction.reset();
         m_resim.reset();
@@ -467,6 +504,7 @@ public:
     void forgetOwner(unsigned int id)
     {
         m_fallbackRuns.erase(id);
+        m_predictionBySender.erase(id);
     }
 
     // --- introspection; tests and diagnostics only -------------------------
@@ -481,6 +519,14 @@ public:
     }
 
     std::size_t trackedOwnerCount() const { return m_fallbackRuns.size(); }
+
+    const RelayReadCounters* predictionCountersFor(unsigned int sender) const
+    {
+        const auto it = m_predictionBySender.find(sender);
+        return it == m_predictionBySender.end() ? nullptr : &it->second;
+    }
+
+    std::size_t trackedSenderCount() const { return m_predictionBySender.size(); }
 
 private:
     // ⛔ THE STALE-RUN HALF OF notePredictionRead, factored out so the two overloads cannot drift. The rule itself is unchanged -- see the block above notePredictionRead. §5
@@ -512,6 +558,8 @@ private:
 
     // Live consecutive-fallback run per character. Bounded by live ids (forgetOwner).
     std::unordered_map<unsigned int, std::uint32_t> m_fallbackRuns;
+
+    std::unordered_map<unsigned int, RelayReadCounters> m_predictionBySender;
 
     std::uint32_t m_windowMaxRun   = 0u;
     unsigned int  m_windowMaxRunId = 0u;

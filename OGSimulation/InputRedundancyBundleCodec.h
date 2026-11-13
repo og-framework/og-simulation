@@ -7,8 +7,9 @@
 // Engine-agnostic byte-codec for the FInputRedundancyBundle wire payload
 // (proposal §3.1 step 8; R-T5 immutability invariant; risks_and_plan.md §5.2).
 //
-// The unreliable + redundancy input channel re-sends the last
-// `redundancyDepthTicks` ticks of input every frame so a dropped UDP datagram
+// The unreliable + redundancy input channel re-sends the last few ticks of
+// input every frame (`redundancyDepthTicks` at `redundancyFrames = 0`, else
+// SimulationNetSync::redundancySlots) so a dropped UDP datagram
 // self-heals on the next send (the R-T1 streeting-saturation mitigation). The
 // bundle on the wire is a length-prefixed byte blob:
 //
@@ -72,7 +73,9 @@
 // appendSlot() keeps its OG_CHECK in front so a checked build still aborts
 // loudly at the offending producer. Note this is DEFENCE IN DEPTH, not a live
 // bug fix: the sole production caller (buildRedundancyBundle) already clamps
-// depth to min(redundancyDepthTicks, kMaxSlots), so an overflow is unreachable
+// the slot count it is handed to kMaxSlots — that count is
+// SimulationNetSync::redundancySlots, which is redundancyDepthTicks at
+// redundancyFrames = 0 — so an overflow is unreachable
 // through the current call graph. The kernel bound exists so a future caller
 // that skips the clamp — or a rewritten client driving the codec directly —
 // cannot emit an over-budget bundle in a shipping build, where an unguarded
@@ -100,7 +103,8 @@ namespace inputRedundancyBundle
 	// in that frame); flip U left it at 2.
 	inline constexpr std::uint8_t  kWireFormatVersion = 3;
 	// Hard upper bound on slots for wire safety; the runtime depth is
-	// min(TimeConfig::redundancyDepthTicks, kMaxSlots).
+	// min(SimulationNetSync::redundancySlots, kMaxSlots), which is
+	// min(TimeConfig::redundancyDepthTicks, kMaxSlots) at redundancyFrames = 0.
 	inline constexpr std::uint8_t  kMaxSlots          = 8;
 
 	// Wire-payload header layout.

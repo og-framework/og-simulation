@@ -2519,3 +2519,33 @@ number.** A line-number label in an archive is a join to a file that has since m
 // a gigantic unsigned one.
 ```
 
+
+---
+
+## 17. The receiver's relay margin per sender, and the late share (og-input-latency task 6)
+
+**What was added.** `RelayReadProbe` keeps a second copy of the **prediction** counters per remote sender
+(`m_predictionBySender`, keyed by the character id the read was for), beside the aggregate it always kept.
+`maybeCloseWindow` hands them out as `RelayReadWindowSummary::predictionBySender`, one `RelaySenderReadCounters`
+per sender that carried a read in the window, sorted by id, and resets them; `forgetOwner` erases the sender, so
+the map stays bounded by live ids (§13). `predictionCountersFor(id)` and `trackedSenderCount()` are the test
+introspection.
+
+`RelayReadCounters` gained `lateReads`: the reads that **formed a probe tick** (`deltaToNewestValid`) and did not
+`Hit`. `lateShareX1000()` is `lateReads * 1000 / delta.sampleCount()`, floored, as every `X1000` field in these
+headers is; 0 when no read formed a probe tick. So:
+
+- **the denominator is the delta histogram's own `n`.** Rung 0 (`NoProbe`) and the `tick < dA` underflow guard form
+  no probe tick and are in neither the numerator nor the denominator: they are the join window and the
+  early-session artefact, not lateness (§2, §3);
+- **`Miss` and `VerifyFail` are both late.** Either way the capture scheduled for the tick was not the one served.
+
+**Why the prediction site only.** The margin a sender's captures arrive with is measured where the schedule is
+kept: the prediction pass's scheduled read. A resimulation's scheduled read replays a tick the prediction already
+ran, after more arrivals, so its "late" means nothing about the wire, and it still takes no id (§5). Its counters
+gain `lateReads` too, because the field lives on the shared counter type, but nothing reports a resimulation's late
+share.
+
+**The per-sender delta is the margin.** The signed distribution `probeTick - newestResident` (§4) per sender is
+that sender's relay margin seen from this receiver: how many capture ticks of that sender's input were resident
+beyond the one asked for. A late share, per sender, is the on-time question the floor is sized against.

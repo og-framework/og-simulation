@@ -1473,3 +1473,44 @@ correction cache, and compares each declaration with the restored body (`Simulat
 for `simTick` (`[ResimCheck.PrepareRestore] found=1`). A simulatable whose anchor slot is missing
 (`found=0`, for example one that joined after the anchor) keeps its present-tick state, and the push
 writes that state into the anchor's world as it is.
+
+## 13. Additions after the archive: the latency knobs' setters (og-input-latency task 4, 2026-11-11)
+
+These are not archived prose. They were written with the code they describe, and the header's `§13` pointers land
+here.
+
+`setRedundancyFrames` and `setRelayResendEntries` are the one writable location for `TimeConfig::redundancyFrames`
+and `TimeConfig::relayResendEntries`. They follow `setCorrectionRotationK` exactly: a narrow setter per knob rather
+than a mutable accessor to the whole `TimeConfig`, and the setter clamps again with the same shared idempotent
+function the configuration intake calls (`latencyKnobs::clampRedundancyFrames`, `latencyKnobs::clampRelayResendEntries`,
+both in `PCTimeManagement/TimeConfig.h`). The call sites clamp first so an out-of-range value is visible in the log;
+the setter clamps again so a caller that skipped the intake cannot store one.
+
+**`setRelayResendEntries` has no reader behind it yet;** its field is consumed by og-input-latency task 8 (the
+authority's relay flush). `redundancyFrames` has had one since task 7 (§14): it falls under the `TimeConfig` re-read
+rule (§4), read live from `m_timeConfig` where the manager hands the send its arguments and never cached in the
+net-sync peer, or the ini override would become silently ineffective.
+
+**Both roles call them.** The composition root applies both knobs on every peer, once at composition, before any
+step. Each field has a reader on one role only, so on the other role the stored value is inert, which keeps one
+`TimeConfig` shape for both roles (`TimeConfig-rationale.md` §12).
+
+The setters' behaviour is pinned by `TimeConfigDefaultsTest.cpp` (`PCTM.TimeConfig.LatencyKnobSettersClamp`), which
+drives a mock-peered manager through in-range, negative and too-large requests.
+
+## 14. Additions after the archive: `redundancyFrames` handed to the send (og-input-latency task 7, 2026-11-11)
+
+Not archived prose; the header's `§14` pointer at `onPostSimulationGameThread` lands here.
+
+`onPostSimulationGameThread` now passes a third value to `SimulationNetSync::sendLocalInputToAuthorityAll`:
+`m_timeConfig.redundancyFrames`, read on every call like `correctionRotationK` and `redundancyDepthTicks`. That makes
+four values under the re-read rule in the orientation block (the depth fold off `resimTriggerPolicy` is the fourth),
+and the block now says so. The net-sync peer keeps no copy of the knob: it keeps only each sender's send cadence,
+which is derived from the ticks it is handed, not from `TimeConfig`.
+
+`SimulationNetSyncPublishConcept` takes the knob as an `int32_t` parameter, so a peer whose send still has two
+parameters fails the requires-clause of `onPostSimulationGameThread` instead of compiling against a stale overload.
+The concept proof's `NetSyncShaped` stub gained the same parameter.
+
+The send's arithmetic and its default (0 = today's `redundancyDepthTicks`, the same bundle bytes) are in
+`SimulationNetSync-rationale.md` §17.

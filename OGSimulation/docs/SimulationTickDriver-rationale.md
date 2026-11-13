@@ -3,9 +3,11 @@
 
 The narrative behind `BodySlotOccupancyCommand`, the `simulationTickDriver` constants and `SimulationTickDriver`,
 the engine- and game-agnostic frame pipeline that pumps the scheduler, runs or dispatches each frame's
-batch of steps, waits for it at the end of the frame, and closes the host's telemetry window. The header
-keeps its licence, its docs pointer, its code, its `OG_CHECK`s, two member-order `static_assert`s and six
-guard tags; everything that explains it lives here. Prohibitions: `SimulationTickDriver-guards.md`.
+batch of steps, waits for it at the end of the frame, and closes the host's telemetry window; in
+`FreeRunning` it runs the same pipeline as the authority's loop on a runner thread of its own. The header
+keeps its licence, its docs pointer, its code, its `OG_CHECK`s, three `static_assert`s (two on the member
+order, one on `isFiniteSeconds`) and eight guard tags; everything that explains it lives here.
+Prohibitions: `SimulationTickDriver-guards.md`.
 
 **If this file and `SimulationTickDriver.h` disagree, the header is authoritative and this file is stale.**
 Fix this file; do not soften the header to match it.
@@ -20,8 +22,8 @@ with no game engine and no other repository.
 
 `SimulationTickDriver<GameT, WorldHostT, PresenterT, EngineT>` is a class template over four
 collaborators, each constrained by its concept from `TickDriverConcepts.h` (`TickDriverGame`,
-`TickDriverWorldHost`, `TickDriverPresenterSteps`, `TickDriverEngine`). An engine adapter calls two entry
-points per frame on the owning thread:
+`TickDriverWorldHost`, `TickDriverPresenterSteps`, `TickDriverEngine`). In `Inline` and `FrameBounded` an
+engine adapter calls two entry points per frame on the owning thread:
 
 * `startFrame(frameDeltaSeconds)` at the start of the engine's physics phase: it times the frame, pumps the
   scheduler with the accumulated frame delta, and either runs the frame's steps on this thread (`Inline`)
@@ -30,14 +32,22 @@ points per frame on the owning thread:
   mode names (by holding the engine's completion event open with `deferUntil`, or by a blocking wait when
   there is no event), then runs the post-physics pass.
 
-`stop()` ends the session: it clears the running flag, then waits for every outstanding step task. The
-driver owns the scheduler, the window and the mailboxes (§5); it borrows the game, the world host, the
-presenter's step doors and the engine. It is header-only and adds no indirect call: every collaborator is a
-template parameter and every call on it is direct.
+In `FreeRunning` (the authority only) a third entry point replaces both for the pump and the batch:
+
+* `runAuthorityLoop(runner, stopRequested)` on the runner thread: it wakes at each step deadline on the
+  engine clock, pumps and runs the due steps inline, and idles to the next deadline until the stop flag is
+  set (§10, §11). `startFrame` then returns at once and `endFrame` runs only the game's post-physics hook
+  on the frame thread (§12).
+
+`stop()` ends the session: it clears the running flag, then waits for every outstanding step task; in
+`FreeRunning` it first checks that the loop has returned (§13). The driver owns the scheduler, the window
+and the mailboxes (§5); it borrows the game, the world host, the presenter's step doors and the engine. It
+is header-only and adds no indirect call: every collaborator is a template parameter and every call on it
+is direct.
 
 An engine host instantiates it with its own game binding, world host, presenter and engine. Its behaviour is a
-transcription of the engine-hosted frame host and of the per-step body of the engine-hosted Jolt host (§10), with one
-intended addition, the `beforePump` seam (§6).
+transcription of the engine-hosted frame host and of the per-step body of the engine-hosted Jolt host (§14), with one
+intended addition, the `beforePump` seam (§6), and the `FreeRunning` mode added after it.
 
 ## §2 Ownership and member order
 
@@ -52,6 +62,9 @@ The driver holds raw pointers to its four borrowed collaborators, then, in this 
 | `m_bodySlotOccupancyCommands` | J1 |
 | `m_stepCosts` | J6 |
 | `m_tickOffset` | J3 |
+| `m_publishedRateScale` | J8, the rate scale the runner publishes after each `beforePump` (§5, §12) |
+| `m_loopOriginSeconds` | the engine clock at the loop's start, `-1.0` before it (§10, §12) |
+| `m_loopActive` | true while `runAuthorityLoop` runs (§13) |
 | `m_pendingSteps`, `m_blockingSteps` | the executor handles (§4) |
 | `m_doors` | the driver's part of the step doors |
 | `m_hooks` | `std::optional<TickDriverStepHooks<…>>` |
@@ -60,8 +73,9 @@ The driver holds raw pointers to its four borrowed collaborators, then, in this 
 Members destruct in reverse declaration order, so the step driver goes first: it holds the hooks by
 reference and, on a client, unregisters its resync callback from the game's manager in its destructor. The
 hooks hold the doors, and the doors reach J1, J3, J6 and the step driver. Two `static_assert`s on
-`__builtin_offsetof` pin the order: config < scheduler < window < J1 < J6 < J3 < the pending handle < the
-blocking handle, and the blocking handle < doors < hooks < step driver.
+`__builtin_offsetof` pin the order: config < scheduler < window < J1 < J6 < J3 < J8 < the loop origin < the
+loop-active flag < the pending handle < the blocking handle, and the blocking handle < doors < hooks < step
+driver.
 
 The hooks and the step driver are `std::optional`s, as in the engine-hosted Jolt host, because the
 constructor builds them under the world lock (§3) before it builds the scheduler, which is also an
@@ -77,34 +91,44 @@ reach the driver's private members through a pointer.
 
 **Construction** (the old start of play):
 
-1. Four `OG_CHECK`s: not `FreeRunning`; the authority is `Inline`; the configured role equals the world
-   host's thread-context role; the configured threading equals the world host's stepping mode.
+1. Five `OG_CHECK`s: a `FreeRunning` client is refused; the authority is `Inline` or `FreeRunning`; the
+   configured role equals the world host's thread-context role; the configured threading equals the
+   thread context's `threading()`; `idleSlackSeconds` is finite and in `[0, dtSeconds)`. Finiteness is read
+   from the exponent bits (`simulationTickDriver::isFiniteSeconds`, pinned by a `static_assert` over both
+   zeros, both largest finite values, the smallest denormal, both infinities and three NaNs), because a comparison can be folded to
+   true for a NaN under a fast floating-point model.
 2. Under `worldHost.lockForStep()` (the world lock, J2), build the hooks and then the step driver
    (`StepDriverConfig{ dt, ResimPolicy::OnRequest, 0 }`). The step driver parks every slot in its
    constructor, a world write, so it is built under J2.
 3. `begin()`: the cap (§6), the cap Warning when it was clamped, the scheduler (`dt`, the cap, the rate
    bounds, start time 0), the window restarted at `nowSeconds()` with the current totals, the running flag,
-   and the `[SimHost.Frame]` line.
+   and the `[SimHost.Frame]` line, which carries the slack in `FreeRunning` (§7).
 
-**`startFrame(frameDeltaSeconds)`**, owning thread:
+**`startFrame(frameDeltaSeconds)`**, owning thread. In `FreeRunning` it returns at once. Otherwise:
 
 1. Take the frame's start time; when there was a previous frame (`m_lastFrameStartSeconds > 0.0`), note
    the period. The window is handed the raw `double` difference.
-2. `pumpAndRunSteps`:
+2. `m_hostTimeSeconds += frameDeltaSeconds` (`⛔G-04`), then `pumpAndRunSteps`:
    1. `m_blockingSteps = m_pendingSteps`: the task dispatched in earlier frames, captured before this frame's
       dispatch, every frame, with steps or not.
-   2. `m_hostTimeSeconds += frameDeltaSeconds`; `beforePump(m_hostTimeSeconds, rate)`; `pump(m_hostTimeSeconds)`
-      (`⛔G-04`). No step due: return 0.
-   3. The batch (J4) by value: `first = physicsStepCount() − numSteps`, the count, each step's deadline.
+   2. `beforePump(m_hostTimeSeconds, rate)`; in `FreeRunning`, publish the rate scale to J8 (§5);
+      `pump(m_hostTimeSeconds)`. No step due: return 0.
+   3. The batch (J4) by value: `first = physicsStepCount() − numSteps`, the count, each step's deadline. In
+      `FreeRunning`, one lateness sample per step (§10).
    4. `firstUpcomingSimTick = first + J3` (`⛔G-03`, §5).
    5. `onFrameStepsDue(firstUpcomingSimTick, numSteps)` (`⛔G-02`).
-   6. `Inline` (`⛔G-01`): `runBatch` here, then `afterInlineBatch(firstUpcomingSimTick)` once (`⛔G-06`).
-      `FrameBounded`: `dispatchAfter(previous, task)`, where `previous` is the pending task when it is still
-      pending and a default handle otherwise; the result becomes `m_pendingSteps`.
+   6. `Inline` and `FreeRunning` (`⛔G-01`): `runBatch` here, then `afterInlineBatch(firstUpcomingSimTick)`
+      once (`⛔G-06`). `FrameBounded`: `dispatchAfter(previous, task)`, where `previous` is the pending task
+      when it is still pending and a default handle otherwise; the result becomes `m_pendingSteps`.
 3. Note the frame, its step count and its own duration (`noteStartPhysics`).
 
+`pumpAndRunSteps` takes no argument: it pumps `m_hostTimeSeconds`, which `startFrame` accumulates and the
+authority loop sets (§6, §10), so both modes share every statement from the capture of `m_blockingSteps`
+to the end of the batch.
+
 **`runBatch`** logs the `[SimHost.FirstStep]` line once (its `thread=` word is `game` when the thread is
-the role's owner thread, `worker` otherwise), then runs `runStep(first + i, deadline[i])` in order. Each step:
+the role's owner thread, `worker` otherwise, and `runner` in `FreeRunning`), then runs
+`runStep(first + i, deadline[i])` in order. Each step:
 
 1. `OG_CHECK` that an `Inline` step runs on the owning thread;
 2. `worldHost.lockForStep()` (J2 for the whole step), then a `StepScope` on the world host's thread context
@@ -114,9 +138,13 @@ the role's owner thread, `worker` otherwise), then runs `runStep(first + i, dead
 5. `worldHost.afterRunTick_Step(step, outcome)`, still under the lock and the scope.
 
 `runStep` is private and `runBatch` is its only caller, so "a step runs only inside the driver's batch" is
-the type's shape; the old per-step body checked it at run time with a thread-local batch marker.
+the type's shape; the old per-step body checked it at run time with a thread-local batch marker. A
+`FreeRunning` step needs no check of its own here: `runAuthorityLoop` checks that it runs on the owner, and
+`pumpAndRunSteps` reaches the scheduler only through the owner-checked accessor.
 
-**`endFrame(completion, blockMode)`**, owning thread:
+**`endFrame(completion, blockMode)`**, owning thread. In `FreeRunning` it runs on the frame thread instead:
+it `OG_CHECK`s that this thread is not the role's owner (the runner), calls `onPostPhysics()` and returns
+(`⛔G-08`): no wait, no J6 drain, no window. Otherwise:
 
 1. `OG_CHECK` that this thread does not hold J2 (G-05).
 2. The task to wait for: `m_blockingSteps`, or `m_pendingSteps` under block mode 1.
@@ -129,10 +157,11 @@ the type's shape; the old per-step body checked it at run time with a thread-loc
 duration; drain J6 into the window; when the window is due, format the `[SimHost.Window]` line, log it,
 and restart the window with the same `now` and the same totals.
 
-**`stop()`:** `m_running = false` first, so a continuation that is still deferred does nothing when it runs;
-then wait (G-05's `OG_CHECK`) for the pending and then the blocking task, each one that is set, and reset
-both. No step runs after `stop()` returns. The engine adapter stops calling the two entry points (the old
-host unregistered its tick functions in the same statement that cleared the flag).
+**`stop()`:** `OG_CHECK` that the authority loop is not running (§13); `m_running = false`, so a
+continuation that is still deferred does nothing when it runs; then wait (G-05's `OG_CHECK`) for the
+pending and then the blocking task, each one that is set, and reset both. No step runs after `stop()`
+returns. The engine adapter stops calling the two entry points (the old host unregistered its tick
+functions in the same statement that cleared the flag).
 
 ## §4 Threading modes
 
@@ -140,7 +169,10 @@ host unregistered its tick functions in the same statement that cleared the flag
 |---|---|---|---|
 | `Inline` | the owning thread, in `startFrame` | the same thread, then `afterInlineBatch` | never waits: the handles stay unset |
 | `FrameBounded` | the owning thread, in `startFrame` | an executor task chained after the previous frame's | waits for earlier frames' task (block mode 0) or also this frame's (1), by deferral or a blocking wait |
-| `FreeRunning` | — | — | refused by an `OG_CHECK` in the constructor; declared for the free-running runner that will own the pump |
+| `FreeRunning` | the runner (the owning thread), in `runAuthorityLoop`, at each wake | the runner, inline, then `afterInlineBatch` | runs `onPostPhysics` only, on the frame thread; never waits (§12) |
+
+`FreeRunning` is the authority's only: the constructor refuses a `FreeRunning` client, as the thread
+context's `configure` does. A client is `FrameBounded`, or `Inline` when it chose to step inline.
 
 Block mode 0 means the end of a frame waits only for steps dispatched in earlier frames; this frame's task
 may still be stepping while the post-physics pass runs. Block mode 1 (debugging) also waits for this frame's.
@@ -148,11 +180,13 @@ may still be stepping while the post-physics pass runs. Block mode 1 (debugging)
 The executor handles are `std::optional<EngineT::Handle>`. An unset optional is the old code's invalid
 event: `stop()` waits for each handle that is set, even one that has completed (a no-op wait), exactly as the
 old wait passed every valid event to one wait call. "Pending" is `has_value()` and `engine.isPending`.
+`FreeRunning` never dispatches, so its handles stay unset.
 
 **The owning thread** is the thread that configured the world host's thread context: the context's
 `isOwnerThreadForRole()` replaces the engine's game-thread query everywhere in the driver (the scheduler
 accessor, the host time, the first-step line's thread word, the inline-step check, and the doors' owner test
-that the authority's `beforeTick` checks).
+that the authority's `beforeTick` checks). In `FreeRunning` that thread is the runner, which builds the
+world host (`TickDriverThreadContext-rationale.md` §8); the frame thread is not an owner.
 
 **One copy per shared library.** The thread context's masks and counts are header thread-locals
 (`TickDriverThreadContext-rationale.md` §7). The driver's `StepScope` and the world host's `configure` must be
@@ -165,7 +199,7 @@ the same module.
   `pushBodySlotOccupancy(slot, occupied)` pushes one; a full ring is an `OG_CHECK` (a lost command leaves the world
   stepping the wrong body set). The hooks drain it first thing in `beforeTick`, through the doors'
   `applyBodySlotOccupancyCommands_Step`, into the step driver's `noteBodySlotOccupancy`; the door `OG_CHECK`s it runs inside
-  a step.
+  a step. In `FreeRunning` the push `OG_CHECK`s the runner, the ring's one producer (§12).
 * **J3, the published tick offset** (step → owning thread): `std::atomic<int64_t>`, relaxed. The hooks'
   `afterTick` stores `outcome.tick − outcome.physicsStep`; `pumpAndRunSteps` adds it to `batch.first`, with
   no `+ 1`, because `outcome.tick` is the tick the step integrated (`⛔G-03`). Before the first step the
@@ -174,7 +208,11 @@ the same module.
   `std::array<double, 240>`, copied into the task by value.
 * **J6, the step cost** (step → owning thread): `SpscRing<StepCostSample, 256>`; the hooks push one sample
   per step, a full ring drops it and counts the drop, and the post-physics pass drains it into the window
-  (`noteStepCost`).
+  (`noteStepCost`). In `FreeRunning` the runner drains it after each wake (§10).
+* **J8, the published rate scale** (runner → any thread, `FreeRunning` only): `std::atomic<double>`,
+  1.0 at construction. `pumpAndRunSteps` stores the scheduler's `rateScale()` with release order right
+  after `beforePump`, so a rate the game set through the door during this wake is the one published;
+  `stepIntervalSeconds()` loads it with acquire order (§12). The other modes never write or read it.
 
 The doors are what `TickDriverStepHooks` needs from the driver (`DriverStepDoors`): the J1 drain, the J3
 store, the J6 push, the step-running test and the owner-thread test, both read from the world host's
@@ -183,18 +221,27 @@ thread context.
 
 ## §6 Time base, `beforePump`, the rate door and the cap
 
-**Time base.** The scheduler is pumped with the sum of the frame deltas the engine adapter passes to
-`startFrame`, never with the engine clock (`⛔G-04`). `hostNowSeconds()` returns that sum and
-`stepIntervalSeconds()` the scheduler's step over its rate scale; both are owning-thread doors (the host
-time `OG_CHECK`s the owning thread, the interval goes through the scheduler accessor), so a render clock
-built on them shares the deadlines' time base.
+**Time base.** `pumpAndRunSteps` pumps `m_hostTimeSeconds` and hands `beforePump` the same value, in every
+mode. What writes it is per mode (`⛔G-04`):
+
+* `Inline` and `FrameBounded`: the sum of the frame deltas the engine adapter passes to `startFrame`, never
+  the engine clock. `hostNowSeconds()` returns that sum and `stepIntervalSeconds()` the scheduler's step
+  over its rate scale; both are owning-thread doors (the host time `OG_CHECK`s the owning thread, the
+  interval goes through the scheduler accessor), so a render clock built on them shares the deadlines'
+  time base.
+* `FreeRunning`: `engine.nowSeconds()` minus the loop's origin, read on the runner at each wake
+  (`timeBase=monotonic`). One clock serves the pump, the idle deadlines, the step hooks' stamps and the
+  present clock, which `hostNowSeconds()` and `stepIntervalSeconds()` give to any thread (§12). The
+  engine's pause, slow motion and frame-time clamp act on frame deltas and do not reach this pump; a runner
+  stall is caught up to the cap and the rest is counted as lost (§10).
 
 **`beforePump(hostNowSeconds, rate)`** is the one addition to the transcribed frame. The game is called on
-the owning thread immediately before `pump()`, once per frame, with the host time the pump is about to
-receive and a `TickRateDoor` over the scheduler. A rate change made through the door therefore applies to
-this frame's pump; called after the pump, it would apply only from the next frame's. Nothing changes the
-rate through it yet. With `tickOffset()` and the timing samples in the scheduler's time base, it is the
-seam a time-dilation controller plugs into.
+the owning thread immediately before `pump()`, once per frame (in `FreeRunning` once per wake, a wake that
+runs no step included), with the host time the pump is about to receive and a `TickRateDoor` over the
+scheduler. A rate change made through the door therefore applies to this frame's pump; called after the
+pump, it would apply only from the next frame's. Nothing changes the rate through it yet. With
+`tickOffset()` and the timing samples in the scheduler's time base, it is the seam a time-dilation
+controller plugs into.
 
 **The cap.** `requestedMaxCatchUpSteps` is clamped to `[1, kMaxStepsPerFrame]` (240, the size of the
 batch's deadline array). When the clamp changed it, the driver logs the Warning
@@ -207,6 +254,9 @@ time.
 `[SimHost.Frame]` line prints the literal `rateScale=[0.75,1.25]`, so a configuration with other bounds
 prints the defaults.
 
+**The idle slack** is `Config::idleSlackSeconds`, 0 by default, read only in `FreeRunning` (§11). The
+constructor checks it in every mode, so a bad value fails where it is configured.
+
 ## §7 Lines
 
 Every line goes through `engine.log(HostLogLevel::Warning, …)` with the text formatted into a buffer the
@@ -214,32 +264,42 @@ window reserved at construction (`TickDriverWindow-rationale.md`):
 
 * `[SimHost.Frame] og.Sim.MaxCatchUpSteps=… is outside [1, 240]; using …`, only when the cap was clamped;
 * `[SimHost.Frame] role=<Authority|Client> stepping=<inline|worker> dt=<s> maxCatchUpSteps=<n> rateScale=[0.75,1.25] timeBase=worldDelta`,
-  once, at the end of construction;
-* `[SimHost.FirstStep] role=… thread=<game|worker> physicsStep=<n> batch=<n>`, once, from the thread that
+  once, at the end of construction; in `FreeRunning`,
+  `[SimHost.Frame] role=Authority stepping=runner dt=<s> maxCatchUpSteps=<n> rateScale=[0.75,1.25] timeBase=monotonic idleSlackUs=<n>`;
+* `[SimHost.FirstStep] role=… thread=<game|worker|runner> physicsStep=<n> batch=<n>`, once, from the thread that
   runs the first batch;
 * `[SimHost.Window] …`, once per due window (`tickDriverWindow::kWindowSeconds`, by the engine clock), at
-  the end of the post-physics pass that finds it due. The totals (the scheduler's `lostTime()` and
-  `ignoredTimeSamples()`, J1's and J6's `drops()`) are read once and passed to both `formatWindowLine` and
-  `restart`.
+  the end of the post-physics pass that finds it due, or in `FreeRunning` after the wake that finds it due,
+  on the runner. The totals (the scheduler's `lostTime()` and `ignoredTimeSamples()`, J1's and J6's
+  `drops()`) are read once and passed to both `formatWindowLine` and `restart`.
 
-`stepping=` reads `inline` for `Inline` and `worker` for `FrameBounded`.
+`stepping=` reads `inline` for `Inline`, `worker` for `FrameBounded` and `runner` for `FreeRunning`. The
+window builds every word and, in `FreeRunning` only, the window line's suffix (`lateUs`, `activityWakes`,
+`earlyWakes`, `idleFallbacks`, `approachUs`) and the re-timed meaning of its fields
+(`TickDriverWindow-rationale.md` §8). The driver passes the slack to `formatFrameLine` in every mode; the
+`Inline` and `FrameBounded` lines ignore it and stay byte-identical.
 
 ## §8 What the compiler and the checks hold
 
 * **Compile time:** each template parameter is constrained by its concept; the hooks satisfy `StepHooks`
   and the doors `DriverStepDoors` (both checked where the types are named); the member order is two
-  `static_assert`s (§2).
-* **`OG_CHECK`s** (each message names what it replaced): the four construction checks (§3); a full J1;
+  `static_assert`s (§2); `runAuthorityLoop` takes a `TickDriverRunnerHost` and requires
+  `TickDriverIdleGame<GameT>`, so a game without `idleUntil` instantiates every other member and cannot
+  call the loop; `isFiniteSeconds` is pinned by a third `static_assert` (§3).
+* **`OG_CHECK`s** (each message names what it replaced): the five construction checks (§3); a full J1;
   `endFrame` and `stop()` with the world lock held (G-05); an inline step off the owning thread; the
   occupancy door outside a step; the scheduler and the host time read off the owning thread; the scheduler
   reached before it was built; and a driver destroyed while a step task is still pending (call `stop()`
-  first).
+  first). For `FreeRunning`: the loop's three entry checks (the mode, the owner thread, not already
+  running) and its origin read below zero; `stop()` and the destructor while the loop runs; the
+  frame-thread pass run on the runner; the occupancy push and the world-lock note off the runner; and any
+  shadow restore.
 * **Allocation.** The driver's own state grows no container on the step path or the frame path: the rings
   are fixed, the batch is an array, the window's sample lists and line buffers are reserved at
-  construction. What its collaborators do is theirs and unchanged by the move: the scheduler keeps a
-  deadline history of at most 64 segments, the step driver a client's occupancy timeline, and the
-  executor stores the dispatched task (a lambda holding the batch) in whatever way the engine's executor
-  does.
+  construction, and the loop's and the idle's state is locals and atomics. What its collaborators do is
+  theirs and unchanged by the move: the scheduler keeps a deadline history of at most 64 segments, the step
+  driver a client's occupancy timeline, and the executor stores the dispatched task (a lambda holding the
+  batch) in whatever way the engine's executor does.
 
 ## §9 Tests
 
@@ -265,7 +325,166 @@ and manager call, clock read, executor dispatch, wait and deferral, task run, an
   step counts also equal a bare `SimulationScheduler` given the same host times with the rate set before
   the same frame's pump, and differ from one with the rate set a frame later.
 
-## §10 Provenance
+The `FreeRunning` cases run the loop on the test thread in virtual time (the fake engine's clock, which
+only the idle scripts and the fake runner host advance), unless they say otherwise. The fake kit's idle
+game and runner hosts are described in the test kit's own rationale.
+
+* `SimulationTickDriver.FreeRunning.WokenAtTheInlineFrameTimesItGivesTheInlineAuthoritysStepTrace`: the
+  600 jittered deltas of the Inline authority case, accumulated into wake times. The Inline arm runs them
+  after a leading `startFrame(0.0)`, which matches the loop's first pump at 0. With the clock reads, the log
+  lines, the idle and sleep calls and the post-physics hook filtered out, the two traces are equal event for
+  event, and so are the lost time and the host times handed to `beforePump`.
+* `SimulationTickDriver.FreeRunning.ADeadlineHonouringIdleRunsOneStepPerWakeAtItsDeadline`: 600 steps of
+  one per wake, each idle's deadline is the origin plus the next step's deadline, and the window line that
+  closes during the run (the driver is built at −1 s) reads `maxStepsPerFrame=1`, `lateUs=0.0/0.0/0.0` and
+  as many frames as steps.
+* `SimulationTickDriver.FreeRunning.ActivityWakesRePumpWithoutStepping`: activity every 3 ms; 600 steps,
+  none before its deadline, `activityWakes` equal to the activity returns, and one `beforePump` per idle
+  return.
+* `SimulationTickDriver.FreeRunning.TheSlackIdlesToTheApproachThenPollsToTheDeadline`: a 0.5 ms slack; each
+  idle starts at the deadline minus the slack and polls with deadlines at now until the deadline, no step is
+  early or more than one 50 µs pass late, and `approachUs` and `lateUs` have 600 samples.
+* `SimulationTickDriver.FreeRunning.AnUnavailableIdleSleepsOnTheRunnerHost`: one hook call and one runner
+  sleep to the same deadline per step, and `idleFallbacks` equal to the steps.
+* `SimulationTickDriver.FreeRunning.ThreeEarlyDeadlineReturnsFallBackToTheRunnerSleep`: three hook calls and
+  one sleep between steps, with `earlyWakes` and `idleFallbacks` counted.
+* `SimulationTickDriver.FreeRunning.AStalledRunnerCatchesUpToTheCapAndCountsTheRest`: a 2 s stall at cap 60
+  runs one batch of 60; the trace, the lost steps and the lost seconds equal the frame-host transcription's
+  for a 2 s frame.
+* `SimulationTickDriver.FreeRunning.AFrameThreadStallLeavesTheRunnersStepsOnePerWake`: `endFrame` runs on a
+  second thread at each wake except for 200 ms; the runner's `maxStepsPerFrame` stays 1, while an Inline
+  driver whose frame thread stalls for the same 200 ms runs at least 12 steps in one frame.
+* `SimulationTickDriver.FreeRunning.TheFrameThreadPassRunsOnlyOnPostPhysics`: the driver is built on a
+  runner thread; `startFrame` and `endFrame` from the test thread run one `onPostPhysics` per `endFrame`
+  and nothing else: no pump, no wait, no window sample, no line.
+* `SimulationTickDriver.FreeRunning.ThePresentClockIsReadableOffTheRunner`: from a second thread, 0 and
+  `dt` before the loop, the engine clock minus the origin at each wake, and `dt / 1.25` from the wake after
+  the game set that rate.
+* `SimulationTickDriver.FreeRunning.StopFromTheFrameThreadEndsTheLoopAndStopChecksIt`: real threads and
+  the real clock; the test thread waits for 5 steps, sets the stop flag, joins the runner and calls
+  `stop()`; no step runs after the join, and the first-step line reads `thread=runner`.
+* Hidden, run by hand: `SimulationTickDriver.FreeRunning.StopWhileTheLoopIsActiveIsRefused` (tag
+  `[TickDriverStopBeforeJoin]`) calls `stop()` from inside the loop and is expected to stop on its check;
+  `SimulationTickDriver.FreeRunning.Timing.LoopOverheadWithASpinPreciseIdle` (tag `[OGSimTiming]`) runs 601
+  steps on the real clock with a spinning idle and bounds the window's `lateUs` p99 at 100 µs. It is a
+  wall-clock bound, so it is never in the default run.
+
+## §10 The authority loop
+
+`runAuthorityLoop(runner, stopRequested)` is the whole frame of a `FreeRunning` driver. It runs on the
+runner, the thread that built the world host and the driver (§13):
+
+1. Three `OG_CHECK`s: the driver is `FreeRunning`; this thread is the role's owner; the loop is not already
+   running. The origin is read from `engine.nowSeconds()` and checked to be at least 0, because the present
+   clock reads a negative origin as "not started" (§12). Then `m_loopActive` is set and the origin is
+   published, both with release order.
+2. Until `stopRequested` reads true (acquire), each wake:
+   1. `t = engine.nowSeconds() − origin`, written to `m_hostTimeSeconds`;
+   2. `pumpAndRunSteps()`, the `Inline` branch unchanged: `beforePump(t, rate)`, J8, `pump(t)`, the batch,
+      one `noteLateness(t − deadline)` per step, `onFrameStepsDue`, `runBatch`, `afterInlineBatch`;
+   3. a wake that ran steps notes the period since the previous stepping wake (`noteFramePeriod`, from the
+      second one on) and `noteStartPhysics(steps, the pump and batch's duration)`; a wake without steps
+      notes neither, so `frames` counts stepping wakes;
+   4. J6 is drained into the window, and when the window is due by the engine clock it is logged and
+      restarted, with the same `logWindow` the post-physics pass uses;
+   5. the idle to the next deadline (§11).
+3. After the loop: `m_running = false`, then `m_loopActive = false` with release order.
+
+**Relative time.** Every comparison the loop and the idle make is in relative time: the engine clock minus
+the origin, against the scheduler's deadlines, which start at 0. The absolute `origin + deadline` is formed
+only as the idle hook's argument. Comparing absolute times would let a rounding residue (`origin + d` read
+back as one step below `d` after the subtraction) leave a wake at the deadline that pumps nothing; compared
+relatively, such a residue costs at most another pass of the idle.
+
+**Lateness.** Each step of a batch is noted as the pump time minus the step's deadline, in microseconds
+(`noteLateness`). It is never negative: `pump` runs only steps whose deadline is at or before the time it
+is given, so a wake at a deadline gives 0 and a late wake gives how late it was.
+
+**The first wake** pumps at t = 0, which runs step 0 (its deadline is 0). An Inline frame at host time 0
+does the same, which is why the equivalence case gives its Inline arm a leading `startFrame(0.0)`.
+
+**A runner stall** (the runner, not the frame thread) is caught up to the cap, `og.Sim.MaxCatchUpSteps`
+clamped to `[1, 240]` as in every mode, and the rest is counted as catch-up loss. No frame-time clamp
+hides it.
+
+**Per-frame hooks are per wake.** `onFrameStepsDue` and `afterInlineBatch` run once per stepping wake, on
+the runner, and `beforePump` once per wake. A game's per-frame sample point is a wake in this mode, and
+its hooks run on the runner, not on the frame thread.
+
+## §11 The idle
+
+`idleUntilNextDeadline` waits for the scheduler's next deadline (`nextDeadline()`, relative), with
+`approach = target − idleSlackSeconds`:
+
+1. **To the approach.** Call `idleUntil(origin + approach)`, then by its answer:
+   * `Activity`: note `activityWakes` and return to the loop, which wakes again: `beforePump` runs and no
+     step is due yet. The run of early returns ends with it.
+   * `Unavailable`: `runner.sleepUntil(origin + approach)`, note `idleFallbacks`, go to the poll.
+   * `Deadline` at or after the approach: go to the poll.
+   * `Deadline` before the approach: note `earlyWakes`. The third in a row
+     (`simulationTickDriver::kEarlyWakesBeforeFallback`) sleeps through the runner host to the approach and
+     notes `idleFallbacks` (`⛔G-07`); the first two call the hook again.
+2. **The poll.** Until the relative clock reaches the target, or `stopRequested` reads true: call
+   `idleUntil(now)`, with the absolute clock just read, which the hook contract makes one non-blocking pass
+   (`TickDriverConcepts-rationale.md` §8). A poll's answer is not counted: a poll is not a wait, and the
+   step that is due when the poll ends runs `beforePump` anyway.
+3. With a slack above 0, `noteApproach` gets the time from the end of step 1 to the end of the poll. Every
+   idle that reaches the poll gives one sample, the last one too when a stop cuts its poll short.
+
+**Why the bound.** The driver never relies on the hook to wait. A hook that returns at once (a failing
+socket reported as `Unavailable`, a timer that fires early and reports its deadline) would otherwise make
+the runner a busy loop. `Unavailable` sleeps at once; early `Deadline`s get two retries, then the sleep.
+`Activity` costs one pump and no step: work was done, so it is not a spin.
+
+**The slack.** With slack 0, the default, step 1 ends at the deadline itself, so the poll makes no call and
+nothing spins. A slack lets a host whose timer wakes late wake early instead and poll the rest; each poll
+is one pass of the hook, so inbound input is still handled as it arrives. The constructor keeps it finite
+and below one step.
+
+**Stop latency.** `stopRequested` is read before each wake and on each poll, not during step 1, so a stop
+takes effect within one idle: at most one step interval plus the slack after it is set, with a hook that
+honours its deadline.
+
+## §12 Doors off the runner
+
+In `FreeRunning` the runner owns the scheduler, the batch, J6's draining side and the window. The frame
+thread keeps queues and snapshots only. The doors, by thread:
+
+| member | thread in `FreeRunning` | rule |
+|---|---|---|
+| constructor, `runAuthorityLoop` | runner | the constructor's threading check; the loop's owner check |
+| `pushBodySlotOccupancy`, `noteWorldLockWait` | runner | `OG_CHECK` the owner thread: J1 has one producer, and the window is the runner's |
+| `noteShadowRestore` | none | refused by an `OG_CHECK`: a `FreeRunning` authority has no shadow world |
+| `hostNowSeconds()` | any | `engine.nowSeconds()` minus the origin, loaded with acquire order; 0 before the loop starts (origin `-1.0`) |
+| `stepIntervalSeconds()` | any | `dt` over J8, loaded with acquire order; `dt` before the first wake |
+| `tickOffset()`, `savesTicks()` | any | J3 is atomic; `savesTicks()` is fixed at construction |
+| `startFrame` | frame thread | returns at once |
+| `endFrame` | frame thread | `OG_CHECK` not the runner, then `onPostPhysics()` only (`⛔G-08`) |
+| `stop()`, destructor | frame thread, after the runner is joined | `OG_CHECK` that the loop has returned (§13) |
+| `getDiagnostics()` | runner, or after the join | the window and the scheduler have no synchronization |
+
+The two any-thread doors are the present clock: what a presenter on the frame thread reads to build its
+render clock. `hostNowSeconds()` reads the engine clock at the call, not at the last wake, so the engine's
+`nowSeconds()` must be safe to call from any thread in this mode. The origin is written once, before the
+first wake; J8 once per wake. Inline and `FrameBounded` keep their owning-thread doors, unchanged.
+
+## §13 The driver's part of start and stop
+
+**Start.** The host builds the world host on the runner (its `configure` marks the runner as the owner),
+constructs the driver there (the constructor takes the world lock, builds the step driver and logs the
+`[SimHost.Frame]` line), and calls `runAuthorityLoop` on the same thread. The driver neither starts nor owns
+the thread: the host chooses it, its priority, and the runner host's sleep.
+
+**Stop.** The frame thread stops calling `endFrame`, sets the stop flag and joins the runner; the loop
+returns at its next check (§11). Then the frame thread calls `stop()`, which `OG_CHECK`s that the loop is no
+longer active, clears `m_running` and waits for the handles, which `FreeRunning` never sets. The
+destructor makes the same check. The join orders the runner's last writes (`m_running`, the window, the
+scheduler) before the frame thread's reads, so the diagnostics are readable after it.
+
+**Which thread destroys.** The driver and the world host are destroyed on the frame thread after the join,
+or on the runner, never on a thread started later (`TickDriverThreadContext-rationale.md` §8).
+
+## §14 Provenance
 
 Transcribed from the engine-hosted frame host of the first game (its start of play, its start-of-physics
 and pump functions, its batch runner, its end-of-physics function, its post-physics pass and step-cost
@@ -284,5 +503,11 @@ Jolt host. The mapping:
   executor adds an owner check of its own);
 * the Jolt host's contact-line call after `runTick` → `worldHost.afterRunTick_Step`.
 
-The guards are the old frame host's six, with fresh ids (`SimulationTickDriver-guards.md`, "Provenance of
-the ids").
+The guards G-01 to G-06 are the old frame host's six, with fresh ids (`SimulationTickDriver-guards.md`,
+"Provenance of the ids").
+
+**2026-11-12, `FreeRunning`.** The authority loop, the idle, the frame-thread pass and the off-runner doors
+(§10 to §13) were added for a server authority that steps on a runner thread of its own, woken at the step
+deadlines on the engine clock. `FreeRunning` had been declared and refused by the constructor until then.
+G-01 and G-04 were restated per mode; G-07 and G-08 are new. The default modes' lines and traces are
+unchanged.

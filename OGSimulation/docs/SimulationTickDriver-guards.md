@@ -16,17 +16,21 @@ to a "Retired" section and its number is spent forever.
 true and actionable to a reader with no game engine and no other repository.
 
 The rules the compiler or a runtime check holds need no entry (rationale §8): the member order is two
-`static_assert`s; `FreeRunning`, an authority that is not `Inline`, and a role or threading that
-disagrees with the world host's thread context are refused by `OG_CHECK`s in the constructor; a full
-occupancy ring, both waits taken while the world lock is held, an inline step off the owning thread,
-the occupancy door outside a step, the scheduler and the host time read off the owning thread, and a
-driver destroyed with a step task outstanding are `OG_CHECK`s. That `beforePump` runs immediately
-before the pump, and that the block mode chooses this frame's task only under 1, are ordinary
-rationale (§3, §6), pinned by the tests: a reorder or a swapped pair of operands is not typed on a
-line a tag could cover.
+`static_assert`s; a `FreeRunning` client, a `FrameBounded` authority, a role or threading that disagrees
+with the world host's thread context, and an idle slack that is not finite or not in `[0, dt)` are
+refused by `OG_CHECK`s in the constructor; a full occupancy ring, both waits taken while the world lock
+is held, an inline step off the owning thread, the occupancy door outside a step, the scheduler and the
+host time read off the owning thread, and a driver destroyed with a step task outstanding are
+`OG_CHECK`s. In `FreeRunning`, the loop run in another mode, off the owner thread or twice, `stop()` and
+the destructor while the loop runs, the frame-thread pass run on the runner, the occupancy push and the
+world-lock note off the runner, and a shadow restore are `OG_CHECK`s too. That `beforePump` runs
+immediately before the pump, and that the block mode chooses this frame's task only under 1, are
+ordinary rationale (§3, §6), pinned by the tests: a reorder or a swapped pair of operands is not typed on
+a line a tag could cover.
 
-**Provenance of the ids.** These six guards are the successors, with fresh ids, of the six guards of the
-engine-hosted frame host this header was transcribed from (rationale §10). Each id here succeeds the
+**Provenance of the ids.** G-01 to G-06 are the successors, with fresh ids, of the six guards of the
+engine-hosted frame host this header was transcribed from (rationale §14). G-07 and G-08 are new with the
+`FreeRunning` mode and succeed nothing. Each of the first six ids succeeds the
 same number there: G-01 (the authority steps inline), G-02 (one per-frame call, before the steps, only
 when steps are due), G-03 (no `+ 1` on the frame's first tick), G-04 (the scheduler is pumped with the
 accumulated frame delta), G-05 (no wait while the world lock is held) and G-06 (one call after the
@@ -34,26 +38,32 @@ inline steps). The task that deletes the old frame host retires the old ids and 
 
 ---
 
-## G-01 — The authority steps inline: the inline-or-task choice is the configured threading, and nothing else
+## G-01 — The authority steps inline on its owning thread: the inline-or-task choice is the configured threading, and nothing else
 
 **Tag site:** `SimulationTickDriver.h`, in `pumpAndRunSteps`, immediately above
-`if (m_config.threading == StepThreading::Inline)`.
+`if (m_config.threading != StepThreading::FrameBounded)`.
 
-**The prohibition.** Do not dispatch an `Inline` batch to the executor, and do not key the choice between
-`runBatch` on this thread and `dispatchAfter` on anything but `m_config.threading`: not an engine's
-threading switch, not whether a worker thread exists, not a role read anywhere else. The threading is
-fixed at world build from the role (the authority always `Inline`; a client `FrameBounded` unless it
-chose to step inline), and the constructor checks it against the world host's thread context.
+**The prohibition.** Do not dispatch an `Inline` or a `FreeRunning` batch to the executor, and do not key
+the choice between `runBatch` on this thread and `dispatchAfter` on anything but `m_config.threading`: not
+an engine's threading switch, not whether a worker thread exists, not a role read anywhere else, and not
+`== StepThreading::Inline`, which sends `FreeRunning` to the executor. Per mode: `Inline` runs the batch
+here, on the frame thread; `FreeRunning` runs it here, on the runner, inside the authority loop; only
+`FrameBounded` dispatches. The threading is fixed at world build from the role (the authority `Inline` or
+`FreeRunning`; a client `FrameBounded` unless it chose to step inline), and the constructor checks it
+against the world host's thread context.
 
 **The consequence.** The authority's input release (`TickDriverStepHooks-guards.md` G-01) hands the
 game the inputs of the tick it is about to simulate, and the game delivers them into objects that
 belong to the owning thread. An authority step on a task thread touches them off that thread, and the
 inline access predicates of the world host's thread context, which accept the owning thread, no longer
-describe the thread that steps.
+describe the thread that steps. In `FreeRunning` the owning thread is the runner: a dispatched batch
+would run on an executor thread while the runner goes on to idle and pump, and nothing in the loop waits
+for it. `SimulationTickDriver.FreeRunning.WokenAtTheInlineFrameTimesItGivesTheInlineAuthoritysStepTrace`
+fails with the branch written as `== StepThreading::Inline`.
 
 **What breaks if the tag moves.** The branch is the only place a batch chooses its thread. The
-constructor refuses an authority that is not `Inline` and a threading that disagrees with the world
-host (both `OG_CHECK`s), but a new dispatch path typed elsewhere would bypass both.
+constructor refuses a `FrameBounded` authority and a threading that disagrees with the world host (both
+`OG_CHECK`s), but a new dispatch path typed elsewhere would bypass both.
 
 ## G-02 — `onFrameStepsDue` runs once per frame, before the frame's steps, and only in a frame with due steps
 
@@ -91,14 +101,16 @@ exactly the server tick plus one, because every earlier step has completed and p
 **What breaks if it moves.** It must stay after the batch is built and before both per-frame calls,
 which take it unchanged.
 
-## G-04 — The scheduler is pumped with the accumulated frame delta
+## G-04 — The pump time is the accumulated frame delta in `Inline` and `FrameBounded`, and the runner's engine clock in `FreeRunning`
 
-**Tag site:** `SimulationTickDriver.h`, in `pumpAndRunSteps`, immediately above
-`const uint32_t numSteps = scheduler.pump(m_hostTimeSeconds);`.
+**Tag site:** `SimulationTickDriver.h`, in `startFrame`, immediately above
+`m_hostTimeSeconds += frameDeltaSeconds;`.
 
-**The prohibition.** Do not pump with the engine clock (`nowSeconds`) or any time source other than
-`m_hostTimeSeconds`, which accumulates `startFrame`'s `frameDeltaSeconds` three statements above. The
-`beforePump` call between them hands the game the same value.
+**The prohibition.** In `Inline` and `FrameBounded`, do not set `m_hostTimeSeconds` here from the engine
+clock (`nowSeconds`) or from any source other than the accumulated `frameDeltaSeconds`. `pumpAndRunSteps`
+pumps `m_hostTimeSeconds`, and hands `beforePump` the same value, in every mode. In `FreeRunning`,
+`startFrame` returns before this statement and `runAuthorityLoop` sets the value from the engine clock
+minus the loop's origin: do not add frame deltas to it.
 
 **The consequence.** The engine's frame delta is what the engine's pause, its slow motion and its
 frame-time clamp act on: a paused world runs no frames and accumulates nothing, and a clamped hitch
@@ -107,10 +119,14 @@ catches up a hitch the engine meant to drop. The render clock reads the same tim
 (`hostNowSeconds` returns `m_hostTimeSeconds`, and the step deadlines come from this scheduler), so a
 second clock would also drift the render interpolation from the deadlines.
 `SimulationTickDriver.Inline.AnAuthoritySessionMatchesTheFrameHostTranscription` fails when the pump
-reads the engine clock.
+reads the engine clock. In `FreeRunning` the runner wakes at the deadlines on the engine clock, and the
+idle deadlines, the step hooks' stamps and the present clock read that clock: frame deltas would stop the
+pump whenever the frame thread stalls, the stall the mode exists to isolate the steps from, and would
+drift the pump from the deadlines the runner idles to.
 
-**What breaks if it moves.** The accumulation, `beforePump` and the pump stay together in this order, on
-the owning thread, after `m_blockingSteps` captures the earlier frames' task.
+**What breaks if it moves.** The accumulation stays in `startFrame`, after the `FreeRunning` return and
+before `pumpAndRunSteps`, on the owning thread; inside `pumpAndRunSteps`, `beforePump` and then the pump
+read it, after `m_blockingSteps` captures the earlier frames' task.
 
 ## G-05 — The owning thread never waits for a step task while it holds the world lock
 
@@ -145,3 +161,40 @@ fails with the call made per step.
 
 **What breaks if it moves.** It must stay inside the `Inline` branch, after `runBatch`: in `FrameBounded`
 the batch has not run when `pumpAndRunSteps` returns.
+
+## G-07 — An early return from the idle hook falls back to the runner's sleep on the third in a row
+
+**Tag site:** `SimulationTickDriver.h`, in `idleUntilNextDeadline`, immediately above
+`if (++earlyReturns == simulationTickDriver::kEarlyWakesBeforeFallback)`.
+
+**The prohibition.** Do not loop back into `idleUntil` without the runner sleep: do not delete this
+fallback, and do not change its condition so that it never fires.
+
+**The consequence.** A hook that returns `Deadline` before the deadline, and keeps doing so (a timer that
+fires early, a hook that cannot wait and says so as a deadline), makes the runner a busy loop: one hook
+call per pass, a full core, until the approach point. `runner.sleepUntil` is the one wait the driver can
+rely on. `SimulationTickDriver.FreeRunning.ThreeEarlyDeadlineReturnsFallBackToTheRunnerSleep` fails with
+the fallback removed: with a hook that advances 1 µs per early return, a step takes 16,667 calls instead
+of three.
+
+**What breaks if it moves.** It must stay inside the idle's loop, after the early-wake note, so that it
+counts consecutive early `Deadline` returns: `Activity` returns to the loop and `Unavailable` sleeps before
+it is reached, and a `Deadline` at or after the approach leaves the loop.
+
+## G-08 — The `FreeRunning` frame-thread pass runs the post-physics hook and nothing else
+
+**Tag site:** `SimulationTickDriver.h`, in `endFrame`'s `FreeRunning` branch, immediately above
+`m_game->onPostPhysics();`.
+
+**The prohibition.** Do not pump, drain J6 or touch the window here: not through `runPostPhysics`,
+`pumpAndRunSteps`, `drainStepCosts` or `logWindow`, and not by noting anything in `m_window`.
+
+**The consequence.** In `FreeRunning` the runner owns the scheduler, the draining side of J6 and the
+window, and it uses them while this pass runs on the frame thread. A pump here stops on the scheduler's
+owner check; a J6 drain makes the frame thread a second consumer of a single-consumer ring; a window note
+races the runner's notes and restarts. `SimulationTickDriver.FreeRunning.TheFrameThreadPassRunsOnlyOnPostPhysics`
+fails with `runPostPhysics` here (a post-physics sample per frame in a window that must stay empty), and
+stops on the scheduler's owner check with a pump here.
+
+**What breaks if it moves.** It must stay inside the `FreeRunning` branch, after its owner check and
+before its `return`; the default modes' post-physics pass below the branch is unchanged.

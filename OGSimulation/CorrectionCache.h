@@ -138,6 +138,13 @@ struct CorrectionInsertVerdict
     // may ever branch on it, or the shipped build's behaviour starts depending on
     // the log verbosity. §13
     FieldDivergence fieldDivergence;
+
+    // HOW CLOSE THE VERDICT CAME TO THE TOLERANCE (og-input-latency task 2h). §14
+    //
+    // ⛔ A SECOND WALK WITH ITS OWN GATE, on agreeing verdicts too. `evaluated` is
+    // false unless an observer asked and `correctionVerdictMargin::enabled()` held.
+    // REPORTING ONLY, like `fieldDivergence`. §14
+    VerdictMargin verdictMargin;
 };
 
 // ---------------------------------------------------------------------------
@@ -763,6 +770,18 @@ public:
 				describeFirstDivergingField(m_stateBuffer[cacheIndex], state, fieldDivergence);
 			}
 
+			// THE MARGIN WALK'S GATE (og-input-latency task 2h). §14
+			//
+			// ⛔ NO VERDICT TEST: the margin is asked on EVERY landed verdict, agreeing
+			// ones above all. Ahead of the call and before the `std::move`, for the
+			// diff's reasons; `Network/VerdictMarginTest.cpp` counts it. §14
+			VerdictMargin verdictMargin;
+			if (outDiagnosticVerdict != nullptr
+				&& correctionVerdictMargin::enabled())
+			{
+				measureVerdictMargin(m_stateBuffer[cacheIndex], state, verdictMargin);
+			}
+
 			m_containsCorrectTick.set(cacheIndex);
 			m_predictionWasCorrect[cacheIndex] = predictionWasCorrect;
 
@@ -808,6 +827,7 @@ public:
 			{
 				*outDiagnosticVerdict = CorrectionInsertVerdict{ true, predictionWasCorrect, tick };
 				outDiagnosticVerdict->fieldDivergence = fieldDivergence;
+				outDiagnosticVerdict->verdictMargin = verdictMargin;
 			}
 
 			if (!predictionWasCorrect)

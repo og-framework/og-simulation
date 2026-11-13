@@ -80,10 +80,11 @@ concept SimulationNetSyncTickConcept = requires(
 
 template <typename T>
 concept SimulationNetSyncPublishConcept = requires(
-    T& t, const SimulationTimeStep& step, uint32_t tick, int32_t correctionRotationK)
+    T& t, const SimulationTimeStep& step, uint32_t tick, int32_t correctionRotationK,
+    int32_t redundancyFrames)
 {
     { t.sendCorrectionAll(step, correctionRotationK) };
-    { t.sendLocalInputToAuthorityAll(tick, tick) };
+    { t.sendLocalInputToAuthorityAll(tick, tick, redundancyFrames) };
 };
 
 // ⛔ The resolution tick group, presence-only for the same reason; `wipeAllForResync` is in it. §2
@@ -173,11 +174,11 @@ concept SimulationSystemsExecutorConcept = requires(
 //     `prepareResimulation` also writes the restored bodies into the host's
 //     already-restored world (the integration executor's push).
 //
-//   * ⛔ THE `TimeConfig` RE-READ RULE, AND ITS SCOPE IS ALL THREE VALUES. This
+//   * ⛔ THE `TimeConfig` RE-READ RULE, AND ITS SCOPE IS ALL FOUR VALUES. This
 //     class is the sole reader-and-hander-down of `TimeConfig` into the peers,
 //     so the rule holds here or nowhere: the depth fold off `resimTriggerPolicy`,
-//     `correctionRotationK` and `redundancyDepthTicks` are ALL read live on every
-//     call and passed down as arguments. Caching any of them in a peer makes an
+//     `correctionRotationK`, `redundancyDepthTicks` and `redundancyFrames` are ALL
+//     read live on every call and passed down as arguments. Caching any of them in a peer makes an
 //     ini-driven setting silently ineffective. §4
 //
 //   * ⛔ THE RESIM TRIGGER POLICY IS **TWO SEPARATE FACTS**. They differ, and
@@ -321,6 +322,24 @@ public:
     void setCorrectionRotationK(int32_t requestedK)
     {
         m_timeConfig.correctionRotationK = correctionRotation::clampK(requestedK);
+    }
+
+    // ⛔ THE one writable location for the redundancy window in frames — the
+    // `[OGNetcode] RedundancyFrames` ini door. §13
+    //
+    // ⛔ CLAMPED HERE TOO, `latencyKnobs::clampRedundancyFrames`. 0 keeps `redundancyDepthTicks`. §13
+    void setRedundancyFrames(int32_t requestedFrames)
+    {
+        m_timeConfig.redundancyFrames = latencyKnobs::clampRedundancyFrames(requestedFrames);
+    }
+
+    // ⛔ THE one writable location for the relay re-send count — the
+    // `[OGNetcode] RelayResendEntries` ini door. §13
+    //
+    // ⛔ CLAMPED HERE TOO, `latencyKnobs::clampRelayResendEntries`. 0 is today's flush. §13
+    void setRelayResendEntries(int32_t requestedEntries)
+    {
+        m_timeConfig.relayResendEntries = latencyKnobs::clampRelayResendEntries(requestedEntries);
     }
 
     // ⛔ THE one writable location for the session resim-gate trigger policy — the
@@ -592,12 +611,14 @@ public:
         requires SimulationNetSyncPublishConcept<NetSyncT>
     {
         const SimulationTimeStep step = currentStep();
-        // ⛔ BOTH VALUES ARE READ LIVE FROM `TimeConfig` AND HANDED DOWN — the rotation width
-        // `correctionRotationK`, and `redundancyDepthTicks` (3 at 60 Hz, 5 at 100 Hz). Caching
-        // either in a peer makes an ini-driven setting silently ineffective. §4
+        // ⛔ ALL THREE VALUES ARE READ LIVE FROM `TimeConfig` AND HANDED DOWN — the rotation width
+        // `correctionRotationK`, `redundancyDepthTicks` (3 at 60 Hz, 5 at 100 Hz) and
+        // `redundancyFrames` (0 = today's depth). Caching any in a peer makes an ini-driven
+        // setting silently ineffective. §4 §14
         m_netSync.sendCorrectionAll(step, m_timeConfig.correctionRotationK);
         m_netSync.sendLocalInputToAuthorityAll(
-            step.getTick(), static_cast<uint32>(m_timeConfig.redundancyDepthTicks));
+            step.getTick(), static_cast<uint32>(m_timeConfig.redundancyDepthTicks),
+            m_timeConfig.redundancyFrames);
     }
 
     // Character-lifecycle notifications — forwarded to the systems executor for its own
@@ -857,7 +878,8 @@ namespace simulationManagerConceptProof
     struct NetSyncShaped
     {
         void sendCorrectionAll(const SimulationTimeStep&, int32 /*correctionRotationK*/) {}
-        void sendLocalInputToAuthorityAll(uint32 /*tick*/, uint32 /*redundancyDepth*/) {}
+        void sendLocalInputToAuthorityAll(uint32 /*tick*/, uint32 /*redundancyDepth*/,
+                                          int32 /*redundancyFrames*/) {}
         void setAuthorityGuardContext(uint32 /*tick*/, int32 /*rollbackWindow*/) {}
     };
 

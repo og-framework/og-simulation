@@ -253,6 +253,15 @@ struct TimeConfig
 	// ⛔ That tick rate is the host's physics timestep, set OUTSIDE this library. §9
 	int32_t redundancyDepthTicks = 3;
 
+	// The redundancy window counted in client FRAMES (sends) rather than ticks, so a
+	// client that steps several ticks per frame still re-sends its last few frames.
+	// ⛔ 0 IS "TODAY", NOT "OFF": the bundle keeps exactly `redundancyDepthTicks`. §12
+	// ⛔ CLAMPED to [0, kMaxRedundancyFrames] by `latencyKnobs::clampRedundancyFrames`
+	// at the intake and at the setter. §12
+	// Read by `SimulationManager::onPostSimulationGameThread`, which hands it to
+	// `SimulationNetSync::sendLocalInputToAuthorityAll` (og-input-latency task 7). §12
+	int32_t redundancyFrames = 0;
+
 	// -------------------------------------------------------------------------
 	// Outbound input relay — the per-character ring of recently captured inputs
 	// the authority replicates on to the other peers
@@ -293,6 +302,15 @@ struct TimeConfig
 	//
 	// If a depth knob is ever reintroduced here, argue against this block, not
 	// merely against its absence.
+
+	// How many already-flushed relay entries the authority re-includes in each flush
+	// that has new entries — the differently-named successor the block above names.
+	// ⛔ IT IS NOT A DEPTH AND NEVER SIZES THE FLUSH STAGE: that capacity stays
+	// `relayedInputRing::kMaxDepth` (the trap in the block above). §12
+	// ⛔ CLAMPED to [0, kMaxRelayResendEntries] by `latencyKnobs::clampRelayResendEntries`
+	// at the intake and at the setter. 0 is today's flush. §12
+	// ⚠ NO PRODUCTION READER YET: the flush that re-sends is not built. §12
+	int32_t relayResendEntries = 0;
 
 	// THE FLOOR LEVER — the session-scoped minimum effective Layer-1 input delay,
 	// in ticks. §7
@@ -429,6 +447,17 @@ struct TimeConfig
 	bool lanZeroDelayOverride = false;
 
 	// -------------------------------------------------------------------------
+	// Back-dating detection (og-input-latency P3)
+	// -------------------------------------------------------------------------
+
+	// The `ArrivalMarginSignal::m0P50Ticks` below which a wire's window counts
+	// toward a back-dating episode: m0 is the arrival margin without the delay. §13
+	// ⛔ DETECT ONLY: crossing it must never refuse, delay or flag an input. §13
+	// Read by `ServerReceptionCoordinator`'s constructor, which passes it to its
+	// `InputArrivalMargin`, the detector (og-input-latency P3-6). §10 §13
+	int32_t backDateM0P50ThresholdTicks = -5;
+
+	// -------------------------------------------------------------------------
 	// OBSERVABILITY — FIELDS ONLY, NO RUNTIME CONSUMER IN THIS LIBRARY YET
 	//
 	// ⛔ EVERY CONSTANT THE DESIGN NAMES MUST EXIST AS A FIELD HERE BEFORE ITS CONSUMER
@@ -513,3 +542,38 @@ struct TimeConfig
 	// ⛔ The field is here so the ring-log reads it instead of hardcoding a literal. §10
 	int32_t hashLogRingCapacity = 600;
 };
+
+// The shared, idempotent clamps of the two latency knobs: the ini intake and the
+// manager's setters call the same function, so the two can never disagree. §12
+namespace latencyKnobs
+{
+	inline constexpr int32_t kMinRedundancyFrames   = 0;
+	inline constexpr int32_t kMaxRedundancyFrames   = 8;
+	inline constexpr int32_t kMinRelayResendEntries = 0;
+	inline constexpr int32_t kMaxRelayResendEntries = 2;
+
+	constexpr int32_t clampRedundancyFrames(int32_t requestedFrames)
+	{
+		if (requestedFrames < kMinRedundancyFrames) return kMinRedundancyFrames;
+		if (requestedFrames > kMaxRedundancyFrames) return kMaxRedundancyFrames;
+		return requestedFrames;
+	}
+
+	constexpr int32_t clampRelayResendEntries(int32_t requestedEntries)
+	{
+		if (requestedEntries < kMinRelayResendEntries) return kMinRelayResendEntries;
+		if (requestedEntries > kMaxRelayResendEntries) return kMaxRelayResendEntries;
+		return requestedEntries;
+	}
+} // namespace latencyKnobs
+
+static_assert(latencyKnobs::clampRedundancyFrames(TimeConfig{}.redundancyFrames) == TimeConfig{}.redundancyFrames,
+	"TimeConfig::redundancyFrames' compiled default must lie inside its own clamp, or the setter would "
+	"silently move a value nobody configured (og-input-latency task 4).");
+static_assert(latencyKnobs::clampRelayResendEntries(TimeConfig{}.relayResendEntries) == TimeConfig{}.relayResendEntries,
+	"TimeConfig::relayResendEntries' compiled default must lie inside its own clamp, or the setter would "
+	"silently move a value nobody configured (og-input-latency task 4).");
+static_assert(TimeConfig{}.backDateM0P50ThresholdTicks < 0,
+	"TimeConfig::backDateM0P50ThresholdTicks must be below 0: an honest session's m0 p50 sits at about 0 in steady "
+	"state, and the clock's dead band lets it fall a few ticks below, so a threshold at or above 0 flags honest "
+	"sessions (og-input-latency P3-1).");

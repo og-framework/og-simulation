@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MPL-2.0
 // docs/SimulationTickBackend-rationale.md · docs/SimulationTickBackend-guards.md
 
+#include <atomic>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
@@ -10,6 +11,7 @@
 #include <utility>
 
 #include "OGSimulation/BodySlotOccupancy.h"
+#include "OGSimulation/Mailbox.h"
 #include "OGSimulation/OGAssert.h"
 #include "OGSimulation/QueryGeometry.h"
 #include "OGSimulation/SimulationTickDriver.h"
@@ -145,6 +147,25 @@ static_assert(!TickBackendWorldBuild<Conforming, std::optional<long>>,
 	"TickBackendWorldBuild self-check: the adapter optionals are the world host's own adapter types");
 } // namespace tickBackendWorldHostSelfCheck
 
+struct AuthorityLoopConfig
+{
+	double  dtSeconds;
+	int32_t requestedMaxCatchUpSteps;
+	double  idleSlackSeconds = 0.0;
+};
+
+namespace simulationTickBackend
+{
+inline constexpr size_t kPresenterRegistrationCapacity = 64u;
+
+struct PresenterRegistration
+{
+	unsigned int id         = 0u;
+	uint32_t     slot       = 0u;
+	bool         registered = false;
+};
+} // namespace simulationTickBackend
+
 template <TickDriverGame GameT, typename WorldHostT, typename SimulatableT, TickDriverEngine EngineT>
 	requires TickBackendWorldHost<WorldHostT, SimulatableT>
 class SimulationTickBackend
@@ -180,12 +201,16 @@ public:
 		, m_engine(engine)
 		, m_renderSource(*this)
 	{
-		static_assert(__builtin_offsetof(SimulationTickBackend, m_renderSource) < __builtin_offsetof(SimulationTickBackend, m_presenter)
+		static_assert(__builtin_offsetof(SimulationTickBackend, m_renderSource)
+				< __builtin_offsetof(SimulationTickBackend, m_presenterRegistrations)
+			&& __builtin_offsetof(SimulationTickBackend, m_presenterRegistrations) < __builtin_offsetof(SimulationTickBackend, m_presenter)
 			&& __builtin_offsetof(SimulationTickBackend, m_presenter) < __builtin_offsetof(SimulationTickBackend, m_driver),
 			"SimulationTickBackend members destruct in REVERSE declaration order. The driver holds the presenter by pointer, "
 			"and its step driver unregisters its resync callback from the game's manager when it goes; the presenter holds the "
-			"render source by reference. Keep m_renderSource < m_presenter < m_driver. Was the presenter < driver and render "
-			"source < presenter rows of the engine-hosted backend");
+			"render source by reference; the presenter registration ring (J9) holds the registrations a FreeRunning runner "
+			"pushed for the presenter, so it outlives the presenter and the driver. Keep m_renderSource < "
+			"m_presenterRegistrations < m_presenter < m_driver. Was the presenter < driver and render source < presenter rows "
+			"of the engine-hosted backend");
 	}
 
 	SimulationTickBackend(const SimulationTickBackend&) = delete;
@@ -199,7 +224,7 @@ public:
 		m_worldHost.build(config, queryableStatics, physicsOnlyStatics, adapterOptionals...);
 	}
 
-	Driver& start(double dtSeconds, bool isAuthority, int32_t requestedMaxCatchUpSteps)
+	Driver& start(double dtSeconds, bool isAuthority, int32_t requestedMaxCatchUpSteps, double idleSlackSeconds = 0.0)
 	{
 		m_worldHost.bindIntegratedTickSource(m_game.manager());
 		m_presenter.emplace(m_engine, m_renderSource, TickDriverPresenterConfig{ m_game.manager().runsPrediction(),
@@ -208,10 +233,33 @@ public:
 			"SimulationTickBackend::start: m_presenter has no value when the driver is built. The driver holds the presenter "
 			"by pointer from its constructor on, so the presenter is emplaced first. Was the order of the engine-hosted "
 			"backend's start of stepping");
-		m_driver.emplace(m_game, m_worldHost, *m_presenter, m_engine, typename Driver::Config{ dtSeconds, isAuthority,
-			m_worldHost.threadContext().stepsInline() ? StepThreading::Inline : StepThreading::FrameBounded,
-			requestedMaxCatchUpSteps });
+		typename Driver::Config driverConfig{ dtSeconds, isAuthority, m_worldHost.threadContext().threading(),
+			requestedMaxCatchUpSteps };
+		driverConfig.idleSlackSeconds = idleSlackSeconds;
+		m_driver.emplace(m_game, m_worldHost, *m_presenter, m_engine, driverConfig);
 		return *m_driver;
+	}
+
+	template <TickDriverRunnerHost RunnerT, typename AfterBuildF, typename AfterStartF, typename... AdapterOptionalTs>
+		requires TickDriverIdleGame<GameT> && TickBackendWorldBuild<WorldHostT, AdapterOptionalTs...>
+	void runAuthorityLoop(const typename WorldHostT::Config& worldConfig, StaticWorldDescription queryableStatics,
+		StaticWorldDescription physicsOnlyStatics, const AuthorityLoopConfig& loopConfig, RunnerT& runner,
+		const std::atomic<bool>& stopRequested, AfterBuildF&& afterBuild, AfterStartF&& afterStart,
+		AdapterOptionalTs&... adapterOptionals)
+	{
+		{
+			const StaticWorldDescription queryable   = std::move(queryableStatics);
+			const StaticWorldDescription physicsOnly = std::move(physicsOnlyStatics);
+			build(worldConfig, queryable, physicsOnly, adapterOptionals...);
+		}
+		OG_CHECK(m_worldHost.threadContext().threading() == StepThreading::FreeRunning,
+			"SimulationTickBackend::runAuthorityLoop: the world host was not built FreeRunning. The authority loop runs on the "
+			"runner that built the world host, and only a FreeRunning build makes the runner the owner thread");
+		afterBuild();
+		Driver& tickDriver = start(loopConfig.dtSeconds, true, loopConfig.requestedMaxCatchUpSteps, loopConfig.idleSlackSeconds);
+		afterStart(tickDriver);
+		if (!stopRequested.load(std::memory_order_acquire))
+			tickDriver.runAuthorityLoop(runner, stopRequested);
 	}
 
 	void stop()
@@ -224,6 +272,9 @@ public:
 	bool acquireAndBind(uint64_t key, const char* name, bool isAuthority, std::optional<uint32_t> replicatedSlot,
 		PublishF&& publish, unsigned int id, SimulatableT& simulatable, const StaticDataT& staticData)
 	{
+		OG_CHECK(!freeRunning() || m_worldHost.threadContext().isOwnerThreadForRole(),
+			"SimulationTickBackend::acquireAndBind: a free-running authority binds on its runner; the game thread reaches it "
+			"through queues only");
 		const std::optional<uint32_t> slot = m_worldHost.acquire(key, name, isAuthority, replicatedSlot, publish);
 		if (!slot.has_value())
 			return false;
@@ -235,44 +286,67 @@ public:
 
 	void onRegistered(unsigned int id, uint64_t key)
 	{
+		OG_CHECK(!freeRunning() || m_worldHost.threadContext().isOwnerThreadForRole(),
+			"SimulationTickBackend::onRegistered: a free-running authority registers on its runner; the presenter hears of it "
+			"through the registration ring (J9), drained by present()");
 		const std::optional<uint32_t> slot = m_worldHost.slotOf(key);
 		OG_CHECK(slot.has_value(),
 			"SimulationTickBackend::onRegistered: slotOf(key) has no value: the id is Ready but its owner holds no slot; the "
 			"first pass binds one. Was the engine-hosted backend's registration check");
 		driver().pushBodySlotOccupancy(*slot, true);
-		presenter().onRegistered(id, *slot);
+		toPresenter(simulationTickBackend::PresenterRegistration{ id, *slot, true });
 	}
 
 	void forgetPresenterTarget(unsigned int id, uint64_t key)
 	{
+		OG_CHECK(!freeRunning() || m_worldHost.threadContext().isOwnerThreadForRole(),
+			"SimulationTickBackend::forgetPresenterTarget: a free-running authority unregisters on its runner; the presenter "
+			"hears of it through the registration ring (J9), drained by present()");
 		if (m_presenter.has_value())
-			m_presenter->onUnregistered(id, m_worldHost.slotOf(key).value_or(0u));
+			toPresenter(simulationTickBackend::PresenterRegistration{ id, m_worldHost.slotOf(key).value_or(0u), false });
 	}
 
 	void releaseSlot(uint64_t key, unsigned int id)
 	{
+		OG_CHECK(!freeRunning() || m_worldHost.threadContext().isOwnerThreadForRole(),
+			"SimulationTickBackend::releaseSlot: a free-running authority releases on its runner; the game thread reaches it "
+			"through queues only");
 		m_worldHost.release(key, id, [this](uint32_t slot, bool occupied) { driver().pushBodySlotOccupancy(slot, occupied); });
 	}
 
 	template <typename SinkT>
 	void present(const PresentControls& controls, SinkT& sink)
 	{
+		if (freeRunning())
+			drainPresenterRegistrations();
 		presenter().present_GameThread(driver(), controls, sink, m_worldHost);
 	}
 
 	void updateVisualization()
 	{
+		OG_CHECK(!freeRunning(),
+			"SimulationTickBackend::updateVisualization: a free-running authority has no game-thread viz world");
 		presenter().updateVisualization_GameThread(m_game.storage());
 	}
 
-	decltype(auto) editVizQuery() { return m_worldHost.editVizQuery(); }
+	decltype(auto) editVizQuery()
+	{
+		OG_CHECK(!freeRunning(), "SimulationTickBackend::editVizQuery: a free-running authority has no game-thread viz world");
+		return m_worldHost.editVizQuery();
+	}
 
-	decltype(auto) getVizReader() const { return m_worldHost.getVizReader(); }
+	decltype(auto) getVizReader() const
+	{
+		OG_CHECK(!freeRunning(), "SimulationTickBackend::getVizReader: a free-running authority has no game-thread viz world");
+		return m_worldHost.getVizReader();
+	}
 
 	template <typename PublishF>
 	std::optional<QueryVolumeId> registerVizVolume(const QueryVolumeDescriptor& descriptor, uint64_t key, const char* name,
 		bool isAuthority, std::optional<uint32_t> replicatedSlot, PublishF&& publish)
 	{
+		OG_CHECK(!freeRunning(),
+			"SimulationTickBackend::registerVizVolume: a free-running authority has no game-thread viz world");
 		return m_worldHost.registerVizVolume(descriptor, key, name, isAuthority, replicatedSlot,
 			std::forward<PublishF>(publish));
 	}
@@ -294,10 +368,44 @@ public:
 	}
 
 private:
+	using PresenterRegistrations =
+		SpscRing<simulationTickBackend::PresenterRegistration, simulationTickBackend::kPresenterRegistrationCapacity>;
+
+	bool freeRunning() const { return m_worldHost.threadContext().threading() == StepThreading::FreeRunning; }
+
+	void toPresenter(const simulationTickBackend::PresenterRegistration& registration)
+	{
+		// ⛔G-01  docs/SimulationTickBackend-guards.md
+		if (freeRunning())
+		{
+			[[maybe_unused]] const bool pushed = m_presenterRegistrations.tryPush(registration);
+			OG_CHECK(pushed,
+				"SimulationTickBackend: the presenter registration ring (J9) is full; the registration would be lost and the "
+				"presenter would keep the wrong render targets. present() has not drained it");
+			return;
+		}
+		applyToPresenter(registration);
+	}
+
+	void applyToPresenter(const simulationTickBackend::PresenterRegistration& registration)
+	{
+		if (registration.registered)
+			presenter().onRegistered(registration.id, registration.slot);
+		else
+			presenter().onUnregistered(registration.id, registration.slot);
+	}
+
+	void drainPresenterRegistrations()
+	{
+		while (const std::optional<simulationTickBackend::PresenterRegistration> registration = m_presenterRegistrations.tryPop())
+			applyToPresenter(*registration);
+	}
+
 	GameT&                   m_game;
 	WorldHostT&              m_worldHost;
 	EngineT&                 m_engine;
 	RenderSource             m_renderSource;
+	PresenterRegistrations   m_presenterRegistrations;
 	std::optional<Presenter> m_presenter;
 	std::optional<Driver>    m_driver;
 };

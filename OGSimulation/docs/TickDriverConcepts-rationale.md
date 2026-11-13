@@ -1,10 +1,10 @@
 <!-- SPDX-License-Identifier: MPL-2.0 -->
 # `TickDriverConcepts.h` — rationale
 
-The narrative behind `StepThreading`, `TickRateDoor` and the five tick-driver concepts:
-`TickDriverEngine`, `TickDriverGame`, `TickDriverPresenterSteps`, `TickDriverWorldHost` and
-`TickDriverRenderSink`. The header keeps its licence, its docs pointer, its code and its self-check
-`static_assert`s; everything that explains it lives here. It has no guards (`TickDriverConcepts-guards.md`
+The narrative behind `TickRateDoor`, `IdleWake` and the seven tick-driver concepts:
+`TickDriverEngine`, `TickDriverGame`, `TickDriverIdleGame`, `TickDriverPresenterSteps`, `TickDriverWorldHost`,
+`TickDriverRenderSink` and `TickDriverRunnerHost`, and the helper concept `OptionalVec3Result` (§5). The header keeps its licence,
+its docs pointer, its code and its self-check `static_assert`s; everything that explains it lives here. It has no guards (`TickDriverConcepts-guards.md`
 says why): every rule it carries is a `static_assert`.
 
 **If this file and `TickDriverConcepts.h` disagree, the header is authoritative and this file is stale.**
@@ -34,6 +34,10 @@ constrain the step driver:
 A fifth concept, `TickDriverRenderSink`, is the engine side of the render path: the presenter writes
 poses into it (§5). The collaborators are template parameters, never `std::function`, so calling them
 adds no indirect call to the step path.
+
+Two more concepts serve the `FreeRunning` mode, where a runner thread of its own pumps and steps (§8):
+`TickDriverIdleGame` refines `TickDriverGame` with the hook the runner waits in, and `TickDriverRunnerHost`
+supplies the runner's fallback sleep.
 
 The driver that uses these concepts is not in this header. This file states what each requirement is
 for; the driver's own documentation states when it calls each one.
@@ -107,22 +111,38 @@ unit suffix; the sink converts to engine units.
 - `readAnchor(id)`: the position the engine holds now, without writing; empty when there is no target;
 - `name(id)`: the id's display name, for log lines.
 
+**`OptionalVec3Result`.** Both position returns are checked by one helper concept: the type is not `void`, **and then**
+it converts to `std::optional<glm::vec3>`. The `void` test has to come first. The `ApplyReturnsVoid` self-check (§6)
+makes the compiler check a `void` return, and the libc++ of Android NDK r27c (clang 18.0.3) fails
+`std::convertible_to<void, std::optional<glm::vec3>>` with a hard error inside `<optional>` ("cannot form a reference
+to 'void'") instead of answering `false`. A concept's `&&` checks its left operand first and does not check the right
+one when the left is not satisfied, so for `void` the conversion is never formed. The MSVC STL answers `false`, so an
+MSVC build accepts the requirement with the `void` test dropped or placed second; only a libc++ compile of this header
+then fails, in every translation unit that includes it. All four spellings were compiled on 2026-11-13: the NDK's
+clang++ with libc++ (`--target=aarch64-linux-android26 -std=c++20`) and clang-cl with the MSVC STL.
+
 ## §6 What the self-checks pin
 
 Each concept has a `<concept>SelfCheck` namespace with one conforming shape and at least two
-non-conforming ones. Every negative shape declares every member of the conforming shape except the one
-property it names, so each assertion stays tied to that property.
+non-conforming ones. Every negative shape declares (or inherits) every member of the conforming shape
+except the one property it names, so each assertion stays tied to that property.
 
 - `tickDriverEngineSelfCheck`: a non-constant `kHostDiagnostics`, a missing `deferUntil`, a non-const
   clock and a move-only `Handle` are refused;
 - `tickDriverGameSelfCheck`: a missing `beforePump`, a missing `afterInlineBatch`, a hook returning
   `bool` and a manager returned by value are refused;
+- `tickDriverIdleGameSelfCheck`: every shape derives from `tickDriverGameSelfCheck::Conforming`, so it is
+  a `TickDriverGame` and differs from the reference only in `idleUntil`. A game without `idleUntil` is
+  refused as an idle game and is still a `TickDriverGame`; an `idleUntil` returning `void` is refused;
 - `tickDriverPresenterStepsSelfCheck`: a missing `captureCorrection_Step` and a `publish_Step` taking a
   mutable outcome are refused;
 - `tickDriverWorldHostSelfCheck`: a missing `threadContext`, a mutable `threadContext`, a `void`
   `lockForStep` and a `World` that is not a `PhysicsWorldAdapter` are refused;
 - `tickDriverRenderSinkSelfCheck`: a sink returning a plain `glm::vec3` is accepted; a missing `name`, a
-  `void` `applyRootPose` and a non-const `readAnchor` are refused.
+  `void` `applyRootPose` and a non-const `readAnchor` are refused. The `void` shape also checks
+  `OptionalVec3Result`'s order, but only under libc++: there the header does not compile when the `void` test is
+  dropped or comes second (§5). Under the MSVC STL it compiles either way;
+- `tickDriverRunnerHostSelfCheck`: a missing `sleepUntil` and a `sleepUntil` returning `bool` are refused.
 
 `BasicLockable` is in `TickDriverThreadContext.h`, with its own self-check.
 
@@ -135,10 +155,47 @@ door is used only on the scheduler's owning thread, which is where `beforePump` 
 
 `StepThreading` names the three ways a driver can run its steps: `Inline` (on the thread that pumps),
 `FrameBounded` (on an engine task, waited for within the frame) and `FreeRunning` (on a thread of its
-own).
+own). It is declared in `TickDriverThreadContext.h`, which this header includes, so every user of this
+header still sees it: the thread context is configured with the mode (`TickDriverThreadContext-rationale.md`
+§8).
 
-## §8 Provenance
+## §8 `IdleWake`, `TickDriverIdleGame` and `TickDriverRunnerHost`
+
+In `FreeRunning` (§7) a runner thread of its own pumps the scheduler and runs the steps. Between steps it
+has nothing to do until the next step's deadline or until input arrives. `TickDriverIdleGame` gives the
+game that wait: `IdleWake idleUntil(double deadlineSeconds)`. It refines `TickDriverGame`, so a game that
+never runs free does not declare it and is still a `TickDriverGame` (the self-check pins both).
+
+**The hook contract.**
+- `idleUntil` runs on the runner thread. Its deadline is absolute seconds on the engine clock
+  (`TickDriverEngine::nowSeconds()`), so whatever the hook waits on must read the same clock source.
+- While the deadline is ahead, it blocks on an OS wait (a socket wait, an event), not a spin.
+- It returns `IdleWake::Activity` after it has handled at least one inbound event. The event's handlers
+  ran on the runner thread, and whatever they sent has left before the hook returns.
+- Otherwise it returns `IdleWake::Deadline`, at or after the deadline.
+- It returns `IdleWake::Unavailable` when it cannot wait, for example because its socket is failing. It
+  returns at once, without spinning.
+- A deadline at or before now is one non-blocking pass. The hook never spins until a deadline.
+- Timer precision belongs to the implementer: how late a wait returns is a property of the OS wait it
+  uses.
+
+**What the values tell the caller.** `Deadline` says the wait reached its deadline. `Activity` says it
+ended early because work arrived and was handled. `Unavailable` says the hook did not wait, and so does a
+`Deadline` that comes back while the deadline is still ahead. Calling the hook again at once after either
+of those would busy-loop; `TickDriverRunnerHost` exists so that the caller can sleep instead.
+
+**`TickDriverRunnerHost`.** The runner's host supplies one thing: `void sleepUntil(double deadlineSeconds)`,
+a plain sleep of the runner thread to an absolute deadline on the engine clock, for when the idle hook
+did not wait. It returns nothing. The clock is the engine's (`TickDriverEngine::nowSeconds()`), not the
+runner host's, and the thread's priority belongs to whoever creates the runner thread, so the concept
+requires neither. The runner thread is dedicated to one loop and ends with it
+(`TickDriverThreadContext-rationale.md` §8).
+
+## §9 Provenance
 
 Written on 2026-10-16 from the og-tickdriver design, as the contracts the brawler's Unreal frame host
-and Jolt backend host fulfil today. Nothing in this file depends on any document outside this
+and Jolt backend host fulfil today. `IdleWake`, `TickDriverIdleGame`, `TickDriverRunnerHost` and §8 were
+added on 2026-11-12 for the `FreeRunning` mode; `StepThreading` moved to `TickDriverThreadContext.h` the
+same day. `OptionalVec3Result` was added on 2026-11-13, when the Android build (libc++) failed on the render sink's
+return-type requirements (§5). Nothing in this file depends on any document outside this
 submodule.

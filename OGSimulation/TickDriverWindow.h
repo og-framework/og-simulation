@@ -5,6 +5,7 @@
 #include "OGSimulation/OGExport.h"
 #include "OGSimulation/SimulationScheduler.h"
 #include "OGSimulation/TickDriverLog.h"
+#include "OGSimulation/TickDriverThreadContext.h"
 
 #include <algorithm>
 #include <array>
@@ -24,6 +25,8 @@ enum class TickDriverWindowSeries : uint8_t
 	StepUs,
 	PreUs,
 	ShadowRestoreUs,
+	LateUs,
+	ApproachUs,
 	Count,
 };
 
@@ -35,15 +38,26 @@ inline constexpr size_t   kSeriesCount             = static_cast<size_t>(TickDri
 inline constexpr size_t   kPercentileFieldReserve  = 160u;
 inline constexpr size_t   kReplayDepthFieldReserve = 64u;
 inline constexpr size_t   kWindowLineReserve       = 4096u;
+inline constexpr size_t   kWindowSuffixReserve     = 512u;
 inline constexpr size_t   kFrameLineReserve        = 512u;
 inline constexpr size_t   kFirstStepLineReserve    = 256u;
 
-static_assert(kSeriesCount == 8u, "TickDriverWindow: the window line carries exactly eight sample series.");
+static_assert(kSeriesCount == 10u, "the window line carries eight sample series, and FreeRunning's suffix two more");
 
 template <typename T, typename Allocator, size_t... Index>
 std::array<T, sizeof...(Index)> makeEach(const Allocator& allocator, std::index_sequence<Index...>)
 {
 	return { { (static_cast<void>(Index), T(allocator))... } };
+}
+
+inline uint32_t roundedMicroseconds(double seconds)
+{
+	const double microseconds = seconds * 1.0e6;
+	if (!(microseconds >= 0.5))
+		return 0u;
+	if (microseconds >= 4294967294.5)
+		return 4294967295u;
+	return static_cast<uint32_t>(microseconds + 0.5);
 }
 } // namespace tickDriverWindow
 
@@ -78,6 +92,9 @@ struct TickDriverWindowCounts
 	uint32_t maxReplayDepth   = 0u;
 	uint32_t resimRefused     = 0u;
 	uint32_t shadowRefused    = 0u;
+	uint32_t activityWakes    = 0u;
+	uint32_t earlyWakes       = 0u;
+	uint32_t idleFallbacks    = 0u;
 	TickDriverWindowTotals atStart;
 };
 
@@ -129,27 +146,35 @@ public:
 	using Line    = BasicHostLine<Allocator>;
 	using Series  = TickDriverWindowSeries;
 
-	BasicTickDriverWindow(bool isAuthority, bool stepsInline, const Allocator& allocator = Allocator())
+	BasicTickDriverWindow(bool isAuthority, StepThreading threading, const Allocator& allocator = Allocator())
 		: m_isAuthority(isAuthority)
-		, m_stepsInline(stepsInline)
+		, m_threading(threading)
 		, m_samples(tickDriverWindow::makeEach<Samples>(allocator, std::make_index_sequence<tickDriverWindow::kSeriesCount>{}))
 		, m_percentileFields(tickDriverWindow::makeEach<Line>(allocator, std::make_index_sequence<tickDriverWindow::kSeriesCount>{}))
 		, m_replayDepthField(allocator)
 		, m_windowLine(allocator)
+		, m_suffixField(allocator)
 		, m_frameLine(allocator)
 	{
 		for (Line& field : m_percentileFields)
 			field.reserve(tickDriverWindow::kPercentileFieldReserve);
 		m_replayDepthField.reserve(tickDriverWindow::kReplayDepthFieldReserve);
 		m_windowLine.reserve(tickDriverWindow::kWindowLineReserve);
+		m_suffixField.reserve(tickDriverWindow::kWindowSuffixReserve);
 		m_frameLine.reserve(tickDriverWindow::kFrameLineReserve);
+	}
+
+	BasicTickDriverWindow(bool isAuthority, bool stepsInline, const Allocator& allocator = Allocator())
+		: BasicTickDriverWindow(isAuthority, stepsInline ? StepThreading::Inline : StepThreading::FrameBounded, allocator)
+	{
 	}
 
 	BasicTickDriverWindow(const BasicTickDriverWindow&) = delete;
 	BasicTickDriverWindow& operator=(const BasicTickDriverWindow&) = delete;
 
 	bool isAuthority() const { return m_isAuthority; }
-	bool stepsInline() const { return m_stepsInline; }
+	bool stepsInline() const { return m_threading == StepThreading::Inline; }
+	StepThreading threading() const { return m_threading; }
 
 	void restart(double nowSeconds, const TickDriverWindowTotals& totals)
 	{
@@ -206,6 +231,16 @@ public:
 		m_counts.resimRefused += resimRefused ? 1u : 0u;
 	}
 
+	void noteLateness(double lateSeconds) { samples(Series::LateUs).add(lateSeconds * 1.0e6); }
+
+	void noteApproach(double seconds) { samples(Series::ApproachUs).add(seconds * 1.0e6); }
+
+	void noteActivityWake() { ++m_counts.activityWakes; }
+
+	void noteEarlyWake() { ++m_counts.earlyWakes; }
+
+	void noteIdleFallback() { ++m_counts.idleFallbacks; }
+
 	TickDriverWindowCounts&       counts() { return m_counts; }
 	const TickDriverWindowCounts& counts() const { return m_counts; }
 
@@ -230,14 +265,14 @@ public:
 		const uint32_t preTicks    = samples(Series::PreUs).count();
 		const uint32_t restores    = samples(Series::ShadowRestoreUs).count();
 
-		return formatHostLine(m_windowLine,
+		const char* const line = formatHostLine(m_windowLine,
 			"[SimHost.Window] role=%s stepping=%s seconds=%.2f frames=%u frameMs=%s startPhysicsUs=%s endWaits=%u "
 			"endWaitUs=%s postPhysicsUs=%s steps=%llu maxStepsPerFrame=%u lostSteps=%llu lostSeconds=%.4f "
 			"ignoredTimeSamples=%llu j1Drops=%llu j2Waits=%u j2WaitUs=%s costSamples=%u stepUs=%s preTicks=%u preUs=%s "
 			"replayDepth=%s resimRefused=%u j6Drops=%llu shadowRestores=%u shadowRestoreUs=%s shadowRefused=%u "
 			"sampleOverflow=%u",
-			m_isAuthority ? "Authority" : "Client",
-			m_stepsInline ? "inline" : "worker",
+			roleWord(),
+			steppingWord(),
 			nowSeconds - counts.startSeconds, counts.frames,
 			formatPercentiles(Series::FrameMs, true),
 			formatPercentiles(Series::StartPhysicsUs, false),
@@ -260,6 +295,15 @@ public:
 			restores,
 			formatPercentiles(Series::ShadowRestoreUs, false),
 			counts.shadowRefused, overflow);
+		if (m_threading != StepThreading::FreeRunning)
+			return line;
+
+		m_windowLine.append(formatHostLine(m_suffixField,
+			" lateUs=%s activityWakes=%u earlyWakes=%u idleFallbacks=%u approachUs=%s",
+			formatPercentiles(Series::LateUs, false),
+			counts.activityWakes, counts.earlyWakes, counts.idleFallbacks,
+			formatPercentiles(Series::ApproachUs, false)));
+		return m_windowLine.c_str();
 	}
 
 	const char* formatCatchUpCapWarningLine(int32_t requestedCap, uint32_t maxStepsPerFrame, uint32_t cap)
@@ -269,16 +313,29 @@ public:
 			requestedCap, maxStepsPerFrame, cap);
 	}
 
-	const char* formatFrameLine(double dtSeconds, uint32_t maxCatchUpSteps)
+	const char* formatFrameLine(double dtSeconds, uint32_t maxCatchUpSteps, double idleSlackSeconds = 0.0)
 	{
+		if (m_threading == StepThreading::FreeRunning)
+			return formatHostLine(m_frameLine,
+				"[SimHost.Frame] role=%s stepping=runner dt=%.6f maxCatchUpSteps=%u rateScale=[0.75,1.25] timeBase=monotonic "
+				"idleSlackUs=%u",
+				roleWord(),
+				dtSeconds, maxCatchUpSteps, tickDriverWindow::roundedMicroseconds(idleSlackSeconds));
 		return formatHostLine(m_frameLine,
 			"[SimHost.Frame] role=%s stepping=%s dt=%.6f maxCatchUpSteps=%u rateScale=[0.75,1.25] timeBase=worldDelta",
-			m_isAuthority ? "Authority" : "Client",
-			m_stepsInline ? "inline" : "worker",
+			roleWord(),
+			steppingWord(),
 			dtSeconds, maxCatchUpSteps);
 	}
 
 private:
+	const char* roleWord() const { return m_isAuthority ? "Authority" : "Client"; }
+
+	const char* steppingWord() const
+	{
+		return m_threading == StepThreading::FreeRunning ? "runner" : m_threading == StepThreading::Inline ? "inline" : "worker";
+	}
+
 	const char* formatPercentiles(Series series, bool twoDecimals)
 	{
 		const TickDriverPercentiles p = samples(series).sortAndTakePercentiles();
@@ -299,12 +356,13 @@ private:
 	}
 
 	const bool                                            m_isAuthority;
-	const bool                                            m_stepsInline;
+	const StepThreading                                   m_threading;
 	TickDriverWindowCounts                                m_counts;
 	std::array<Samples, tickDriverWindow::kSeriesCount>   m_samples;
 	std::array<Line, tickDriverWindow::kSeriesCount>      m_percentileFields;
 	Line                                                  m_replayDepthField;
 	Line                                                  m_windowLine;
+	Line                                                  m_suffixField;
 	Line                                                  m_frameLine;
 };
 
@@ -324,13 +382,18 @@ public:
 	BasicTickDriverFirstStepLine(const BasicTickDriverFirstStepLine&) = delete;
 	BasicTickDriverFirstStepLine& operator=(const BasicTickDriverFirstStepLine&) = delete;
 
-	const char* format(bool onOwnerThread, uint64_t physicsStep, uint32_t batchCount)
+	const char* format(StepThreading threading, bool onOwnerThread, uint64_t physicsStep, uint32_t batchCount)
 	{
 		return formatHostLine(m_line,
 			"[SimHost.FirstStep] role=%s thread=%s physicsStep=%llu batch=%u",
 			m_isAuthority ? "Authority" : "Client",
-			onOwnerThread ? "game" : "worker",
+			threading == StepThreading::FreeRunning ? "runner" : onOwnerThread ? "game" : "worker",
 			static_cast<unsigned long long>(physicsStep), batchCount);
+	}
+
+	const char* format(bool onOwnerThread, uint64_t physicsStep, uint32_t batchCount)
+	{
+		return format(StepThreading::Inline, onOwnerThread, physicsStep, batchCount);
 	}
 
 private:

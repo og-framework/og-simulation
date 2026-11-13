@@ -180,10 +180,10 @@ bool fieldwiseIsSimilarTo(const T& a, const T& b)
 // Declared IMMEDIATELY AFTER `fieldwiseIsSimilarTo`, with nothing declared between the
 // two but this banner, it sees EXACTLY the overload set the fold above sees — including
 // the fact that the `Serializable<T>` and `std::vector<T>` overloads BELOW are not yet
-// declared, and that the glm overloads in SimulationComparisonGlm.h are never found
-// from here at all (they are in the global namespace, not in `glm`, so a glm::vec3
-// field falls to the generic template's `a == b` — an EXACT compare, not the 1e-4
-// epsilon).
+// declared. The glm overloads in SimulationComparisonGlm.h are found from both by ADL:
+// they are in `namespace glm` since og-input-latency task 2e. Before that they were in
+// the global namespace, found from neither, and a glm::vec3 field fell to the generic
+// template's `a == b` — an EXACT compare, not the 1e-4 epsilon.
 //
 // ⛔ MOVE IT BELOW THE TWO OVERLOADS AND `describeFirstDivergingField` STARTS
 // DISAGREEING WITH THE VERDICT IT EXISTS TO EXPLAIN: the fold would report

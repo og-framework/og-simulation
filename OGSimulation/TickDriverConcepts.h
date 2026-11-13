@@ -16,13 +16,6 @@
 #include "OGSimulation/TickDriverLog.h"
 #include "OGSimulation/TickDriverThreadContext.h"
 
-enum class StepThreading : uint8_t
-{
-	Inline,
-	FrameBounded,
-	FreeRunning,
-};
-
 class TickRateDoor
 {
 public:
@@ -281,6 +274,73 @@ static_assert(!TickDriverGame<ManagerByValue>,
 	"TickDriverGame self-check: manager() returns the game's own manager by reference, never a copy");
 } // namespace tickDriverGameSelfCheck
 
+enum class IdleWake : uint8_t
+{
+	Deadline,
+	Activity,
+	Unavailable,
+};
+
+template <typename G>
+concept TickDriverIdleGame = TickDriverGame<G> && requires(G& g, double s)
+{
+	{ g.idleUntil(s) } -> std::same_as<IdleWake>;
+};
+
+namespace tickDriverIdleGameSelfCheck
+{
+struct Conforming : tickDriverGameSelfCheck::Conforming
+{
+	IdleWake idleUntil(double);
+};
+
+struct MissingIdleUntil : tickDriverGameSelfCheck::Conforming
+{
+};
+
+struct IdleReturnsVoid : tickDriverGameSelfCheck::Conforming
+{
+	void idleUntil(double);
+};
+
+static_assert(TickDriverIdleGame<Conforming>,
+	"TickDriverIdleGame self-check: the reference shape must satisfy the concept");
+static_assert(TickDriverGame<MissingIdleUntil> && !TickDriverIdleGame<MissingIdleUntil>,
+	"TickDriverIdleGame self-check: idleUntil is required, and a game without it is still a TickDriverGame");
+static_assert(!TickDriverIdleGame<IdleReturnsVoid>,
+	"TickDriverIdleGame self-check: idleUntil returns the IdleWake that says why the runner woke");
+} // namespace tickDriverIdleGameSelfCheck
+
+template <typename R>
+concept TickDriverRunnerHost = requires(R& r, double s)
+{
+	{ r.sleepUntil(s) } -> std::same_as<void>;
+};
+
+namespace tickDriverRunnerHostSelfCheck
+{
+struct Conforming
+{
+	void sleepUntil(double);
+};
+
+struct MissingSleepUntil
+{
+};
+
+struct SleepReturnsBool
+{
+	bool sleepUntil(double);
+};
+
+static_assert(TickDriverRunnerHost<Conforming>,
+	"TickDriverRunnerHost self-check: the reference shape must satisfy the concept");
+static_assert(!TickDriverRunnerHost<MissingSleepUntil>,
+	"TickDriverRunnerHost self-check: sleepUntil (the runner's bounded sleep when the idle hook did not wait) is required");
+static_assert(!TickDriverRunnerHost<SleepReturnsBool>,
+	"TickDriverRunnerHost self-check: sleepUntil returns void; it sleeps to the deadline and reports nothing");
+} // namespace tickDriverRunnerHostSelfCheck
+
 template <typename P>
 concept TickDriverPresenterSteps = requires(P& p, uint64_t step, const TickOutcome& outcome, double deadline)
 {
@@ -405,12 +465,15 @@ static_assert(!TickDriverWorldHost<WorldIsNotAnAdapter>,
 	"TickDriverWorldHost self-check: the step world is a PhysicsWorldAdapter, so the step driver can run over it");
 } // namespace tickDriverWorldHostSelfCheck
 
+template <typename T>
+concept OptionalVec3Result = !std::is_void_v<T> && std::convertible_to<T, std::optional<glm::vec3>>;
+
 template <typename S>
 concept TickDriverRenderSink = requires(S& s, const S& cs, uint32_t id, const glm::vec3& position,
 	const std::optional<glm::quat>& rotation)
 {
-	{ s.applyRootPose(id, position, rotation) } -> std::convertible_to<std::optional<glm::vec3>>;
-	{ cs.readAnchor(id) }                       -> std::convertible_to<std::optional<glm::vec3>>;
+	{ s.applyRootPose(id, position, rotation) } -> OptionalVec3Result;
+	{ cs.readAnchor(id) }                       -> OptionalVec3Result;
 	{ cs.name(id) }                             -> std::convertible_to<const char*>;
 };
 

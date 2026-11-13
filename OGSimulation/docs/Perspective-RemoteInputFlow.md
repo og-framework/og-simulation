@@ -78,7 +78,7 @@ connection's staged inputs once per replication poll.
 | 4 | A's own integrator reads the capture from `tick - effectiveDelay` | A · PT | `<core>Network/LocalInputCache.h` | `resolveDelayedInput` |
 | 5 | The **undelayed** capture is queued for the wire | A · PT (producer) | `<core>SimulationQueues.h` | `PendingInputQueue::enqueue` |
 | 6 | Once per game frame, the send sweep drains the queue's recent window | A · GT | `<core>SimulationNetSync.h` | `sendLocalInputToAuthorityAll` |
-| 7 | The redundancy bundle is built from the last `redundancyDepthTicks` entries | A · GT | `Plugins/OGSimulation/Source/OGSimulationUnreal/InputRedundancyBundleBuilder.h` | `buildRedundancyBundle` |
+| 7 | The redundancy bundle is built from the last `redundancySlots` entries the send hands it (`redundancyDepthTicks` at `redundancyFrames = 0`), clamped to `kMaxSlots` | A · GT | `Plugins/OGSimulation/Source/OGSimulationUnreal/InputRedundancyBundleBuilder.h` | `buildRedundancyBundle` |
 | 8 | One **unreliable** RPC carries the bundle to the authority | A→S · GT | `Plugins/OGSimulation/Source/OGSimulationUnreal/SimulatableNetSyncComponent.h` | `ServerReceiveRemoteMove` |
 | 9 | The bundle is decoded and each slot is offered to the coordinator | S · GT | `<core>Network/ServerReceptionCoordinator.h` | `receiveInputBundle` |
 | 10 | Per slot: domain gate, dedup watermark, park | S · GT | `<core>Network/ServerReceptionCoordinator.h` | `receiveRemoteInput` |
@@ -192,7 +192,8 @@ Three details worth carrying:
    injection into a warning at registration rather than a silent poison.
 
 The RPC is **unreliable**, and that is deliberate: instead of one reliable message per tick, one
-bundle per frame carries the last `redundancyDepthTicks` captures, so a dropped datagram self-heals
+bundle per frame carries the last few captures (`redundancyDepthTicks` at `redundancyFrames = 0`, else
+the count `SimulationNetSync::redundancySlots` returns), so a dropped datagram self-heals
 on the next frame's overlapping bundle. `releaseAllButRecent` keeps the queue bounded to exactly that
 overlap window.
 

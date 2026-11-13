@@ -41,7 +41,7 @@ emits. Which tags those are is the host's business; this header names only the c
 |---|---|
 | `SimTick` | per-tick simulation lines: the authority and prediction steps, input collection, resim checks per tick, the per-character resim input table |
 | `Sim` | rare simulation lifecycle lines: resim prepare and finish, time resyncs, divergence and restore events |
-| `Net` | replication lines: input and correction sends and receipts, the server's reception coordinator (park, release, gaps, drops, delay shifts, stats) |
+| `Net` | replication lines: input and correction sends and receipts, the server's reception coordinator (park, release, gaps, drops, delay shifts, stats, arrival margins, back-dating episodes) |
 | `DivergenceProbe` | the correction-verdict probe family: every `[DivergenceProbe.*]` line |
 
 A host may send two routes to one channel. Each probe family has its own route so a host can switch it on
@@ -51,7 +51,8 @@ or off without touching any other line.
 
 A line's level is decided in this order: a leading `[Verbose]` or `[Warning]` token wins; otherwise the
 matching row's `plainLevel` applies. So the rows whose lines all carry a token (`[InputGap]`, `[InputDrop]`,
-`[DelayShift]`, `[InputStats]`, `[InputDomain]`, `[RelaySkip]`, `[DivergenceProbe`, and `[Resim.Input]`,
+`[DelayShift]`, `[InputStats]`, `[InputArrival.Window]`, `[InputDomain]`, `[RelaySkip]`, `[DivergenceProbe`,
+and `[Resim.Input]`,
 which carries `[Verbose]`) have a `plainLevel` that applies to no line today.
 
 The rule that classified the rows: a row whose token-less lines arrive per tick, per packet or per relay
@@ -117,6 +118,8 @@ core, with the severity token removed, 2026-10-16):
 | `[InputDrop]` | `Net` | `Log` | `Network/ServerReceptionCoordinator.h` |
 | `[DelayShift]` | `Net` | `Log` | `Network/ServerReceptionCoordinator.h` |
 | `[InputStats]` | `Net` | `Log` | `Network/ServerReceptionCoordinator.h` |
+| `[InputArrival.Window]` | `Net` | `Log` | `Network/ServerReceptionCoordinator.h` |
+| `[InputArrival.BackDate]` | `Net` | `Log` | none yet |
 | `[Park]` | `Net` | `Verbose` | `Network/ServerReceptionCoordinator.h` |
 | `[Release]` | `Net` | `Verbose` | `Network/ServerReceptionCoordinator.h` |
 | `[InputDomain]` | `Net` | `Log` | `Network/ServerReceptionCoordinator.h` |
@@ -128,6 +131,19 @@ core, with the severity token removed, 2026-10-16):
 one row for lines from both sources. The `[SendRemoteInputToClients]` row also stays with the host: the
 core's write of that line is retired (the absence marker in `SimulationNetSync.h`), and the tag has no
 emitter.
+
+`[InputArrival.Window]` was added after that search (og-input-latency task 5b, 2026-11-11). Its one
+emitter is the coordinator's arrival-margin line, which always carries `[Warning]`; no host emits it.
+
+`[InputArrival.BackDate]` was added after it (og-input-latency P3-1, 2026-11-12), **before its emitter exists**.
+Nothing emits it yet. Its planned emitter is og-input-latency P3-6's back-dating detector, in the coordinator's
+arrival-margin pass, as a line that always carries `[Warning]` (`TimeConfig-rationale.md` §13 has its rule). No host
+is to emit it. It is a warning family, so its `plainLevel` is `Log` by the rule of §3. It sits after
+`[InputArrival.Window]`, which it does not begin with, and no earlier row's prefix begins it.
+
+`[InputDelay]` has no row. The coordinator emits it (`Network/ServerReceptionCoordinator.h`, the one-shot
+warning for a derived player slot out of range), and no host emits it, so by the rule of §6 it should have
+one. Without it a host prints the line on its fallback channel. Adding the row is not done here.
 
 The search cannot see a tag assembled at run time (a `"%s"` that prints a tag); none is known.
 
@@ -144,13 +160,14 @@ The search cannot see a tag assembled at run time (a `"%s"` that prints a tag); 
 ## §7 Tests
 
 `TickDriver/SimulationLogRoutesTest.cpp` (tag `[TickDriver]`):
-- `SimulationLogRoutes.Rows.PrefixRouteAndPlainLevelArePinnedInOrder` pins all 25 rows, in order;
+- `SimulationLogRoutes.Rows.PrefixRouteAndPlainLevelArePinnedInOrder` pins all 27 rows, in order;
 - `SimulationLogRoutes.Checks.HoldForTheTableAndRejectAShadowedRowOrAWarningLevel` checks both functions on
   the table and on four bad tables (a catch-all above its specific row, `DISCARD` below its catch-all, a
   lower-case duplicate, a `Warning` row) and one good one;
 - `SimulationLogRoutes.FirstMatch.TakesTheSpecificRowIgnoresCaseAndLeavesHostTagsUnrouted` resolves sample
-  lines by first match: the specific rows win, case is ignored, and the host's tags (`[ResimProbe.Gate]`,
-  `[ServerReceive]`, `[ReleaseBatch]`, …) match no core row.
+  lines by first match: the specific rows win, case is ignored, an `[InputArrival.Window]` line and an
+  `[InputArrival.BackDate]` line each take their own `Net` row at `Log`, and the host's tags (`[ResimProbe.Gate]`, `[ServerReceive]`, `[ReleaseBatch]`, …)
+  match no core row.
 
 ## §8 Provenance
 
@@ -158,3 +175,9 @@ og-tickdriver task 12 (2026-10-16). The rows, their order, routes and levels, an
 were moved from the brawler game's adapter table, where all 39 rows of the host's table were kept together.
 The adapter now puts this block first and its own 14 rows after it; the routing of every line is unchanged
 (the adapter's rationale records the proof).
+
+og-input-latency task 5b (2026-11-11) added the `[InputArrival.Window]` row after `[InputStats]`, so the
+coordinator's arrival-margin line takes the `Net` route like its window sibling. 25 rows became 26.
+
+og-input-latency P3-1 (2026-11-12) added the `[InputArrival.BackDate]` row after `[InputArrival.Window]`, ahead of
+its emitter (§5). 26 rows became 27.

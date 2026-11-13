@@ -19,6 +19,9 @@ true and actionable to a reader with no game engine and no other repository.
 
 **There are no live guards.** Every rule this header carries is a concept requirement checked by a
 `static_assert` in one of its self-check namespaces, so the compiler enforces it and it needs no tag.
-`TickDriverConcepts-rationale.md` §6 lists what each self-check pins.
+`TickDriverConcepts-rationale.md` §6 lists what each self-check pins. One of them is enforced only where the
+standard library is libc++: `OptionalVec3Result` tests for `void` before the conversion, and the
+`ApplyReturnsVoid` self-check fails to compile without that order under libc++ but not under the MSVC STL
+(rationale §5).
 
 No id has been issued or retired yet. The first guard this header ever needs is G-01.

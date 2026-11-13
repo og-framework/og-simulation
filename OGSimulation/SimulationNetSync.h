@@ -11,6 +11,7 @@
 #include <unordered_map>
 
 #include "OGSimulation/CorrectionStateBufferCodec.h"
+#include "OGSimulation/InputRedundancyBundleCodec.h"
 #include "OGSimulation/Network/LocalInputCache.h"
 #include "OGSimulation/Network/CorrectionRotation.h"
 #include "OGSimulation/Network/CorrectionVerdictProbe.h"
@@ -488,8 +489,8 @@ public:
     // THIS TREE DOES — nothing routes through `DeferredLifecycleQueue`; today both halves
     // run on the GAME thread, back to back, through the composed facade below. ⛔ AND THE
     // DEFERRED HALF IS NOT PHYSICS-ONLY EITHER: step 2 erases `m_authorityWriters` and
-    // `m_localInputSenders` (:529-530), which the GAME thread range-fors every tick at
-    // :599 and :656 — so deferring it is blocked on marshalling that send path first.
+    // `m_localInputSenders` (:534-535), which the GAME thread range-fors every tick at
+    // :605 and :686 — so deferring it is blocked on marshalling that send path first.
     // The ruling is in DeferredLifecycleQueue.h's banner and docs/ThreadingCrossings.md
     // row 11. The fixed order survives the split intact: step 1 still happens first,
     // EARLIER than before rather than later.
@@ -529,9 +530,10 @@ public:
         unsigned int id,
         SimulationInputResolution<SimulatableTs...>& inputResolution)
     {
-        // Step 2: erase writer structs.
+        // Step 2: erase writer structs, and the sender's redundancy cadence with them. §17
         std::get<AuthorityWriterMapFor<T>>(m_authorityWriters).erase(id);
         std::get<LocalInputSenderMapFor<T>>(m_localInputSenders).erase(id);
+        m_redundancyCadences.erase(id);
 
         // Step 3: the container-lifecycle erase, on the peer —
         // SimulationInputResolution::unregisterCharacter.
@@ -647,7 +649,31 @@ public:
 
     // Outbound — local input RPC to authority (game thread)
 
-    void sendLocalInputToAuthorityAll(uint32 currentTick, uint32 redundancyDepth)
+    // The redundancy slot count for one send: `redundancyFrames` frames' worth of ticks, from the
+    // sender's smoothed ticks per send.
+    // ⛔ `redundancyFrames <= 0` RETURNS `redundancyDepthTicks` EXACTLY, unclamped — that is the
+    // EQUIV default, and it keeps today's bundle bytes. §17
+    // ⛔ OTHERWISE NEVER ABOVE `inputRedundancyBundle::kMaxSlots` and never below
+    // min(`redundancyDepthTicks`, kMaxSlots). §17
+    static uint32 redundancySlots(float ticksSinceLastSend, uint32 redundancyDepthTicks, int32 redundancyFrames)
+    {
+        if (redundancyFrames <= 0)
+        {
+            return redundancyDepthTicks;
+        }
+        const uint32 maxSlots   = inputRedundancyBundle::kMaxSlots;
+        const uint32 floorSlots = redundancyDepthTicks < maxSlots ? redundancyDepthTicks : maxSlots;
+        const float  ticksPerSend = ticksSinceLastSend > 1.0f ? ticksSinceLastSend : 1.0f;
+        const float  wanted       = static_cast<float>(redundancyFrames) * ticksPerSend;
+        const uint32 rounded      = wanted < static_cast<float>(maxSlots)
+            ? static_cast<uint32>(wanted + 0.5f)
+            : maxSlots;
+        return rounded < floorSlots ? floorSlots : rounded;
+    }
+
+    // ⛔ THE THIRD ARGUMENT IS NOT DEFAULTED, like `correctionRotationK` — production passes
+    // `TimeConfig::redundancyFrames`, read live by the manager. §17
+    void sendLocalInputToAuthorityAll(uint32 currentTick, uint32 redundancyDepth, int32 redundancyFrames)
     {
         // ⛔ ONE unreliable RPC carrying a redundancy bundle, NOT one reliable RPC per
         // entry — a dropped datagram then self-heals on the next frame's overlapping
@@ -664,10 +690,15 @@ public:
                 OG_CHECK(pendingQueue != nullptr,
                     "sendLocalInputToAuthorityAll: no pending queue for a registered local sender id "
                     "- the cross-peer sender/provider set invariant is broken");
-                SIMLOG(m_logger, "[SendLocalInputToServer] id=%u tick=%u depth=%u",
-                    id, currentTick, redundancyDepth);
-                s.owner->sendLocalInputToAuthority(*pendingQueue, currentTick, redundancyDepth);
-                pendingQueue->releaseAllButRecent(static_cast<size_t>(redundancyDepth));
+                const uint32 slots = redundancySlots(
+                    noteRedundancySend(m_redundancyCadences[id], currentTick), redundancyDepth, redundancyFrames);
+                // ⛔ `slots=` IS APPENDED, NEVER INSERTED, so greps keying on `depth=` still match. §17
+                SIMLOG(m_logger, "[SendLocalInputToServer] id=%u tick=%u depth=%u slots=%u",
+                    id, currentTick, redundancyDepth, slots);
+                // ⛔ ONE COUNT FOR THE SEND AND THE RELEASE — a release shorter than the bundle
+                // drops ticks the next bundle must re-carry. §17
+                s.owner->sendLocalInputToAuthority(*pendingQueue, currentTick, slots);
+                pendingQueue->releaseAllButRecent(static_cast<size_t>(slots));
             }
         });
     }
@@ -685,6 +716,40 @@ private:
     void forEachTypeMap(TupleT& tup, Fn&& fn)
     {
         forEachTypeMapImpl(tup, std::forward<Fn>(fn), std::index_sequence_for<SimulatableTs...>{});
+    }
+
+    // One local sender's send cadence: the tick it last sent, and the EMA of
+    // `currentTick - lastSentTick` over its sends (`ticksPerFrameEma`). §17
+    struct RedundancySendCadence
+    {
+        uint32 lastSentTick     = 0;
+        float  ticksPerFrameEma = 1.0f;
+        bool   hasSent          = false;
+        bool   hasSample        = false;
+    };
+
+    static constexpr float kTicksPerFrameEmaWeight = 0.125f;
+
+    // Folds this send into the cadence and returns the updated EMA.
+    // ⛔ THE FIRST SAMPLE SEEDS THE EMA; a backwards tick samples 0 and a jump samples at most
+    // kMaxSlots, so one resync cannot pin the window at the cap. §17
+    static float noteRedundancySend(RedundancySendCadence& cadence, uint32 currentTick)
+    {
+        if (cadence.hasSent)
+        {
+            const uint32 elapsed = currentTick > cadence.lastSentTick ? currentTick - cadence.lastSentTick : 0u;
+            const uint32 bounded = elapsed < inputRedundancyBundle::kMaxSlots
+                ? elapsed
+                : static_cast<uint32>(inputRedundancyBundle::kMaxSlots);
+            const float  sample  = static_cast<float>(bounded);
+            cadence.ticksPerFrameEma = cadence.hasSample
+                ? cadence.ticksPerFrameEma + kTicksPerFrameEmaWeight * (sample - cadence.ticksPerFrameEma)
+                : sample;
+            cadence.hasSample = true;
+        }
+        cadence.lastSentTick = currentTick;
+        cadence.hasSent      = true;
+        return cadence.ticksPerFrameEma;
     }
 
     // registerPredictionOwner's two named callbacks.
@@ -804,6 +869,7 @@ private:
         // must never acquire one. The cache walked them under its own gate; this is the
         // pure half's only job with the result. §11
         decision.fieldDivergence      = verdict.fieldDivergence;
+        decision.verdictMargin        = verdict.verdictMargin;
         return decision;
     }
 
@@ -854,6 +920,10 @@ private:
     // and this is a round-robin position, not a tick-keyed quantity. Re-phasing would
     // skip or double-write a character for one round. §13
     std::size_t m_correctionRotationRound = 0u;
+
+    // ⛔ PER LOCAL SENDER, KEYED BY ID, GAME THREAD ONLY — inserted by the send, erased in
+    // unregister step 2 beside the sender map. §17
+    std::unordered_map<unsigned int, RedundancySendCadence> m_redundancyCadences;
 };
 
 // SimulationNetSyncConcept
@@ -865,11 +935,11 @@ private:
 template <typename T, typename... SimulatableTs>
 concept SimulationNetSyncConcept = requires(
     T& t, const SimulationTimeStep& step, uint32 tick, int32 rollbackWindow,
-    int32 correctionRotationK)
+    int32 correctionRotationK, int32 redundancyFrames)
 {
     // The rotation width is required, not defaulted — see the note at the definition.
     { t.sendCorrectionAll(step, correctionRotationK) };
-    { t.sendLocalInputToAuthorityAll(tick, tick) };
+    { t.sendLocalInputToAuthorityAll(tick, tick, redundancyFrames) };
     { t.setAuthorityGuardContext(tick, rollbackWindow) };
 };
 

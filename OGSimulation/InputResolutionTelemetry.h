@@ -50,8 +50,8 @@ OGSIM_OPTIMIZE_OFF
 //         NoStore / RefRead / ScheduledRead           ForCharacter
 //       forgetOwner                                 forgetOwner, lifecycle
 //
-//     `emitMissClassLine` / `emitDeltaLine` are private and reached only from
-//     `emitRelayReadWindowIfDue`. `emitReadTickLine` is private and reached
+//     `emitMissClassLine` / `emitDeltaLine` / `emitSenderDeltaLine` are private
+//     and reached only from `emitRelayReadWindowIfDue`. `emitReadTickLine` is private and reached
 //     only from `emitPredictionInputRead` and `emitResimScheduledRead`.
 //
 //   * THE READ SEAM IS NOT ON THIS CLASS.
@@ -75,7 +75,9 @@ OGSIM_OPTIMIZE_OFF
 //                                  the ScheduledRead rung
 //                                  adds 1 Verbose `ReadTick`
 //       emitRelayReadWindowIfDue   NOTHING                  2 Warning, plus up
-//                                                           to 4 gated Warning,
+//                                                           to 3 gated Warning
+//                                                           and 1 gated Warning
+//                                                           per remote sender,
 //                                                           plus 1 if stale
 //       emitLocalInputCacheMiss    NOTHING                  1 Warning PER TICK,
 //                                                           in a state that is
@@ -123,7 +125,7 @@ OGSIM_OPTIMIZE_OFF
 //
 // ⛔ NO REFERENCE INTO A PRODUCTION CONTAINER IS EVER HANDED IN — the same ruling the GAME-thread sibling carries; nothing about it was thread-specific. §2
 //
-// ⛔ `emitMissClassLine` / `emitDeltaLine` ARE PRIVATE AND MUST STAY SO — their sole caller `emitRelayReadWindowIfDue` is a member of this same class. §10
+// ⛔ `emitMissClassLine` / `emitDeltaLine` / `emitSenderDeltaLine` ARE PRIVATE AND MUST STAY SO — their sole caller `emitRelayReadWindowIfDue` is a member of this same class. §10
 //
 // ⛔ EVERY METHOD ON THIS CLASS IS PHYSICS THREAD ONLY, so no member here is atomic and none may be made concurrent. §3
 // ⛔ `forgetOwner` is the one either-thread member and is never concurrent by construction — reached from `SimulationNetSync::unregisterSimulatable` via `SimulationInputResolution::forgetOwner`. §3
@@ -327,7 +329,10 @@ public:
         // ⛔ Each is gated, so a call site that carried nothing is silent rather than zero. §10
         emitMissClassLine(summary, summary.prediction, "Prediction");
         emitMissClassLine(summary, summary.resim,      "Resim");
-        emitDeltaLine(summary, summary.prediction, "Prediction");
+        for (const RelaySenderReadCounters& sender : summary.predictionBySender)
+        {
+            emitSenderDeltaLine(summary, sender);
+        }
         emitDeltaLine(summary, summary.resim,      "Resim");
 
         // ⛔ SILENT WHEN NOTHING WENT STALE, which is the healthy state; `rung-0` serves are DELIBERATELY excluded from the run, so a join window produces none. §10
@@ -380,6 +385,25 @@ private:
             delta.samples, delta.p10, delta.p50, delta.p90,
             delta.minDelta, delta.maxDelta,
             delta.saturatedLow, delta.saturatedHigh);
+    }
+
+    void emitSenderDeltaLine(const RelayReadWindowSummary& summary, const RelaySenderReadCounters& sender)
+    {
+        RelayDeltaSummary delta;
+        sender.counters.delta.fillSummary(delta);
+        if (delta.samples == 0u)
+        {
+            return;
+        }
+
+        SIMLOG(m_logger,
+            "[Warning][RelayProbe.Delta] window=[%u,%u] src=Prediction n=%u p10=%d p50=%d "
+            "p90=%d min=%d max=%d satLow=%u satHigh=%u sender=%u lateShareX1000=%u",
+            summary.windowStartTick, summary.windowEndTick,
+            delta.samples, delta.p10, delta.p50, delta.p90,
+            delta.minDelta, delta.maxDelta,
+            delta.saturatedLow, delta.saturatedHigh,
+            sender.sender, sender.counters.lateShareX1000());
     }
 
     // ⛔ PRIVATE; the two callers are `emitPredictionInputRead` and `emitResimScheduledRead`, in this class. §13

@@ -5,8 +5,10 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <optional>
 
 #include "OGSimulation/Mailbox.h"
@@ -31,6 +33,22 @@ namespace simulationTickDriver
 inline constexpr uint32_t kMaxStepsPerFrame                 = 240u;
 inline constexpr size_t   kBodySlotOccupancyCommandCapacity = 64u;
 inline constexpr size_t   kStepCostSampleCapacity           = 256u;
+inline constexpr uint32_t kEarlyWakesBeforeFallback         = 3u;
+
+inline constexpr bool isFiniteSeconds(double seconds)
+{
+	constexpr uint64_t kExponentBits = 0x7ff0000000000000ull;
+	return (std::bit_cast<uint64_t>(seconds) & kExponentBits) != kExponentBits;
+}
+
+static_assert(isFiniteSeconds(0.0) && isFiniteSeconds(-0.0) && isFiniteSeconds(std::numeric_limits<double>::max())
+		&& isFiniteSeconds(-std::numeric_limits<double>::max()) && isFiniteSeconds(std::numeric_limits<double>::denorm_min())
+		&& !isFiniteSeconds(std::numeric_limits<double>::infinity()) && !isFiniteSeconds(-std::numeric_limits<double>::infinity())
+		&& !isFiniteSeconds(std::numeric_limits<double>::quiet_NaN())
+		&& !isFiniteSeconds(-std::numeric_limits<double>::quiet_NaN())
+		&& !isFiniteSeconds(std::numeric_limits<double>::signaling_NaN()),
+	"simulationTickDriver::isFiniteSeconds reads the exponent bits, so every NaN and both infinities fail it whatever the "
+	"floating-point model; a comparison (x == x, x <= bound) can be folded to true for a NaN");
 } // namespace simulationTickDriver
 
 template <TickDriverGame GameT, TickDriverWorldHost WorldHostT, TickDriverPresenterSteps PresenterT, TickDriverEngine EngineT>
@@ -46,8 +64,9 @@ public:
 		bool          isAuthority;
 		StepThreading threading;
 		int32_t       requestedMaxCatchUpSteps;
-		double        minRateScale = 0.75;
-		double        maxRateScale = 1.25;
+		double        minRateScale     = 0.75;
+		double        maxRateScale     = 1.25;
+		double        idleSlackSeconds = 0.0;
 	};
 
 	SimulationTickDriver(GameT& game, WorldHostT& worldHost, PresenterT& presenter, EngineT& engine, const Config& config)
@@ -55,7 +74,7 @@ public:
 		, m_worldHost(&worldHost)
 		, m_engine(&engine)
 		, m_config(config)
-		, m_window(config.isAuthority, config.threading == StepThreading::Inline)
+		, m_window(config.isAuthority, config.threading)
 		, m_firstStepLine(config.isAuthority)
 		, m_doors(*this)
 	{
@@ -64,10 +83,14 @@ public:
 			&& __builtin_offsetof(SimulationTickDriver, m_window) < __builtin_offsetof(SimulationTickDriver, m_bodySlotOccupancyCommands)
 			&& __builtin_offsetof(SimulationTickDriver, m_bodySlotOccupancyCommands) < __builtin_offsetof(SimulationTickDriver, m_stepCosts)
 			&& __builtin_offsetof(SimulationTickDriver, m_stepCosts) < __builtin_offsetof(SimulationTickDriver, m_tickOffset)
-			&& __builtin_offsetof(SimulationTickDriver, m_tickOffset) < __builtin_offsetof(SimulationTickDriver, m_pendingSteps)
+			&& __builtin_offsetof(SimulationTickDriver, m_tickOffset) < __builtin_offsetof(SimulationTickDriver, m_publishedRateScale)
+			&& __builtin_offsetof(SimulationTickDriver, m_publishedRateScale) < __builtin_offsetof(SimulationTickDriver, m_loopOriginSeconds)
+			&& __builtin_offsetof(SimulationTickDriver, m_loopOriginSeconds) < __builtin_offsetof(SimulationTickDriver, m_loopActive)
+			&& __builtin_offsetof(SimulationTickDriver, m_loopActive) < __builtin_offsetof(SimulationTickDriver, m_pendingSteps)
 			&& __builtin_offsetof(SimulationTickDriver, m_pendingSteps) < __builtin_offsetof(SimulationTickDriver, m_blockingSteps),
 			"SimulationTickDriver's owned state is declared in a fixed order: the config, the scheduler, the window, J1, J6, "
-			"J3, then the pending and the blocking step handle. Reorder it only together with the rationale's member table");
+			"J3, J8, the loop origin, the loop-active flag, then the pending and the blocking step handle. Reorder it only "
+			"together with the rationale's member table");
 		static_assert(__builtin_offsetof(SimulationTickDriver, m_blockingSteps) < __builtin_offsetof(SimulationTickDriver, m_doors)
 			&& __builtin_offsetof(SimulationTickDriver, m_doors) < __builtin_offsetof(SimulationTickDriver, m_hooks)
 			&& __builtin_offsetof(SimulationTickDriver, m_hooks) < __builtin_offsetof(SimulationTickDriver, m_stepDriver),
@@ -76,17 +99,21 @@ public:
 			"doors reach J1, J3 and J6. Keep the mailboxes < m_doors < m_hooks < m_stepDriver, last. Was the frame host < "
 			"hooks < step driver row of the engine-hosted step's composition");
 
-		OG_CHECK(config.threading != StepThreading::FreeRunning,
-			"SimulationTickDriver: FreeRunning (the runner thread owns the pump and the batch) is declared but not yet "
-			"implemented; choose Inline or FrameBounded");
-		OG_CHECK(!config.isAuthority || config.threading == StepThreading::Inline,
-			"SimulationTickDriver: the authority must step inline on the owning thread. Its input release delivers into "
-			"the game's objects. Was the authority check of the engine-hosted frame host's start of play");
+		OG_CHECK(config.threading != StepThreading::FreeRunning || config.isAuthority,
+			"SimulationTickDriver: FreeRunning is the authority's only; a client stays Inline or FrameBounded. Was the refusal "
+			"of FreeRunning as declared but not yet implemented");
+		OG_CHECK(!config.isAuthority || config.threading == StepThreading::Inline || config.threading == StepThreading::FreeRunning,
+			"SimulationTickDriver: the authority steps inline on its owning thread: Inline on the frame thread or FreeRunning on "
+			"its runner. Was the authority check of the engine-hosted frame host's start of play");
 		OG_CHECK(config.isAuthority == (worldHost.threadContext().roleBit() == tickDriverThread::kAuthorityRoleBit),
 			"SimulationTickDriver: the driver's role must be the world host's thread-context role; both are fixed at world build");
-		OG_CHECK((config.threading == StepThreading::Inline) == worldHost.threadContext().stepsInline(),
-			"SimulationTickDriver: the driver's threading must match the world host's stepping mode, which chose the access "
-			"predicates at world build");
+		OG_CHECK(config.threading == worldHost.threadContext().threading(),
+			"SimulationTickDriver: the driver's threading must be the world host's thread-context threading, which chose the "
+			"access predicates and the owner thread at world build. Was the match of Inline against the context's stepsInline()");
+		OG_CHECK(simulationTickDriver::isFiniteSeconds(config.idleSlackSeconds) && config.idleSlackSeconds >= 0.0
+				&& config.idleSlackSeconds < config.dtSeconds,
+			"SimulationTickDriver: idleSlackSeconds must be finite and in [0, dtSeconds). The FreeRunning runner idles to each "
+			"deadline minus the slack and polls the rest; a slack of a whole step or more would poll through every idle");
 
 		{
 			const auto worldLock = m_worldHost->lockForStep();
@@ -100,6 +127,9 @@ public:
 
 	~SimulationTickDriver()
 	{
+		OG_CHECK(!m_loopActive.load(std::memory_order_acquire),
+			"SimulationTickDriver: destroyed while the authority loop runs on its runner. Set the loop's stop flag, join the "
+			"runner, then call stop()");
 		OG_CHECK(!isPendingHandle(m_pendingSteps) && !isPendingHandle(m_blockingSteps),
 			"SimulationTickDriver: destroyed with a step task outstanding; the task would run on a destroyed driver. Call "
 			"stop() first, as the engine-hosted frame host's end of play waited for its outstanding steps");
@@ -110,18 +140,33 @@ public:
 
 	void startFrame(double frameDeltaSeconds)
 	{
+		if (m_config.threading == StepThreading::FreeRunning)
+			return;
+
 		const double startSeconds = m_engine->nowSeconds();
 		if (m_lastFrameStartSeconds > 0.0)
 			m_window.noteFramePeriod(startSeconds - m_lastFrameStartSeconds);
 		m_lastFrameStartSeconds = startSeconds;
 
-		const uint32_t numSteps = pumpAndRunSteps(frameDeltaSeconds);
+		// ⛔G-04  docs/SimulationTickDriver-guards.md
+		m_hostTimeSeconds += frameDeltaSeconds;
+		const uint32_t numSteps = pumpAndRunSteps();
 
 		m_window.noteStartPhysics(numSteps, m_engine->nowSeconds() - startSeconds);
 	}
 
 	void endFrame(Completion* completion, int32_t blockMode)
 	{
+		if (m_config.threading == StepThreading::FreeRunning)
+		{
+			OG_CHECK(!m_worldHost->threadContext().isOwnerThreadForRole(),
+				"SimulationTickDriver::endFrame: the FreeRunning frame-thread pass ran on the runner. The runner owns the pump, "
+				"the step-cost drain and the window; the frame thread runs only the post-physics hook");
+			// ⛔G-08  docs/SimulationTickDriver-guards.md
+			m_game->onPostPhysics();
+			return;
+		}
+
 		OG_CHECK(!m_worldHost->threadContext().isWorldLockHeldOnThisThread(),
 			"SimulationTickDriver::endFrame: this thread holds the world lock (J2) at end of physics, where it waits for "
 			"step tasks that take it: a deadlock. Was frame-host G-05");
@@ -141,26 +186,94 @@ public:
 		runPostPhysics(endStartSeconds);
 	}
 
+	template <TickDriverRunnerHost RunnerT>
+	void runAuthorityLoop(RunnerT& runner, const std::atomic<bool>& stopRequested)
+		requires TickDriverIdleGame<GameT>
+	{
+		OG_CHECK(m_config.threading == StepThreading::FreeRunning,
+			"SimulationTickDriver::runAuthorityLoop: only a FreeRunning driver runs the authority loop; Inline and "
+			"FrameBounded are driven by startFrame and endFrame");
+		OG_CHECK(m_worldHost->threadContext().isOwnerThreadForRole(),
+			"SimulationTickDriver::runAuthorityLoop: the loop runs on the runner, the thread that built the world host and "
+			"owns the scheduler, the batch and the window");
+		OG_CHECK(!m_loopActive.load(std::memory_order_acquire),
+			"SimulationTickDriver::runAuthorityLoop: the authority loop is already running");
+
+		const double originSeconds = m_engine->nowSeconds();
+		OG_CHECK(originSeconds >= 0.0,
+			"SimulationTickDriver::runAuthorityLoop: the engine clock read below zero at the loop's start; the present clock "
+			"reads a negative loop origin as a loop that has not started");
+		m_loopActive.store(true, std::memory_order_release);
+		m_loopOriginSeconds.store(originSeconds, std::memory_order_release);
+
+		std::optional<double> lastSteppingWakeSeconds;
+		while (!stopRequested.load(std::memory_order_acquire))
+		{
+			const double wakeSeconds = m_engine->nowSeconds() - originSeconds;
+			m_hostTimeSeconds = wakeSeconds;
+			const uint32_t numSteps = pumpAndRunSteps();
+			if (numSteps > 0u)
+			{
+				if (lastSteppingWakeSeconds.has_value())
+					m_window.noteFramePeriod(wakeSeconds - *lastSteppingWakeSeconds);
+				lastSteppingWakeSeconds = wakeSeconds;
+				m_window.noteStartPhysics(numSteps, (m_engine->nowSeconds() - originSeconds) - wakeSeconds);
+			}
+
+			drainStepCosts();
+			const double windowNowSeconds = m_engine->nowSeconds();
+			if (m_window.isDue(windowNowSeconds))
+				logWindow(windowNowSeconds);
+
+			idleUntilNextDeadline(runner, stopRequested, originSeconds);
+		}
+
+		m_running = false;
+		m_loopActive.store(false, std::memory_order_release);
+	}
+
 	void stop()
 	{
+		OG_CHECK(!m_loopActive.load(std::memory_order_acquire),
+			"SimulationTickDriver::stop: the authority loop is still running on its runner. Set its stop flag and join the "
+			"runner before stop(); the loop would step on after the session ended");
 		m_running = false;
 		waitForOutstandingSteps();
 	}
 
 	void pushBodySlotOccupancy(uint32_t slot, bool occupied)
 	{
+		OG_CHECK(m_config.threading != StepThreading::FreeRunning || m_worldHost->threadContext().isOwnerThreadForRole(),
+			"SimulationTickDriver::pushBodySlotOccupancy: in FreeRunning the occupancy ring (J1) is pushed on the runner, "
+			"where the binds and releases run; it is a single-producer ring");
 		[[maybe_unused]] const bool pushed = m_bodySlotOccupancyCommands.tryPush(BodySlotOccupancyCommand{ slot, occupied });
 		OG_CHECK(pushed,
 			"SimulationTickDriver::pushBodySlotOccupancy: the occupancy ring (J1) is full; the command would be lost and the step "
 			"world would keep the wrong body set. No step has drained it");
 	}
 
-	void noteWorldLockWait(double waitSeconds) { m_window.noteWorldLockWait(waitSeconds); }
+	void noteWorldLockWait(double waitSeconds)
+	{
+		OG_CHECK(m_config.threading != StepThreading::FreeRunning || m_worldHost->threadContext().isOwnerThreadForRole(),
+			"SimulationTickDriver::noteWorldLockWait: in FreeRunning the runner owns the window; the wait is noted by the "
+			"bind that waited, on the runner");
+		m_window.noteWorldLockWait(waitSeconds);
+	}
 
-	void noteShadowRestore(double restoreSeconds, bool refused) { m_window.noteShadowRestore(restoreSeconds, refused); }
+	void noteShadowRestore(double restoreSeconds, bool refused)
+	{
+		OG_CHECK(m_config.threading != StepThreading::FreeRunning,
+			"SimulationTickDriver::noteShadowRestore: a FreeRunning authority has no shadow world to restore");
+		m_window.noteShadowRestore(restoreSeconds, refused);
+	}
 
 	double hostNowSeconds() const
 	{
+		if (m_config.threading == StepThreading::FreeRunning)
+		{
+			const double originSeconds = m_loopOriginSeconds.load(std::memory_order_acquire);
+			return originSeconds < 0.0 ? 0.0 : m_engine->nowSeconds() - originSeconds;
+		}
 		OG_CHECK(m_worldHost->threadContext().isOwnerThreadForRole(),
 			"SimulationTickDriver::hostNowSeconds: the host time is the owning thread's accumulated frame delta, written "
 			"in startFrame; read off the owning thread it races that write");
@@ -169,6 +282,8 @@ public:
 
 	double stepIntervalSeconds()
 	{
+		if (m_config.threading == StepThreading::FreeRunning)
+			return m_config.dtSeconds / m_publishedRateScale.load(std::memory_order_acquire);
 		const SimulationScheduler& scheduler = schedulerOnOwningThread();
 		return scheduler.config().dtSeconds / scheduler.rateScale();
 	}
@@ -245,18 +360,18 @@ private:
 
 		m_running = true;
 
-		m_engine->log(HostLogLevel::Warning, m_window.formatFrameLine(m_config.dtSeconds, cap));
+		m_engine->log(HostLogLevel::Warning, m_window.formatFrameLine(m_config.dtSeconds, cap, m_config.idleSlackSeconds));
 	}
 
-	uint32_t pumpAndRunSteps(double frameDeltaSeconds)
+	uint32_t pumpAndRunSteps()
 	{
 		m_blockingSteps = m_pendingSteps;
 
 		SimulationScheduler& scheduler = schedulerOnOwningThread();
-		m_hostTimeSeconds += frameDeltaSeconds;
 		TickRateDoor rate(scheduler);
 		m_game->beforePump(m_hostTimeSeconds, rate);
-		// ⛔G-04  docs/SimulationTickDriver-guards.md
+		if (m_config.threading == StepThreading::FreeRunning)
+			m_publishedRateScale.store(scheduler.rateScale(), std::memory_order_release);
 		const uint32_t numSteps = scheduler.pump(m_hostTimeSeconds);
 		if (numSteps == 0u)
 			return 0u;
@@ -266,6 +381,11 @@ private:
 		batch.count = numSteps;
 		for (uint32_t index = 0u; index < numSteps; ++index)
 			batch.deadlines[index] = scheduler.stepDeadline(batch.first + index);
+		if (m_config.threading == StepThreading::FreeRunning)
+		{
+			for (uint32_t index = 0u; index < numSteps; ++index)
+				m_window.noteLateness(m_hostTimeSeconds - batch.deadlines[index]);
+		}
 
 		// ⛔G-03  docs/SimulationTickDriver-guards.md
 		const int32_t firstUpcomingSimTick =
@@ -275,7 +395,7 @@ private:
 		m_game->onFrameStepsDue(firstUpcomingSimTick, static_cast<int32_t>(numSteps));
 
 		// ⛔G-01  docs/SimulationTickDriver-guards.md
-		if (m_config.threading == StepThreading::Inline)
+		if (m_config.threading != StepThreading::FrameBounded)
 		{
 			runBatch(batch);
 			// ⛔G-06  docs/SimulationTickDriver-guards.md
@@ -288,13 +408,59 @@ private:
 		return numSteps;
 	}
 
+	template <typename RunnerT>
+	void idleUntilNextDeadline(RunnerT& runner, const std::atomic<bool>& stopRequested, double originSeconds)
+	{
+		const double targetSeconds   = schedulerOnOwningThread().nextDeadline();
+		const double approachSeconds = targetSeconds - m_config.idleSlackSeconds;
+
+		uint32_t earlyReturns = 0u;
+		for (;;)
+		{
+			const IdleWake wake = m_game->idleUntil(originSeconds + approachSeconds);
+			if (wake == IdleWake::Activity)
+			{
+				m_window.noteActivityWake();
+				return;
+			}
+			if (wake == IdleWake::Unavailable)
+			{
+				runner.sleepUntil(originSeconds + approachSeconds);
+				m_window.noteIdleFallback();
+				break;
+			}
+			if (m_engine->nowSeconds() - originSeconds >= approachSeconds)
+				break;
+			m_window.noteEarlyWake();
+			// ⛔G-07  docs/SimulationTickDriver-guards.md
+			if (++earlyReturns == simulationTickDriver::kEarlyWakesBeforeFallback)
+			{
+				runner.sleepUntil(originSeconds + approachSeconds);
+				m_window.noteIdleFallback();
+				break;
+			}
+		}
+
+		const double approachedSeconds = m_engine->nowSeconds() - originSeconds;
+		while (!stopRequested.load(std::memory_order_acquire))
+		{
+			const double clockSeconds = m_engine->nowSeconds();
+			if (clockSeconds - originSeconds >= targetSeconds)
+				break;
+			m_game->idleUntil(clockSeconds);
+		}
+		if (m_config.idleSlackSeconds > 0.0)
+			m_window.noteApproach((m_engine->nowSeconds() - originSeconds) - approachedSeconds);
+	}
+
 	void runBatch(const StepBatch& batch)
 	{
 		if (!m_loggedFirstStep)
 		{
 			m_loggedFirstStep = true;
 			m_engine->log(HostLogLevel::Warning,
-				m_firstStepLine.format(m_worldHost->threadContext().isOwnerThreadForRole(), batch.first, batch.count));
+				m_firstStepLine.format(m_config.threading, m_worldHost->threadContext().isOwnerThreadForRole(), batch.first,
+					batch.count));
 		}
 
 		for (uint32_t index = 0u; index < batch.count; ++index)
@@ -395,9 +561,10 @@ private:
 	SimulationScheduler& schedulerOnOwningThread()
 	{
 		OG_CHECK(m_worldHost->threadContext().isOwnerThreadForRole(),
-			"SimulationTickDriver: the scheduler was reached off the owning thread. The owning thread owns it in Inline "
-			"and FrameBounded: it pumps it in startFrame, and the step reads only the batch it was handed by value. It has "
-			"no synchronization, so a call from the step or any other thread (a rate change included) races the pump");
+			"SimulationTickDriver: the scheduler was reached off the owning thread. The owning thread owns it: it pumps it in "
+			"startFrame in Inline and FrameBounded, and in the authority loop on the runner in FreeRunning, and the step reads "
+			"only the batch it was handed by value. It has no synchronization, so a call from the step or any other thread (a "
+			"rate change or the FreeRunning frame thread included) races the pump");
 		OG_CHECK(m_scheduler.has_value(), "SimulationTickDriver: the scheduler was reached before it was built");
 		return *m_scheduler;
 	}
@@ -423,6 +590,9 @@ private:
 	SpscRing<BodySlotOccupancyCommand, simulationTickDriver::kBodySlotOccupancyCommandCapacity> m_bodySlotOccupancyCommands;
 	SpscRing<StepCostSample, simulationTickDriver::kStepCostSampleCapacity>     m_stepCosts;
 	std::atomic<int64_t>                                                       m_tickOffset{ 0 };
+	std::atomic<double>                                                        m_publishedRateScale{ 1.0 };
+	std::atomic<double>                                                        m_loopOriginSeconds{ -1.0 };
+	std::atomic<bool>                                                          m_loopActive{ false };
 	std::optional<Handle>                                                      m_pendingSteps;
 	std::optional<Handle>                                                      m_blockingSteps;
 	DriverDoors                                                                m_doors;
