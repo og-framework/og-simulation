@@ -41,7 +41,7 @@ emits. Which tags those are is the host's business; this header names only the c
 |---|---|
 | `SimTick` | per-tick simulation lines: the authority and prediction steps, input collection, resim checks per tick, the per-character resim input table |
 | `Sim` | rare simulation lifecycle lines: resim prepare and finish, time resyncs, divergence and restore events |
-| `Net` | replication lines: input and correction sends and receipts, the server's reception coordinator (park, release, gaps, drops, delay shifts, stats, arrival margins, back-dating episodes) |
+| `Net` | replication lines: input and correction sends and receipts, the server's reception coordinator (park, release, gaps, drops, delay shifts, stats, arrival margins, back-dating episodes), the relay stager's flush report |
 | `DivergenceProbe` | the correction-verdict probe family: every `[DivergenceProbe.*]` line |
 
 A host may send two routes to one channel. Each probe family has its own route so a host can switch it on
@@ -51,7 +51,7 @@ or off without touching any other line.
 
 A line's level is decided in this order: a leading `[Verbose]` or `[Warning]` token wins; otherwise the
 matching row's `plainLevel` applies. So the rows whose lines all carry a token (`[InputGap]`, `[InputDrop]`,
-`[DelayShift]`, `[InputStats]`, `[InputArrival.Window]`, `[InputDomain]`, `[RelaySkip]`, `[DivergenceProbe`,
+`[DelayShift]`, `[InputStats]`, `[InputArrival.Window]`, `[InputDomain]`, `[RelaySkip]`, `[RelayFlush]`, `[DivergenceProbe`,
 and `[Resim.Input]`,
 which carries `[Verbose]`) have a `plainLevel` that applies to no line today.
 
@@ -124,6 +124,7 @@ core, with the severity token removed, 2026-10-16):
 | `[Release]` | `Net` | `Verbose` | `Network/ServerReceptionCoordinator.h` |
 | `[InputDomain]` | `Net` | `Log` | `Network/ServerReceptionCoordinator.h` |
 | `[RelaySkip]` | `Net` | `Log` | `Network/ServerReceptionCoordinator.h` |
+| `[RelayFlush]` | `Net` | `Log` | `Network/RelayRingStager.h` |
 | `[DivergenceProbe` | `DivergenceProbe` | `Log` | `NetSyncTelemetry.h` |
 
 **Not here, and why.** Three tag families are emitted by the core **and** by the brawler game's adapter:
@@ -140,6 +141,12 @@ Nothing emits it yet. Its planned emitter is og-input-latency P3-6's back-dating
 arrival-margin pass, as a line that always carries `[Warning]` (`TimeConfig-rationale.md` §13 has its rule). No host
 is to emit it. It is a warning family, so its `plainLevel` is `Log` by the rule of §3. It sits after
 `[InputArrival.Window]`, which it does not begin with, and no earlier row's prefix begins it.
+
+`[RelayFlush]` was added after the search too (og-input-latency P2-5, 2026-11-14). Its emitter is `RelayRingStager`'s
+window and teardown line, which always carries `[Warning]`, so its `plainLevel` is `Log` by the rule of §3. The
+Unreal host's relay actor still prints a line with the same tag, through its own log category and not through a
+route table, until that host binds the stager and retires the actor; no host routes the tag. It sits after
+`[RelaySkip]`: neither begins with the other, and no earlier row's prefix (`[Release]` included) begins it.
 
 `[InputDelay]` has no row. The coordinator emits it (`Network/ServerReceptionCoordinator.h`, the one-shot
 warning for a derived player slot out of range), and no host emits it, so by the rule of §6 it should have
@@ -160,7 +167,7 @@ The search cannot see a tag assembled at run time (a `"%s"` that prints a tag); 
 ## §7 Tests
 
 `TickDriver/SimulationLogRoutesTest.cpp` (tag `[TickDriver]`):
-- `SimulationLogRoutes.Rows.PrefixRouteAndPlainLevelArePinnedInOrder` pins all 27 rows, in order;
+- `SimulationLogRoutes.Rows.PrefixRouteAndPlainLevelArePinnedInOrder` pins all 28 rows, in order;
 - `SimulationLogRoutes.Checks.HoldForTheTableAndRejectAShadowedRowOrAWarningLevel` checks both functions on
   the table and on four bad tables (a catch-all above its specific row, `DISCARD` below its catch-all, a
   lower-case duplicate, a `Warning` row) and one good one;
@@ -181,3 +188,6 @@ coordinator's arrival-margin line takes the `Net` route like its window sibling.
 
 og-input-latency P3-1 (2026-11-12) added the `[InputArrival.BackDate]` row after `[InputArrival.Window]`, ahead of
 its emitter (§5). 26 rows became 27.
+
+og-input-latency P2-5 (2026-11-14) added the `[RelayFlush]` row after `[RelaySkip]`, for `RelayRingStager`'s line
+(§5). 27 rows became 28.

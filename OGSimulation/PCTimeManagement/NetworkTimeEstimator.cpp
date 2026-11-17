@@ -100,7 +100,7 @@ void NetworkTimeEstimator::updateRTT(double rawRTTSeconds)
                     "only signal that the offset is unmeasured; do not read the offset value as evidence. "
                     "One-shot; running total via getRejectedRTTSampleCount().",
                     rawRTTSeconds,
-                    m_hasFirstSample ? 1 : 0,
+                    m_hasFirstSample.load(std::memory_order_relaxed) ? 1 : 0,
                     static_cast<unsigned int>(m_config.predOffsetFloorTicks));
             };
             const int length = format(nullptr, 0);
@@ -189,9 +189,9 @@ void NetworkTimeEstimator::updateRTT(double rawRTTSeconds)
 
         if (m_consecutiveOutliers >= escapeAfter)
         {
-            m_smoothedRTT         = rawRTTSeconds;
-            m_smoothedJitter      = 0.0;
-            m_hasFirstSample      = true;
+            m_smoothedRTT.store(rawRTTSeconds, std::memory_order_relaxed);
+            m_smoothedJitter.store(0.0, std::memory_order_relaxed);
+            m_hasFirstSample.store(true, std::memory_order_relaxed);
             m_consecutiveOutliers = 0;
             ++m_outlierEscapes;
             ++m_outlierWindowEscapes;
@@ -208,23 +208,26 @@ void NetworkTimeEstimator::updateRTT(double rawRTTSeconds)
 
     m_consecutiveOutliers = 0;
 
-    if (!m_hasFirstSample)
+    if (!m_hasFirstSample.load(std::memory_order_relaxed))
     {
-        m_smoothedRTT    = rawRTTSeconds;
-        m_smoothedJitter = 0.0;
-        m_hasFirstSample = true;
+        m_smoothedRTT.store(rawRTTSeconds, std::memory_order_relaxed);
+        m_smoothedJitter.store(0.0, std::memory_order_relaxed);
+        m_hasFirstSample.store(true, std::memory_order_relaxed);
     }
     else
     {
         const double alpha  = m_config.rttSmoothingAlpha;
         const double alphaJ = m_config.jitterSmoothingAlpha;
 
-        const double delta  = rawRTTSeconds >= m_smoothedRTT
-                                ? rawRTTSeconds - m_smoothedRTT
-                                : m_smoothedRTT - rawRTTSeconds;
+        const double smoothedRTT    = m_smoothedRTT.load(std::memory_order_relaxed);
+        const double smoothedJitter = m_smoothedJitter.load(std::memory_order_relaxed);
 
-        m_smoothedRTT    = alpha  * rawRTTSeconds + (1.0 - alpha)  * m_smoothedRTT;
-        m_smoothedJitter = alphaJ * delta          + (1.0 - alphaJ) * m_smoothedJitter;
+        const double delta  = rawRTTSeconds >= smoothedRTT
+                                ? rawRTTSeconds - smoothedRTT
+                                : smoothedRTT - rawRTTSeconds;
+
+        m_smoothedRTT.store(alpha  * rawRTTSeconds + (1.0 - alpha)  * smoothedRTT, std::memory_order_relaxed);
+        m_smoothedJitter.store(alphaJ * delta          + (1.0 - alphaJ) * smoothedJitter, std::memory_order_relaxed);
     }
 
     noteOutlierWindowSample();
@@ -253,10 +256,10 @@ void NetworkTimeEstimator::updateRTT(double rawRTTSeconds)
 // the baseline.
 bool NetworkTimeEstimator::isPlausibleRTTSample(double rawRTTSeconds) const
 {
-    if (!m_hasFirstSample)
+    if (!m_hasFirstSample.load(std::memory_order_relaxed))
         return rawRTTSeconds <= m_config.rttOutlierColdStartCeilingSeconds;
 
-    return rawRTTSeconds <= m_config.rttOutlierMultiplier * m_smoothedRTT
+    return rawRTTSeconds <= m_config.rttOutlierMultiplier * m_smoothedRTT.load(std::memory_order_relaxed)
                             + m_config.rttOutlierMarginSeconds;
 }
 
@@ -295,8 +298,8 @@ void NetworkTimeEstimator::noteOutlierWindowSample()
             m_outlierWindowRejects,
             m_outlierWindowEscapes,
             m_outlierWindowSamples,
-            m_smoothedRTT    * 1000.0,
-            m_smoothedJitter * 1000.0);
+            m_smoothedRTT.load(std::memory_order_relaxed)    * 1000.0,
+            m_smoothedJitter.load(std::memory_order_relaxed) * 1000.0);
         m_logger(buf);
     }
 
@@ -315,8 +318,8 @@ void NetworkTimeEstimator::recordAuthorityTick(unsigned int serverTick)
         std::snprintf(buf, sizeof(buf),
             "[Verbose] PCTM NTE: authorityTick=%u smoothedRTT=%.3fms smoothedJitter=%.3fms targetPredTick=%u",
             m_authorityTick.load(std::memory_order_relaxed),
-            m_smoothedRTT    * 1000.0,
-            m_smoothedJitter * 1000.0,
+            m_smoothedRTT.load(std::memory_order_relaxed)    * 1000.0,
+            m_smoothedJitter.load(std::memory_order_relaxed) * 1000.0,
             getTargetPredictionTick());
         m_logger(buf);
     }
@@ -367,10 +370,11 @@ unsigned int NetworkTimeEstimator::getPredictionOffsetTicks() const
     //     mattering once authority ticks arrive — which is precisely the
     //     harmful case.
     // -----------------------------------------------------------------------
-    if (!m_hasFirstSample)
+    if (!m_hasFirstSample.load(std::memory_order_relaxed))
         return static_cast<unsigned int>(m_config.predOffsetFloorTicks);
 
-    const double rawOffset = (m_smoothedRTT + m_config.jitterMultiplier * m_smoothedJitter)
+    const double rawOffset = (m_smoothedRTT.load(std::memory_order_relaxed)
+                              + m_config.jitterMultiplier * m_smoothedJitter.load(std::memory_order_relaxed))
                              * m_config.tickFrequency;
 
     // ceil rounds up so predictions arrive slightly early rather than late.
@@ -400,17 +404,17 @@ unsigned int NetworkTimeEstimator::getLastAuthorityTick() const
 
 double NetworkTimeEstimator::getSmoothedRTT() const
 {
-    return m_smoothedRTT;
+    return m_smoothedRTT.load(std::memory_order_relaxed);
 }
 
 double NetworkTimeEstimator::getSmoothedJitter() const
 {
-    return m_smoothedJitter;
+    return m_smoothedJitter.load(std::memory_order_relaxed);
 }
 
 bool NetworkTimeEstimator::hasFirstRTTSample() const
 {
-    return m_hasFirstSample;
+    return m_hasFirstSample.load(std::memory_order_relaxed);
 }
 
 unsigned int NetworkTimeEstimator::getRejectedRTTSampleCount() const

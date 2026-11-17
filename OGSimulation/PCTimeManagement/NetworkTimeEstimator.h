@@ -26,25 +26,31 @@ OGSIM_OPTIMIZE_OFF
 //   Game thread (GT)  — writes via: updateRTT(), recordAuthorityTick()
 //                       Called from the adapter's timing-buffer arrival callback,
 //                       on the thread replication delivers on. One adapter binds
-//                       that to `AOGBrawlerSimulationManager::onTimingInfoReceived`,
+//                       that to `UESimulationSession::onTimingInfoReceived`,
 //                       fed from `ASimulationTimingRelay::OnRep_Buffer`.
 //
-//   Physics thread (PT) — reads via: getTargetPredictionTick(), getLastAuthorityTick(),
-//                          getSmoothedRTT(), getSmoothedJitter(), getPredictionOffsetTicks()
+//   Physics thread (PT) — reads via: getTargetPredictionTick(), and through it
+//                          getPredictionOffsetTicks().
 //                          Called inside ClientPredictionClock::advancePrediction().
+//                          The other accessors read the same members and are
+//                          safe from either thread.
 //
-// m_authorityTick is declared std::atomic<unsigned int> so that PT reads of
-// the server tick are always coherent, regardless of platform.
+// m_authorityTick, m_smoothedRTT, m_smoothedJitter and m_hasFirstSample are
+// all std::atomic, with ONE writer (GT) and memory_order_relaxed on every
+// access. Every crossing read is therefore correctly synchronized on every
+// platform — no data race, no torn value — not only on x86-64, where a relaxed
+// atomic compiles to the same plain load and store the old fields used.
 //
-// m_smoothedRTT and m_smoothedJitter are plain double.  On x86-64, naturally-
-// aligned 8-byte stores and loads are single-bus-cycle operations and cannot
-// tear.  This holds for MSVC/Clang on Windows x64 (UE's primary PT target).
-// If this class is ever ported to ARM or compiled with unaligned-access enabled,
-// wrap these fields in std::atomic<double> as well.
+// Each member is coherent on its own; the four are NOT a snapshot. A PT read
+// may combine values written by different writer calls (e.g. the first-sample
+// flag already true while the seed is not yet visible). The worst outcome is
+// one frame's offset computed from that mix (the floor, in the flag example),
+// superseded by the next read. That is accepted: the estimate is data.
 //
-// m_hasFirstSample is written exactly once (GT, on the first updateRTT call)
-// and thereafter only read (PT).  On x86-64 this is safe; on weaker memory
-// models a one-time publish fence or atomic<bool> would be needed.
+// The static_assert on std::atomic<double> below replaces the old caveat
+// "if this class is ever ported to ARM ... wrap these fields in
+// std::atomic<double>": a platform without lock-free 8-byte atomics now
+// fails to compile instead of silently taking a lock on the PT.
 // ============================================================
 class NetworkTimeEstimator
 {
@@ -143,10 +149,15 @@ private:
 
     const TimeConfig& m_config;
 
-    std::atomic<unsigned int> m_authorityTick{0}; // GT writes, PT reads — explicit atomic
-    double m_smoothedRTT          = 0.0;
-    double m_smoothedJitter       = 0.0;
-    bool   m_hasFirstSample       = false;
+    static_assert(std::atomic<double>::is_always_lock_free,
+        "NetworkTimeEstimator: needs lock-free double atomics for its GT->PT estimate. Was the "
+        "THREAD-SAFETY CONTRACT's ARM caveat: 'if ported to ARM, wrap these fields in std::atomic<double>'");
+
+    // GT writes, PT reads — relaxed atomics, one writer (see the contract above).
+    std::atomic<unsigned int> m_authorityTick{0};
+    std::atomic<double>       m_smoothedRTT{0.0};
+    std::atomic<double>       m_smoothedJitter{0.0};
+    std::atomic<bool>         m_hasFirstSample{false};
 
     // T21 validity-gate bookkeeping. GT-only, like every other non-atomic
     // member here: both are touched exclusively inside updateRTT (a GT writer
