@@ -118,8 +118,8 @@ concept CorrectionStateSyncedBufferConcept =
 // reads the ring at bind. An owner with one fails at the registerSimulatable call
 // site instead of leaving a proxy with a dead store. §2
 //
-// ⛔ FRelayedInputRing is NEVER named in this layer — it arrives as
-// OwnerT::RelayedInputRingType, consumed only through the codec's concept. §2
+// ⛔ The ring type (og-sim-net's RelayRingBuffer; the Unreal FRelayedInputRing until og-input-latency task P5-9)
+// is NEVER named in this layer — it arrives as OwnerT::RelayedInputRingType, consumed only through the codec's concept. §2
 template <typename OwnerT, typename StateT, typename InputT>
 concept PredictionSyncedBufferOwnerConcept =
     requires(OwnerT& owner,
@@ -141,8 +141,8 @@ concept PredictionSyncedBufferOwnerConcept =
         { owner.setOnRelayedInputReceivedCallback(relayFn) };
         { owner.clearOnRelayedInputReceivedCallback() };
         { constOwner.getRelayedInputRing() } -> std::same_as<const typename OwnerT::RelayedInputRingType&>;
-        // ⛔ FInputRedundancyBundle NEVER appears in this layer — only the core
-        // PendingInputQueue and the redundancyDepth scalar cross this line. §2
+        // ⛔ The bundle type (og-sim-net's InputBundleBuffer; the Unreal FInputRedundancyBundle until og-input-latency
+        // task P5-9) NEVER appears in this layer — only the core PendingInputQueue and the redundancyDepth scalar cross this line. §2
         { owner.sendLocalInputToAuthority(pendingQueue, currentTick, redundancyDepth) };
     };
 

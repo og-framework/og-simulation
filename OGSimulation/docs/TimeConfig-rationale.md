@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: MPL-2.0 -->
+<!-- lint-external-ref: ASimulationTimingRelay -- deleted by og-input-latency task P5-9 (the relay actors, their listeners, the Iris sim buffers, serializers and proofs, and UEConnectionHandle); kept in the history -->
 # `TimeConfig.h` — rationale
 
 This is the narrative, the derivations, the measurement records and the deferral history for
@@ -17,7 +18,8 @@ below it is there to make an argument readable, and the argument is what this fi
 adapter this library was first measured on is `OGSimulationUnreal` + `Source/OGBrawlerUnreal`, on
 Unreal Engine. Where a section names one of that adapter's symbols — `FApp::GetCurrentTime`,
 `FReplicationWriter::HandleObjectBatchFailure`, `SplitHugeObject`, `GetBitCountSplitThreshold`,
-`UPROPERTY`, `ASimulationTimingRelay`, the `AsyncFixedTimeStepSize` key, `Config/DefaultEngine.ini`
+`UPROPERTY`, `ASimulationTimingRelay` (deleted by og-input-latency task P5-9, named as history), the
+`AsyncFixedTimeStepSize` key, `Config/DefaultEngine.ini`
 — it is **one adapter's binding, an example and not the definition**. Another adapter substitutes
 its own; the ROLE is what the argument rests on.
 
@@ -215,8 +217,9 @@ the validity gate's doctrine in the same function. `rttOutlierConsecutiveLimit` 
 being a bug: a filter that never lets the estimate move cannot follow a GENUINE step change in
 network conditions, so after a run of consecutive implausible samples the estimator concludes the
 level really has moved and re-seeds. A single hitch is isolated and never reaches the limit; a real
-step is sustained and always does. About 30 samples is about 0.3 s at a 100 Hz timing relay — longer
-than a hitch's inflated-acknowledgement backlog, short enough that a real step is absorbed in well
+step is sustained and always does. About 30 samples is about 0.5 s at og-sim-net's clock cadence (at
+most one `ClockPublish` per server frame, `SimNetServer::flushClock`; 60 Hz in the shipped game; the
+deleted timing relay's was given as 100 Hz) — longer than a hitch's inflated-acknowledgement backlog, short enough that a real step is absorbed in well
 under a second.
 
 **Why the multiplicative bound is loose and the additive one exists.** 4x is deliberately loose: this
@@ -237,7 +240,8 @@ hitch-inflated first reading outright.
 **Why rejections are counted and summarised.** A silent reject hides a genuine RTT step change
 exactly as well as it hides a hitch artifact, so rejections are counted per window and summarised in
 ONE log line per window that contains any. The window is sized to bound log volume at roughly one
-line per 6 s at a 100 Hz timing relay even if the ping source misbehaves continuously. Setting it to
+line per 10 s at that 60 Hz clock cadence (600 samples, `rttOutlierLogWindowSamples`) even if the ping
+source misbehaves continuously. Setting it to
 0 disables the window summary; the running totals stay available through the estimator's accessors
 either way.
 
@@ -342,15 +346,17 @@ capacity down). Beyond that cap the client's own capture for the scheduled tick 
 evicted from `LocalInputCache` before it can be consumed, and the whole scheduled regime silently
 degenerates into permanent fallback reads instead of failing loudly. The clamp is enforced at BOTH
 intake points — the configuration override at the composition root and the client's floor
-replication callback — and once more on every read inside `applyRelayDelayFloor`. That
+receipt — and once more on every read inside `applyRelayDelayFloor`. That
 belt-and-braces shape is the same one `clampConnectionTierIndex` uses for the replicated tier.
 
 **Source of truth and distribution.** The SERVER owns the value, optionally overridden from the
-`RelayDelayFloorTicks` key under `[OGNetcode]` at the composition root, and replicates it to every
-client as its own uint8 replicated property on the session-scoped TIMING RELAY — session-scoped state
-on the session-scoped vehicle. (One adapter's binding: a `UPROPERTY` on `ASimulationTimingRelay`.)
-Clients never derive it locally; a client's copy of the field is written from that property's
-replication callback. The deferred dynamic-floor policy (design §11 Q6) needs no new mechanism: it
+`RelayDelayFloorTicks` key under `[OGNetcode]` at the composition root, and sends it to every client
+as a `RelayFloor` message on og-net's Control lane (`SimNetServer::publishFloor`, and again to a client
+that attaches later) — session-scoped state on the session's control channel. (Until og-input-latency
+task P5-7 it was a uint8 replicated property, a `UPROPERTY`, on the session-scoped timing relay,
+`ASimulationTimingRelay`, deleted by P5-9.) Clients never derive it locally; a client's copy of the
+field is written from that message's receipt (`SimNetClient::onFloor`, then
+`UESimulationSession::onRelayDelayFloorReceived`). The deferred dynamic-floor policy (design §11 Q6) needs no new mechanism: it
 writes this field and the property again.
 
 **This field owns the hiccup-absorption rationale** that the retired no-tier-baseline field used to
@@ -640,3 +646,202 @@ tightened only once the clock holds m0 close to its target, which is time-dilati
 **The `static_assert` below the struct** checks that the compiled default is below 0. An honest m0 p50 sits at about 0
 in steady state, and the dead band lets it fall a few ticks below, so a threshold at or above 0 would flag honest
 sessions. The check replaces a comment; no tag is needed.
+
+## 14. The one-shot re-centre: `recentreSettleSamples`
+
+One field added by og-input-latency task 27, 2026-11-18: `recentreSettleSamples`. Its reader is `ClientPredictionClock`;
+it counts the samples with `NetworkTimeEstimator::getMeasuredRTTSampleCount`, the running total of samples that passed
+`updateRTT`'s validity gate (plausible or not) **and read above 0**. The composition root may override it with the `RecentreSettleSamples`
+key under `[OGNetcode]`, read on both roles (one adapter's binding: `UESimulationSession`'s `readSessionKnobs` and
+`applyLatencyKnobs`, with the start-up line `[ClockRecentre.Config] recentreSettleSamples=… (ini|compiled)`). The key
+exists so the A arm (0) runs on the same binary as the B arm.
+
+**The problem it fixes: the dead band keeps a join's landing error for the session.** The clock corrects only a drift
+larger than `softDriftThresholdTicks` (3). Whatever lead a join leaves inside that band stays until the next hard resync.
+Two joins measured by og-input-latency left one:
+- **The Ph3 landing** (task P5-25, the Ph3 gate, and its review). A joining client's first frame runs a catch-up batch of
+  10 to 17 steps. The first step is the hard resync onto the target; the batch's remaining steps then run past it, with one
+  graduated Stall per `gradualCorrectionRate` steps, and end 7 to 10 ticks above the target. Graduated Stalls walk the lead
+  back down, and the walk stops at the dead band's edge, so the clients settled 2 to 3 ticks of drift above the target, a
+  lead of 6.3 to 7.1 ticks, about +58 ms of input latency against the Ph2 reference.
+- **An inflated first RTT** (task P4-12's F10, fixed at its trigger by P4-13). A raised first target makes the client skip
+  up to it; when the RTT falls back, the client is left above the new target, inside the band.
+
+**The rule.** The re-centre is armed when the clock is constructed and again by every hard resync, with the estimator's
+measured-sample count at that moment. Once `recentreSettleSamples` more measured samples have arrived, the next
+`advancePrediction` past the warm-up guard decides **once** how many ticks the lead is off, and logs one line:
+
+`[Warning][Clock.Recentre] fromLead=<x> toLead=<y> owed=<n> target=<t> rttMs=<r> samples=<s> cause=<c>`, with
+` fromTarget=<a> toTarget=<b>` appended when `cause` is `rearm`, then ` skipped=within1` when `owed` is 0. `cause` names
+the arm the decision closes (since rework 2): `join` for the clock's first decision (the arm at construction, and a hard
+resync that lands before any decision, as every measured join does), `resync` for a hard resync after a decision, and
+`rearm` for the re-arm below.
+
+**The decision reads a median, not one frame** (og-input-latency task 27, rework 1, after its review's finding F3). Every
+advance of an armed re-centre past the warm-up guard stores one reading: the lead over the last authority tick that the
+clock would have had if every advance since the arm had been Normal. The decision takes the median of the last
+`ClientPredictionClock::kRecentreMedianAdvances` (15) readings, an odd count so that a full run's median is one reading
+(a `static_assert` checks it). It moves the median to the current frontier by taking off the Skips and Stalls the clock
+has made since the arm, and subtracts the current prediction offset; `owed` is the result, rounded half away from zero
+(only a run shorter than 15 with an even count has a half). The readings are stored uncorrected so that the graduated
+Stalls of a landing's walk down, which run inside the window, do not move the median. The median is of the lead over the
+authority tick, not of the drift, and the offset is the decision's own: the median filters the authority tick's arrival
+phase, which flickers frame to frame, and an RTT step inside the run counts in full. That matters because the outlier gate
+re-seeds on its `rttOutlierConsecutiveLimit`-th consecutive outlier, which with the default window is the sample that
+fills it: a median of the drift owed 0 there and left the client two ticks low
+(`PCTM.ClientPredictionClock.Recentre.ZeroReadingsDoNotFillTheWindow`).
+
+`fromLead` is `toLead + owed`, `toLead` the target minus the last authority tick (the prediction offset), `target` the
+target tick, `rttMs` the smoothed RTT and `samples` the samples since the arm. A non-zero `owed` is a debt of exactly that
+many graduated corrections, one per `gradualCorrectionRate` advances, **inside the dead band too**, in the debt's
+direction (ahead: Stall; behind: Skip). Outside the dead band the drift sets the direction, as before. Every graduated
+correction fired while a debt is owed pays one tick of it, so the debt ends after exactly `|owed|` corrections; an
+opposite one can only come from outside the band, where the drift disagrees with the debt by more than the band, and
+counting it too keeps the episode bounded. No later reading ends the debt; a hard resync or a re-arm clears it and
+re-arms. Otherwise it does not fire again. A hard resync or an input-delay stall debt keeps its priority over it (hard
+resync, then debt, then drift correction), and `evaluateDrift` reports the correction it owes.
+
+**The re-arm: a target that moves after the decision** (og-input-latency task 27, rework 2, from the Ph3 gate's finding
+R10). After a decision the clock compares the **RTT-only offset**, `max(predOffsetFloorTicks, ceil(smoothedRTT ×
+tickFrequency))`, with its value at that decision, on every advance that is not a hard resync. That is the prediction
+offset (`getPredictionOffsetTicks`, the quantity the target adds to the authority tick) without its jitter term, floored
+as the prediction offset is; the clock computes it itself (`ClientPredictionClock::recentreRttOffsetTicks`, since rework
+3; floored since rework 4), from its own `TimeConfig`, which is the estimator's. When the two differ by
+`ClientPredictionClock::kRecentreRearmTicks` (2) or more on every one of the last `kRecentreMedianAdvances` (15) advances,
+the re-centre re-arms: any outstanding debt is cleared, the settle window counts `recentreSettleSamples` measured samples
+again from that advance, the median run restarts, and the next decision is made as above, from the state at that moment.
+The decision itself still aims at the full prediction offset; only the trigger leaves the jitter out. Both constants are
+`constexpr` in the clock; there is no new `TimeConfig` field and no new ini key. The decision's line then carries
+`cause=rearm fromTarget=<a> toTarget=<b>`: `a` is the RTT-only offset at the previous decision and `b` the RTT-only offset
+on the advance that re-armed, both floored (the full offset is the line's `toLead`). There is no cap on re-arms. A hard
+resync keeps its own re-arm unchanged. `evaluateDrift` reports no correction on the advance that re-arms, because the
+re-arm clears the debt before the band is read.
+
+The case it was built for: in the Ph3 gate's shaped rendered shape (b) (P5-25 rework 1), both client1s decided on the
+start-up RTT spike. They logged `rttMs` 131.6 and 139.9 ms, offsets 8 and 9, about 1.2 s after the join. Their
+averaged ping then fell one bucket per second, to 106–113 ms at 1.5–3 s and 78–87 ms from 5 s on, and the offset fell to
+5–6. The dead band held the difference at +2 for the session. A replay of both RTT timelines
+(`PCTM.ClientPredictionClock.Recentre.ThePh3bJoinsReArmWhenTheirStartUpRttSpikeSettles`) re-arms one client once
+(RTT-only offset 8 to 6) and the other twice (9 to 7, then 7 to 5). It settles both with a median lead error of 0 and a
+mean of +0.15 and −0.25 over the 10–30 s window. Before the re-arm the same replay settled at +2 and +4. On the RTT-only
+offset each re-arm comes 12 to 14 samples sooner than on the full offset (rework 2's trigger), whose jitter term the
+RTT's own fall raised; the decisions' `owed`, the Skips and Stalls and the settled readings are the same.
+
+**Why the trigger is floored** (rework 4, from the Ph3 gate's finding R13). Unfloored (rework 3), an RTT that moves
+entirely under the floor (`predOffsetFloorTicks`, 4, so a smoothed RTT under about 67 ms at 60 Hz) moved the trigger and
+re-armed although the target did not move. The re-decision then measured the same lead again. On the Ph3 gate's loopback
+shape (c) (P5-25 rework 2) six of the eight re-arms were of this kind (`toLead=4`, the RTT-only offset 4 to 2 or 3 to 1).
+Four decided `skipped=within1`. Two, the main clients of one pair, decided `owed=-1` on a lead that flickered between 0
+and −1 in the 15 readings, took one Skip, and sat at +1 for the session (p50 +1, means +0.61 and +0.75 over 10–30 s;
+p50 0 in the 3 s before).
+Floored as the target is, the trigger moves only when the target's RTT part does.
+`PCTM.ClientPredictionClock.Recentre.ThePh3cMainClientDoesNotReArmUnderTheOffsetFloor` replays one of those two clients,
+its first 900 samples as its log has them (the RTT the smoothed RTT implies, the authority ticks and the advances per
+sample): on the unfloored trigger it reproduces all three logged decisions, the third `owed=-1`; floored, it decides
+twice (at 89 and 52 ms) and settles at a median lead error of 0. The same replay of all ten (b) and (c) clients of that
+capture (60 s each) removes the six under-floor re-arms and the two Skips they took, and changes no other decision or
+correction; every (b) client's decisions, corrections and lead are identical. `PCTM.ClientPredictionClock.Recentre.AnRttFallUnderTheOffsetFloorReArmsOnlyOnTheFlooredOffset` pins the
+rule on a fall to 15 ms: from 90 ms (offset 6) it re-arms and logs `toTarget=4`; from 75 and 55 ms (5 and 4) it does not.
+
+**Why it cannot oscillate on jitter alone** (rewritten in rework 3, after its review's finding R1). The trigger does not
+read the prediction offset. That offset adds `jitterMultiplier` (2) times the smoothed jitter, an exponential average
+(`jitterSmoothingAlpha`, 0.15) of each sample's distance from the smoothed RTT, and on a heavy-tailed steady link that
+term alone moves it by several ticks. Ten minutes at 70 ms + Exp(30 ms), or on a bursty Wi-Fi profile (75 ms + Exp(5 ms),
+with an Exp(80 ms) burst on 5 % of the samples), one sample and one advance per frame, three seeds each: the offset ranged
+over 5 to 21 ticks, and a trigger on it (rework 2's) re-armed 62 to 108 times a session and took 3.2 to 4.4 times the
+Skips and Stalls of the clock without the re-arm. The trigger reads the RTT-only offset instead, so jitter reaches it only
+through the smoothed RTT, an exponential average (`rttSmoothingAlpha`, 0.15) of the samples themselves. Two guards
+filter what is left: the 2-tick threshold (a `static_assert` keeps it at 2 or more), which the one-tick wobble of the
+`ceil` near a tick boundary never reaches, and the 15-advance run, which a short excursion of the RTT average does not
+complete. On the same links and seeds the RTT-only trigger re-armed at most once in ten minutes, and the session took at
+most 4 Skips and Stalls more than the clock before the re-arm (rework 1).
+`PCTM.ClientPredictionClock.Recentre.AJitterySteadyLinkDoesNotReArmIt` pins it: at most 2 re-arms, at most 5 Skips and
+Stalls more, and a full offset that does swing by 10 ticks or more. The one-tick wobble around a decision is
+`PCTM.ClientPredictionClock.Recentre.AOneTickOffsetWobbleNeverReArmsIt` (offsets 5–6 around a decision at 5, and 5–7
+around a decision at 6). Only a sustained move of the RTT average re-arms, which is an RTT step. Each re-arm then needs a
+full settle window and the next decision before another can start, and that decision's RTT-only offset becomes the new
+reference.
+
+A client hitch that inflates the averaged ping for a few seconds is such a step, and it re-arms twice, once into the
+spike and once out of it. In rework 2's shaped rendered smoke (2026-11-18), both clients stalled 1.5 s at the same
+instant and hard-resynced. The averaged ping then read about 154 and 188 ms for about 4 s where the link gave 80, and the
+full offset went from 5 to 12 and 15. Each client re-armed into the spike (`owed=0`: the ordinary graduated Skips outside
+the dead band had already followed it) and out of it (`owed` 3 and 2). Both were on target again about 6 s after the
+resync. That smoke ran rework 2's trigger. Re-read from its logged smoothed RTT, the RTT-only offset went from 5 to 10
+and 12, stood there for about 180 samples and fell back to 5, so the RTT-only trigger re-arms into and out of the same
+spike: its 15-sample run completes 1 sample later going in and 10 to 11 samples sooner coming out (the jitter term no
+longer leads the run in, nor holds it back on the way out).
+
+**The zero point is drift = 1, not 0.** The clock's drift is the target minus the tick it last stepped, so a Normal advance
+at drift 1 steps the target tick itself, and at drift 0 it steps one tick past the target. A hard resync lands the same way:
+it steps the target tick, and the next frame's drift is 1. og-input-latency P4-12's estimator trace tool reads the
+lead the same way, as the stepped tick minus the server's tick against the target minus the server's tick, so a re-centre
+onto drift 1 is what that tool reads as "on target". The ordinary dead band is unchanged and stays centred on drift 0.
+
+**Why one shot and not a controller.** The user's ruling for this fix (2026-11-18, "one-shot now, dilation later"): the
+continuous controller, a drift law with a band of about one tick, is og-time-dilation's work, and this step must stay
+compatible with it. A one-shot re-centre adds no state a controller would have to undo, and its knob has an off value a
+controller can set. The re-arm (rework 2) keeps that shape: each decision is still one discrete step, and a re-arm only
+schedules another one when the target's RTT part (floored, as the target is) has moved by 2 or more ticks. It does not
+follow the lead continuously.
+
+**The window: 30 samples, the size of `rttOutlierConsecutiveLimit`.** A `static_assert` below the struct checks that the
+compiled default spans a whole outlier run, so an inflated reading that the outlier gate is about to re-seed from has
+either been rejected or re-seeded inside the window before the clock re-centres on it. The window counts from the hard
+resync, so the resync frame's catch-up batch and the walk down from it are inside it. With the og-sim-net client's clock
+coalesce (`SimNetClient-rationale.md` §8) a sample is one frame, so 30 samples is about half a second at 60 frames per
+second.
+
+⚠ **What it does not cover.** An RTT step that arrives after the window (for example a re-seed long after the join, or
+the start-up spike settling) is covered since rework 2 when it moves the RTT-only offset by 2 or more ticks: the re-arm
+above (`PCTM.ClientPredictionClock.Recentre.AMidSessionRttStepReArmsItOnce`: 80 to 120 ms, offset 5 to 8, one re-arm,
+lands on 0). A move of one tick, and a continuous drift that stays under 2 ticks from the last decision, are not covered:
+the dead band holds them, as before. Since rework 4 an RTT change under the floor is invisible to the re-arm, as it is
+to the target: it moves neither. That includes a fall that takes the target one tick down onto the floor (75 to 15 ms,
+offset 5 to 4: the lead stays +1, as after any one-tick fall above the floor), which the unfloored trigger re-armed on
+and corrected only because it read the fall as four ticks. Since rework 3 neither is a move of the jitter term alone: on the jittery links
+above the clock holds a mean lead error of +1.8 to +2.8 ticks with or without the re-centre, which is the dead band
+against a fast-moving jitter term. That is og-time-dilation's controller (src-29). A lead error that flickers across a tick boundary frame to frame is covered by
+the median and the fixed debt since rework 1. Before it, one frame decided and the first frame that read on target ended
+the correction, so a client at p50 +1 kept its +1 (one B client of nine in the task's headless smokes) and a +4 landing
+stopped a tick short (`PCTM.ClientPredictionClock.Recentre.AFlickeringLeadIsDecidedOnItsMedianAndPaidInFull` pins the fix for
+both). What remains is a share that moves after the decision. The decision sees only the run that the window ends in,
+and the authority tick's arrival phase can drift over seconds. In the rework's headless smoke (2026-11-18) one client
+read +1 on 6 of the 15 readings before its decision, which correctly owed 0, and then read +1 on 55 to 72 % of the
+frames in the following seconds: its integer median over 10 to 30 s was +1, though its mean lead error stayed within
+half a tick (+0.35 by the estimator trace tool). Following such a drift is a controller's work, not a one-shot's.
+
+⚠ **The landing's source is not fixed here.** The catch-up batch runs in the tick driver's batch loop
+(`SimulationTickDriver::runBatch`, called from `pumpAndRunSteps`), which steps every scheduled step of the frame whatever
+the clock decided on the first one. Dropping the batch's remaining steps on a hard resync, or resyncing to the target minus
+the remaining batch, needs the driver to learn of the clock's resync: a change across the tick driver's interface, not one
+in the clock. The re-centre corrects the landing either way.
+
+**Why a 0 reading does not count** (found by this task's headless smoke, 2026-11-18). One adapter's client RTT is
+an averaged RoundTrip ping (one adapter's binding: `FNetPing` with `RoundTrip=PlayerStateAvg`, read in
+`UESimNetClientHost::serverRttSeconds`), which reads exactly 0 until its first one-second bucket fills. The estimator
+takes the 0 as a real first reading and seeds from it. In the smoke every client's window filled on 0 readings
+(`rttMs=0.000 samples=30`, about 0.5 s after the join) while the first real reading arrived 0.9 s after it. On that
+loopback the offset stayed at its floor, so nothing moved; on a 100 ms link the target rises by two ticks after the
+decision and the dead band keeps the client two ticks low (the float64 model and
+`PCTM.ClientPredictionClock.Recentre.ZeroReadingsDoNotFillTheWindow`). Counting only readings above 0 starts the window at
+the first real reading; a real round trip, even on loopback, reads above 0 (the smoke's first real readings were 21 to 31 ms: the smoothed RTT one sample after the 0 seed was 3.2 to 4.6 ms,
+which is 0.15 of the reading).
+
+**0 disables it exactly.** With `recentreSettleSamples = 0` the window never fills, so the decision never runs, nothing is
+owed or logged and the dead band is the only correction: the clock is the one before this field (an armed clock still
+stores its readings, and nothing reads them). The re-arm only runs after a decision, so at 0 it never runs either. `PCTM.ClientPredictionClock.Recentre.ZeroDisablesItExactly` compares every
+result, tick and log line of a join, a hard resync and a steady stretch at 0 with a window that can never fill
+(`UINT32_MAX`), not with the code before this field, so it shows only that 0 takes the never-fills path. The proof that 0
+is the old clock is the goldens: with `recentreWindowFull()` poisoned to false (0 for every config), every golden in both
+`[@og]` suites passes and only the re-centre's own cases fail (seven of them at rework 1, ten at rework 2, eleven at
+rework 3, thirteen at rework 4, 2026-11-18). At the default no golden re-arms: with a failing check poisoned into the
+re-arm, only the cases built to re-arm fail (two at rework 2; three at rework 3: the Ph3 (b) replay, the RTT step, and the
+jittery-link case, two of whose six sessions re-arm once; five at rework 4: those three, the Ph3 (c) replay and the fall
+under the floor).
+
+⚠ **0 is not the binary before task 27 at a join.** The og-sim-net client's clock coalesce (`SimNetClient-rationale.md`
+§8) is not gated by this field, so an arm at 0 runs the old clock fed one sample per drain, where the binary before task 27
+fed one sample per queued clock message. At the Ph3 join every first-frame sample carried a smoothed RTT of 0 and the
+floor offset, so the newest gives the same target as the last of them and the landing does not move; an attribution
+arm should still say so.

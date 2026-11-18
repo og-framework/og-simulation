@@ -63,8 +63,9 @@
 //
 // ENGINE-AGNOSTIC. Sim-core header: includes ONLY other `OGSimulation/` headers
 // and the STL — no UE types, no engine headers. Wire identity arrives as the
-// opaque `Address` parameter, bound in production to `FUEConnectionHandle` and
-// in the Catch2 suite to `FStandaloneTestHandle`.
+// opaque `Address` parameter, bound in production to og-sim-net's
+// `SimNetConnectionHandle` (the Unreal `FUEConnectionHandle` until og-input-latency
+// task P5-7; deleted by P5-9) and in the Catch2 suite to `FStandaloneTestHandle`.
 //
 // ---------------------------------------------------------------------------
 // THREADING CONTRACT — THIS CLASS IS **NOT** THREAD-SAFE. (Added T10, 2026-07-20.)
@@ -88,7 +89,8 @@
 // server input path already crosses. The correct integration shape, and the one
 // T10 ships, is:
 //
-//   game thread:     RPC arrives -> enqueue() here
+//   game thread:     an input bundle arrives (og-sim-net's frame-locked drain
+//                    since og-input-latency task P5-7; an RPC before) -> enqueue() here
 //   game thread:     immediately before the physics step -> tryDequeueForTick()
 //                    here, then hand the released input to RemoteMoveQueue
 //   physics thread:  the authority tick consumes it from RemoteMoveQueue
@@ -98,13 +100,17 @@
 // wants to dequeue from the physics thread must NOT simply add a lock here: a
 // lock would fix this container's internal race and still leave the caller doing
 // ENGINE-OBJECT traversal on the physics thread — resolving a weak object handle
-// (one adapter: `TWeakObjectPtr::Get`), then walking from the owning actor to its
+// (the Unreal handle's `TWeakObjectPtr::Get`, until og-input-latency task P5-7),
+// then walking from the owning actor to its
 // transport connection (`AActor::GetNetConnection`) — which this codebase forbids.
 // ---------------------------------------------------------------------------
 //
-// CONSUMER: wired in Phase B (T10) — the UE server binding parks inbound RPC
-// input here and releases it on the game thread immediately before the authority
-// physics step. The Catch2 suite additionally drives it standalone.
+// CONSUMER: wired in Phase B (T10). Since og-input-latency task P5-7 og-sim-net's
+// server parks inbound input here (through ServerReceptionCoordinator, in its
+// frame-locked drain on the game thread) and the Unreal session releases it on the
+// game thread immediately before the authority step
+// (UESimulationSession::releaseDelayedInputsForStep); the UE server binding parked
+// inbound RPC input here before. The Catch2 suite additionally drives it standalone.
 //
 // NAMESPACE NOTE: declared in the GLOBAL namespace, matching the rest of the
 // OGSim core (see the same note on ConnectionTierTable.h, NetConfig in

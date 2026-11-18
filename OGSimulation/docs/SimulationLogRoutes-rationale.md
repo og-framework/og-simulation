@@ -25,7 +25,7 @@ first-match table of prefixes.
 
 `kSimulationLogRoutes` is the part of that table that belongs to the core: **one row per tag that
 og-simulation emits and no host emits.** Two rows break that rule: `[SimNet.` and `[Roster.` route the lines of og-sim-net, a
-library built on og-simulation (§5). A row is:
+library built on og-simulation, and of a host that runs it (§5). A row is:
 - `prefix`: the start of the tag. A host compares it with the line after the severity token,
   ignoring case;
 - `route`: the channel the line belongs to (§2);
@@ -95,7 +95,7 @@ would take every `[ResimCheck.` row's lines and fail `allReachable`.
 ## §5 The rows and their emitters
 
 Each row's tag is emitted by these core files and by no host (a search of every string literal in the
-core, with the severity token removed, 2026-10-16):
+core, with the severity token removed, 2026-10-16), except `[SimNet.` and `[Roster.` (below the table):
 
 | row | route | `plainLevel` | emitting file |
 |---|---|---|---|
@@ -126,8 +126,8 @@ core, with the severity token removed, 2026-10-16):
 | `[InputDomain]` | `Net` | `Log` | `Network/ServerReceptionCoordinator.h` |
 | `[RelaySkip]` | `Net` | `Log` | `Network/ServerReceptionCoordinator.h` |
 | `[RelayFlush]` | `Net` | `Log` | `Network/RelayRingStager.h` |
-| `[SimNet.` | `Net` | `Log` | none in the core; og-sim-net's `SimNetServer.h` and `SimNetClient.h` |
-| `[Roster.` | `Net` | `Log` | none in the core; og-sim-net's `SimNetServer.h`, `SimNetClient.h` and `SimNetRoster.h` |
+| `[SimNet.` | `Net` | `Log` | none in the core; og-sim-net's `SimNetServer.h` and `SimNetClient.h`, and the Unreal host (below) |
+| `[Roster.` | `Net` | `Log` | none in the core; og-sim-net's `SimNetServer.h`, `SimNetClient.h` and `SimNetRoster.h`, and the Unreal host (below) |
 | `[DivergenceProbe` | `DivergenceProbe` | `Log` | `NetSyncTelemetry.h` |
 
 **Not here, and why.** Three tag families are emitted by the core **and** by the brawler game's adapter:
@@ -152,18 +152,30 @@ route table, until that host binds the stager and retires the actor; no host rou
 `[RelaySkip]`: neither begins with the other, and no earlier row's prefix (`[Release]` included) begins it.
 
 `[SimNet.` and `[Roster.` were added after `[RelayFlush]` (og-input-latency P5-4, 2026-11-18), and **they break the rule of
-§1**: no og-simulation file emits them. Their emitters are og-sim-net's two sessions and its roster, a library built on
-og-simulation in a module of its own, which has no route table. The rows are here so that a host of og-sim-net routes its lines
-through the one table it already reads. Both are family catch-alls, with the dot (as `[TimeResync.`):
-- `[SimNet.Window]` (both sessions' window line) and `[SimNet.Disconnect]` (a quota disconnect) always carry `[Warning]`;
-- `[Roster.Refused]` carries `[Warning]` from the server (a refused add) and no token from the client (a refused roster
-  message); `[Roster.InputRefused]` (the server's refused input bundle) carries no token; `[Roster.BindMismatch]` has a
-  formatter in `SimNetRoster.h` and no emitter yet. A token-less line of either family prints at `Log`, so a host that
-  filters its Net channel above `Log` does not show it.
+§1** twice: no og-simulation file emits them, and a host emits lines of both. The exception is decided (og-input-latency P5-7,
+2026-11-18): the rows stay in this block, so that a host of og-sim-net routes its lines through the one table it already reads.
+og-sim-net has no route table of its own, and a row in a host's own block would leave every other host of og-sim-net without
+it. Both are family catch-alls, with the dot (as `[TimeResync.`). Their emitters:
+- **og-sim-net**, a library built on og-simulation in a module of its own: its two sessions and its roster.
+  - `[SimNet.Window]` (both sessions' window line) and `[SimNet.Disconnect]` (either session's quota disconnect) always carry
+    `[Warning]`.
+  - `[Roster.Refused]` carries `[Warning]` from the server (`SimNetServer.h`, a refused add) and no token from the client
+    (`SimNetClient.h`, a refused roster message). `[Roster.InputRefused]` (the server's refused input bundle) carries no token.
+    `SimNetRoster.h` holds the roster lines' formats.
+- **The Unreal host** (og-simulation-unreal), which runs og-sim-net's sessions:
+  - its session prints one `[Warning][SimNet.Host]` start-up line per process through its router;
+  - it prints its other `[SimNet.Host]` lines (a refused driver, a refused immediate-traffic setting, a client's disconnect
+    after a refused roster) directly at its `Error` level, past the route table;
+  - on a client, its session emits `[Roster.BindMismatch]` (`SimNetRoster.h`'s format) when the roster and the engine
+    disagree on whether a character is local, and then fails a check.
 
-A host may emit lines of these families too, and the Unreal host is planned to (a `[SimNet.Host]` start-up line), so the rule's
-"no host emits" will not hold for `[SimNet.` either. Neither prefix begins with an earlier row's prefix, and `[DivergenceProbe`,
-the one row after them, begins with neither.
+By the rule of §3 a token-less line of either family prints at `Log`, so a host that filters its Net channel above `Log`
+does not show it. Every token-less line of the two families that reaches a router is a `[Roster.` line. The Unreal host does
+not leave them at `Log`: its two og-sim-net hosts print every og-sim-net line, and its session the `[Roster.BindMismatch]`
+line, through one function that puts `[Warning]` in front of a token-less `[Roster.` line before the router sees it. So the
+line shows at the `Warning` filter the brawler game ships for that channel.
+
+Neither prefix begins with an earlier row's prefix, and `[DivergenceProbe`, the one row after them, begins with neither.
 
 `[InputDelay]` has no row. The coordinator emits it (`Network/ServerReceptionCoordinator.h`, the one-shot
 warning for a derived player slot out of range), and no host emits it, so by the rule of §6 it should have
@@ -211,4 +223,5 @@ og-input-latency P2-5 (2026-11-14) added the `[RelayFlush]` row after `[RelaySki
 (§5). 27 rows became 28.
 
 og-input-latency P5-4 (2026-11-18) added the `[SimNet.` and `[Roster.` rows after `[RelayFlush]`, for og-sim-net's lines (§5).
-28 rows became 30.
+28 rows became 30. og-input-latency P5-7 (2026-11-18) made the Unreal host emit lines of both families and kept the two
+rows here by decision (§5); no row changed.

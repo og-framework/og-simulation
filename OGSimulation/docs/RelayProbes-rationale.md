@@ -1,4 +1,6 @@
 <!-- SPDX-License-Identifier: MPL-2.0 -->
+<!-- lint-external-ref: ASimulationInputRelay -- deleted by og-input-latency task P5-9 (the relay actors, their listeners, the Iris sim buffers, serializers and proofs, and UEConnectionHandle); kept in the history -->
+<!-- lint-external-ref: ASimulationInputRelay::OnRep_RelayedInputRing -- deleted by og-input-latency task P5-9 (the relay actors, their listeners, the Iris sim buffers, serializers and proofs, and UEConnectionHandle); kept in the history -->
 # `Network/RelayReadProbe.h` + `Network/RelayWritePathProbe.h` — rationale
 
 The two headers keep a one-line guard at every site that has one, plus an orientation block
@@ -36,7 +38,7 @@ nothing for a reader with no workspace. Task 35 moved that provenance out of the
 -->
 <!-- lint-external-ref: ServerFrameProbe -- RETIRED NAME: PROBE 4's type was renamed to FrameHealthProbe when it gained the client role. The old name must not resolve; SS9 and SS14 name it as history -->
 <!-- lint-external-ref: SimulationNetSync::collectInputAll -- DEAD OWNER, the subject of F-35-1: the method lives on SimulationInputResolution. Quoted here unrepaired because SS16 is an archive; the shipped header states the correct owner. `CorrectionCache-rationale.md` declares the same token for the same reason -->
-<!-- lint-external-ref: USimmableUpdateComponent::OnRep_RelayedInputRing -- DEAD SYMBOL, the subject of F-35-2: the OnRep moved to ASimulationInputRelay with the property it notifies. It must not resolve -->
+<!-- lint-external-ref: USimmableUpdateComponent::OnRep_RelayedInputRing -- DEAD SYMBOL, the subject of F-35-2: the OnRep moved to ASimulationInputRelay with the property it notifies, and og-input-latency task P5-9 deleted that actor. It must not resolve -->
 <!-- lint-external-ref: kMaxTrackedGap -- NEVER EXISTED, the subject of F-35-7: the real constant is kRelayArrivalMaxTrackedGap. Quoted so the defect is on the record; it must not resolve -->
 <!-- lint-external-ref: FReplicationWriter -- ENGINE TYPE, outside every scan root by construction: this core is engine-free. Named once as ONE adapter's binding -->
 <!-- lint-external-ref: FReplicationWriter::HandleDroppedRecord -- ENGINE MEMBER, same reason: the near-miss send-success signal that recovers the changemask and not the values -->
@@ -770,8 +772,10 @@ The engine-name binding block said the adapter's replicated-ring OnRep is
 **That OnRep moved to the relay actor with the property it notifies.** The component's own source
 records the move — *"`OnRep_RelayedInputRing()` stood here. The OnRep moved to
 `ASimulationInputRelay` with the property it notifies"* — and the component header records the
-property, the OnRep and the registration all moving together. The live symbol is
-`ASimulationInputRelay::OnRep_RelayedInputRing`. The binding block now names it.
+property, the OnRep and the registration all moving together. The live symbol was then
+`ASimulationInputRelay::OnRep_RelayedInputRing`, and the binding block named it. (og-input-latency task P5-9
+deleted that actor; since task P5-7 the ring arrives through og-sim-net, `SimNetClient::onRing` →
+`SimNetChannel::storeRing`, and the binding block names that.)
 
 ⚠ **This symbol was moved INTO the binding block by the engine-name pass, from the body**, which is
 worth recording as a general hazard: **a relocation pass can promote a dead symbol into the very

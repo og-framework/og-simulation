@@ -66,7 +66,8 @@
 //
 // ENGINE-AGNOSTIC. Sim core: only other `OGSimulation/` headers and the STL. Wire
 // identity arrives as the opaque template parameter `Address`, bound in production to
-// `FUEConnectionHandle` (OGSimulationUnreal) and in the Catch2 suite to
+// og-sim-net's `SimNetConnectionHandle` (the Unreal `FUEConnectionHandle` until
+// og-input-latency task P5-7; deleted by P5-9) and in the Catch2 suite to
 // `FStandaloneTestHandle` (`Network/StandaloneTestHandle.h`).
 // GLOBAL NAMESPACE, matching the rest of the OGSim core (same note as `NetConfig` in
 // SimulationManagerConcept.h and SimulatableList.h). The design corpus writes

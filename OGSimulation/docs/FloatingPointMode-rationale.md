@@ -107,3 +107,12 @@ An Unreal module sets the mode with `FPSemantics = FPSemanticsMode.Precise;` in 
   its own executable, so it shares no copy with the game.
 - **How to check a build:** every compile response file (`.obj.rsp`) under the module's intermediate directory names its
   `/fp` option. A module added later that compiles og-simulation code needs both lines.
+- **The compile-time check** (og-input-latency task 20a). `CompilerControl.h` stops the compile with an `#error` when
+  `_M_FP_FAST` or `__FAST_MATH__` is defined. MSVC defines `_M_FP_FAST` under `/fp:fast` only (`_M_FP_PRECISE` under
+  `/fp:precise`, `_M_FP_STRICT` under `/fp:strict`); clang-cl defines both macros under `/fp:fast` and `-ffast-math`, and
+  clang defines `__FAST_MATH__` under `-ffast-math` (one-file probes, MSVC 19.38, clang 19.1.5, NDK 27.2, 2026-11-18). On
+  2026-11-18 at least one translation unit of each module in the table included the header, except OGSimulationNet, whose
+  one source file includes no og-simulation header (UnrealBuildTool's `.dep.json` files). Measured: OGBrawler left on the
+  target's default stops the OGBrawlerTests build in its unity file Module.OGBrawler.cpp with error C1189. The check does not see
+  clang's contraction setting: clang-cl `/fp:precise` without `-ffp-contract=off` defines `_M_FP_CONTRACT` and compiles
+  clean. Nor does it see a module none of whose files reaches the header.

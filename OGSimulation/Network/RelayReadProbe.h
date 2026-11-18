@@ -47,11 +47,14 @@
 // ONE ADAPTER'S BINDING FOR EVERY ENGINE NAME BELOW. The body names ROLES ONLY:
 // the physics engine, the replication system, the replicated-ring arrival
 // callback, the server frame-rate cap, the global game-thread frame counter. For
-// one adapter (Unreal/Chaos) those are Chaos, Iris, the relay actor's OnRep
-// `ASimulationInputRelay::OnRep_RelayedInputRing`, the `NetServerMaxTickRate`
-// setting and `GFrameCounter`; there the missing send-success signal is
-// `FReplicationWriter::HandleDroppedRecord`, which recovers the changemask and
-// not the values. Another adapter substitutes its own. §15
+// one adapter (Unreal/Chaos) those are Chaos; og-net's sim lanes since
+// og-input-latency task P5-7 (Iris before); og-sim-net's ring arrival
+// (`SimNetClient::onRing` -> `SimNetChannel::storeRing`; until P5-7 the relay
+// actor's OnRep `ASimulationInputRelay::OnRep_RelayedInputRing`, deleted by P5-9);
+// the `NetServerMaxTickRate` setting and `GFrameCounter`. Under Iris the missing
+// send-success signal was `FReplicationWriter::HandleDroppedRecord`, which recovers
+// the changemask and not the values; og-sim-net's relay sends carry none. Another
+// adapter substitutes its own. §15
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------

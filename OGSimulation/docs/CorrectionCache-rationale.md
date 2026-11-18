@@ -27,9 +27,11 @@ core, and the quotations are byte-verbatim, so their ROLES are given here instea
 **`Chaos`** is that adapter's **physics engine** — the party handed a tick to restore at, and the
 owner of the rewind loop; **`FSimulationManagerAsyncCallback::OnPreSimulate_Internal`** is one
 adapter's **pre-simulate physics callback**, where the core's step is entered before the solve; and
-**`FSimulationStateSyncBuffer`** is one adapter's **replicated state buffer** — the wire-side type
-whose `writeToBuffer<T>` / `readFromBuffer<T>` surface `ChecksumByteBuffer` deliberately mirrors so
-the same serializers can target both. A fourth, `Config/DefaultEngine.ini`, is one adapter's
+**`FSimulationStateSyncBuffer`** was one adapter's **replicated state buffer** (deleted by
+og-input-latency task P5-9) — the wire-side type whose `writeToBuffer<T>` / `readFromBuffer<T>` surface
+`ChecksumByteBuffer` deliberately mirrors so the same serializers can target both. Since task P5-7 the
+correction travels in og-simulation's own `CorrectionStateBuffer` (`Network/SimPayloadBuffers.h`),
+which exposes the same surface. A fourth, `Config/DefaultEngine.ini`, is one adapter's
 **host-application configuration surface**, named where a section records which compiled default the
 shipped session actually runs; another adapter sets the same value under its own key.
 None of the four is a dependency of this core.

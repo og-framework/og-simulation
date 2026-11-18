@@ -1,4 +1,8 @@
 <!-- SPDX-License-Identifier: MPL-2.0 -->
+<!-- lint-external-ref: SimulationInputRelay.cpp -- deleted by og-input-latency task P5-9 (the relay actors, their listeners, the Iris sim buffers, serializers and proofs, and UEConnectionHandle); kept in the history -->
+<!-- lint-external-ref: SimulationInputRelay.h -- deleted by og-input-latency task P5-9 (the relay actors, their listeners, the Iris sim buffers, serializers and proofs, and UEConnectionHandle); kept in the history -->
+<!-- lint-external-ref: PreReplication -- Unreal Engine replication hook name, outside every scan root -->
+<!-- lint-external-ref: emitFlushReport -- deleted by og-input-latency task P5-9 (the relay actors, their listeners, the Iris sim buffers, serializers and proofs, and UEConnectionHandle); kept in the history -->
 # `RelayRingStager.h` — guards
 
 Every prohibition that governs a line of `RelayRingStager.h`. Each entry has an **opaque, stable id**. In the header a

@@ -1,4 +1,7 @@
 <!-- SPDX-License-Identifier: MPL-2.0 -->
+<!-- lint-external-ref: NetSerialize -- Unreal Engine's struct serializer hook, named as a member of the UE structs og-input-latency task P5-9 deleted; outside every scan root -->
+<!-- lint-external-ref: SyncedSimulationStateBuffer.h -- deleted by og-input-latency task P5-9 (the relay actors, their listeners, the Iris sim buffers, serializers and proofs, and UEConnectionHandle); kept in the history -->
+<!-- lint-external-ref: SimulatableNetSyncComponent.cpp -- deleted by og-input-latency task P5-8 (the net-sync component, the pawn's subobject, the bundle builder and the owner binding's net half); kept in the history -->
 # `SimEnvelope.h` — rationale
 
 The narrative behind `Network/SimEnvelope.h`, the sim envelope: the two bytes in front of every sim message, the
@@ -160,8 +163,9 @@ simId:u8 │ ring
 simId:u8 │ corrVersion:u8 │ payload
 ```
 
-- **This is the engine-replicated correction buffer's framing minus its length field.** That buffer serializes
-  `version:u8 │ used:u16 │ used bytes` (`SyncedSimulationStateBuffer.h`, `NetSerialize`). Here `corrVersion` is
+- **This is the engine-replicated correction buffer's framing minus its length field.** That buffer serialized
+  `version:u8 │ used:u16 │ used bytes` (`SyncedSimulationStateBuffer.h`, `NetSerialize`, deleted by og-input-latency
+  task P5-9). Here `corrVersion` is
   that version byte, moved behind the sim id, and the length comes from the message length: the payload is the
   rest of the message. `CorrectionStateBuffer::assignFromWire` sets the used length from it.
 - **`payload`** is the correction codec's bytes: `tick:u32 │ appliedCaptureTick:u32 │ state composite`.
@@ -169,9 +173,11 @@ simId:u8 │ corrVersion:u8 │ payload
   `kCorrectionPayloadBytes` (`8 + StateBytes`), and `DecodedSimMessage::tick` carries the correction's tick, the
   value a newest-wins filter compares.
 - **Another `corrVersion` passes through** with the payload uncounted and `tick` 0 (guard G-01). Its receiver
-  keeps today's one-shot latch: the Unreal adapter's correction receiver logs an Error with both versions, shows
-  the build-mismatch toast, and ignores every later correction (`SimulatableNetSyncComponent.cpp`,
-  `OnRep_CorrectionState`). That needs the message, not a refusal.
+  keeps the one-shot latch: og-sim-net's client compares it (`SimNetClient::onCorrection`) and calls its host's
+  `onWireMismatch`, which logs an Error with both versions and shows the build-mismatch toast, and every later
+  correction is ignored. Until og-input-latency task P5-7 the Unreal net-sync component did this
+  (`SimulatableNetSyncComponent.cpp`, `OnRep_CorrectionState`, deleted by P5-8). That needs the message, not a
+  refusal.
 - **Either way the payload is at most `CorrectionStateBuffer::kBufferBytes`** (384 B), else `Overlong`.
 - **Size.** The brawler state composite is 325 B, so a brawler correction is `2 + 2 + 8 + 325 = 337` B.
 

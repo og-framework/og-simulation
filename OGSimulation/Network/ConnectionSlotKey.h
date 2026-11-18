@@ -48,8 +48,9 @@
 // check lives here rather than at one call site.
 //
 // ENGINE-AGNOSTIC. Sim-core header: includes ONLY other `OGSimulation/` headers
-// and the STL. The `Address` half stays opaque, bound in production to
-// `FUEConnectionHandle` and in the Catch2 suite to `FStandaloneTestHandle`.
+// and the STL. The `Address` half stays opaque, bound in production to og-sim-net's
+// `SimNetConnectionHandle` (the Unreal `FUEConnectionHandle` until og-input-latency
+// task P5-7; deleted by P5-9) and in the Catch2 suite to `FStandaloneTestHandle`.
 //
 // NO IMPLICIT CONVERSION FROM `Address`, DELIBERATELY. A converting constructor
 // defaulting playerSlot to 0 would make every un-migrated call site compile and
@@ -103,7 +104,7 @@ struct ConnectionSlotKey
         return playerSlot <= kMaxPlayerSlot;
     }
 
-    // Hidden friend, matching FUEConnectionHandle's operator==: supplies
+    // Hidden friend, as SimNetConnectionHandle's operator== is: supplies
     // std::equality_comparable (and the C++20-rewritten operator!=) without
     // adding a name to the enclosing scope.
     friend bool operator==(const ConnectionSlotKey& lhs, const ConnectionSlotKey& rhs)
@@ -119,9 +120,9 @@ namespace std
     {
         std::size_t operator()(const ConnectionSlotKey<Address>& key) const noexcept
         {
-            // Reuses the Address's own hash — which for FUEConnectionHandle is the
-            // weak-pointer remote id, deliberately stable after the pointee dies so
-            // a table keyed on possibly-dead connections can still find and reap
+            // Reuses the Address's own hash — which for SimNetConnectionHandle is the
+            // og-net connection id, unchanged after the connection closes, so a
+            // table keyed on possibly-dead connections can still find and reap
             // its entries. The slot is mixed in with the usual boost-style
             // constant; slots are small consecutive integers and would otherwise
             // land in adjacent buckets.

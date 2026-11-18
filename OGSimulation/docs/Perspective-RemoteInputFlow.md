@@ -1,4 +1,6 @@
 <!-- SPDX-License-Identifier: MPL-2.0 -->
+<!-- lint-external-ref: ASimulationInputRelay -- deleted by og-input-latency task P5-9 (the relay actors, their listeners, the Iris sim buffers, serializers and proofs, and UEConnectionHandle); kept in the history -->
+<!-- lint-external-ref: PreReplication -- Unreal Engine replication hook name, outside every scan root -->
 # Perspective: how a remote input reaches a proxy
 
 **One input, followed end to end.** A player presses a key on machine A. This document follows that
@@ -61,14 +63,16 @@ is Chaos's async-callback thread under `bTickPhysicsAsync`. `machine` is A (the 
 authority) or B (an observing peer). Paths are relative to the repository root; `<core>` abbreviates
 `Plugins/OGSimulation/Source/OGSimulation/og-simulation/OGSimulation/`.
 
-⚠ **Rows whose `file` column starts with `Source/` are outside `og-simulation`, and are one
-adapter's binding rather than the binding.** The engine-free core owns only the `<core>` rows; the
-`Source/` rows are how *this project's* adapter happens to reach them, and an adapter on another
-engine substitutes its own. Two carry a whole hop rather than illustrating it, so their roles are
-named here. `AOGBrawlerSimulationManager` — one adapter's **composition root**: the object that owns
-the per-role manager and routes an arriving input to the component owning that character.
-`ASimulationInputRelay` — one adapter's **per-connection transport actor**: it publishes a
-connection's staged inputs once per replication poll.
+⚠ **Rows whose `file` column does not start with `<core>` are outside `og-simulation`, and are one
+host's binding rather than the binding.** The engine-free core owns only the `<core>` rows. The
+`Source/` and `Plugins/OGSimulation/Source/OGSimulationUnreal/` rows are how *this project's* Unreal
+adapter happens to reach them, and the `Plugins/OGSimulation/Source/OGSimulationNet/` rows are
+og-sim-net, the engine-free transport host that adapter uses; another engine or transport
+substitutes its own. Until og-input-latency tasks P5-7 to P5-9 two adapter classes carried whole hops:
+`AOGBrawlerSimulationManager`, the composition root that routed an arriving input to the component
+owning that character, and `ASimulationInputRelay`, a per-connection transport actor that published a
+connection's staged inputs once per replication poll (deleted by P5-9). og-sim-net's sessions do both
+hops now (hops 8 to 20).
 
 | # | hop | machine · thread | file | symbol |
 |---:|---|---|---|---|
@@ -78,21 +82,21 @@ connection's staged inputs once per replication poll.
 | 4 | A's own integrator reads the capture from `tick - effectiveDelay` | A · PT | `<core>Network/LocalInputCache.h` | `resolveDelayedInput` |
 | 5 | The **undelayed** capture is queued for the wire | A · PT (producer) | `<core>SimulationQueues.h` | `PendingInputQueue::enqueue` |
 | 6 | Once per game frame, the send sweep drains the queue's recent window | A · GT | `<core>SimulationNetSync.h` | `sendLocalInputToAuthorityAll` |
-| 7 | The redundancy bundle is built from the last `redundancySlots` entries the send hands it (`redundancyDepthTicks` at `redundancyFrames = 0`), clamped to `kMaxSlots` | A · GT | `Plugins/OGSimulation/Source/OGSimulationUnreal/InputRedundancyBundleBuilder.h` | `buildRedundancyBundle` |
-| 8 | One **unreliable** RPC carries the bundle to the authority | A→S · GT | `Plugins/OGSimulation/Source/OGSimulationUnreal/SimulatableNetSyncComponent.h` | `ServerReceiveRemoteMove` |
+| 7 | The redundancy bundle is built from the last `redundancySlots` entries the send hands it (`redundancyDepthTicks` at `redundancyFrames = 0`), clamped to `kMaxSlots` (the character's og-sim-net channel since og-input-latency task P5-7; the Unreal bundle builder before, deleted by P5-8) | A · GT | `Plugins/OGSimulation/Source/OGSimulationNet/og-sim-net/OGSimNet/SimNetChannel.h` | `sendLocalInputToAuthority` |
+| 8 | The bundle joins the frame's input set, which og-net's SimInput lane carries to the authority (since og-input-latency task P5-7; one unreliable RPC of the Unreal net-sync component before, deleted by P5-8) | A→S · GT | `Plugins/OGSimulation/Source/OGSimulationNet/og-sim-net/OGSimNet/SimNetTransport.h` | `appendInputBundle` |
 | 9 | The bundle is decoded and each slot is offered to the coordinator | S · GT | `<core>Network/ServerReceptionCoordinator.h` | `receiveInputBundle` |
 | 10 | Per slot: domain gate, dedup watermark, park | S · GT | `<core>Network/ServerReceptionCoordinator.h` | `receiveRemoteInput` |
 | 11 | The input is parked for `effectiveDelay` ticks | S · GT | `<core>Network/ServerInputDelayQueue.h` | `ServerInputDelayQueue::enqueue` |
 | 12 | **The relay tap** — the same delay becomes the schedule stamp `dA` | S · GT | `<core>Network/ServerReceptionCoordinator.h` | `stampFromDelay` |
-| 13 | The tap resolves `id` → owning component and stages the entry | S · GT | `Plugins/OGSimulation/Source/OGSimulationUnreal/UESimulationSession.h` | `UESimulationSession::relayRemoteInput` |
-| 14 | The entry lands in the **staging** ring, not the replicated one | S · GT | `Plugins/OGSimulation/Source/OGSimulationUnreal/UESimulatableOwnerBinding.h` | `stageRelayedInput` |
-| 15 | …via the ring type's staging entry point | S · GT | `Plugins/OGSimulation/Source/OGSimulationUnreal/RelayedInputRing.h` | `stageArrival` |
-| 16 | The whole staged burst is published once per replication poll | S · GT | `Plugins/OGSimulation/Source/OGSimulationUnreal/SimulationInputRelay.cpp` | `ASimulationInputRelay::PreReplication` |
+| 13 | The tap resolves `id` → the character and stages the entry (og-sim-net's server since og-input-latency task P5-7; the Unreal session's own relay sink before) | S · GT | `Plugins/OGSimulation/Source/OGSimulationNet/og-sim-net/OGSimNet/SimNetServer.h` | `relayRemoteInput` |
+| 14 | The entry lands in the **staging** ring, not the published one (the server's per-character stager since og-input-latency task P5-7; the Unreal owner binding's staging write before, deleted by P5-8) | S · GT | `<core>Network/RelayRingStager.h` | `stageArrival` |
+| 15 | …via the stager's staging entry point (since og-input-latency task P5-7; the Unreal ring type's before, deleted by P5-9) | S · GT | `<core>Network/RelayRingStager.h` | `stageArrival` |
+| 16 | The whole staged burst is published once per frame (og-sim-net's server since og-input-latency task P5-7; the input relay actor's replication poll before, deleted by P5-9) | S · GT | `Plugins/OGSimulation/Source/OGSimulationNet/og-sim-net/OGSimNet/SimNetServer.h` | `flushRelays` |
 | 17 | …by flushing staging into the replicated ring | S · GT | `<core>RelayedInputRingCodec.h` | `flushStagedInto` |
-| 18 | The replicated property lands on the peer | S→B | `Plugins/OGSimulation/Source/OGSimulationUnreal/SimulationInputRelay.h` | `m_relayedInputRing` |
-| 19 | The peer is notified | B · GT | `Plugins/OGSimulation/Source/OGSimulationUnreal/SimulationInputRelay.cpp` | `OnRep_RelayedInputRing` |
-| 20 | The host actor routes the ring to the character's component | B · GT | `Plugins/OGSimulation/Source/OGSimulationUnreal/SimulatableNetSyncComponent.cpp` | `onRelayedInputRingArrived` |
-| 21 | The component's bound callback enters the engine-free core | B · GT | `<core>SimulationNetSync.h` | `onRelayedInputReceived` |
+| 18 | The ring lands on the peer, an og-net `RelayRing` message (since og-input-latency task P5-7; the relay actor's replicated property before, deleted by P5-9) | S→B | `Plugins/OGSimulation/Source/OGSimulationNet/og-sim-net/OGSimNet/SimNetClient.h` | `onRing` |
+| 19 | The peer stores it on the character's channel (since og-input-latency task P5-7; the relay actor's OnRep before, deleted by P5-9) | B · GT | `Plugins/OGSimulation/Source/OGSimulationNet/og-sim-net/OGSimNet/SimNetChannel.h` | `storeRing` |
+| 20 | The client session routes the ring to the character's channel (since og-input-latency task P5-7; the relay host actor to the character's net-sync component before, deleted by P5-8) | B · GT | `Plugins/OGSimulation/Source/OGSimulationNet/og-sim-net/OGSimNet/SimNetClient.h` | `onRing` |
+| 21 | The channel's bound callback (the one `registerPredictionOwner` installed) enters the engine-free core | B · GT | `<core>SimulationNetSync.h` | `onRelayedInputReceived` |
 | 22 | …through the resolution peer's by-id door | B · GT | `<core>SimulationInputResolution.h` | `ingestRelayRing` |
 | 23 | Every entry in the ring is re-consumed, idempotently | B · GT | `<core>Network/RemoteInputCache.h` | `populateRemoteInputCache` |
 | 24 | Each `(captureTick, dA, input)` triple is stored, sender-keyed | B · GT | `<core>Network/RemoteInputCache.h` | `RemoteInputCache::push` |
@@ -112,7 +116,7 @@ input the authority is still holding. That held copy travels its own short path.
 | A1 | Once per physics frame, the drain runs for the tick(s) about to be simulated | S · GT | `Plugins/OGSimulation/Source/OGSimulationUnreal/UESimulationSession.h` | `releaseDelayedInputsForStep` |
 | A2 | Every claimed slot releases what is due, or overdue | S · GT | `<core>Network/ServerReceptionCoordinator.h` | `releaseDelayedInputs` |
 | A3 | …surfacing the entry's **stored** capture tick, not a reconstructed one | S · GT | `<core>Network/ServerInputDelayQueue.h` | `tryDequeueForTick` |
-| A4 | Delivery routes id → component → core | S · GT | `Plugins/OGSimulation/Source/OGSimulationUnreal/UESimulationSession.h` | `deliverRemoteInput` |
+| A4 | Delivery routes id → the character's channel → core (og-sim-net's server since og-input-latency task P5-7; id → component before) | S · GT | `Plugins/OGSimulation/Source/OGSimulationNet/og-sim-net/OGSimNet/SimNetServer.h` | `deliverRemoteInput` |
 | A5 | …into the SPSC ring the physics thread drains | S · GT (producer) | `<core>SimulationInputResolution.h` | `queueRemoteMove` |
 | A6 | The authority's collect dequeues it on the remote branch | S · PT | `<core>SimulationQueues.h` | `dequeueMove` |
 | A7 | The tick is integrated | S · PT | `<core>SimulationManager.h` | `onGameSimulationAuthority` |
@@ -228,19 +232,24 @@ through the same sink the drain uses — so no player input is ever silently dro
 out-of-domain rejection above is the one case that is dropped, deliberately: delivering it undelayed
 would defeat the gate that rejected it.
 
-**Staging, and why it exists.** The tap does not write the replicated ring. `stageRelayedInput` puts
-the entry in a *staging* ring, and a pre-replication hook flushes the whole staged burst into the
-replicated property once per replication poll (one adapter's binding: `PreReplication`). Without that, two arrivals inside one server frame would collapse
-to one on the wire — the second overwriting the first in server memory before the poll ever compared
-it. The ring's capacity is the codec constant `kMaxDepth` (`<core>RelayedInputRingCodec.h`); no depth
+**Staging, and why it exists.** The tap does not write the published ring. `RelayRingStager::stageArrival`
+puts the entry in a *staging* ring, and og-sim-net's server publishes the whole staged burst once per
+frame (`SimNetServer::flushRelays`, from `flushFrame` at the og-net driver's tick flush). Until
+og-input-latency task P5-7 the Unreal owner binding's `stageRelayedInput` staged it and the relay actor's
+pre-replication hook (`PreReplication`) flushed it once per replication poll; P5-8 and P5-9 deleted both.
+Without staging, two arrivals inside one server frame would collapse to one on the wire — the second
+overwriting the first in server memory before the flush ever sent it. The ring's capacity is the codec constant `kMaxDepth` (`<core>RelayedInputRingCodec.h`); no depth
 parameter reaches `stageArrival`, deliberately, so no caller can silently reduce the flush back to
 replace-latest.
 
-**The ring is a per-connection object, not a per-character property.** The transport actor named in
-§2 owns the replicated ring; the character component keeps the accessor pair and the callback pair
-that the engine-free core sees, and never learns that the ring lives on a different object
-altogether. That is why hop 20 exists at all — it is a pure forwarder. (One adapter's binding:
-`ASimulationInputRelay` in `Plugins/OGSimulation/Source/OGSimulationUnreal/` owns the replicated `FRelayedInputRing`.)
+**The ring is per character.** Since og-input-latency task P5-7 og-sim-net's server keeps one
+stager, with its published ring, per relayed character (`SimNetServer.h`, `Character::stager`), and
+the client stores the arriving ring on that character's channel (`SimNetChannel::storeRing`), which
+keeps the accessor pair and the callback pair the engine-free core sees. Before P5-7 the ring was a
+per-connection object: the transport actor `ASimulationInputRelay` in
+`Plugins/OGSimulation/Source/OGSimulationUnreal/` owned the replicated `FRelayedInputRing`, and hop 20
+was a pure forwarder to the character component that never learned the ring lived on a different
+object (P5-9 deleted both).
 
 ---
 

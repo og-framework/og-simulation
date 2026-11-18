@@ -148,6 +148,16 @@ struct TimeConfig
 	// ⛔ Prevents spurious corrections during startup.
 	uint32_t minTicksBeforeDriftCheck = 60;
 
+	// ONE-SHOT RE-CENTRE: measured RTT samples (valid and above 0) after a join or a
+	// HardResync before the CLIENT CLOCK decides once, on the median lead of its last
+	// 15 advances, how many ticks it is off the target, and pays exactly that many
+	// corrections through the graduated Skip/Stall path.
+	// ⛔ 0 DISABLES IT: the clock then behaves exactly as it did before the re-centre. §14
+	// ⚠ Not a controller: it fires once per arm, then the dead band applies again; a
+	// move of 2+ ticks in the RTT-only offset, max(predOffsetFloorTicks,
+	// ceil(smoothed RTT * tickFrequency)), held for 15 advances re-arms it. §14
+	uint32_t recentreSettleSamples = 30;
+
 	// -------------------------------------------------------------------------
 	// Tick frequency
 	// -------------------------------------------------------------------------
@@ -573,6 +583,10 @@ static_assert(latencyKnobs::clampRedundancyFrames(TimeConfig{}.redundancyFrames)
 static_assert(latencyKnobs::clampRelayResendEntries(TimeConfig{}.relayResendEntries) == TimeConfig{}.relayResendEntries,
 	"TimeConfig::relayResendEntries' compiled default must lie inside its own clamp, or the setter would "
 	"silently move a value nobody configured (og-input-latency task 4).");
+static_assert(TimeConfig{}.recentreSettleSamples >= TimeConfig{}.rttOutlierConsecutiveLimit,
+	"TimeConfig::recentreSettleSamples' compiled default must span a whole outlier run (rttOutlierConsecutiveLimit), so "
+	"a join's inflated RTT is either rejected or re-seeded inside the settle window before the clock re-centres on it "
+	"(og-input-latency task 27: the window is 'the size rttOutlierConsecutiveLimit already uses').");
 static_assert(TimeConfig{}.backDateM0P50ThresholdTicks < 0,
 	"TimeConfig::backDateM0P50ThresholdTicks must be below 0: an honest session's m0 p50 sits at about 0 in steady "
 	"state, and the clock's dead band lets it fall a few ticks below, so a threshold at or above 0 flags honest "

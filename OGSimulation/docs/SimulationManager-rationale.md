@@ -1514,3 +1514,21 @@ The concept proof's `NetSyncShaped` stub gained the same parameter.
 
 The send's arithmetic and its default (0 = today's `redundancyDepthTicks`, the same bundle bytes) are in
 `SimulationNetSync-rationale.md` §17.
+
+## 15. Additions after the archive: the re-centre window's setter (og-input-latency task 27, 2026-11-18)
+
+Not archived prose; the header's `§15` pointers at `setRecentreSettleSamples` land here.
+
+`setRecentreSettleSamples` is the one writable location for `TimeConfig::recentreSettleSamples`, the number of measured
+RTT samples the client clock waits after a join or a hard resync before its one-shot re-centre
+(`TimeConfig-rationale.md` §14). It follows the latency knobs' setters (§13): a narrow setter, not a mutable
+`TimeConfig`. It has no clamp: every `uint32_t` is a valid window, and 0 is the documented "off".
+
+**Why a door at all.** The re-centre's measured acceptance needs an A arm (`recentreSettleSamples = 0`) on the same
+binary as the B arm (the default), so the A/B difference is the knob and nothing else. Without a configuration key the A
+arm would need a second build.
+
+**One-shot at composition.** `ClientPredictionClock` reads the field live from `m_timeConfig` (the re-read rule, §4) on
+every `advancePrediction`, which runs on the client's stepping thread. The composition root calls the setter on the game
+thread before stepping starts and never again, so the read needs no synchronization; a `cvar` or any later write would
+race it. Both roles call it (the field has no reader on the authority), keeping one `TimeConfig` shape for both roles.

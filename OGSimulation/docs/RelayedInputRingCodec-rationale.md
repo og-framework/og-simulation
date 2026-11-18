@@ -1,4 +1,10 @@
 <!-- SPDX-License-Identifier: MPL-2.0 -->
+<!-- lint-external-ref: FRelayedInputRing::NetSerialize -- deleted by og-input-latency task P5-9 (the relay actors, their listeners, the Iris sim buffers, serializers and proofs, and UEConnectionHandle); kept in the history -->
+<!-- lint-external-ref: FRelayedInputRing::writeLatest -- deleted by og-input-latency task P5-9 (the relay actors, their listeners, the Iris sim buffers, serializers and proofs, and UEConnectionHandle); kept in the history -->
+<!-- lint-external-ref: FRelayedInputRing::kMaxInputBytes -- deleted by og-input-latency task P5-9 (the relay actors, their listeners, the Iris sim buffers, serializers and proofs, and UEConnectionHandle); kept in the history -->
+<!-- lint-external-ref: noteStageOverflowDrop -- deleted by og-input-latency task P5-9 (the relay actors, their listeners, the Iris sim buffers, serializers and proofs, and UEConnectionHandle); kept in the history -->
+<!-- lint-external-ref: ASimulationInputRelay::setRelayResendEntries -- deleted by og-input-latency task P5-9 (the relay actors, their listeners, the Iris sim buffers, serializers and proofs, and UEConnectionHandle); kept in the history -->
+<!-- lint-external-ref: FRelayedInputRing::findEntry -- deleted by og-input-latency task P5-9 (the relay actors, their listeners, the Iris sim buffers, serializers and proofs, and UEConnectionHandle); kept in the history -->
 # `RelayedInputRingCodec.h` — rationale
 
 The narrative behind `relayedInputRing`, the byte codec for the **outbound** (server → peers) relay
@@ -79,19 +85,23 @@ in increasing order. That is precisely replace-latest semantics, and it is what 
 ## §3 Why it lives in core, and the adapter's names
 
 The ring's write, evict and scan logic is pure byte manipulation over the og-simulation serialization
-free functions. One adapter (Unreal) wraps it in `FRelayedInputRing`, a USTRUCT that owns a replicated
-byte array and delegates every operation here. Hoisting the algorithm into core is what lets the
-engine-free Low-Level Tests exercise the real production path (`WireFormat/RelayedInputRingTest.cpp`):
-that target links engine-free modules only and cannot see a USTRUCT. A USTRUCT also cannot be a
-template, so the type-erased byte payload is also what lets one replicated property carry an arbitrary
-`InputType`.
+free functions. Its production buffer is og-simulation's own `RelayRingBuffer` (`Network/SimPayloadBuffers.h`),
+a fixed-capacity byte array that delegates every operation here; og-sim-net's server publishes it per
+character (`RelayRingStager`) and its client stores it on the character's channel
+(`SimNetChannel::storeRing`). Until og-input-latency task P5-9 deleted it, one adapter (Unreal) wrapped it in
+`FRelayedInputRing`, a USTRUCT that owned a replicated byte array. Hoisting the algorithm into core is what
+lets the engine-free Low-Level Tests exercise the real production path (`WireFormat/RelayedInputRingTest.cpp`):
+that target links engine-free modules only. The type-erased byte payload is also what lets one buffer
+carry an arbitrary `InputType`.
 
 The replication system, its once-per-frame poll of a replicated property, the property comparison
 that decides whether that property is dirty, and the game-thread tick whose early and late broadcasts
 run receipt and then the flush are named here by role only; nothing in the header depends on which
-engine supplies them. In the Unreal adapter they are Iris, its poll of a replicated UPROPERTY, the
-property system's identity comparison, and the world tick's dispatch and flush broadcasts; that
-adapter's wire serializer is `FRelayedInputRing::NetSerialize`. Another adapter substitutes its own.
+engine supplies them. In the Unreal adapter they were Iris, its poll of a replicated UPROPERTY, the
+property system's identity comparison, and the world tick's dispatch and flush broadcasts, and the wire
+serializer was `FRelayedInputRing::NetSerialize`, until og-input-latency task P5-7. Since then og-sim-net
+sends the ring as a sim-envelope message on og-net's SimRelay lane, at most once per frame from the og-net
+driver's tick flush, and only when the flush published something. Another adapter substitutes its own.
 
 ## §4 The buffer concept
 
@@ -137,8 +147,9 @@ shrink case above was a documented non-scenario). That field is retired (item 63
 its identifier is on record there). `writeLatest`'s only production caller is now `stageArrival`, which
 passes `kMaxDepth` as a constant, so the shrink non-scenario is moot on the live relay path. It survives
 only as a property of `writeLatest` itself, which direct test callers still exercise with arbitrary
-depths. The adapter's `FRelayedInputRing::writeLatest` member forwards to it with whatever depth its
-caller passes; no production code calls that member.
+depths. `RelayRingBuffer::writeLatest` forwards to it with whatever depth its caller passes; no production
+code calls that member (nor did any call the Unreal `FRelayedInputRing::writeLatest` it replaced, deleted by
+og-input-latency task P5-9).
 
 The flush path's capacity is the constant, not a parameter (guard G-02).
 `Network/RelayRedundancyDepthTest.cpp` pins the absence of a depth parameter on `stageArrival` at
@@ -178,8 +189,9 @@ It must stay below `kMaxDepth`, and the header `static_assert`s that: a flush al
 one new entry, so the tail never needs the whole ring. The session knob that feeds it,
 `TimeConfig::relayResendEntries`, has its own clamp to the same range in `TimeConfig.h`
 (`latencyKnobs::clampRelayResendEntries`, `latencyKnobs::kMaxRelayResendEntries`). The two maxima are
-held equal by a `static_assert` where the Unreal adapter hands the knob to the relay host
-(`UESimulatableOwnerBinding.h`) and by `Network/RelayResendTest.cpp`. The codec does not include
+held equal by a `static_assert` in `UESimulationSession.h` (until og-input-latency task P5-7 it sat where the
+Unreal adapter handed the knob to the relay host, `UESimulatableOwnerBinding.h`) and by
+`Network/RelayResendTest.cpp`. The codec does not include
 `TimeConfig.h`: it stays a byte codec with no session dependency.
 
 ## §8 The malformed-length bound
@@ -187,9 +199,10 @@ held equal by a `static_assert` where the Unreal adapter hands the knob to the r
 `kMaxInputBytes`, `kMaxWireBytes` and `isAcceptableWireLength` were `FRelayedInputRing::kMaxInputBytes`
 and `::kMaxWireBytes` and an inline comparison inside that USTRUCT's wire serializer until T29. They
 moved here for the same reason every other rule in this file lives here: the Low-Level Test target
-cannot see a USTRUCT, so a guard expressed inside one is untestable. The USTRUCT keeps both names as
-aliases and `static_assert`s the value it produces (1066), so the wire format did not change: it was a
-move, not a redesign.
+cannot see a USTRUCT, so a guard expressed inside one is untestable. The USTRUCT kept both names as
+aliases and `static_assert`ed the value it produced (1066), so the wire format did not change: it was a
+move, not a redesign. `RelayRingBuffer` keeps the aliases and the 1066 pin now; og-input-latency task P5-9
+deleted the USTRUCT.
 
 `kMaxInputBytes` (128) is the upper bound on the serialized input of one entry. It used to be anchored,
 by comment only, to one adapter's 128-byte input sync buffer; that buffer was retired in
@@ -386,9 +399,10 @@ only ticks not already resident). A recovered tick that the store did not hold i
 `lostCaptureTicksX1000` falls by the ticks the tail recovered and is not flattered by the ones it
 re-delivered.
 
-**Who sets it.** The host, from the session's `TimeConfig::relayResendEntries`, on the authority only. In
-the Unreal adapter the binding hands it to the relay host when it spawns it
-(`ASimulationInputRelay::setRelayResendEntries`), and the host passes it to every flush.
+**Who sets it.** The host, from the session's `TimeConfig::relayResendEntries`, on the authority only.
+og-sim-net's server reads it from that config and clamps it at every flush (`SimNetServer::flushRelays`).
+Until og-input-latency task P5-7 the Unreal binding handed it to the relay host when it spawned it
+(`ASimulationInputRelay::setRelayResendEntries`, deleted by P5-9), and the host passed it to every flush.
 
 ## §16 What the header does not do
 
@@ -419,14 +433,15 @@ The header's comments were verified against the tree before they moved (og-input
    only at the default; §12 and §14 say so.
 6. **"[`findEntry` is] the read the client-side store (T5) is populated from"**. The store is populated
    by `populateRemoteInputCache`, which iterates the ring with `forEachEntry`. Outside the tests,
-   `findEntry`'s only caller is the adapter's forwarding member `FRelayedInputRing::findEntry`, which
-   nothing calls. Corrected in §10.
+   `findEntry`'s only caller was the adapter's forwarding member `FRelayedInputRing::findEntry`, which
+   nothing called (deleted by og-input-latency task P5-9; `RelayRingBuffer::findEntry` forwards the same way
+   now). Corrected in §10.
 
 The old header also cited three initiative design documents (the input-relay design §4 and the
 relay-delay-spectrum design §5 and §8.2). They live outside this repository, so this file does not cite
 them; the task ids above are the provenance.
 
-Outbound, one stale sentence about this payload was found in a file the conversion does not own:
-`FRelayedInputRing`'s header says the property is registered with a plain replication declaration and
-no condition, while the relay host registers it skip-owner. It is recorded in the task's notes for its
-owner.
+Outbound, one stale sentence about this payload was found in a file the conversion did not own:
+`FRelayedInputRing`'s header said the property was registered with a plain replication declaration and
+no condition, while the relay host registered it skip-owner. It was recorded in the task's notes for its
+owner; og-input-latency task P5-9 deleted both files.

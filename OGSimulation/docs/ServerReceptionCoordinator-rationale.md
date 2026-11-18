@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: MPL-2.0 -->
+<!-- lint-external-ref: USimulatableNetSyncComponent -- deleted by og-input-latency task P5-8 (the net-sync component, the pawn's subobject, the bundle builder and the owner binding's net half); kept in the history -->
 # `ServerReceptionCoordinator.h` — rationale
 
 The derivations, the rejected alternatives, the wire contracts and the correction record behind
@@ -14,15 +15,15 @@ claims that stood in this header were checked against the tree and found wrong, 
 over-stated. §9 quotes each one so the correction is legible; nowhere else in this document restates
 a quoted sentence as fact.
 
-<!-- lint-external-ref: ASimulationConnectionRelay -- ENGINE-SIDE ADAPTER ACTOR of ONE adapter (Unreal), named in Sec 4 and Sec 9 as that adapter's transport for the connection tier; another adapter substitutes its own and this token means nothing there -->
+<!-- lint-external-ref: ASimulationConnectionRelay -- deleted by og-input-latency task P5-9 (the relay actors, their listeners, the Iris sim buffers, serializers and proofs, and UEConnectionHandle); kept in the history: named in Sec 4 and Sec 9 as that adapter's transport for the connection tier until task P5-7 -->
 <!-- lint-external-ref: bOnlyRelevantToOwner -- ENGINE REPLICATION FLAG of ONE adapter, named in Sec 4 because it is what narrows the tier to the owning client after the property moved off the component -->
 <!-- lint-external-ref: m_replicatedConnectionTier -- RETIRED SYMBOL: the component property the tier used to ride, removed when the tier moved to the connection relay. Quoted in Sec 9 precisely because it must NOT resolve -->
 <!-- lint-external-ref: COND_OwnerOnly -- ENGINE REPLICATION CONDITION of ONE adapter, named in Sec 9 as the mechanism that was removed; it has no counterpart in this repository -->
 <!-- lint-external-ref: GetPlayerSlotForActor -- ENGINE-SIDE ADAPTER HELPER of ONE adapter, named in Sec 2 as the source of the playerSlot primitive the core cannot derive -->
-<!-- lint-external-ref: FInputRedundancyBundle -- ENGINE-SIDE WIRE TYPE of ONE adapter, named in Sec 4 as the production Buffer binding beside the suite's; the core never names it -->
+<!-- lint-external-ref: FInputRedundancyBundle -- deleted by og-input-latency task P5-9 (the relay actors, their listeners, the Iris sim buffers, serializers and proofs, and UEConnectionHandle); kept in the history: named in Sec 4 as the production Buffer binding until task P5-7 -->
 <!-- lint-external-ref: ASimulationManagerUImpl -- ENGINE-SIDE COMPOSITION ROOT of ONE adapter, named in Sec 9's quoted finding F-37-2 (history); RENAMED by og-ue-simulationcomponentandmanagersplit task 30 to AOGBrawlerSimulationManager, the name Sec 1 uses for that adapter's owner of this type -->
 <!-- lint-external-ref: USimmableUpdateComponent -- ENGINE-SIDE PER-CHARACTER COMPONENT of ONE adapter, named in Sec 9 (F-37-1, F-37-2) as that adapter's ConnectionTierSink binding before og-ue-simulationcomponentandmanagersplit task 20b -->
-<!-- lint-external-ref: FUEConnectionHandle -- ENGINE-SIDE Address BINDING of ONE adapter, named in Sec 7 beside the suite's FStandaloneTestHandle -->
+<!-- lint-external-ref: FUEConnectionHandle -- deleted by og-input-latency task P5-9 (the relay actors, their listeners, the Iris sim buffers, serializers and proofs, and UEConnectionHandle); kept in the history: named in Sec 7 as the production Address binding until task P5-7 -->
 <!-- lint-external-ref: Unreal -- ENGINE VENDOR NAME, quoted in Sec 9 as one of the three literal grep TOKENS the falsified sentence promised would return nothing; it names no symbol in this repository -->
 <!-- lint-external-ref: getServerReceptionTick -- ENGINE-SIDE ADAPTER ACCESSOR of ONE adapter, named in Sec 5 as the tick source the gate deliberately does NOT use -->
 
@@ -54,11 +55,13 @@ members on the adapter's manager before. The queue borrows the tier table by ref
 * **member-declaration order is the only thing enforcing either.** There is no assertion. That is
   why the rule is fenced twice in the header — once at the constructor, once at the members.
 
-Both borrow `const TimeConfig&`, so the coordinator must not outlive the config. In the one adapter
-that exists today — `AOGBrawlerSimulationManager`, that engine's composition root — the whole coordinator
-is a `std::optional` emplaced inside `BeginPlay`'s authority branch, after the core manager whose
-`TimeConfig` it borrows, and reset in `EndPlay` **before** that manager. The adapter's own comments
-state the borrow rule at both ends. A second engine binds its own root and this name means nothing
+Both borrow `const TimeConfig&`, so the coordinator must not outlive the config. Since og-input-latency
+task P5-7 its one owner is og-sim-net's server: `SimNetServer` holds it by value (`m_coordinator`,
+constructed from the `TimeConfig&` the server is given), and the Unreal session holds that server in a
+`std::optional` (`UESimulationSession::m_simNetServer`) destroyed before the manager whose `TimeConfig`
+it borrows; a `static_assert` on the member offsets in `UESimulationSession.h` keeps that order. Before
+P5-7 the session held the coordinator itself (`m_receptionCoordinator`, the same order rule), and before
+that the adapter's composition root did. A second engine binds its own owner and these names mean nothing
 there.
 
 ---
@@ -178,32 +181,36 @@ target entity, so a sink that is a central manager rather than the entity itself
 A sink missing the method is a compile error at the `noteRttSample` call site, the same way the
 buffer-owner concepts in `SimulationNetSync.h` fail at theirs.
 
-The one adapter that exists today binds it to `USimulatableNetSyncComponent`, its per-character wire
+Since og-input-latency task P5-7 og-sim-net's server is the sink: `SimNetServer::sendConnectionTierToOwningClient`
+resolves the id to the character's owning connection through its roster and sends a `ConnectionTier`
+message on og-net's Control lane to that connection only (`publishTier`, which skips a value that connection
+already has). Before P5-7 the one adapter bound it to `USimulatableNetSyncComponent`, its per-character wire
 component (since og-ue-simulationcomponentandmanagersplit task 20b; before that, the adapter's game
-component), which does **not** hold the tier itself. It forwards to `ASimulationConnectionRelay`, a
-per-connection actor whose tier property
-replicates unconditionally and is narrowed to the owning client by `bOnlyRelevantToOwner`
-**relevancy** rather than by a replication condition. §9 records the correction; the operational
-point is that split-screen siblings resolve to the same root connection and therefore to the same
-relay, so the sibling-starvation class the core's per-owner dedup guards against is also structurally
-impossible on the transport side.
+component), which did **not** hold the tier itself. It forwarded to `ASimulationConnectionRelay`, a
+per-connection actor whose tier property replicated unconditionally and was narrowed to the owning client by
+`bOnlyRelevantToOwner` **relevancy** rather than by a replication condition; tasks P5-8 and P5-9 deleted both.
+§9 records the correction of that time. The operational point holds on the new transport: split-screen
+siblings share their client's one og-net connection and therefore its one per-connection tier record, so
+the sibling-starvation class the core's per-owner dedup guards against is also structurally impossible on
+the transport side.
 
 ### `receiveInputBundle` — the loop, and what deliberately stays outside it
 
 `receiveInputBundle` is the whole per-slot loop: decode the bundle with the redundancy codec, park
 each slot through `receiveRemoteInput`, and on the one non-parked path deliver immediately. `wire` is
 any type satisfying the codec's Buffer concept (`bundleByteNum`, `readFromBuffer` and the rest) — in
-production `FInputRedundancyBundle`, in the Catch2 suite a `std::vector`-backed test buffer, and the
-core names neither.
+production og-sim-net's `InputBundleBuffer` (`SimNetServer.h`, `m_bundle`; the Unreal `FInputRedundancyBundle`
+until og-input-latency task P5-7, deleted by P5-9), in the Catch2 suite a `std::vector`-backed test buffer,
+and the core names neither.
 
-Two things stay outside on purpose. The **no-wire early-out** is the adapter's: it only reaches this
-method when it has a live wire and a coordinator, so the core handles only `hasValidSlot`. The
-**once-per-bundle RTT sample** is also the adapter's, immediately before this call, because this
-method is purely the slot loop.
+Two things stay outside on purpose. The **no-wire early-out** is the caller's: og-sim-net's server
+(`SimNetServer::receiveBundle`) reaches this method only with a bundle it decoded (`assignFromWire`) and with
+its own coordinator, so the core handles only `hasValidSlot`. The **once-per-bundle RTT sample** is also the
+caller's (`noteRttSample`), immediately before this call, because this method is purely the slot loop.
 
 `relay` is threaded straight through to `receiveRemoteInput`'s tap and this method adds no relay
-policy of its own. Production passes the *same object* for both sinks — the adapter's manager binds
-delivery and relay — but they stay separate parameters because they are separate boundaries: one
+policy of its own. Production passes the *same object* for both sinks — og-sim-net's server passes itself
+for delivery and relay — but they stay separate parameters because they are separate boundaries: one
 routes an input into this simulation, the other forwards it out to everyone else.
 
 ---
@@ -472,7 +479,8 @@ double-apply the gate removes.
 
 This is a sim-core header. Its includes are other `OGSimulation/` headers and the STL, and **no
 declaration in it names an engine type**: the `Address` half stays opaque and is bound in production
-to `FUEConnectionHandle` and in the Catch2 suite to `FStandaloneTestHandle`; every boundary that
+to og-sim-net's `SimNetConnectionHandle` (the Unreal `FUEConnectionHandle` until og-input-latency task
+P5-7, deleted by P5-9) and in the Catch2 suite to `FStandaloneTestHandle`; every boundary that
 would otherwise need an engine type is a concept instead.
 
 The **comments** do name one adapter's bindings, in several places, and that is deliberate. Naming
@@ -606,7 +614,9 @@ Eight claims that stood in this header were checked against the tree before anyt
 Compressing a false statement makes it shorter, denser and more authoritative, and every existence
 check in the toolchain passes it — so the check has to be a reading of the code, not of the comment.
 **The quoted "before" text in this table is reproduced so the correction is legible. It is not a
-statement of fact.**
+statement of fact.** The "what the tree says" column is the tree of that audit: og-input-latency tasks
+P5-7 to P5-9 have since moved the tier and the input bundle onto og-sim-net and deleted the Unreal
+classes it names.
 
 | # | the claim as it stood | what the tree says |
 |---|---|---|

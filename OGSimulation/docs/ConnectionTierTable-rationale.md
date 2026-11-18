@@ -1,4 +1,7 @@
 <!-- SPDX-License-Identifier: MPL-2.0 -->
+<!-- lint-external-ref: FUEConnectionHandle -- deleted by og-input-latency task P5-9 (the relay actors, their listeners, the Iris sim buffers, serializers and proofs, and UEConnectionHandle); kept in the history -->
+<!-- lint-external-ref: ISimulationConnectionRelayListener::onConnectionTierReceived -- deleted by og-input-latency task P5-9 (the relay actors, their listeners, the Iris sim buffers, serializers and proofs, and UEConnectionHandle); kept in the history -->
+<!-- lint-external-ref: onConnectionTierReplayed -- deleted by og-input-latency task P5-9 (the relay actors, their listeners, the Iris sim buffers, serializers and proofs, and UEConnectionHandle); kept in the history -->
 <!-- lint-external-ref: SimulationManagerUImpl.cpp -- RENAMED by og-ue-simulationcomponentandmanagersplit task 30 to OGBrawlerSimulationManager.cpp (one adapter's composition root); kept in F-38-6's verbatim quote -->
 # `ConnectionTierTable.h` — rationale
 
@@ -75,9 +78,10 @@ put a breakpoint:
 `ServerReceptionCoordinator` (`Network/ServerReceptionCoordinator.h`) holds the only production
 instance, **by value**, constructs it with the shared `TimeConfig`, reaps it on its own cadence, and
 exposes it read-only. `ServerInputDelayQueue` (`Network/ServerInputDelayQueue.h`) borrows a
-`const ConnectionTierTable*` from it and never mutates it. One adapter instantiates the coordinator
-as `ServerReceptionCoordinator<FUEConnectionHandle, ...>`, so a production
-`ConnectionTierTable<FUEConnectionHandle>` exists in the shipped build.
+`const ConnectionTierTable*` from it and never mutates it. og-sim-net's server instantiates the
+coordinator as `ServerReceptionCoordinator<SimNetConnectionHandle, SimTs...>` (`SimNetServer::Coordinator`,
+`SimNetServer.h`), so a production `ConnectionTierTable<SimNetConnectionHandle>` exists in the shipped
+build. Until og-input-latency task P5-7 the address was the Unreal `FUEConnectionHandle` (deleted by P5-9).
 
 **The config is BORROWED, not owned.** One `TimeConfig` instance is shared by the whole
 time-management stack, and a copy inside the table could silently diverge from the one the clocks
@@ -362,10 +366,13 @@ default and a legal tier. It says whether the caller had ALREADY received an aut
 before this call.
 
 **One adapter's bindings for the three roles this section names**, so a reader can put a breakpoint:
-the tier-arrival callback is `ISimulationConnectionRelayListener::onConnectionTierReceived`, the
-late-join entry point is `onConnectionTierReplayed`, and the stall applier is
-`applyTierTransitionStall` — all three in the `OGBrawlerUnreal` adapter subtree. Another adapter
-substitutes its own; every claim here is about those ROLES.
+the tier-arrival callback is `UESimulationSession::onConnectionTierReceived`, which og-sim-net's client
+reaches through its host (`SimNetClient::onTier`); the late-join entry point is
+`SimNetClient::bindListener`, which replays the latched tier through the same callback; and the stall
+applier is `UESimulationSession::applyTierTransitionStall`. The session is in the `OGSimulationUnreal`
+subtree. Until og-input-latency task P5-7 the first two were
+`ISimulationConnectionRelayListener::onConnectionTierReceived` and `onConnectionTierReplayed` (deleted
+by P5-9). Another adapter substitutes its own; every claim here is about those ROLES.
 
 ### The worked table
 

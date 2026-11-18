@@ -2,6 +2,7 @@
 #include "ClientPredictionClock.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 
 #include "OGSimulation/OGAssert.h"
@@ -26,6 +27,7 @@ ClientPredictionClock::ClientPredictionClock(const TimeConfig& config, const Net
     , m_predictionTick(0)
     , m_resimulationTick(0)
     , m_gradualCorrectionCounter(0)
+    , m_recentreBaseSamples(estimator.getMeasuredRTTSampleCount())
     , m_logger(std::move(logger))
 {
 }
@@ -85,6 +87,12 @@ ClientPredictionClock::AdvanceResult ClientPredictionClock::advancePrediction()
         m_gradualCorrectionCounter = 0;
         m_requiredInputDelayIncreaseStallTicks = 0;
 
+        // [task 27] A hard resync clears the re-centre's debt and re-arms it: the
+        // settle window counts from here, so it includes this frame's catch-up
+        // steps, and the median run restarts at the new frontier. Before the
+        // first decision it is still the join's arm.
+        armRecentre(m_recentreDecidedOnce ? RecentreCause::Resync : RecentreCause::Join, targetTick);
+
         // ⛔ Event seam - the two ticks before the count, in that order.
         m_eventSeamDiagnostics.lastHardResyncFromTick = oldTick;
         m_eventSeamDiagnostics.lastHardResyncToTick   = targetTick;
@@ -102,6 +110,12 @@ ClientPredictionClock::AdvanceResult ClientPredictionClock::advancePrediction()
         fireResyncCallbacks(targetTick);
         return AdvanceResult::HardResync;
     }
+
+    // [task 27] Every other advance of an armed re-centre is one reading of its
+    // median run, taken before any branch below moves the frontier. A decided
+    // one re-arms first if the RTT-only offset has moved away from its decision.
+    trackRecentreRearm(pastGuard);
+    recordRecentreReading(pastGuard);
 
     // [T11] Pay down one tick of input-delay-increase stall. The mechanism is the
     // SAME Stall the soft-drift path uses: do not advance this call, so the
@@ -139,7 +153,12 @@ ClientPredictionClock::AdvanceResult ClientPredictionClock::advancePrediction()
         return AdvanceResult::Normal;
     }
 
-    if (absDrift <= m_config.softDriftThresholdTicks)
+    // [task 27] The one-shot re-centre: decided once per arm; its debt keeps the
+    // graduated path running inside the dead band until every owed tick is paid.
+    decideRecentre(targetTick);
+
+    const bool inDeadBand = absDrift <= m_config.softDriftThresholdTicks;
+    if (inDeadBand && m_recentreOwedTicks == 0u)
     {
         // Dead-band — no correction.
         doNormalAdvance(m_predictionTick, m_resimulationTick, &m_logger);
@@ -149,13 +168,21 @@ ClientPredictionClock::AdvanceResult ClientPredictionClock::advancePrediction()
     {
         // Graduated correction zone. The hard-resync zone was already handled
         // and returned above (T11 priority hoist), so reaching here means
-        // softDriftThresholdTicks < absDrift <= hardResyncThresholdTicks.
+        // softDriftThresholdTicks < absDrift <= hardResyncThresholdTicks, or a
+        // re-centre still owes a correction inside the dead band. Inside the band
+        // the debt sets the direction; outside it the drift does, as before.
         ++m_gradualCorrectionCounter;
         if (m_gradualCorrectionCounter >= m_config.gradualCorrectionRate)
         {
             m_gradualCorrectionCounter = 0;
 
-            if (drift > 0)
+            // [task 27] Every graduated correction fired while a debt is owed pays
+            // one tick of it, so the episode ends after exactly the owed corrections.
+            const bool skip = inDeadBand ? !m_recentreAhead : drift > 0;
+            if (m_recentreOwedTicks > 0u)
+                --m_recentreOwedTicks;
+
+            if (skip)
             {
                 // Client is BEHIND target → skip: apply an extra advance before the normal one.
                 // Mirror the resim tick if the clocks are in sync, so isResimulating() stays false.
@@ -167,7 +194,7 @@ ClientPredictionClock::AdvanceResult ClientPredictionClock::advancePrediction()
                 {
                     char buf[192];
                     std::snprintf(buf, sizeof(buf),
-                        "[Log] PCTM CPC: graduated Skip  predTick=%u targetTick=%u drift=+%d",
+                        "[Log] PCTM CPC: graduated Skip  predTick=%u targetTick=%u drift=%+d",
                         m_predictionTick, targetTick, drift);
                     m_logger(buf);
                 }
@@ -339,9 +366,206 @@ ClientPredictionClock::DriftAction ClientPredictionClock::evaluateDrift() const
         return DriftAction::None;
 
     if (absDrift <= m_config.softDriftThresholdTicks)
-        return DriftAction::None;
+    {
+        // [task 27] Inside the band only a re-centre's debt corrects, in its own direction.
+        const int pending = recentrePendingTicks();
+        if (pending == 0)
+            return DriftAction::None;
+        return pending > 0 ? DriftAction::Stall : DriftAction::Skip;
+    }
 
     return drift > 0 ? DriftAction::Skip : DriftAction::Stall;
+}
+
+// ---------------------------------------------------------------------------
+// One-shot re-centre (og-input-latency task 27)
+// ---------------------------------------------------------------------------
+
+bool ClientPredictionClock::isRecentreArmed() const
+{
+    return m_config.recentreSettleSamples > 0u && m_recentreArmed;
+}
+
+bool ClientPredictionClock::isRecentring() const
+{
+    return m_recentreOwedTicks > 0u;
+}
+
+bool ClientPredictionClock::recentreWindowFull() const
+{
+    return m_config.recentreSettleSamples > 0u
+        && m_estimator.getMeasuredRTTSampleCount() - m_recentreBaseSamples >= m_config.recentreSettleSamples;
+}
+
+// Arms a re-centre: no debt, the settle window counting from the estimator's
+// count now, and the median run restarting at frontierTick (the tick the clock
+// last stepped, so the next advance's reading is the tick it steps).
+void ClientPredictionClock::armRecentre(RecentreCause cause, unsigned int frontierTick)
+{
+    m_recentreArmed           = true;
+    m_recentreCause           = cause;
+    m_recentreOwedTicks       = 0;
+    m_recentreBaseSamples     = m_estimator.getMeasuredRTTSampleCount();
+    m_recentreUncorrectedTick = frontierTick;
+    m_recentreReadingCount    = 0;
+    m_recentreReadingNext     = 0;
+    m_recentreRearmRun        = 0;
+}
+
+// [task 27 reworks 3, 4] The re-arm's offset: getPredictionOffsetTicks() without its
+// jitter term, max(predOffsetFloorTicks, ceil(smoothedRTT * tickFrequency)). The full
+// offset carries jitterMultiplier times the jitter EWMA, which a heavy-tailed
+// steady link moves by several ticks with no RTT step (review_27 R1). The floor
+// is the target's own (m_config is the estimator's TimeConfig), so an RTT move
+// entirely under it, which leaves the target where it is, cannot re-arm (Ph3 R13).
+unsigned int ClientPredictionClock::recentreRttOffsetTicks() const
+{
+    const double ceiled = std::ceil(m_estimator.getSmoothedRTT() * m_config.tickFrequency);
+    const unsigned int rttTicks = ceiled > 0.0 ? static_cast<unsigned int>(ceiled) : 0u;
+    return std::max(rttTicks, static_cast<unsigned int>(m_config.predOffsetFloorTicks));
+}
+
+bool ClientPredictionClock::recentreOffsetMoved() const
+{
+    const unsigned int offset = recentreRttOffsetTicks();
+    const unsigned int moved  = offset >= m_recentreDecisionRttOffset ? offset - m_recentreDecisionRttOffset
+                                                                      : m_recentreDecisionRttOffset - offset;
+    return moved >= kRecentreRearmTicks;
+}
+
+// True when this advance completes the run that re-arms a decided re-centre.
+bool ClientPredictionClock::recentreRearmDue() const
+{
+    return !m_recentreArmed && recentreOffsetMoved() && m_recentreRearmRun + 1u >= kRecentreMedianAdvances;
+}
+
+// [task 27 reworks 2-4] A decided re-centre re-arms once the floored RTT-only offset
+// has stood kRecentreRearmTicks or more from its value at the decision on every one
+// of the last kRecentreMedianAdvances advances (an RTT step after the decision).
+// The jitter term is left out of this test, so only the RTT EWMA can make the
+// run, and only above the floor; an outstanding debt is cleared, the next decision measures from the
+// current state (the full offset). Never runs while armed, so never at 0.
+void ClientPredictionClock::trackRecentreRearm(bool pastGuard)
+{
+    if (m_recentreArmed)
+        return;
+    if (!pastGuard || !recentreOffsetMoved())
+    {
+        m_recentreRearmRun = 0;
+        return;
+    }
+    if (++m_recentreRearmRun < kRecentreMedianAdvances)
+        return;
+
+    m_recentreRearmFromOffset = m_recentreDecisionRttOffset;
+    m_recentreRearmToOffset   = recentreRttOffsetTicks();
+    armRecentre(RecentreCause::Rearm, m_predictionTick);
+}
+
+// The re-centre's zero is drift == 1, not 0: drift is the target minus the tick
+// the clock last stepped, so a Normal advance at drift 1 steps the target tick
+// itself, which is also where a hard resync lands. A lead error is 1 - drift,
+// which is the lead over the authority tick minus the prediction offset.
+//
+// A reading is the lead over the authority tick the clock would read had every
+// advance since the arm been Normal: m_recentreUncorrectedTick moves one tick
+// per advance, the frontier 0 (Stall), 1 or 2 (Skip), so the clock's own
+// corrections inside the run do not move its median. The median filters the
+// authority tick's arrival phase; the offset is the decision's own, so an RTT
+// step inside the run (an outlier re-seed lands on the window's last sample)
+// counts in full.
+void ClientPredictionClock::recordRecentreReading(bool pastGuard)
+{
+    if (!m_recentreArmed)
+        return;
+
+    ++m_recentreUncorrectedTick;
+    if (pastGuard)
+    {
+        m_recentreReadings[m_recentreReadingNext] =
+            static_cast<int>(m_recentreUncorrectedTick - m_estimator.getLastAuthorityTick());
+        m_recentreReadingNext  = (m_recentreReadingNext + 1u) % kRecentreMedianAdvances;
+        m_recentreReadingCount = std::min(m_recentreReadingCount + 1u, kRecentreMedianAdvances);
+    }
+}
+
+// N = round(median lead over authority of the run, moved to today's frontier,
+// minus today's offset). uncorrectedTick is m_recentreUncorrectedTick as of
+// this advance; extraReading, when given, joins the run without being stored
+// (evaluateDrift's query). An even run's median is the midpoint of its two
+// middle readings, rounded half away from zero.
+int ClientPredictionClock::recentreCorrectionTicks(unsigned int uncorrectedTick, const int* extraReading) const
+{
+    std::array<int, kRecentreMedianAdvances> run = m_recentreReadings;
+    unsigned int count = m_recentreReadingCount;
+    if (extraReading)
+    {
+        run[m_recentreReadingNext] = *extraReading;
+        count = std::min(count + 1u, kRecentreMedianAdvances);
+    }
+    if (count == 0u)
+        return 0;
+
+    std::sort(run.begin(), run.begin() + count);
+    const int twiceMedian    = (count % 2u == 1u) ? 2 * run[count / 2u] : run[count / 2u - 1u] + run[count / 2u];
+    const int ownCorrections = static_cast<int>(uncorrectedTick - (m_predictionTick + 1u));
+    const int offset         = static_cast<int>(m_estimator.getPredictionOffsetTicks());
+    const int twice          = twiceMedian - 2 * (ownCorrections + offset);
+    return twice >= 0 ? (twice + 1) / 2 : -((1 - twice) / 2);
+}
+
+// What a re-centre would make the next advance correct, signed as a lead error
+// (> 0: the client is ahead, Stall). The owed debt if one runs; otherwise, on
+// the advance that decides, the decision itself; otherwise 0.
+int ClientPredictionClock::recentrePendingTicks() const
+{
+    if (recentreRearmDue())
+        return 0;
+    if (m_recentreOwedTicks > 0u)
+        return m_recentreAhead ? static_cast<int>(m_recentreOwedTicks) : -static_cast<int>(m_recentreOwedTicks);
+    if (!m_recentreArmed || !recentreWindowFull())
+        return 0;
+    const unsigned int uncorrectedTick = m_recentreUncorrectedTick + 1u;
+    const int          readingNow      = static_cast<int>(uncorrectedTick - m_estimator.getLastAuthorityTick());
+    return recentreCorrectionTicks(uncorrectedTick, &readingNow);
+}
+
+void ClientPredictionClock::decideRecentre(unsigned int targetTick)
+{
+    if (!m_recentreArmed || !recentreWindowFull())
+        return;
+
+    const int owed = recentreCorrectionTicks(m_recentreUncorrectedTick, /*extraReading=*/nullptr);
+    m_recentreArmed          = false;
+    m_recentreAhead          = owed > 0;
+    m_recentreOwedTicks      = static_cast<unsigned int>(owed >= 0 ? owed : -owed);
+    m_recentreDecidedOnce    = true;
+    m_recentreDecisionRttOffset = recentreRttOffsetTicks();
+    m_recentreRearmRun          = 0;
+
+    if (m_logger)
+    {
+        const int toLead = static_cast<int>(targetTick) - static_cast<int>(m_estimator.getLastAuthorityTick());
+        const char* const cause = m_recentreCause == RecentreCause::Join   ? "join"
+                                : m_recentreCause == RecentreCause::Resync ? "resync"
+                                                                           : "rearm";
+        char rearm[64] = "";
+        if (m_recentreCause == RecentreCause::Rearm)
+            std::snprintf(rearm, sizeof(rearm), " fromTarget=%u toTarget=%u", m_recentreRearmFromOffset, m_recentreRearmToOffset);
+        char buf[288];
+        std::snprintf(buf, sizeof(buf),
+            "[Warning][Clock.Recentre] fromLead=%d toLead=%d owed=%d target=%u rttMs=%.3f samples=%u cause=%s%s%s",
+            toLead + owed,
+            toLead,
+            owed,
+            targetTick,
+            m_estimator.getSmoothedRTT() * 1000.0,
+            m_estimator.getMeasuredRTTSampleCount() - m_recentreBaseSamples,
+            cause,
+            rearm,
+            owed != 0 ? "" : " skipped=within1");
+        m_logger(buf);
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -62,10 +62,11 @@
 // WHY THIS LIVES IN CORE (same rationale as InputRedundancyBundleCodec.h and
 // RelayedInputRingCodec.h).
 //
-// The UE-side wrapper FSimulationStateSyncBuffer
-// (Plugins/OGSimulation/Source/OGSimulationUnreal/SyncedSimulationStateBuffer.h) is a USTRUCT owning a
-// UPROPERTY TArray<uint8> plus NetSerialize; it DELEGATES the payload layout
-// here. Hoisting the layout into core is what lets the pure-C++ Low-Level-Tests
+// The production buffer is og-simulation's own CorrectionStateBuffer
+// (Network/SimPayloadBuffers.h), which og-sim-net's per-character channel holds and
+// sends; it DELEGATES the payload layout here. Until og-input-latency task P5-9 deleted
+// it, the buffer was the UE-side wrapper FSimulationStateSyncBuffer, a USTRUCT owning a
+// UPROPERTY TArray<uint8> plus NetSerialize. Hoisting the layout into core is what lets the pure-C++ Low-Level-Tests
 // round-trip the REAL production framing (WireFormat/CorrectionStateBufferCodecTest.cpp)
 // — the LLT target links only Core + OGSimulation and cannot see a USTRUCT at all.
 //
@@ -86,10 +87,9 @@
 // and 3 -> 4 by og-netcode-v2-field-defects task 9 because a field left the
 // middle of the state composite and every later offset moved (and again 4 -> 5
 // by task 17 and 5 -> 6 by task 27, the same plain case).
-// The version BYTE itself is emitted by the UE buffer's NetSerialize (it
-// is transport framing, not payload), and the refusal path lives in the
-// adapter's correction-state arrival callback (one adapter binds it to
-// `UOGBrawlerSimulatableComponent::OnRep_CorrectionState`), which compares the
+// The version BYTE itself is written by og-sim-net's sim envelope beside the
+// payload (`corrVersion`; it is transport framing, not payload), and the refusal
+// path lives in og-sim-net's client (`SimNetClient::onCorrection`), which compares the
 // received byte against this constant symbolically — so a mismatched build still
 // fails loudly with no edit at the fence site. The relay ring's own version byte
 // (relayedInputRing::kWireFormatVersion) is a NEW property's first format and is
@@ -226,8 +226,8 @@ namespace correctionStateBuffer
 	inline constexpr std::uint32_t kPayloadOffset            = 2 * sizeof(std::uint32_t);
 
 	// Header bytes that precede the state composite. A payload shorter than this
-	// carries no readable ref (a never-replicated buffer), which is what
-	// FSimulationStateSyncBuffer::getAppliedCaptureTick guards on.
+	// carries no readable ref (a never-written buffer), which is what
+	// CorrectionStateBuffer::getAppliedCaptureTick guards on.
 	inline constexpr std::uint32_t kHeaderBytes = kPayloadOffset;
 
 	// Writes one correction: (tick, appliedCaptureTick, state).

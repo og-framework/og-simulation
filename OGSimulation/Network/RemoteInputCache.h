@@ -30,8 +30,10 @@
 //   LocalInputCache<InputT>   this machine's OWN captures, read at `T - d`.
 //                             Sender-side delay mechanism. CLOCK-KEYED.
 //   the relayed input ring    the WIRE payload, server -> peers. Bytes, plus its
-//                             codec in core. One adapter's binding:
-//                             `FRelayedInputRing`.
+//                             codec in core. Its buffer: `RelayRingBuffer`
+//                             (SimPayloadBuffers.h); one adapter's
+//                             `FRelayedInputRing` until og-input-latency task
+//                             P5-9 deleted it.
 //   RemoteInputCache<InputT>  THIS: the client's typed read-side cache. SENDER-KEYED.
 //
 // THE CONTRACTS, one line each. Every one is fenced at its own declaration:
@@ -127,10 +129,13 @@
 // `populateRemoteInputCache`. READER: `SimulationInputResolution::collectInputAll` and
 // `SimulationInputResolution::collectResimInputAll`, on the PHYSICS thread, i.e. only
 // where the host ticks physics asynchronously. ONE ADAPTER'S BINDING FOR BOTH ENDS:
-// the async-physics switch is `bTickPhysicsAsync`; the arrival callback is
-// `ASimulationInputRelay::OnRep_RelayedInputRing`, which hands the ring to the owning
-// per-character component and thence to the core callback `registerPredictionOwner`
-// installed. `docs/ThreadingCrossings.md` row 1 cites this block as authoritative.
+// the async-physics switch is `bTickPhysicsAsync`; the arrival callback is og-sim-net's
+// ring receipt (`SimNetClient::onRing` -> `SimNetChannel::storeRing`), run in the
+// frame-locked drain the og-net driver calls on the game thread at the end of its
+// `PostTickDispatch`, which hands the ring to the core callback `registerPredictionOwner`
+// installed. Until og-input-latency task P5-7 it was the relay actor's OnRep,
+// `ASimulationInputRelay::OnRep_RelayedInputRing` (deleted by P5-9).
+// `docs/ThreadingCrossings.md` row 1 cites this block as authoritative.
 //
 // ⛔⛔ DO NOT COPY LocalInputCache's "not thread-safe; single-threaded by construction"
 //   claim with the ring mechanics: TRUE of the delay line (its push and read are two
@@ -402,13 +407,16 @@ private:
 // populateRemoteInputCache -- THE ingest, in one place, carrying the wire fence.
 //
 // It lives in core beside the store (the RelayedInputRingCodec precedent) so the
-// engine-free Low-Level-Tests exercise the REAL path: the adapter side does nothing
-// but call this with the freshly-replicated ring.
+// engine-free Low-Level-Tests exercise the REAL path: the transport side does nothing
+// but call this with the freshly-received ring.
 //
-// ONE ADAPTER'S BINDING FOR THE WIRE NAMES IN THIS BLOCK: the replicated wrapper is
-// `FRelayedInputRing`, its property serializer is `NetSerialize`, and the archive's
-// failure switch is `SetError`. Another adapter substitutes its own; every claim here
-// is about those ROLES, not about one engine.
+// ONE ADAPTER'S BINDING FOR THE WIRE NAMES IN THIS BLOCK, until og-input-latency task
+// P5-7: the replicated wrapper was `FRelayedInputRing` (deleted by P5-9), its property
+// serializer `NetSerialize`, and the archive's failure switch `SetError`; the archive
+// and bunch wording below is that adapter's. Since P5-7 og-sim-net carries the ring as
+// a sim-envelope message whose decoder checks only this build's layout and passes
+// another version through (SimEnvelope.h, `decodeRelayRing`), so the version is still
+// decided here, at consume. Every claim here is about those ROLES, not about one engine.
 //
 // ⛔⛔ THE VERSION IS CHECKED BEFORE ANY STRUCTURAL READ. The serializer only
 //   LENGTH-checks, so a layout change makes an old peer read arbitrary bytes as

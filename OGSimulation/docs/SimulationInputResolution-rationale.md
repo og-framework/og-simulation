@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: MPL-2.0 -->
+<!-- lint-external-ref: Source/OGSimulationUnreal/SimulationConnectionRelay.h -- deleted by og-input-latency task P5-9 (the relay actors, their listeners, the Iris sim buffers, serializers and proofs, and UEConnectionHandle); kept in the history -->
 # `SimulationInputResolution.h` — relocation history, retired rationale and
 # archived measurement records
 

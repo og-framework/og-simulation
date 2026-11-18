@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 #include "OGSimulation/OGExport.h"
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <limits>
@@ -151,6 +152,41 @@ using PCClockLoggerFn = std::function<void(const char*)>;
     OGSIMULATION_API DriftAction evaluateDrift() const;
 
     // -----------------------------------------------------------------------
+    // One-shot re-centre (og-input-latency task 27; TimeConfig::recentreSettleSamples)
+    //
+    // Armed at construction and by every hard resync. Once the estimator has
+    // taken recentreSettleSamples measured RTT samples since the arm, the next
+    // advancePrediction() past the warm-up guard decides ONCE and logs one
+    // [Clock.Recentre] line. It owes N graduated corrections, N the rounded
+    // median lead error of the last kRecentreMedianAdvances advances, and pays
+    // them one per gradualCorrectionRate advances, inside the dead band too;
+    // no later reading ends the debt, a hard resync clears it. Then the dead
+    // band applies again, until the RTT-only offset (the prediction offset
+    // without its jitter term, floored at predOffsetFloorTicks as it is) has
+    // stood kRecentreRearmTicks or more from its value at the decision on every
+    // one of the last kRecentreMedianAdvances advances: that re-arms it
+    // (reworks 2-4). The decision itself still aims at the full prediction offset.
+    // recentreSettleSamples == 0 never decides.
+    // Rationale: docs/TimeConfig-rationale.md §14.
+    // -----------------------------------------------------------------------
+
+    static constexpr unsigned int kRecentreMedianAdvances = 15u;
+    static_assert(kRecentreMedianAdvances % 2u == 1u,
+        "ClientPredictionClock: the re-centre's median run must be odd, so a full run's median is one reading "
+        "(og-input-latency task 27 rework 1, review_27 F3)");
+
+    static constexpr unsigned int kRecentreRearmTicks = 2u;
+    static_assert(kRecentreRearmTicks >= 2u,
+        "ClientPredictionClock: a re-arm on a 1-tick offset move would chase the offset's ceil() wobble on a steady "
+        "link (og-input-latency task 27 rework 2, Ph3 R10)");
+
+    // True while a re-centre is armed and has not yet decided.
+    OGSIMULATION_API bool isRecentreArmed() const;
+
+    // True while a re-centre still owes corrections.
+    OGSIMULATION_API bool isRecentring() const;
+
+    // -----------------------------------------------------------------------
     // Resync callbacks
     // Called with the new predictionTick when a hard resync fires, in
     // registration order.
@@ -224,6 +260,24 @@ using PCClockLoggerFn = std::function<void(const char*)>;
 private:
     void fireResyncCallbacks(unsigned int newTick);
 
+    // [task 27] The re-centre's pieces. With recentreSettleSamples == 0 the
+    // window is never full, so the decision never fires and nothing corrects.
+    // A reading is the lead over the authority tick, stored UNCORRECTED (as if
+    // the clock had taken no Skip or Stall since the arm), so the clock's own
+    // corrections inside the run do not move its median.
+    enum class RecentreCause { Join, Resync, Rearm };
+
+    bool recentreWindowFull() const;
+    void armRecentre(RecentreCause cause, unsigned int frontierTick);
+    unsigned int recentreRttOffsetTicks() const;
+    bool recentreOffsetMoved() const;
+    bool recentreRearmDue() const;
+    void trackRecentreRearm(bool pastGuard);
+    void recordRecentreReading(bool pastGuard);
+    int  recentreCorrectionTicks(unsigned int uncorrectedTick, const int* extraReading) const;
+    int  recentrePendingTicks() const;
+    void decideRecentre(unsigned int targetTick);
+
     const TimeConfig&           m_config;
     const NetworkTimeEstimator& m_estimator;
 
@@ -234,6 +288,26 @@ private:
     // [T11] Unpaid input-delay-increase stall, in ticks. Paid down one tick per
     // advancePrediction() call (as a Stall), cleared by a hard resync.
     unsigned int m_requiredInputDelayIncreaseStallTicks = 0;
+
+    // [task 27] The one-shot re-centre: armed at construction and by a hard
+    // resync, with the estimator's measured-sample count at that moment.
+    bool         m_recentreArmed       = true;
+    bool         m_recentreAhead       = false;  // the debt's direction: true = client ahead, Stall
+    unsigned int m_recentreOwedTicks   = 0;      // corrections still owed; only a correction or a hard resync lowers it
+    unsigned int m_recentreBaseSamples = 0;
+    unsigned int m_recentreUncorrectedTick = 0;  // the frontier had every advance since the arm been Normal
+    std::array<int, kRecentreMedianAdvances> m_recentreReadings{};
+    unsigned int m_recentreReadingCount = 0;
+    unsigned int m_recentreReadingNext  = 0;
+
+    // [task 27 reworks 2-4] The re-arm: the floored RTT-only offset at the last decision, and how
+    // many advances in a row it has stood kRecentreRearmTicks or more from that.
+    RecentreCause m_recentreCause          = RecentreCause::Join;
+    bool          m_recentreDecidedOnce    = false;
+    unsigned int  m_recentreDecisionRttOffset = 0;
+    unsigned int  m_recentreRearmRun       = 0;
+    unsigned int  m_recentreRearmFromOffset = 0;  // the decision's RTT-only offset, for the re-armed decision's line
+    unsigned int  m_recentreRearmToOffset   = 0;  // the RTT-only offset when it re-armed
 
     struct RegisteredResyncCallback
     {

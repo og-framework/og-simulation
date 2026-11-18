@@ -211,12 +211,15 @@ og-sim-metres-yup initiative, 2026-10):
    vector mirrored. The 3-D frame and the unit did not change, and a recorded game trace compared
    exactly through its planar converter's mirror.
 
-Three findings from that work are still true of the toolchain:
+Three findings from that work are still true of the toolchain, the first only under `/fp:fast`:
 - **A float made from a double in a constant expression.** With MSVC (`/std:c++20 /fp:fast`), in a
   constant expression a float produced from a double kept the double's value, so `float(0.3) == 0.3f`
   evaluated false although the bit pattern was the correctly rounded float. The wrappers narrowed
   through a round trip of the float's bit pattern (`std::bit_cast`) to make constant evaluation and
-  run time agree.
+  run time agree. This one holds under `/fp:fast` only: with `/fp:precise` (the mode simulation
+  code compiles with since og-input-latency task 20) or `/fp:strict`, `float(0.3) == 0.3f` and
+  `float(0.1) == 0.1f` evaluate true in a constant expression (MSVC 19.38, a one-file probe,
+  2026-11-18).
 - **The sign of a zero** (§6): a run-time copy of a vocabulary axis, or a negated axis
   (`-kUp * x`, `kUp * -x`), gives `-0` components where a literal had `+0`. `withHeight`, `compose`
   and `fromForwardRight` place a value without touching the other components, so they keep `+0`.

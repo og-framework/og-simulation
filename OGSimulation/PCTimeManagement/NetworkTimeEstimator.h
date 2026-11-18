@@ -24,20 +24,27 @@ OGSIM_OPTIMIZE_OFF
 // This class is accessed from two threads without a mutex:
 //
 //   Game thread (GT)  — writes via: updateRTT(), recordAuthorityTick()
-//                       Called from the adapter's timing-buffer arrival callback,
-//                       on the thread replication delivers on. One adapter binds
-//                       that to `UESimulationSession::onTimingInfoReceived`,
-//                       fed from `ASimulationTimingRelay::OnRep_Buffer`.
+//                       Called from the adapter's clock arrival callback, on
+//                       the game thread. One adapter binds that to
+//                       `UESimulationSession::onTimingInfoReceived`, fed since
+//                       og-input-latency task P5-7 by og-sim-net's
+//                       `SimNetClient::drain` in the frame-locked drain the
+//                       og-net driver runs at the end of its `PostTickDispatch`
+//                       (by `ASimulationTimingRelay::OnRep_Buffer` before;
+//                       deleted by P5-9). Since og-input-latency task 27 that
+//                       drain hands over at most one clock sample, the newest.
 //
 //   Physics thread (PT) — reads via: getTargetPredictionTick(), and through it
-//                          getPredictionOffsetTicks().
+//                          getPredictionOffsetTicks(); getMeasuredRTTSampleCount(),
+//                          getLastAuthorityTick() and getPredictionOffsetTicks()
+//                          directly for the clock's re-centre.
 //                          Called inside ClientPredictionClock::advancePrediction().
 //                          The other accessors read the same members and are
 //                          safe from either thread.
 //
-// m_authorityTick, m_smoothedRTT, m_smoothedJitter and m_hasFirstSample are
-// all std::atomic, with ONE writer (GT) and memory_order_relaxed on every
-// access. Every crossing read is therefore correctly synchronized on every
+// m_authorityTick, m_smoothedRTT, m_smoothedJitter, m_hasFirstSample and
+// m_measuredRTTSamples are all std::atomic, with ONE writer (GT) and
+// memory_order_relaxed on every access. Every crossing read is therefore correctly synchronized on every
 // platform — no data race, no torn value — not only on x86-64, where a relaxed
 // atomic compiles to the same plain load and store the old fields used.
 //
@@ -136,6 +143,14 @@ using LoggerFn = std::function<void(const char*)>;
     // Number of ticks added on top of authorityTick to form the target.
     OGSIMULATION_API unsigned int  getPredictionOffsetTicks() const;
 
+    // Running total of MEASURED samples: past updateRTT's validity gate (plausible
+    // or not) and above 0. A 0 reading is counted out because it carries no
+    // measurement: one adapter's ping source (an averaged RoundTrip) reads 0 until
+    // its first averaging bucket fills, about a second into the connection.
+    // ClientPredictionClock reads it on the PT to count its re-centre's settle
+    // window (og-input-latency task 27).
+    OGSIMULATION_API unsigned int  getMeasuredRTTSampleCount() const;
+
 private:
     // True when `rawRTTSeconds` is plausible given the current estimate. Cold
     // start (no first sample yet) uses the absolute ceiling; afterwards the
@@ -158,6 +173,7 @@ private:
     std::atomic<double>       m_smoothedRTT{0.0};
     std::atomic<double>       m_smoothedJitter{0.0};
     std::atomic<bool>         m_hasFirstSample{false};
+    std::atomic<unsigned int> m_measuredRTTSamples{0};
 
     // T21 validity-gate bookkeeping. GT-only, like every other non-atomic
     // member here: both are touched exclusively inside updateRTT (a GT writer

@@ -1,4 +1,6 @@
 <!-- SPDX-License-Identifier: MPL-2.0 -->
+<!-- lint-external-ref: OnRep -- Unreal Engine replication hook name, outside every scan root -->
+<!-- lint-external-ref: Plugins/OGSimulation/Source/OGSimulationUnreal/SimulatableNetSyncComponent.h -- deleted by og-input-latency task P5-8 (the net-sync component, the pawn's subobject, the bundle builder and the owner binding's net half); kept in the history -->
 # Perspective: the authority simulation vs the prediction simulation
 
 **One class, two behaviours.** `SimulationManager` is instantiated with a single `bool`, and that

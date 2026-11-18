@@ -149,8 +149,10 @@ public:
 
     // Const peek of up to `maxSlots` most-recent still-pending entries whose tick
     // is <= upToTick, invoking cb(uint32 tick, const InputType& input) oldest-first.
-    // Does NOT advance head/tail — used by the Stage 1 redundancy-bundle producer
-    // (buildRedundancyBundle) to re-send the last N ticks every frame so a
+    // Does NOT advance head/tail — used by the redundancy-bundle producer
+    // (og-sim-net's SimNetChannel::sendLocalInputToAuthority; the Unreal
+    // buildRedundancyBundle until og-input-latency task P5-8 deleted it) to re-send
+    // the last N ticks every frame so a
     // dropped unreliable datagram self-heals on the next send. Consumer-thread only
     // (the game thread that also calls dequeue / releaseAllButRecent).
     template <typename Callback>

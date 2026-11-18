@@ -342,6 +342,16 @@ public:
         m_timeConfig.relayResendEntries = latencyKnobs::clampRelayResendEntries(requestedEntries);
     }
 
+    // ⛔ THE one writable location for the client clock's re-centre window — the
+    // `[OGNetcode] RecentreSettleSamples` ini door. 0 disables the re-centre. §15
+    //
+    // ⛔ ONE-SHOT AT COMPOSITION — the client clock reads it on its stepping thread with no
+    // synchronization, safe only because nothing writes it once stepping has started. §15
+    void setRecentreSettleSamples(uint32_t samples)
+    {
+        m_timeConfig.recentreSettleSamples = samples;
+    }
+
     // ⛔ THE one writable location for the session resim-gate trigger policy — the
     // `[OGNetcode] ResimTriggerPolicy` ini door. §4
     //

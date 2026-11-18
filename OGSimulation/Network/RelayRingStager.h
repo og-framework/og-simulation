@@ -137,4 +137,5 @@ static_assert(std::is_same_v<decltype(&RelayRingStager::stageArrival<relayRingSt
 	"RelayRingStager::stageArrival takes NO depth parameter. The stage's capacity is relayedInputRing::kMaxDepth, fixed "
 	"inside the codec; a depth passed down here would cap every round at one entry and silently restore the "
 	"replace-latest behaviour the staging removed. Was the 'NO DEPTH PARAMETER' fence, the same one "
-	"UESimulatableOwnerBinding::stageRelayedInput's signature static_assert carries for the UE stage");
+	"UESimulatableOwnerBinding::stageRelayedInput's signature static_assert carried for the UE stage until "
+	"og-input-latency task P5-8 deleted it");

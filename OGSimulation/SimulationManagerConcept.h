@@ -15,8 +15,9 @@ concept SyncedTimingBufferConcept = requires(BufferT& b, const ServerTickClock& 
 };
 
 // Owner-layer concept for the composition root that owns a SimulationManager.
-// One adapter's binding: `AOGBrawlerSimulationManager`, whose replicated timing-info
-// arrival callback is `OnRep_TimingInfo`.
+// No type in this tree satisfies it (nothing defines getSyncedTimingBuffer); since
+// og-input-latency task P5-7 a client's clock arrives as og-sim-net's ClockPublish
+// message (SimNetClient::drain, the newest tick per drain -> UESimulationSession::onTimingInfoReceived).
 // Server side: getSyncedTimingBuffer() is writable; SimulationManager writes the server
 // clock into it each tick via write(). Client side: setOnTimingInfoReceivedCallback
 // registers the deserialized-tick+RTT handler; the adapter's timing-info arrival
@@ -39,10 +40,13 @@ concept SimulationManagerOwnerConcept =
 // opaque wire-identity handle type (`Address`) and the session tick rate. Every
 // engine-agnostic per-connection structure in this core — ConnectionTierTable,
 // ServerInputDelayQueue, and (Stage 4) ServerSubstitutionTracker — is templated
-// on `Address`, so the sim core never names a UE / Godot / engine type. Engine
-// adapters supply the concrete handle: `OGSimulationUnreal` provides
-// `FUEConnectionHandle` (wrapping `TWeakObjectPtr<UNetConnection>`), and the
-// engine-free Catch2 harness provides `FStandaloneTestHandle`.
+// on `Address`, so the sim core never names a UE / Godot / engine type. The
+// transport supplies the concrete handle: og-sim-net provides
+// `SimNetConnectionHandle` (an og-net connection id, an epoch and its liveness
+// table), which the Unreal game's NetConfig names since og-input-latency task P5-7
+// (`OGSimulationUnreal`'s `FUEConnectionHandle`, a `TWeakObjectPtr<UNetConnection>`
+// wrapper, until then; deleted by P5-9), and the engine-free Catch2 harness provides
+// `FStandaloneTestHandle`.
 //
 // WHY `NetConfig` DOES NOT CARRY `Input` / `State` TYPES (proposal §2.1
 // Correction 3): GGRS models a session over a single simulatable, so its config

@@ -114,6 +114,9 @@ void NetworkTimeEstimator::updateRTT(double rawRTTSeconds)
         return;
     }
 
+    if (rawRTTSeconds > 0.0)
+        m_measuredRTTSamples.fetch_add(1u, std::memory_order_relaxed);
+
     // -----------------------------------------------------------------------
     // PLAUSIBILITY GATE (og-netcode-v2-input-relay T26b).
     //
@@ -430,6 +433,11 @@ unsigned int NetworkTimeEstimator::getOutlierRejectedSampleCount() const
 unsigned int NetworkTimeEstimator::getOutlierEscapeCount() const
 {
     return m_outlierEscapes;
+}
+
+unsigned int NetworkTimeEstimator::getMeasuredRTTSampleCount() const
+{
+    return m_measuredRTTSamples.load(std::memory_order_relaxed);
 }
 
 OGSIM_OPTIMIZE_ON
