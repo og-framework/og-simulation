@@ -50,6 +50,8 @@ inline constexpr SimulationLogRouteEntry kSimulationLogRoutes[] = {
 	{ "[InputDomain]",                  SimulationLogRoute::Net,             HostLogLevel::Log },
 	{ "[RelaySkip]",                    SimulationLogRoute::Net,             HostLogLevel::Log },
 	{ "[RelayFlush]",                   SimulationLogRoute::Net,             HostLogLevel::Log },
+	{ "[SimNet.",                       SimulationLogRoute::Net,             HostLogLevel::Log },
+	{ "[Roster.",                       SimulationLogRoute::Net,             HostLogLevel::Log },
 	{ "[DivergenceProbe",               SimulationLogRoute::DivergenceProbe, HostLogLevel::Log }
 };
 

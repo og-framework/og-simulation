@@ -18,3 +18,11 @@ target_include_directories(og_simulation PUBLIC
 )
 
 target_link_libraries(og_simulation PUBLIC glm::glm-header-only)
+
+if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+    target_compile_options(og_simulation PUBLIC /fp:precise)
+elseif(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+    target_compile_options(og_simulation PUBLIC /fp:precise /clang:-ffp-contract=off)
+else()
+    target_compile_options(og_simulation PUBLIC -ffp-contract=off)
+endif()
