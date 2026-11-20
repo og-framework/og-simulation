@@ -495,15 +495,15 @@ The design corpus writes `ogsim::`; no such namespace exists in this tree.
 
 ## §8 — The diagnostics: twelve tags, one sink, one window
 
-Every line this file emits goes through the optional `setLogger` sink — thirteen `SIMLOG` call sites
-across twelve tags. A leading `[Warning]` or `[Verbose]` token selects the severity; an unprefixed line
+Every line this file emits goes through the optional `setLogger` sink — fifteen `SIMLOG` call sites
+across twelve tags (`[Release]` has two: with and without its step time; `[ServerReceive]` has two: with and without its receive time). A leading `[Warning]` or `[Verbose]` token selects the severity; an unprefixed line
 stays at Log, which is hidden under the shipped `LogOGNet=Warning`.
 
 | tag | severity | fires | notes |
 |---|---|---|---|
-| `[ServerReceive]` | Log | per decoded slot | the generic replacement for a former game-specific trace |
+| `[ServerReceive]` | Log | per decoded slot | the generic replacement for a former game-specific trace; ends with ` recvSeconds=%.6f` only when the host passes the bundle's receive time (below) |
 | `[Park]` | Log | per genuinely-new park | gated on `acceptedNew`, so a redundancy bundle does not spam it |
-| `[Release]` | Log | per released input | the timeline companion to `[Park]` |
+| `[Release]` | Log | per released input | the timeline companion to `[Park]`; ends with ` stepSeconds=%.6f` only when the host passes the drain's time (below) |
 | `[InputGap]` | Warning | per hole in an id's delivered ticks | the primary, cause-agnostic drop signal |
 | `[InputDrop]` | Warning | per purged, never-released entry | the precise attributable record |
 | `[DelayShift]` | Warning | per wire, per change | keyed on the wire, so at most once per wire per drain |
@@ -538,6 +538,30 @@ end-of-line does not.
 window, not on the OOO-older count alone. The whole point of the field is to make the late class
 visible at shipped verbosity, and a late-only window is the common shape — it is what the
 2026-09-13 session would have produced.
+
+### The step time on `[Release]` (og-input-latency P5-37)
+
+`releaseDelayedInputs` takes an optional `stepSeconds`, and when it is present every `[Release]` line
+of that drain ends with ` stepSeconds=<s>` (six decimals). The value is the host's, from the clock the
+host uses for its own timing: this header reads no clock (§7), and it formats the number without
+interpreting it. One drain gets one value, so a drain that releases several ticks writes the same
+time on each of their lines: the time of the release, not of each tick's step.
+
+The field exists because a host's log may stamp a line later than it was written. A host that logs
+from a thread other than the one that writes its log file can queue the line and stamp it when the
+queue is flushed, and then the stamp of `[Release]` is not the time of the release. The field is that
+time, written with the line. Without it (every caller that passes nothing, the tests among them) the
+line is byte-identical to what it was before the field existed.
+
+### The receive time on `[ServerReceive]` (og-input-latency P5-38)
+
+`receiveInputBundle` takes an optional `recvSeconds` after its relay sink, and when it is present every
+`[ServerReceive]` line of that bundle ends with ` recvSeconds=<s>` (six decimals). As with the step time
+above, the value is the host's and this header formats it without interpreting it; every slot of one
+bundle carries the same value, the time the host received the message that held it. The reason is the
+same as for `[Release]`: a line written on a thread that does not write the log file can be stamped
+when the log is next flushed, and the field is the time written with the line. Without it the line is
+byte-identical to what it was before the field existed.
 
 ### Where the late count actually lives
 

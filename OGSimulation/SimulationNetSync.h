@@ -247,7 +247,7 @@ concept AuthoritySyncedBufferOwnerConcept =
 //     there, and inventoried in the same doc under decideCorrectionArrival.
 //
 //     ⚠ THE TABLE IS og-sim-net's FRAME-LOCKED MODE (`SimNetConfig::immediate`
-//     false, the shipped default). On a client in the IMMEDIATE mode
+//     false, `SimNetConfig`'s default; Jolt clients ship immediate). On a client in the IMMEDIATE mode
 //     (og-input-latency P2-15) the host calls `SimNetClient::drain` at the start
 //     of each step, before `collectInputAll`, on the step's thread: the two
 //     client arrival callbacks then run on the PHYSICS (step) thread, between

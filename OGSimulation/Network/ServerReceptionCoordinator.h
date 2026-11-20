@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <functional>
 #include <iterator>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -439,7 +440,8 @@ public:
               && RemoteInputRelaySink<RelaySink, InputFor<SimT>>
     void receiveInputBundle(unsigned int id, const Address& addr, uint8_t playerSlot,
                             const Buffer& wire, Sink&& deliver,
-                            RelaySink&& relay = RelaySink{})
+                            RelaySink&& relay = RelaySink{},
+                            std::optional<double> recvSeconds = std::nullopt)
     {
         bool         bundleParked = false;
         std::int32_t bundleNewest = 0;
@@ -447,8 +449,16 @@ public:
             wire,
             [&](std::uint32_t captureTick, const InputFor<SimT>& input)
             {
-                SIMLOG(m_logger, "[ServerReceive] id=%u tick=%u",
-                    id, static_cast<unsigned int>(captureTick));
+                if (recvSeconds.has_value())
+                {
+                    SIMLOG(m_logger, "[ServerReceive] id=%u tick=%u recvSeconds=%.6f",
+                        id, static_cast<unsigned int>(captureTick), *recvSeconds);
+                }
+                else
+                {
+                    SIMLOG(m_logger, "[ServerReceive] id=%u tick=%u",
+                        id, static_cast<unsigned int>(captureTick));
+                }
 
                 const ReceiveRemoteInputResult result = receiveRemoteInput<SimT>(
                     id, addr, playerSlot, static_cast<int32_t>(captureTick), input, relay);
@@ -487,8 +497,11 @@ public:
     // `RemoteMoveQueue`'s capture-tick dedup. §2
     // ⚠ Release lateness is reported separately, as `[Release] late=N` TICKS. §8
     // ⚠ NOT the same quantity as `[InputStats] late=N`, which is a COUNT. §8
+    // ⚠ `stepSeconds`, when the host passes it, is appended to every [Release]
+    // line of this drain as ` stepSeconds=`; without it the line is unchanged. §8
     template <typename SimT, typename DeliverFn>
-    void releaseDelayedInputs(int32_t firstUpcomingSimTick, int32_t numSteps, DeliverFn&& deliver)
+    void releaseDelayedInputs(int32_t firstUpcomingSimTick, int32_t numSteps, DeliverFn&& deliver,
+                              std::optional<double> stepSeconds = std::nullopt)
     {
         // ⛔ RECORDED BEFORE THE EMPTY EARLY-OUT, so an idle server still advances it. §5
         // ⛔ `+ numSteps`, NOT `firstUpcomingSimTick`: this frame serves the whole
@@ -545,8 +558,16 @@ public:
 
                 // [Release] is the timeline companion to [Park]; this point sees
                 // every released tick per id, so [InputGap] lives here too. §8
-                SIMLOG(m_logger, "[Release] id=%u captureTick=%d releaseTick=%d late=%d",
-                    id, deliveredCaptureTick, simTick, late);
+                if (stepSeconds.has_value())
+                {
+                    SIMLOG(m_logger, "[Release] id=%u captureTick=%d releaseTick=%d late=%d stepSeconds=%.6f",
+                        id, deliveredCaptureTick, simTick, late, *stepSeconds);
+                }
+                else
+                {
+                    SIMLOG(m_logger, "[Release] id=%u captureTick=%d releaseTick=%d late=%d",
+                        id, deliveredCaptureTick, simTick, late);
+                }
                 noteDeliveredForGap(id, deliveredCaptureTick);
             }
 

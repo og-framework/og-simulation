@@ -52,6 +52,7 @@ simulation thread, and a build with its own socket, and the numbers stay compara
 | `N4` | Input | NetReceived → ServerReceived | the authority's transport received a datagram carrying a capture → the host decoded that capture (§11) |
 | `N6` | Input | NetReceived → ClientReceived | a client's transport received a datagram carrying a relayed capture → the host decoded it (§11) |
 | `N6c` | State | NetReceived → ClientReceived | a client's transport received a datagram carrying a state for tick T → the host decoded it (§11) |
+| `N6u` | Input | NetReceived → Consumed | a client's transport received a datagram carrying a relayed capture → the step that consumed it: the capture's arrival margin (§12) |
 | `WIRE` | — | direct sample | half the round-trip time, fed by `addSample` |
 
 `Handed` and `LeftProcess` are shared by several hops. That is safe because a probe instance
@@ -61,10 +62,10 @@ client it is the input send. Routes the role does not measure are masked out (§
 `kClientHops` and `kServerHops` are the two role masks. `H7` is in both because a listen host
 presents too; on a headless authority it measures the host's per-frame presentation point, not a
 render. `H6L` is a client hop only. The net hops are in neither: `kServerNetHops` (`N4`) and
-`kClientNetHops` (`N6`, `N6c`) are separate masks a host ORs into its role mask (§11), and a
-`static_assert` beside each role mask pins its exact hop set by name.
+`kClientNetHops` (`N6`, `N6c`, `N6u`) are separate masks a host ORs into its role mask (§11, §12), and a
+`static_assert` beside each role mask, and one beside `kClientNetHops`, pins its exact hop set by name.
 
-`H6L` is declared after `H7`, and `N4`, `N6` and `N6c` after `H6L`, each immediately before `WIRE`,
+`H6L` is declared after `H7`, and `N4`, `N6`, `N6c` and then `N6u` after `H6L`, each immediately before `WIRE`,
 so every hop that existed before them keeps its enumerator value and its place in a window's output;
 only `WIRE` moved, and it is still last. Likewise `Healed` and then `NetReceived` were added as the
 last points.
@@ -181,7 +182,7 @@ windowing scheme.
 
 - **Memory.** `maxLanes × 2 streams × ticksPerLane` slots of about 100 bytes (one timestamp per
   point, eleven points), plus `maxSamplesPerHop` doubles reserved per hop, enabled or not. The
-  defaults (8, 64, 4096) come to about 100 KB of slots and 490 KB of sample storage for the fifteen
+  defaults (8, 64, 4096) come to about 100 KB of slots and 520 KB of sample storage for the sixteen
   hops, allocated once in the constructor. Nothing allocates after construction.
 - **The longest measurable hop** is bounded by `ticksPerLane` ticks of the key domain: a hop whose
   end lands more than `ticksPerLane` ticks after its start finds its slot reused and is counted as
@@ -283,3 +284,33 @@ counts `noStart` or `noEnd` (§4), so a stray `NetReceived` stamp changes no rep
 **Known error.** The first stamp of a point wins (G-03). A host that stamps both `NetReceived` and the
 decode point for every redundant copy of a capture measures the first copy decoded, and counts two
 duplicate stamps per later copy instead of one.
+
+---
+
+## §12 `N6u` — a relayed input's arrival margin (og-input-latency P5-37)
+
+`N6u` (Input, `NetReceived` → `Consumed`) is, per relayed capture, the time from its first arrival at the
+client's transport to the step that consumed it. Per capture it is exactly `N6` + `H6`: the residence before
+the decode, then the wait between the decode and the use.
+
+**Why a hop of its own.** A window line holds percentiles, and a percentile of a sum is not the sum of the
+percentiles. Adding a window's `N6` p50 to its `H6` p50 only approximates the p50 of the arrival-to-use
+time, and the two hops' p95s add to a figure no capture has. `N6u` is that time, sampled per capture, so
+its p50 / p95 / max are percentiles of the margin itself.
+
+**What it measures.** For a capture used at its scheduled tick, the use's time is set by the schedule, not
+by the arrival, so `N6u` is how early the capture arrived: its margin before the use. A smaller margin is
+not a lower latency; a margin that reaches zero is a late capture. A capture that misses its scheduled use
+is an `N6u` sample only if the host stamps a later `Consumed` for it, and the sample then includes that
+wait; otherwise its slot counts `noEnd`. `H6L` (§10) is the hop that follows late captures to their heal.
+
+**The points.** `NetReceived` is the time the transport recorded the datagram (§11), and `Consumed` is
+whatever the host stamps for the step that applied the capture; a host whose drain runs at the start of
+each step and stamps `Consumed` at that step's start measures arrival → the drain of the use step, to
+within the drain's own cost. Both are stamps of the same clock (§1). The first stamp of each point wins
+(G-03): a redundant copy of the capture does not move its arrival, and a later re-read does not move its
+use.
+
+**Which inputs.** Only a capture that has both points: a relayed capture on a client. A local input has
+no `NetReceived`; if the host stamps its `Consumed`, its slot counts `noStart` when it is finalized. A state
+has its own stream, and `N6c` + `H6c` cover it. `N6u` is in `kClientNetHops` and in no role mask, like `N6` (§11).

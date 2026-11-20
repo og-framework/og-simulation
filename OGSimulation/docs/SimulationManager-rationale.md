@@ -1573,3 +1573,24 @@ measurement (P3-13) ran every value on one binary.
 (the re-read rule, §4) on the client's stepping thread. The composition root calls the setter before stepping starts and never
 again, so the read needs no synchronization; a `cvar` or any later write would race it. Both roles may call it; neither
 field has a reader on the authority.
+
+## 18. Additions after the archive: the authority step's time on `[AuthoritySimulation]` (og-input-latency P5-37, 2026-11-20)
+
+Not archived prose; the header's `§18` pointer at `noteAuthorityStepSeconds` lands here.
+
+`noteAuthorityStepSeconds` hands the manager the host's time for the next authority step. The next
+`onGameSimulationAuthority` appends it to its line as `[AuthoritySimulation] tick=<t> stepSeconds=<s>` (six decimals)
+and clears it, so each value is written on exactly one step's line. A step with no value set logs the line as it was
+before the field existed, byte for byte: the tests, a host that never calls the setter, and the second and later steps
+of a host that releases several steps at once and notes one time for them. The manager reads no clock and does not
+interpret the number; the host chooses the clock (one adapter's binding: the Unreal session's
+`releaseDelayedInputsForStep` notes `FPlatformTime::Seconds()` at the release that precedes the step, the same value it
+passes to the coordinator's `[Release]` lines, `ServerReceptionCoordinator-rationale.md` §8).
+
+**Why.** A host may stamp a log line later than it was written. The Unreal dedicated server has no log thread, so a line
+the authority runner logs is stamped when the game thread next flushes the log queue, up to one server frame late. The
+field is the step's own time, written with the line, so a tool that reads the server's step timeline needs no estimate
+of that lag.
+
+**Threads.** The setter and the line run on the thread that steps the authority, in that order, inside one step; nothing
+else reads the value. It is not a configuration value (§4's one-shot rule does not apply): it is written every step.

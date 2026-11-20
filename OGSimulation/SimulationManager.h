@@ -374,6 +374,14 @@ public:
         m_timeConfig.simClockJitterMultiplier = clamped;
     }
 
+    // ⚠ The host's time for the NEXT authority step, appended to that step's
+    // [AuthoritySimulation] line as ` stepSeconds=` and then cleared; unset, the line is
+    // unchanged. Called on the stepping thread, before the step. §18
+    void noteAuthorityStepSeconds(double stepSeconds)
+    {
+        m_authorityStepSeconds = stepSeconds;
+    }
+
     // ⛔ THE one writable location for the session resim-gate trigger policy — the
     // `[OGNetcode] ResimTriggerPolicy` ini door. §4
     //
@@ -807,7 +815,15 @@ private:
     {
         m_serverClock->advanceTick();
         const SimulationTimeStep step = m_serverClock->getSimulationStep();
-        SIMLOG(m_logger, "[AuthoritySimulation] tick=%u", step.getTick());
+        if (m_authorityStepSeconds.has_value())
+        {
+            SIMLOG(m_logger, "[AuthoritySimulation] tick=%u stepSeconds=%.6f", step.getTick(), *m_authorityStepSeconds);
+            m_authorityStepSeconds.reset();
+        }
+        else
+        {
+            SIMLOG(m_logger, "[AuthoritySimulation] tick=%u", step.getTick());
+        }
         // ⛔ Publishes the authority tick + `TimeConfig::rollbackWindowTicks` for the queueMove guard —
         // no literal. §4
         m_netSync.setAuthorityGuardContext(step.getTick(), m_timeConfig.rollbackWindowTicks);
@@ -892,6 +908,8 @@ private:
     // consumed by the matching `onPostGameSimulation`, so post-solve writes target the tick that
     // produced the captured state. §7
     std::optional<SimulationTimeStep>    m_lastStep;
+
+    std::optional<double>                m_authorityStepSeconds;
 
     // ⛔ CONSTRUCTED UNCONDITIONALLY, ON THE AUTHORITY TOO, where `onCheckIsSimilar` is never
     // reached (`!runsPrediction`) so it never flushes — which is why "zero new lines on the

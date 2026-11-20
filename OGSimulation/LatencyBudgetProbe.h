@@ -60,6 +60,7 @@ enum class Hop : uint8_t
 	N4,
 	N6,
 	N6c,
+	N6u,
 	Wire,
 	Count
 };
@@ -84,6 +85,7 @@ constexpr const char* hopName(Hop hop)
 	case Hop::N4:    return "N4";
 	case Hop::N6:    return "N6";
 	case Hop::N6c:   return "N6c";
+	case Hop::N6u:   return "N6u";
 	case Hop::Wire:  return "WIRE";
 	case Hop::Count: break;
 	}
@@ -113,6 +115,7 @@ inline constexpr std::array<HopRoute, kHopCount - 1> kHopRoutes{ {
 	{ Hop::N4,  Stream::Input, Point::NetReceived,    Point::ServerReceived },
 	{ Hop::N6,  Stream::Input, Point::NetReceived,    Point::ClientReceived },
 	{ Hop::N6c, Stream::State, Point::NetReceived,    Point::ClientReceived },
+	{ Hop::N6u, Stream::Input, Point::NetReceived,    Point::Consumed },
 } };
 
 constexpr bool hopRoutesAreIndexedByHop()
@@ -151,7 +154,7 @@ inline constexpr HopMask kServerHops =
 
 inline constexpr HopMask kServerNetHops = hopBit(Hop::N4);
 
-inline constexpr HopMask kClientNetHops = hopBit(Hop::N6) | hopBit(Hop::N6c);
+inline constexpr HopMask kClientNetHops = hopBit(Hop::N6) | hopBit(Hop::N6c) | hopBit(Hop::N6u);
 
 static_assert(kClientHops
 		== (hopBit(Hop::H1) | hopBit(Hop::H2) | hopBit(Hop::H3) | hopBit(Hop::H6) | hopBit(Hop::H6c)
@@ -164,6 +167,14 @@ static_assert(kServerHops
 			| hopBit(Hop::H7) | hopBit(Hop::Wire)),
 	"kServerHops must be exactly H3 H3c H4 H4r H5 H7 WIRE: net hops stay off until the host stamps "
 	"NetReceived; was og-input-latency P8-5");
+
+static_assert(kClientNetHops == (hopBit(Hop::N6) | hopBit(Hop::N6c) | hopBit(Hop::N6u))
+		&& kHopRoutes[static_cast<std::size_t>(Hop::N6u)].stream == Stream::Input
+		&& kHopRoutes[static_cast<std::size_t>(Hop::N6u)].from == Point::NetReceived
+		&& kHopRoutes[static_cast<std::size_t>(Hop::N6u)].to == Point::Consumed,
+	"kClientNetHops must be exactly N6 N6c N6u, and N6u must stay a relayed input's og-net arrival -> the start of the step "
+	"that uses it (Input, NetReceived -> Consumed), the per-input arrival margin that a sum of the N6 and H6 window "
+	"percentiles only approximates; was og-input-latency P5-37");
 
 enum class EventKind : uint8_t
 {

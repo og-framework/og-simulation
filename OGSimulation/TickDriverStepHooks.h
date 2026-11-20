@@ -167,6 +167,13 @@ public:
 			tickEndSeconds - m_stepStartSeconds, outcome.replayedTicks, outcome.resimRefused });
 	}
 
+	void afterBatch()
+		requires TickDriverDisplayGame<typename DoorsT::Game>
+	{
+		checkInStep();
+		m_doors.game.publishForDisplay();
+	}
+
 	double currentStepDeadline = 0.0;
 
 private:
@@ -190,6 +197,16 @@ using Doors = StepDoors<driverStepDoorsSelfCheck::Conforming, tickDriverGameSelf
 
 template <typename DoorsT>
 concept HooksExistFor = requires { typename TickDriverStepHooks<DoorsT>; };
+
+template <typename DoorsT>
+concept HooksPublishAfterBatch = requires(TickDriverStepHooks<DoorsT>& hooks) { hooks.afterBatch(); };
+
+using DisplayDoors = StepDoors<driverStepDoorsSelfCheck::Conforming, tickDriverDisplayGameSelfCheck::Conforming,
+	tickDriverPresenterStepsSelfCheck::Conforming, tickDriverWorldHostSelfCheck::Conforming, tickDriverEngineSelfCheck::Conforming>;
+
+static_assert(HooksPublishAfterBatch<DisplayDoors> && !HooksPublishAfterBatch<Doors>,
+	"TickDriverStepHooks::afterBatch exists only for a game that publishes for display, so the driver's call compiles out for "
+	"every other game");
 
 static_assert(StepHooks<TickDriverStepHooks<Doors>>,
 	"TickDriverStepHooks must satisfy og-simulation's StepHooks concept: all four hooks, each returning void, afterTick "

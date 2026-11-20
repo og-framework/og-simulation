@@ -69,7 +69,7 @@ struct ResimSweepDiagnostics
 // it guards; none of them restates this map, and this map states no invariant.
 //
 //   * TWO THREADS TOUCH THIS CLASS, AND ONLY ONE OF THEM TICKS — in og-sim-net's
-//     FRAME-LOCKED mode (`SimNetConfig::immediate` false, the shipped default).
+//     FRAME-LOCKED mode (`SimNetConfig::immediate` false, `SimNetConfig`'s default; Jolt clients ship immediate).
 //       GAME thread    corrections arrive — `injectCorrectionState`, from the
 //                      lambda NetSync binds on the owner's correction callback,
 //                      called from og-sim-net's frame-locked drain

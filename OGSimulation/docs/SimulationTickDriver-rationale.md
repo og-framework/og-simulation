@@ -149,6 +149,15 @@ the role's owner thread, `worker` otherwise, and `runner` in `FreeRunning`), the
 4. `m_stepDriver->runTick(physicsStep)`;
 5. `worldHost.afterRunTick_Step(step, outcome)`, still under the lock and the scope.
 
+**After the batch**, a client whose game models `TickDriverDisplayGame` (`TickDriverConcepts-rationale.md` §11) gets
+one `publishAfterBatch()`: under a world lock and a `StepScope` of its own, the hooks' `afterBatch()`, which calls the
+game's `publishForDisplay()`. It runs on the thread that ran the batch, after its last step and before any later
+batch: a later frame's task is dispatched after this one (`dispatchAfter`), so the engine starts it only once this one
+has returned. Nothing steps during it, whatever `endFrame` waits for. An authority never calls it, and for a game
+without the hook the call, the lock and the scope compile out (`if constexpr`), so its trace and its lock count are
+unchanged. Under `ThisFramesSingleStep` a one-step frame waits for the task, so its post-physics pass reads what the
+hook published; a frame that did not wait reads the newest batch published before it.
+
 `runStep` is private and `runBatch` is its only caller, so "a step runs only inside the driver's batch" is
 the type's shape; the old per-step body checked it at run time with a thread-local batch marker. A
 `FreeRunning` step needs no check of its own here: `runAuthorityLoop` checks that it runs on the owner, and
@@ -476,6 +485,21 @@ has had published.
   settings' traces hold the same events in the same numbers, in a different order, with the same per-frame
   step counts and the same published steps.
 
+The `DisplayFill` cases (`SimulationTickDriverDisplayFillTest.cpp`) run a `FrameBounded` client over the fake
+engine's worker thread, for 60 frames of 0, 1 and 2 steps, under each frame wait. The test's game counts the steps in
+flight (from `receiveForStep` to the end of `onStepEnded`) and records each fill. In every frame whose batch the
+driver does not wait for, it holds the batch's first step inside `onStepEnded` until that frame's post-physics pass
+has seen it held and run, so whatever the pass does overlaps a step that is mid-flight.
+
+* `SimulationTickDriver.DisplayFill.TheAfterBatchFillNeverRunsBesideAStep`: the game fills in `publishForDisplay`.
+  There is one fill per batch, each on the worker, each after its batch's last step and none beside a step; under
+  `ThisFramesSingleStep` a one-step frame's pass sees its own batch's fill. On the driver without the after-batch
+  call there is no fill; with the game filling in `onPostPhysics` instead, 52 of 60 frame-locked fills and 26
+  immediate ones ran beside a step (og-input-latency task P5-36's seen-failing runs).
+* `SimulationTickDriver.DisplayFill.AFillAtPostPhysicsRunsBesideAStepTheDriverDoesNotWaitFor`: the harness's
+  control. A game that fills in `onPostPhysics` fills beside a step in exactly the frames whose batch the driver
+  does not wait for, so the first case's zero is not the harness failing to see an overlap.
+
 The `FreeRunning` cases run the loop on the test thread in virtual time (the fake engine's clock, which
 only the idle scripts and the fake runner host advance), unless they say otherwise. The fake kit's idle
 game and runner hosts are described in the test kit's own rationale.
@@ -680,3 +704,10 @@ it once for the window, so under `HostDelta` every trace, line and golden is unc
 `m_frameSteps` and `waitsForThisFrame` were added (§4), for a client host whose post-physics pass is what it
 draws, and which measured each step shown one frame period late under block mode 0 when the step ended just
 after the pass. G-10 is new. With the default every trace, line and golden is unchanged.
+
+**2026-11-20, the after-batch publish.** `publishAfterBatch` (§3) was added for a client game that models
+`TickDriverDisplayGame`, so that a host's display copy is taken where nothing steps. The host that needed it filled its
+display snapshot in `onPostPhysics`, which `EarlierFrames`, and `ThisFramesSingleStep` in a frame of two or more steps,
+run while the frame's own batch may be stepping. No guard was added: the step-context check is an `OG_CHECK`, the
+one-per-batch placement is pinned by the tests (§9), and a game without the hook compiles exactly the code it compiled
+before, so every existing trace, line and golden is unchanged.

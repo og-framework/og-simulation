@@ -157,6 +157,26 @@ owns one.
 | loop origin | `FreeRunning` only: the loop's origin on the engine clock, `std::atomic<double>` (`-1.0` before the loop), with the loop's active flag, `std::atomic<bool>` | runner write (`runAuthorityLoop`: the active flag, then the origin, once before the first wake; the flag cleared when the loop returns; release) → frame-thread read (`hostNowSeconds()` reads the origin; `stop()` and the destructor read the flag; acquire) | **Correctly synchronized** — single-writer atomics. The origin is written once, so a read sees `-1.0` (`hostNowSeconds()` then returns 0) or the final value. The flag is read only after the frame thread joined the runner, where the join already orders it; the check catches a `stop()` before the join | `SimulationTickDriver-rationale.md` §12, §13 |
 | J9 | `FreeRunning` only: presenter registrations, `SpscRing<PresenterRegistration, 64>` (`SimulationTickBackend`) | runner write (`onRegistered`, `forgetPresenterTarget`: push `{id, slot, registered}`) → frame-thread read (`present()` drains it into the presenter's `onRegistered` / `onUnregistered` before it presents) | **Staged SPSC ring** — one producer, one consumer; a full ring is an `OG_CHECK`, because a lost registration would leave the presenter rendering a character that left, or never rendering one that joined. Applied in push order | `SimulationTickBackend-rationale.md` §10; `SimulationTickBackend-guards.md` G-01 |
 
+## The display snapshot's crossings (og-input-latency P2-18, P5-36)
+
+A tick-driver client's host fills og-simulation's display snapshot (`SimulationDisplaySnapshot.h`) after each step batch,
+on the step's thread, from the driver's after-batch hook (`TickDriverConcepts-rationale.md` §11), and its drawing thread
+reads only the published copies. Until og-input-latency P5-36 the Unreal host filled it on the game thread in the frame's
+post-physics pass, which the driver runs while the frame's own batch may still be stepping: an unsynchronized read of
+everything the step writes. The fill's own reads now run on the step's thread; three hand-overs carry what crosses. Like
+the J-rows, none is accepted debt.
+
+| Crossing | Direction | Shape |
+|---|---|---|
+| the display snapshots, `SnapshotChannel<Snapshot, 4>` (`SimulationDisplayPublisher`) | step write (`publish_Step` in the after-batch fill) → drawing-thread read (acquire the newest, then release the one held) | **Snapshot channel**, as J5: the reader holds at most two of four, so the writer always finds a slot and a held snapshot is never rewritten |
+| the display tier reading, a `TripleBuffer` (the Unreal session's `m_displayTier`) | the tier receipt's write (the game thread frame-locked, the step's thread immediate) → the fill's read on the step's thread | **Triple buffer**, one writer and one reader: the reader takes the newest published reading |
+| frame-locked only: the relay stage, a `TripleBuffer` of `DisplayRelayStage` (the Unreal session's `m_displayRelay`) | game-thread write (`stageDisplayRelay` before each batch is dispatched: each stored character's last relayed input and arrival ring) → the fill's read on the step's thread | **Triple buffer**, so the fill reads neither the relay stores nor the arrival rings, which the frame-locked drain writes on the game thread |
+
+What the frame-locked drain still writes under the fill (a correction landing, a relay store the collect also reads, a
+registration's storage insert) is rows 1, 2 and 11: the fill is one more reader on the step's thread beside the step's own
+sweeps and adds no crossing to them. In immediate mode those writers run on the step's thread, and the fill crosses
+nothing but the snapshot channel.
+
 ## What is not on this list
 
 - **The relay codec's own receipt/flush pair** (`RelayedInputRingCodec.h`) is GT-only — receipt

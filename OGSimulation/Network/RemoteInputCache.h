@@ -47,7 +47,7 @@
 //                        delay floor's hard cap.
 //
 // THREADING: GAME-thread write, PHYSICS-thread read, NO SEAM, in og-sim-net's FRAME-LOCKED
-// mode (`SimNetConfig::immediate` false, the shipped default). Accepted, priced,
+// mode (`SimNetConfig::immediate` false, `SimNetConfig`'s default; Jolt clients ship immediate). Accepted, priced,
 // correction-healed debt -- `docs/ThreadingCrossings.md` row 1, analysis of record in
 // `docs/RemoteInputCache-rationale.md` §6. The PROHIBITIONS stay here. In the IMMEDIATE mode
 // the write runs on the step's thread and is same-thread with the read (the block below).
@@ -140,7 +140,7 @@
 // `docs/ThreadingCrossings.md` row 1 cites this block as authoritative.
 //
 // TWO MODES (og-input-latency P2-15). Everything above is the FRAME-LOCKED mode
-// (og-sim-net's `SimNetConfig::immediate` false, the shipped default): the GAME-thread write
+// (og-sim-net's `SimNetConfig::immediate` false, `SimNetConfig`'s default; Jolt clients ship immediate): the GAME-thread write
 // is accepted debt. In the IMMEDIATE mode the host calls `SimNetClient::drain` at the start
 // of each step, before `collectInputAll`, on the step's thread (a FrameBounded client's chain
 // of worker tasks), so the writer and both readers are one serialized context: no crossing,

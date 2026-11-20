@@ -79,12 +79,18 @@ batch; `afterTick` copies it into the presenter's publish.
 | `beforeSimulate(u)` | check the step context; `captureCorrection_Step(u.physicsStep)` (it does work only after a resimulation); take `t1` (`⛔G-03`) | the same; the authority never resimulates, so the capture finds nothing to do; then `t1`, after the release, immediately before the integrate |
 | `beforePhysics(t)` | check the step context; `onStepStarted(t1)` | the same |
 | `afterTick(o)` | take `t2`; check the step context; `onStepEnded()`; `publish_Step(o, currentStepDeadline)`; `afterTick_Step(o)`; publish J3 = `o.tick - o.physicsStep` (`⛔G-02`); push J6 | the same |
+| `afterBatch()` | check the step context; `publishForDisplay()`. It exists only when the game models `TickDriverDisplayGame` | never called |
 
 `TickDriverStepHooks.CallOrder.AClientTickWithAResimRunsEachHookOnceAroundTheReplay` and
 `TickDriverStepHooks.CallOrder.AnAuthorityTickReleasesBeforeTheCaptureAndPublishesInOrder` pin these
 sequences exactly, interleaved with the step driver's own world and manager calls. Their game does not
 model `TickDriverReceiveGame`, so they show the client `beforeTick` without the receive; the receive's
 position is pinned by the `SimulationTickDriver.ReceiveForStep.*` cases (§7).
+
+`afterBatch` is not one of `StepHooks`' four: the step driver runs one tick and knows no batch. The tick driver calls it
+once after a client batch's last step, under the world lock and a step scope of its own (`SimulationTickDriver-rationale.md`
+§3), so its step-context check holds there as it does in the four step hooks. It has a `requires` clause on the game's
+concept, so for a game without the hook the member does not exist and the driver's `if constexpr` call compiles out.
 
 ## §4 Why each hook does what it does
 
@@ -170,7 +176,9 @@ probe shows the checks are compiled in.
   - `StepDoors` is an aggregate;
   - `TickDriverStepHooks` cannot be named over a lone collaborator (`HooksExistFor`);
   - `TickDriverStepHooks` is not copyable: the step driver holds it by reference, and the step's times
-    live in it.
+    live in it;
+  - `afterBatch` can be called for a `StepDoors` whose game is `tickDriverDisplayGameSelfCheck::Conforming` and not for
+    the reference doors, whose game does not publish (`HooksPublishAfterBatch`).
 
 ## §7 Tests
 
@@ -197,6 +205,17 @@ inbox held and whose resimulation check records itself:
 - `SimulationTickDriver.ReceiveForStep.AFreeRunningAuthorityNeverReceives`;
 - `SimulationTickDriver.ReceiveForStep.AGameThatReceivesHasTheSameTraceWithTheReceivesRemoved`.
 
+The after-batch hook's cases run a whole `SimulationTickDriver` over the fake engine's worker thread
+(SimulationTickDriverDisplayFillTest.cpp, tag `[TickDriver]`), with a game of the test's own that records each fill
+and holds a step the driver does not wait for until the frame's post-physics pass has run, so a fill there overlaps
+it every time:
+- `SimulationTickDriver.DisplayFill.TheAfterBatchFillNeverRunsBesideAStep` (frame-locked and immediate: one fill per
+  batch, on the worker, after the batch's last step, never beside a step; an immediate one-step frame's post-physics
+  pass sees its own batch's fill);
+- `SimulationTickDriver.DisplayFill.AFillAtPostPhysicsRunsBesideAStepTheDriverDoesNotWaitFor` (the harness's control:
+  a game that fills in `onPostPhysics`, as the brawler's binding did before og-input-latency task P5-36, fills beside a
+  step in every frame whose batch the driver does not wait for).
+
 ## §8 Provenance
 
 Transcribed from the brawler's engine-hosted step hooks (the class BrawlerStepHooksUImpl, which called
@@ -219,3 +238,7 @@ The three guards G-01…G-03 are the successors of the old class's three (`TickD
 **2026-11-19, the receive.** The client `beforeTick` gained the optional `receiveForStep` call (`⛔G-04`) and
 `StepDoors` its `Game` alias. Before it, a client game had no hook ahead of the step's collect: one that
 received in `onStepStarted` (`beforePhysics`) fed every arrival to the next step.
+
+**2026-11-20, the after-batch publish.** `afterBatch` was added for `TickDriverDisplayGame`. Before it, a client game had
+no hook after its batch on the step's thread, and the brawler copied its display state in `onPostPhysics` on the game
+thread, where the frame's own batch could still be stepping.

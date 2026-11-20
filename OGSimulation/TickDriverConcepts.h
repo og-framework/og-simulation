@@ -368,6 +368,56 @@ static_assert(TickDriverSampleGame<SamplesButDoesNotReceive> && !TickDriverRecei
 	"TickDriverReceiveGame self-check: the per-frame sampleInput is not the per-step receiveForStep; each is opted into alone");
 } // namespace tickDriverReceiveGameSelfCheck
 
+template <typename G>
+concept TickDriverDisplayGame = TickDriverGame<G> && requires(G& g)
+{
+	{ g.publishForDisplay() } -> std::same_as<void>;
+};
+
+namespace tickDriverDisplayGameSelfCheck
+{
+struct Conforming : tickDriverGameSelfCheck::Conforming
+{
+	void publishForDisplay();
+};
+
+struct MissingPublishForDisplay : tickDriverGameSelfCheck::Conforming
+{
+};
+
+struct PublishReturnsBool : tickDriverGameSelfCheck::Conforming
+{
+	bool publishForDisplay();
+};
+
+struct PublishTakesAnArgument : tickDriverGameSelfCheck::Conforming
+{
+	void publishForDisplay(int32_t);
+};
+
+struct PublishesButIsNoGame
+{
+	void publishForDisplay();
+};
+
+struct ReceivesButDoesNotPublish : tickDriverReceiveGameSelfCheck::Conforming
+{
+};
+
+static_assert(TickDriverDisplayGame<Conforming>,
+	"TickDriverDisplayGame self-check: the reference shape must satisfy the concept");
+static_assert(TickDriverGame<MissingPublishForDisplay> && !TickDriverDisplayGame<MissingPublishForDisplay>,
+	"TickDriverDisplayGame self-check: publishForDisplay is required, and a game without it is still a TickDriverGame");
+static_assert(!TickDriverDisplayGame<PublishReturnsBool>,
+	"TickDriverDisplayGame self-check: publishForDisplay returns void, so it cannot veto or repeat the batch");
+static_assert(!TickDriverDisplayGame<PublishTakesAnArgument>,
+	"TickDriverDisplayGame self-check: publishForDisplay takes nothing; the game publishes its own state as the batch left it");
+static_assert(!TickDriverDisplayGame<PublishesButIsNoGame>,
+	"TickDriverDisplayGame self-check: it refines TickDriverGame, so a publishForDisplay alone is not a game");
+static_assert(TickDriverReceiveGame<ReceivesButDoesNotPublish> && !TickDriverDisplayGame<ReceivesButDoesNotPublish>,
+	"TickDriverDisplayGame self-check: the per-step receiveForStep is not the per-batch publishForDisplay; each is opted into alone");
+} // namespace tickDriverDisplayGameSelfCheck
+
 enum class IdleWake : uint8_t
 {
 	Deadline,

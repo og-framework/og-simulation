@@ -169,7 +169,7 @@ struct CorrectionInsertVerdict
 //     replaced each read is listed at the two gravestones. §1
 //
 //   * TWO THREADS TOUCH THIS CLASS — in the FRAME-LOCKED mode (og-sim-net's
-//     `SimNetConfig::immediate` false, the shipped default).
+//     `SimNetConfig::immediate` false, `SimNetConfig`'s default; Jolt clients ship immediate).
 //       GAME thread     corrections land — `tryInsertingCorrectState`, reached via
 //                       `SimulationReconciliation::injectCorrectionState` from og-sim-net's
 //                       frame-locked drain (`SimNetClient::onCorrection`; the OnRep_-dispatched
@@ -1237,7 +1237,7 @@ private:
 	//
 	// ⚠ THREADING — THE ONE NEW CROSS-THREAD SURFACE THE LANDING STAMPS ADD. GT-written (W1), PT-read (the
 	// classifier), PLAIN `uint32`s deliberately. That is the FRAME-LOCKED mode (og-sim-net's
-	// `SimNetConfig::immediate` false, the shipped default). In the IMMEDIATE mode W1 runs in the
+	// `SimNetConfig::immediate` false, `SimNetConfig`'s default; Jolt clients ship immediate). In the IMMEDIATE mode W1 runs in the
 	// drain at step start, on the step's thread, so the stamps, `m_stateBuffer` and
 	// `m_containsCorrectTick` are written and read by one serialized context, and neither race
 	// below occurs. The bullets price the frame-locked mode:

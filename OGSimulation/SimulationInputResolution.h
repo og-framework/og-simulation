@@ -85,19 +85,22 @@ OGSIM_OPTIMIZE_OFF
 //   m_inputResolutionTelemetry        --                  write (every emit*)
 //   registration / unregistration     all of it           --
 //
-// (*) og-sim-net's FRAME-LOCKED mode (`SimNetConfig::immediate` false, the
-//   shipped default): the client's drain runs on the GAME thread
+// (*) og-sim-net's FRAME-LOCKED mode (`SimNetConfig::immediate` false,
+//   `SimNetConfig`'s default; Jolt clients ship immediate): the client's
+//   drain runs on the GAME thread
 //   (`SimNetClient::onTier` -> the host's tier receipt, `SimNetClient::onRing`;
 //   the OnRep_ConnectionTier / OnRep_RelayedInputRing callbacks until
 //   og-input-latency task P5-7), and the table reads as written. In the
 //   IMMEDIATE mode (P2-15) the host drains at the start of each step, before
 //   `collectInputAll`, on the step's thread: both writes move to the PHYSICS
-//   (step) thread and are same-thread with their reads, and the game-thread
-//   read below then reads a store the step writes (og-input-latency P2-18's
-//   display snapshot carries it for the game thread).
-// ⛔ getLastRelayedInput is THE ONE game-thread reader of a store the physics
-//   thread also reads -- and is same-thread with that store's WRITER, which is
-//   why it alone does not participate in the accepted tear. §14
+//   (step) thread and are same-thread with their reads, and the display read
+//   below runs there too, in the display snapshot's fill after the batch
+//   (og-input-latency P2-18, P5-36).
+// ⛔ getLastRelayedInput is THE ONE display reader of a store the physics
+//   thread also reads -- and runs on that store's WRITER thread (the game
+//   thread frame-locked, where the host stages it for the display; the step's
+//   thread immediate), which is why it alone does not participate in the
+//   accepted tear. §14
 // ⛔ TWO crossings are ACCEPTED TEARS argued elsewhere, NOT re-derived here: the
 //   relay stores (Network/RemoteInputCache.h) and the join key (member below).
 //
@@ -290,8 +293,10 @@ struct RelayedReadObservationMapFor
 // answers for one display window instead.
 //
 // ⛔ THIS IS A DIAGNOSTIC READ AND MUST STAY ONE.
-// ⛔ WRITTEN AND READ ON THE GAME THREAD ALONE -- the arrival door and the display are
-//   both game-thread, so unlike the observation ring this crosses nothing. §14
+// ⛔ WRITTEN AND READ ON ONE THREAD -- the arrival door and the display's read run on
+//   the relay receipt's thread (the game thread frame-locked, where the host stages
+//   the ring for the display; the step's thread immediate), so unlike the
+//   observation ring this crosses nothing. §14
 // ---------------------------------------------------------------------------
 
 struct RelayedInputArrival
@@ -782,7 +787,7 @@ public:
     }
 
     // ---------------------------------------------------------------------------
-    // getLastRelayedInput -- LAST-KNOWN, for the GAME-THREAD viz readers. The
+    // getLastRelayedInput -- LAST-KNOWN, for the display's viz readers. The
     // newest relayed input for a REMOTE character, or nothing if none ever arrived.
     // ---------------------------------------------------------------------------
     // ⛔ THE ONLY SOURCE of a remote character's actual input on the client --
@@ -792,8 +797,8 @@ public:
     //   silently draw an aim indicator at the neutral pose. §7
     // ⛔ NULLABLE FOR TWO SEPARATE REASONS: no store exists for a LOCAL character or on
     //   the AUTHORITY at all, and a store that exists may still be cold. §7
-    // ⛔ THREADING -- THE ONE GAME-THREAD READER, and same-thread with the store's
-    //   WRITER, so it does NOT participate in the accepted tear. Returns a COPY. §14
+    // ⛔ THREADING -- THE ONE DISPLAY READER, called on the store's WRITER thread,
+    //   so it does NOT participate in the accepted tear. Returns a COPY. §14
     template <typename SimulatableT>
     std::optional<typename SimulatableT::InputType> getLastRelayedInput(unsigned int id) const
     {
@@ -1618,7 +1623,7 @@ private:
     // observations are keyed by. A character whose first read has not run yet is stamped
     // against nothing and is therefore not recorded: no observation exists for an arrival
     // to have been late for.
-    // ⛔ GAME THREAD ON BOTH SIDES. The frontier read is the accepted value tear the
+    // ⛔ ONE THREAD ON BOTH SIDES, the relay receipt's. The frontier read is the accepted value tear the
     //   observation ring already carries; nothing here writes that ring. §14
     template <typename SimulatableT, typename RingT>
     void noteRelayedArrivals(unsigned int id, const RingT& ring,
@@ -1716,13 +1721,15 @@ private:
 
     // What the scheduled read SERVED, per remote character, per sim tick. Display-side
     // diagnostic state only.
-    // Written on the PHYSICS thread (both collects), read on the GAME thread.
+    // Written on the PHYSICS thread (both collects), read by the display fill: on the
+    // step's thread for a tick-driver client (og-input-latency P5-36), on the game
+    // thread for the Chaos host.
     // ⛔ THE TEAR AND THE NO-REHASH PAIRING ARE ARGUED AT RelayedReadObservationRing. §14
     std::tuple<RelayedReadObservationMapFor<SimulatableTs>...> m_relayedReadObservations;
 
     // When each relayed capture first arrived, per remote character. Display-side
     // diagnostic state only, and the join key is the observation's own `probeTick`.
-    // ⛔ WRITTEN AND READ ON THE GAME THREAD ALONE -- argued at RelayedInputArrivalRing. §14
+    // ⛔ WRITTEN AND READ ON ONE THREAD, the relay receipt's -- argued at RelayedInputArrivalRing. §14
     std::tuple<RelayedInputArrivalMapFor<SimulatableTs>...> m_relayedInputArrivals;
 
     // OWNED HERE, NOT ON NETSYNC. The PHYSICS-THREAD-ONLY telemetry

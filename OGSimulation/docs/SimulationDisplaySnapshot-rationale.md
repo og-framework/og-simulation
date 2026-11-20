@@ -52,15 +52,15 @@ step batch, and points its drawing-side readers at `acquire_GameThread` (§5).
 - `vizState`: a copy of the simulatable's `getAllState()` (§3 and guard G-01). Its type is that
   accessor's type, which is also the type of `getVizState()` for a simulatable whose visualization
   copy is a copy of its state.
-- `lastRelayedInput`: `SimulationInputResolution::getLastRelayedInput`, so empty for a local character
-  and for a remote one whose relay store is still cold.
+- `lastRelayedInput`: the relay source's answer (§3), by default `SimulationInputResolution::getLastRelayedInput`,
+  so empty for a local character and for a remote one whose relay store is still cold.
 - `hasLocalInputCache` and `localCaptures`: whether the simulatable has a local input cache (the
   answer a host uses as "is this character controlled on this peer"), and the cache's captures for the
   window of ticks of §4.
 - `hasRelayedReadObservations` / `relayedReadObservations` and `hasRelayedInputArrivals` /
   `relayedInputArrivals`: whole copies of the two diagnostic rings of a remote character
-  (`SimulationInputResolution.h`), or default-constructed empty rings and `false` when the character
-  has none. The rings are copied whole because their readers walk every slot.
+  (`SimulationInputResolution.h`; the arrival ring through the relay source, §3), or default-constructed empty
+  rings and `false` when the character has none. The rings are copied whole because their readers walk every slot.
 - `applied`: whether the correction cache exists (`findCorrectionCache`), and for each tick of §4's
   window the cache's `getAppliedCaptureTickRef` and `slotStateProvenance` answers.
 
@@ -71,16 +71,31 @@ re-deriving anything: `DisplayCaptureWindow::at` answers like a capture history'
 
 ## §3 Where the fill reads, and on which thread
 
-The fill is meant to run on the thread that steps the simulation, after the batch's last step. Its
+The fill runs on the thread that steps the simulation, after the batch's last step and before the next one: a
+tick driver's client calls its game's `publishForDisplay()` there (`TickDriverConcepts-rationale.md` §11). Its
 sources are the storage's simulatables, `SimulationInputResolution`, `SimulationReconciliation`,
 `ClientPredictionClock` and `NetworkTimeEstimator`, and `ReplicatedTierConsumer` with its borrowed
 `TimeConfig`. The stepping thread writes the storage's states, the local captures, the read
 observations, the correction caches and the prediction clock. When the host drains the network on the
 stepping thread too (at step start), the relay stores, the arrival ring, the tier and the floor are
-written there as well, and the fill crosses nothing. When the host drains on the drawing thread
-instead, those four are still written there and the fill reads them across threads, the same accepted
-race their step-side readers already have; the snapshot then removes the drawing thread's own reads but
-not that one.
+written there as well, and the fill crosses nothing.
+
+When the host drains on the drawing thread instead, those four are written there, and a fill on the stepping
+thread would read them across threads. Two of them reach the fill as values the host hands over: the tier reading,
+which the host builds where the tier arrives and passes in, and the relay fields (each entry's last relayed input
+and arrival ring), which the fill takes from a **relay source**:
+- `LiveDisplayRelaySource` answers from the input resolution itself. The six-argument fill uses it: right for a
+  host whose drain runs on the stepping thread, or whose fill runs on the draining thread.
+- `DisplayRelayStage` is a copy of the relay fields for every stored simulatable (up to `MaxSimulatables`), taken by
+  `stageDisplayRelay` on the draining thread, where those fields are written, and handed to the stepping thread
+  through a mailbox of the host's (the Unreal session uses a `TripleBuffer`). The fill then answers from the stage, so
+  it reads neither the relay stores nor the arrival rings across threads. A stage taken before a batch carries the
+  relay fields as of the drain before that batch; an id the stage does not hold answers as one with no relay store.
+
+What a drawing-thread drain still writes under the fill is what the step's own sweeps already read across threads:
+the correction caches' landings, the relay stores the input collect reads, and the storage's membership at a
+registration. Those crossings are the netcode's, priced in `ThreadingCrossings.md` (rows 1, 2 and 11); the fill is
+one more reader on the stepping thread beside the step's own, and adds no crossing of its own.
 
 The visualization state is copied from `getAllState()`, not from `getVizState()` (guard G-01). A host's
 visualization copy is refreshed on the drawing thread (`updateVisualizationAll`, `SimulationObjectStorage.h`)
@@ -119,7 +134,8 @@ it visible to a reader; a reader never sees a snapshot the writer is still writi
 `SimulationDisplaySnapshot.TheReaderSeesAPublishOnlyOnceItIsCommitted` pins that a publish is seen only
 once committed: with the `commit` removed, the reader's first acquire returns `nullptr`.
 
-The reader calls `acquire_GameThread(back)` (the channel's `peekNewest`: 0 for the newest, 1 for the one
+The writer and the reader run on different threads, and a publish may land at any instant of a read. The reader
+calls `acquire_GameThread(back)` (the channel's `peekNewest`: 0 for the newest, 1 for the one
 before it), reads, and calls `release_GameThread` on every pointer it acquired. A held snapshot is never
 recycled, so its contents do not change while it is held. With four slots the writer always finds a
 free slot while the reader holds at most two (`kMaxHeldByReader`, the channel's
@@ -164,4 +180,7 @@ copied.
 ## §8 Provenance
 
 Added by og-input-latency task P2-18, with the inventory of drawing-thread readers it was sized from.
-The Unreal session's game-thread readers moved to it in og-input-latency task P5-16.
+The Unreal session's game-thread readers moved to it in og-input-latency task P5-16, which filled it on the game
+thread in the frame's post-physics pass, while the frame's own batch could still be stepping. og-input-latency task
+P5-36 moved the client's fill to the stepping thread after the batch (§3) and added the relay source, the relay stage
+and `stageDisplayRelay`, for a host that drains on the drawing thread.

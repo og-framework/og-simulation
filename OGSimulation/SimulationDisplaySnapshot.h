@@ -251,14 +251,15 @@ struct SimulationDisplaySnapshotT
 };
 
 template <typename SimulatableT, size_t MaxSimulatables, size_t CaptureWindow, size_t AppliedWindow,
-	typename StorageT, typename ResolutionT, typename ReconciliationT>
+	typename StorageT, typename ResolutionT, typename ReconciliationT, typename RelaySourceT>
 void fillSimulationDisplaySnapshot(
 	SimulationDisplaySnapshotT<SimulatableT, MaxSimulatables, CaptureWindow, AppliedWindow>& snapshot,
 	const StorageT&            storage,
 	const ResolutionT&         resolution,
 	const ReconciliationT&     reconciliation,
 	const DisplayClockReading& clock,
-	const DisplayTierReading&  tier)
+	const DisplayTierReading&  tier,
+	const RelaySourceT&        relay)
 {
 	snapshot.clock      = clock;
 	snapshot.tier       = tier;
@@ -279,7 +280,7 @@ void fillSimulationDisplaySnapshot(
 		entry.simId = id;
 		// ⛔G-01  docs/SimulationDisplaySnapshot-guards.md
 		entry.vizState         = simulatable.getAllState();
-		entry.lastRelayedInput = resolution.template getLastRelayedInput<SimulatableT>(id);
+		entry.lastRelayedInput = relay.lastRelayedInput(id);
 
 		const auto* const captures = diagnostics.template localInputCache<SimulatableT>(id);
 		entry.hasLocalInputCache = captures != nullptr;
@@ -292,11 +293,101 @@ void fillSimulationDisplaySnapshot(
 		entry.hasRelayedReadObservations = reads != nullptr;
 		entry.relayedReadObservations    = reads != nullptr ? *reads : RelayedReadObservationRing{};
 
-		const RelayedInputArrivalRing* const arrivals = diagnostics.template relayedInputArrivals<SimulatableT>(id);
+		const RelayedInputArrivalRing* const arrivals = relay.relayedInputArrivals(id);
 		entry.hasRelayedInputArrivals = arrivals != nullptr;
 		entry.relayedInputArrivals    = arrivals != nullptr ? *arrivals : RelayedInputArrivalRing{};
 
 		entry.applied.template fill<SimulatableT>(reconciliation, id, newestTick);
+	});
+}
+
+template <typename SimulatableT, typename ResolutionT>
+class LiveDisplayRelaySource
+{
+public:
+	using Input = typename SimulatableT::InputType;
+
+	explicit LiveDisplayRelaySource(const ResolutionT& resolution) : m_resolution(&resolution) {}
+
+	std::optional<Input> lastRelayedInput(unsigned int simId) const
+	{
+		return m_resolution->template getLastRelayedInput<SimulatableT>(simId);
+	}
+
+	const RelayedInputArrivalRing* relayedInputArrivals(unsigned int simId) const
+	{
+		return m_resolution->getDiagnostics().template relayedInputArrivals<SimulatableT>(simId);
+	}
+
+private:
+	const ResolutionT* m_resolution;
+};
+
+template <typename SimulatableT, size_t MaxSimulatables, size_t CaptureWindow, size_t AppliedWindow,
+	typename StorageT, typename ResolutionT, typename ReconciliationT>
+void fillSimulationDisplaySnapshot(
+	SimulationDisplaySnapshotT<SimulatableT, MaxSimulatables, CaptureWindow, AppliedWindow>& snapshot,
+	const StorageT&            storage,
+	const ResolutionT&         resolution,
+	const ReconciliationT&     reconciliation,
+	const DisplayClockReading& clock,
+	const DisplayTierReading&  tier)
+{
+	fillSimulationDisplaySnapshot(snapshot, storage, resolution, reconciliation, clock, tier,
+		LiveDisplayRelaySource<SimulatableT, ResolutionT>(resolution));
+}
+
+template <typename InputT, size_t MaxSimulatables>
+struct DisplayRelayStage
+{
+	static_assert(MaxSimulatables >= 1u, "DisplayRelayStage: MaxSimulatables must be at least 1");
+
+	size_t                                               count = 0u;
+	std::array<unsigned int, MaxSimulatables>            ids{};
+	std::array<std::optional<InputT>, MaxSimulatables>   lastRelayedInputs{};
+	std::array<bool, MaxSimulatables>                    hasArrivals{};
+	std::array<RelayedInputArrivalRing, MaxSimulatables> arrivals{};
+
+	std::optional<InputT> lastRelayedInput(unsigned int simId) const
+	{
+		const size_t index = indexOf(simId);
+		return index < count ? lastRelayedInputs[index] : std::nullopt;
+	}
+
+	const RelayedInputArrivalRing* relayedInputArrivals(unsigned int simId) const
+	{
+		const size_t index = indexOf(simId);
+		return index < count && hasArrivals[index] ? &arrivals[index] : nullptr;
+	}
+
+private:
+	size_t indexOf(unsigned int simId) const
+	{
+		for (size_t index = 0u; index < count; ++index)
+		{
+			if (ids[index] == simId)
+				return index;
+		}
+		return count;
+	}
+};
+
+template <typename SimulatableT, size_t MaxSimulatables, typename StorageT, typename ResolutionT>
+void stageDisplayRelay(DisplayRelayStage<typename SimulatableT::InputType, MaxSimulatables>& stage, const StorageT& storage,
+	const ResolutionT& resolution)
+{
+	const LiveDisplayRelaySource<SimulatableT, ResolutionT> live(resolution);
+	stage.count = 0u;
+	storage.template forEachSimulatable<SimulatableT>([&](unsigned int id, const SimulatableT&)
+	{
+		if (stage.count >= MaxSimulatables)
+			return;
+		const size_t index = stage.count++;
+		stage.ids[index]               = id;
+		stage.lastRelayedInputs[index] = live.lastRelayedInput(id);
+		const RelayedInputArrivalRing* const ring = live.relayedInputArrivals(id);
+		stage.hasArrivals[index] = ring != nullptr;
+		stage.arrivals[index]    = ring != nullptr ? *ring : RelayedInputArrivalRing{};
 	});
 }
 

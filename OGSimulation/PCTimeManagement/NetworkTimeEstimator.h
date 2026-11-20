@@ -37,7 +37,8 @@ OGSIM_OPTIMIZE_OFF
 //                       deleted by P5-9). Since og-input-latency task 27 that
 //                       drain hands over at most one clock sample, the newest.
 //                       That is og-sim-net's FRAME-LOCKED mode
-//                       (`SimNetConfig::immediate` false, the shipped default).
+//                       (`SimNetConfig::immediate` false, `SimNetConfig`'s
+//                       default; Jolt clients ship immediate).
 //                       In its IMMEDIATE mode (og-input-latency P2-15) the
 //                       host calls `SimNetClient::drain` at the start of each
 //                       step, on the step's thread, so the one writer is the

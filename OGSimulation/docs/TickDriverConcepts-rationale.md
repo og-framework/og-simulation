@@ -1,8 +1,8 @@
 <!-- SPDX-License-Identifier: MPL-2.0 -->
 # `TickDriverConcepts.h` — rationale
 
-The narrative behind `TickRateDoor`, `IdleWake` and the nine tick-driver concepts:
-`TickDriverEngine`, `TickDriverGame`, `TickDriverSampleGame`, `TickDriverReceiveGame`, `TickDriverIdleGame`, `TickDriverPresenterSteps`,
+The narrative behind `TickRateDoor`, `IdleWake` and the ten tick-driver concepts:
+`TickDriverEngine`, `TickDriverGame`, `TickDriverSampleGame`, `TickDriverReceiveGame`, `TickDriverDisplayGame`, `TickDriverIdleGame`, `TickDriverPresenterSteps`,
 `TickDriverWorldHost`, `TickDriverRenderSink` and `TickDriverRunnerHost`, and the helper concept `OptionalVec3Result` (§5). The header keeps its licence,
 its docs pointer, its code and its self-check `static_assert`s; everything that explains it lives here. It has no guards (`TickDriverConcepts-guards.md`
 says why): every rule it carries is a `static_assert`.
@@ -42,7 +42,9 @@ supplies the runner's fallback sleep.
 `TickDriverSampleGame` refines `TickDriverGame` with an optional input-sample hook, for a game whose
 host-side input must be sampled once per frame before the pump (§9). `TickDriverReceiveGame` refines it with an
 optional per-step receive hook, for a client game that takes in what arrived from its authority at the start of
-each step, before the step reads it (§10).
+each step, before the step reads it (§10). `TickDriverDisplayGame` refines it with an optional per-batch publish hook,
+for a client game whose display is copied from its simulation state once the frame's steps have run, on the step's
+thread (§11).
 
 The driver that uses these concepts is not in this header. This file states what each requirement is
 for; the driver's own documentation states when it calls each one.
@@ -143,6 +145,9 @@ except the one property it names, so each assertion stays tied to that property.
 - `tickDriverReceiveGameSelfCheck`: the same four refusals for `receiveForStep` (missing, returning `bool`, taking an
   argument, on a type that is not a `TickDriverGame`), and a game that samples but does not receive is a sample game and
   not a receive game: each hook is opted into alone;
+- `tickDriverDisplayGameSelfCheck`: the same four refusals for `publishForDisplay` (missing, returning `bool`, taking an
+  argument, on a type that is not a `TickDriverGame`), and a game that receives but does not publish is a receive game
+  and not a display game;
 - `tickDriverIdleGameSelfCheck`: every shape derives from `tickDriverGameSelfCheck::Conforming`, so it is
   a `TickDriverGame` and differs from the reference only in `idleUntil`. A game without `idleUntil` is
   refused as an idle game and is still a `TickDriverGame`; an `idleUntil` returning `void` is refused;
@@ -263,7 +268,45 @@ arrivals, once per client step on the step's thread.
   covers every kind of arrival, it reads as the remote counterpart of `sampleInput`, and it collides with no name in
   this library.
 
-## §11 Provenance
+## §11 `TickDriverDisplayGame`
+
+`TickDriverDisplayGame` gives a client game one more hook: `void publishForDisplay()`. It refines `TickDriverGame` the
+way §10's does, and the driver checks the concept with `if constexpr` before it calls it, so a game that does not
+declare it compiles neither the call nor the lock and scope around it (`SimulationTickDriver-rationale.md` §3).
+
+**What it means to a game author.** "The steps this frame dispatched have all run, and none is running: copy, now, what
+your display shows." A client whose steps run on another thread than its frame cannot read its simulation state from
+the frame: under `FrameBounded` the frame's end of physics waits only for earlier frames' steps (or for this frame's
+single step, `FrameWait::ThisFramesSingleStep`), so the frame's own batch may be stepping while the frame reads. This
+hook runs where nothing steps: on the step's thread, after the batch's last step and before the next batch, which the
+engine runs only after this one. The game publishes a copy there (og-simulation's `SimulationDisplaySnapshot.h` is
+such a copy) and the frame reads only the copy.
+
+**The hook contract.**
+- It is called once per client batch (the steps one frame dispatched), after the batch's last step, on the thread
+  that ran the batch: the worker task under `FrameBounded`, the owning thread under `Inline`. A frame with no due step
+  dispatches no batch and calls nothing.
+- It runs under the world lock and inside a step scope, like a step's hooks, so the game may reach what a step may
+  reach; it is not a step, and no step hook runs around it.
+- It is never called on an authority. An authority's steps run on the thread that owns its frame (`Inline`) or on its
+  runner (`FreeRunning`), and its host publishes for display there, if at all.
+- It takes nothing and returns `void`: it cannot veto or repeat the batch.
+- Its cost is part of the batch's task. Under `ThisFramesSingleStep` a one-step frame waits for it.
+
+**Beside `receiveForStep`.** The two hooks are independent (the self-check pins it): `receiveForStep` is per step and
+takes in; `publishForDisplay` is per batch and gives out.
+
+<!-- lint-external-ref: afterClientBatch -- a candidate name for publishForDisplay that was weighed and not chosen; it names nothing -->
+<!-- lint-external-ref: afterStepBatch -- a candidate name for publishForDisplay that was weighed and not chosen; it names nothing -->
+**The name.** Three were weighed, for what each tells a game author:
+- `afterClientBatch`: says only where it runs, and reads as a client twin of `afterInlineBatch`, which is the authority's
+  work on the owning thread after an inline batch. An author would expect the two to be called on the same thread.
+- `afterStepBatch`: also positional. It hides the one thing the hook is for, so an author would put any per-batch work
+  in it, and the batch's task (which a one-step immediate frame waits for) would grow with it.
+- `publishForDisplay` (chosen): it names the job (publish) and its reader (the display), it says the frame reads only
+  what is published here, and it collides with no name in this library.
+
+## §12 Provenance
 
 Written on 2026-10-16 from the og-tickdriver design, as the contracts the brawler's Unreal frame host
 and Jolt backend host fulfil today. `IdleWake`, `TickDriverIdleGame`, `TickDriverRunnerHost` and §8 were
@@ -272,5 +315,7 @@ same day. `OptionalVec3Result` was added on 2026-11-13, when the Android build (
 return-type requirements (§5). `TickDriverSampleGame` and §9 were added on 2026-11-18, so that taking the
 input sample before the pump is the driver's rule rather than each host's. `TickDriverReceiveGame` and §10 were
 added on 2026-11-19, so that a client step's receive precedes the step's resimulation check and input collect, rather
-than following the collect in `onStepStarted`, where what it received reached only the next step. Nothing in this
+than following the collect in `onStepStarted`, where what it received reached only the next step.
+`TickDriverDisplayGame` and §11 were added on 2026-11-20, so that a client's display copy is taken after its batch on the
+step's thread, rather than on the frame's thread while the frame's own batch could still be stepping. Nothing in this
 file depends on any document outside this submodule.

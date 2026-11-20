@@ -540,6 +540,20 @@ private:
 
 		for (uint32_t index = 0u; index < batch.count; ++index)
 			runStep(batch.first + index, batch.deadlines[index]);
+
+		if constexpr (TickDriverDisplayGame<GameT>)
+		{
+			if (!m_config.isAuthority)
+				publishAfterBatch();
+		}
+	}
+
+	void publishAfterBatch()
+		requires TickDriverDisplayGame<GameT>
+	{
+		const auto worldLock = m_worldHost->lockForStep();
+		const StepScope stepScope(m_worldHost->threadContext());
+		m_hooks->afterBatch();
 	}
 
 	void runStep(uint64_t physicsStep, double stepDeadlineSeconds)
