@@ -352,6 +352,28 @@ public:
         m_timeConfig.recentreSettleSamples = samples;
     }
 
+    // ⛔ THE one writable location for the client's clock RTT source — the
+    // `[OGNetcode] ClockRttSource` ini door. §16
+    //
+    // ⛔ ONE-SHOT AT COMPOSITION — the estimator reads it on its writer thread with no
+    // synchronization, safe only because nothing writes it once samples flow. §16
+    void setClockRttSource(TimeConfig::ClockRttSource source)
+    {
+        m_timeConfig.clockRttSource = source;
+    }
+
+    // ⛔ THE one writable location for both RTT sources' jitter multipliers — the
+    // `[OGNetcode] JitterMultiplier` ini door, which sets both to one value. §17
+    //
+    // ⛔ CLAMPED HERE TOO, `clockJitter::clampJitterMultiplier`. ONE-SHOT AT COMPOSITION —
+    // the estimator reads both on the stepping thread with no synchronization. §17
+    void setJitterMultiplier(double multiplier)
+    {
+        const double clamped = clockJitter::clampJitterMultiplier(multiplier);
+        m_timeConfig.jitterMultiplier         = clamped;
+        m_timeConfig.simClockJitterMultiplier = clamped;
+    }
+
     // ⛔ THE one writable location for the session resim-gate trigger policy — the
     // `[OGNetcode] ResimTriggerPolicy` ini door. §4
     //

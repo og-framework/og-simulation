@@ -28,6 +28,18 @@ struct BodySlotOccupancyCommand
 	bool     occupied = false;
 };
 
+enum class FrameTimeBase : uint8_t
+{
+	HostDelta,
+	Monotonic,
+};
+
+enum class FrameWait : uint8_t
+{
+	EarlierFrames,
+	ThisFramesSingleStep,
+};
+
 namespace simulationTickDriver
 {
 inline constexpr uint32_t kMaxStepsPerFrame                 = 240u;
@@ -67,6 +79,9 @@ public:
 		double        minRateScale     = 0.75;
 		double        maxRateScale     = 1.25;
 		double        idleSlackSeconds = 0.0;
+		FrameTimeBase frameTimeBase    = FrameTimeBase::HostDelta;
+		double        monotonicFrameClampSeconds = 0.4;
+		FrameWait     frameWait        = FrameWait::EarlierFrames;
 	};
 
 	SimulationTickDriver(GameT& game, WorldHostT& worldHost, PresenterT& presenter, EngineT& engine, const Config& config)
@@ -114,6 +129,15 @@ public:
 				&& config.idleSlackSeconds < config.dtSeconds,
 			"SimulationTickDriver: idleSlackSeconds must be finite and in [0, dtSeconds). The FreeRunning runner idles to each "
 			"deadline minus the slack and polls the rest; a slack of a whole step or more would poll through every idle");
+		OG_CHECK(config.frameTimeBase == FrameTimeBase::HostDelta || config.threading != StepThreading::FreeRunning,
+			"SimulationTickDriver: frameTimeBase Monotonic is a time base for the frame-driven modes, Inline and FrameBounded. "
+			"FreeRunning already pumps the runner's engine clock minus the loop's origin, with no frame clamp");
+		OG_CHECK(config.frameTimeBase == FrameTimeBase::HostDelta
+				|| (simulationTickDriver::isFiniteSeconds(config.monotonicFrameClampSeconds)
+					&& config.monotonicFrameClampSeconds * config.minRateScale >= config.dtSeconds),
+			"SimulationTickDriver: monotonicFrameClampSeconds must be finite and at least the longest step interval, "
+			"dtSeconds / minRateScale. The clamp re-anchors the next deadline by the frame's excess, and a clamp shorter "
+			"than one interval would move it past the frame's own time");
 
 		{
 			const auto worldLock = m_worldHost->lockForStep();
@@ -143,14 +167,24 @@ public:
 		if (m_config.threading == StepThreading::FreeRunning)
 			return;
 
+		sampleFrameInput();
+
 		const double startSeconds = m_engine->nowSeconds();
 		if (m_lastFrameStartSeconds > 0.0)
 			m_window.noteFramePeriod(startSeconds - m_lastFrameStartSeconds);
 		m_lastFrameStartSeconds = startSeconds;
 
-		// ⛔G-04  docs/SimulationTickDriver-guards.md
-		m_hostTimeSeconds += frameDeltaSeconds;
+		if (m_config.frameTimeBase == FrameTimeBase::Monotonic)
+		{
+			advanceMonotonicHostTime(startSeconds);
+		}
+		else
+		{
+			// ⛔G-04  docs/SimulationTickDriver-guards.md
+			m_hostTimeSeconds += frameDeltaSeconds;
+		}
 		const uint32_t numSteps = pumpAndRunSteps();
+		m_frameSteps = numSteps;
 
 		m_window.noteStartPhysics(numSteps, m_engine->nowSeconds() - startSeconds);
 	}
@@ -172,7 +206,7 @@ public:
 			"step tasks that take it: a deadlock. Was frame-host G-05");
 
 		const double endStartSeconds = m_engine->nowSeconds();
-		const std::optional<Handle> waitFor = blockMode == 1 ? m_pendingSteps : m_blockingSteps;
+		const std::optional<Handle> waitFor = waitsForThisFrame(blockMode) ? m_pendingSteps : m_blockingSteps;
 		if (!isPendingHandle(waitFor))
 		{
 			runPostPhysics(std::nullopt);
@@ -241,6 +275,17 @@ public:
 		waitForOutstandingSteps();
 	}
 
+	void reanchor()
+	{
+		OG_CHECK(m_config.frameTimeBase == FrameTimeBase::Monotonic,
+			"SimulationTickDriver::reanchor: only a Monotonic driver re-anchors on resume. A HostDelta driver's pause is the "
+			"engine's: its frame deltas stop and nothing is owed on resume");
+		SimulationScheduler& scheduler = schedulerOnOwningThread();
+		const double hostSeconds = m_engine->nowSeconds() - m_monotonicOriginSeconds;
+		scheduler.reanchor(hostSeconds);
+		m_hostTimeSeconds = hostSeconds;
+	}
+
 	void pushBodySlotOccupancy(uint32_t slot, bool occupied)
 	{
 		OG_CHECK(m_config.threading != StepThreading::FreeRunning || m_worldHost->threadContext().isOwnerThreadForRole(),
@@ -275,8 +320,9 @@ public:
 			return originSeconds < 0.0 ? 0.0 : m_engine->nowSeconds() - originSeconds;
 		}
 		OG_CHECK(m_worldHost->threadContext().isOwnerThreadForRole(),
-			"SimulationTickDriver::hostNowSeconds: the host time is the owning thread's accumulated frame delta, written "
-			"in startFrame; read off the owning thread it races that write");
+			"SimulationTickDriver::hostNowSeconds: the host time is written by the owning thread in startFrame (the "
+			"accumulated frame delta, or in Monotonic the engine clock minus the origin); read off the owning thread it "
+			"races that write");
 		return m_hostTimeSeconds;
 	}
 
@@ -302,6 +348,7 @@ public:
 		const TickDriverWindowCounts& windowCounts() const { return m_driver.m_window.counts(); }
 		uint32_t windowSampleCount(TickDriverWindowSeries series) const { return m_driver.m_window.samples(series).count(); }
 		LostTime lostTime() const { return m_driver.m_scheduler->lostTime(); }
+		LostTimeByCause lostTimeByCause() const { return m_driver.m_scheduler->lostTimeByCause(); }
 		uint64_t physicsStepCount() const { return m_driver.m_scheduler->physicsStepCount(); }
 		double rateScale() const { return m_driver.m_scheduler->rateScale(); }
 		bool isRunning() const { return m_driver.m_running; }
@@ -356,11 +403,39 @@ private:
 		m_scheduler.emplace(
 			SchedulerConfig{ m_config.dtSeconds, MaxCatchUpSteps{ cap }, m_config.minRateScale, m_config.maxRateScale },
 			m_hostTimeSeconds);
-		m_window.restart(m_engine->nowSeconds(), windowTotals());
+		const double beginSeconds = m_engine->nowSeconds();
+		m_monotonicOriginSeconds  = beginSeconds;
+		m_window.restart(beginSeconds, windowTotals());
 
 		m_running = true;
 
-		m_engine->log(HostLogLevel::Warning, m_window.formatFrameLine(m_config.dtSeconds, cap, m_config.idleSlackSeconds));
+		m_engine->log(HostLogLevel::Warning, m_window.formatFrameLine(m_config.dtSeconds, cap, m_config.idleSlackSeconds,
+			m_config.frameTimeBase == FrameTimeBase::Monotonic, m_config.frameWait == FrameWait::ThisFramesSingleStep));
+	}
+
+	void advanceMonotonicHostTime(double clockSeconds)
+	{
+		const double hostSeconds   = clockSeconds - m_monotonicOriginSeconds;
+		const double excessSeconds = (hostSeconds - m_hostTimeSeconds) - m_config.monotonicFrameClampSeconds;
+		if (excessSeconds > 0.0)
+		{
+			SimulationScheduler& scheduler = schedulerOnOwningThread();
+			// ⛔G-09  docs/SimulationTickDriver-guards.md
+			scheduler.reanchor(scheduler.nextDeadline() + excessSeconds);
+		}
+		m_hostTimeSeconds = hostSeconds;
+	}
+
+	void sampleFrameInput()
+	{
+		if constexpr (TickDriverSampleGame<GameT>)
+		{
+			OG_CHECK(m_config.threading != StepThreading::FreeRunning,
+				"SimulationTickDriver: sampleInput ran in FreeRunning. The sample is taken once per startFrame in Inline and "
+				"FrameBounded, first; a free-running authority has no local input to sample, and pumpAndRunSteps and the "
+				"loop run on the runner at every wake");
+			m_game->sampleInput();
+		}
 	}
 
 	uint32_t pumpAndRunSteps()
@@ -481,6 +556,12 @@ private:
 		m_worldHost->afterRunTick_Step(physicsStep, outcome);
 	}
 
+	bool waitsForThisFrame(int32_t blockMode) const
+	{
+		// ⛔G-10  docs/SimulationTickDriver-guards.md
+		return blockMode == 1 || (m_config.frameWait == FrameWait::ThisFramesSingleStep && m_frameSteps == 1u);
+	}
+
 	bool deferPostPhysics(Completion& completion, const Handle& waitFor, double endStartSeconds)
 	{
 		return m_engine->deferUntil(completion, waitFor,
@@ -583,6 +664,8 @@ private:
 	bool         m_loggedFirstStep       = false;
 	double       m_hostTimeSeconds       = 0.0;
 	double       m_lastFrameStartSeconds = 0.0;
+	double       m_monotonicOriginSeconds = 0.0;
+	uint32_t     m_frameSteps            = 0u;
 
 	std::optional<SimulationScheduler>                                         m_scheduler;
 	TickDriverWindow                                                           m_window;

@@ -224,7 +224,8 @@ public:
 		m_worldHost.build(config, queryableStatics, physicsOnlyStatics, adapterOptionals...);
 	}
 
-	Driver& start(double dtSeconds, bool isAuthority, int32_t requestedMaxCatchUpSteps, double idleSlackSeconds = 0.0)
+	Driver& start(double dtSeconds, bool isAuthority, int32_t requestedMaxCatchUpSteps, double idleSlackSeconds = 0.0,
+		FrameWait frameWait = FrameWait::EarlierFrames)
 	{
 		m_worldHost.bindIntegratedTickSource(m_game.manager());
 		m_presenter.emplace(m_engine, m_renderSource, TickDriverPresenterConfig{ m_game.manager().runsPrediction(),
@@ -236,6 +237,7 @@ public:
 		typename Driver::Config driverConfig{ dtSeconds, isAuthority, m_worldHost.threadContext().threading(),
 			requestedMaxCatchUpSteps };
 		driverConfig.idleSlackSeconds = idleSlackSeconds;
+		driverConfig.frameWait        = frameWait;
 		m_driver.emplace(m_game, m_worldHost, *m_presenter, m_engine, driverConfig);
 		return *m_driver;
 	}
@@ -327,6 +329,14 @@ public:
 		OG_CHECK(!freeRunning(),
 			"SimulationTickBackend::updateVisualization: a free-running authority has no game-thread viz world");
 		presenter().updateVisualization_GameThread(m_game.storage());
+	}
+
+	template <typename VizStateT>
+	void overlayRenderPoses(unsigned int id, VizStateT& vizState)
+	{
+		OG_CHECK(!freeRunning(),
+			"SimulationTickBackend::overlayRenderPoses: a free-running authority has no game-thread viz world");
+		presenter().template overlayRenderPoses_GameThread<SimulatableT>(id, vizState);
 	}
 
 	decltype(auto) editVizQuery()

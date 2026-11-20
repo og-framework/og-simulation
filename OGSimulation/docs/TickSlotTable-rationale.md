@@ -139,7 +139,8 @@ Both are also caught by tests (the guards doc names them), and both name their p
 `TickSlotTableTest.cpp`, tag `[TickSlotTable]`:
 - `TickSlotTable.Differential.EqualsTheLegacyJoltSlotAcquireOverRandomOrders`: a reference model,
   transcribed literally from the code this table replaces (§10), with only its engine types and
-  macros swapped for plain ones, against the table plus a test caller. Each of 24 fixed seeds runs 500
+  macros swapped for plain ones and, since og-input-latency task P5-10, its fake actor's slot member
+  named ReplicatedSlotValue (PhysicsSlotValue before), against the table plus a test caller. Each of 24 fixed seeds runs 500
   random events on an authority peer and a client peer:
   - joins (the authority acquires);
   - repeated acquires;

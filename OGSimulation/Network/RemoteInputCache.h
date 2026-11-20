@@ -46,9 +46,11 @@
 //   capacity             64 slots -- and the number is load-bearing for the relay
 //                        delay floor's hard cap.
 //
-// THREADING: GAME-thread write, PHYSICS-thread read, NO SEAM. Accepted, priced,
+// THREADING: GAME-thread write, PHYSICS-thread read, NO SEAM, in og-sim-net's FRAME-LOCKED
+// mode (`SimNetConfig::immediate` false, the shipped default). Accepted, priced,
 // correction-healed debt -- `docs/ThreadingCrossings.md` row 1, analysis of record in
-// `docs/RemoteInputCache-rationale.md` §6. The PROHIBITIONS stay here.
+// `docs/RemoteInputCache-rationale.md` §6. The PROHIBITIONS stay here. In the IMMEDIATE mode
+// the write runs on the step's thread and is same-thread with the read (the block below).
 //
 // WHAT PINS WHAT, so a reader knows which test breaks on a change:
 //   no wipe surface exists       `RemoteInputCacheTest.cpp` -- the `HasClearMethod`
@@ -136,6 +138,13 @@
 // installed. Until og-input-latency task P5-7 it was the relay actor's OnRep,
 // `ASimulationInputRelay::OnRep_RelayedInputRing` (deleted by P5-9).
 // `docs/ThreadingCrossings.md` row 1 cites this block as authoritative.
+//
+// TWO MODES (og-input-latency P2-15). Everything above is the FRAME-LOCKED mode
+// (og-sim-net's `SimNetConfig::immediate` false, the shipped default): the GAME-thread write
+// is accepted debt. In the IMMEDIATE mode the host calls `SimNetClient::drain` at the start
+// of each step, before `collectInputAll`, on the step's thread (a FrameBounded client's chain
+// of worker tasks), so the writer and both readers are one serialized context: no crossing,
+// no torn slot. The three fences below price the frame-locked mode.
 //
 // ⛔⛔ DO NOT COPY LocalInputCache's "not thread-safe; single-threaded by construction"
 //   claim with the ring mechanics: TRUE of the delay line (its push and read are two

@@ -25,7 +25,8 @@ sit where that edit is typed.
 of the engine-hosted step hooks this header was transcribed from (rationale §8): G-01 here succeeds
 that class's G-01 (one tick of release), G-02 here succeeds its G-02 (the offset is the tick minus
 the physics step), and G-03 here succeeds its G-03 (the step-start time is taken in
-`beforeSimulate`). The task that deletes the old class retires the old ids and names these.
+`beforeSimulate`). The task that deletes the old class retires the old ids and names these. G-04 has no
+predecessor: the receive hook was added on 2026-11-19 (rationale §8).
 
 ---
 
@@ -95,3 +96,25 @@ time taken in `beforeTick`.
 
 **What breaks if it moves.** Inside `beforeSimulate` it must follow the correction capture, so the
 capture's cost is in `t1 - t0` with the replay it follows (rationale §5).
+
+## G-04 — A client's `receiveForStep` runs in `beforeTick`, after J1, and never on the authority
+
+**Tag site:** `TickDriverStepHooks.h`, in `TickDriverStepHooks::beforeTick`, inside the client branch's
+`if constexpr (TickDriverReceiveGame<...>)`, immediately above `m_doors.game.receiveForStep();`.
+
+**The prohibition.** Do not move the call into `beforeSimulate`, `beforePhysics` or `afterTick`, and do not
+call it on the authority path of `beforeTick`. It is the game's receive for the step that is about to run,
+and `beforeTick` is the only hook that precedes that step's resimulation check and input collect.
+
+**The consequence.** In `beforeSimulate` a correction the game receives misses this step's resimulation
+check; in `beforePhysics` (the game's `onStepStarted`) the input it receives also misses this step's collect,
+so every arrival reaches the next step only, a whole step late. In `afterTick` the same, after the step's
+outputs are published. On the authority it would run a client's receive inside an authority step, beside the
+input release, which the hook's contract excludes (`TickDriverConcepts-rationale.md` §10).
+`SimulationTickDriver.ReceiveForStep.WhatAClientStepReceivesIsCollectedByThatSameStep` and
+`SimulationTickDriver.ReceiveForStep.ACorrectionReceivedForAStepIsReplayedByThatSameStep` fail with the call
+moved into `beforePhysics`; `SimulationTickDriver.ReceiveForStep.RunsOncePerClientStepFirstAndNeverOnTheAuthority`
+fails with it on the authority path.
+
+**What breaks if it moves.** Inside `beforeTick` it must follow the J1 drain and the step-context check, and
+stay inside the `if constexpr`, so a game that does not model `TickDriverReceiveGame` compiles no call.

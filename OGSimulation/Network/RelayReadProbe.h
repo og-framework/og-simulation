@@ -26,10 +26,15 @@
 //                               collectInputAll / collectResimInputAll
 //   RelayArrivalProbe  GAME     NetSyncTelemetry::            120 GAP SAMPLES
 //     PROBE 2                   emitRelayArrival, off the     (the game thread
-//                               replicated-ring arrival       has no sim tick)
-//                               callback registerPredictionOwner binds
+//                               ring arrival callback         has no sim tick)
+//                               registerPredictionOwner binds
 //   FrameHealthProbe   GAME     the adapter's per-frame hook, 120 SAMPLES
 //     PROBE 4                   on EITHER role
+//
+//   ⚠ GAME is the frame-locked thread. PROBE 2 runs where the client session
+//   drains: on an immediate client that is the step's thread (og-input-latency
+//   P2-15). PROBE 4 runs on the runner on the authority loop (P5-20). Each object
+//   still has one thread.
 //
 //   PROBE 1 which rung of the scheduled-read ladder replied; PROBE B why a miss
 //   missed; PROBE 3 how long one character was served stale; PROBE 2 how often
@@ -888,8 +893,9 @@ private:
 // PROBE 4 -- SIM TICKS PER GAME-THREAD FRAME, i.e. FRAME HEALTH.
 //
 // Built server-only, to measure the CAUSE of what PROBE 2 measures the EFFECT of:
-// property replication runs once per server GAME-THREAD FRAME, so a 60 Hz sim on a
-// 30 fps server advances TWO sim ticks per replication. Later extended to the
+// the server sends once per server GAME-THREAD FRAME (Iris's property replication
+// until og-input-latency P5-7; og-sim-net's frame-locked flush since), so a 60 Hz sim
+// on a 30 fps server advances TWO sim ticks per send. Later extended to the
 // CLIENT, where the same ratio plus `meanFrameMicros` is frame health under resim
 // load. §9
 //
@@ -898,7 +904,7 @@ private:
 // ⛔ ON A RESIMMING CLIENT THAT SEPARATION IS THE WHOLE POINT: a resim burst folds extra ticks into `numSteps` at the SAME hook, so `numStepsAboveOne > 0` means resim, not a hitch. §9
 // ⛔ HOOK-INDEPENDENT BY CONSTRUCTION: the caller supplies a GLOBAL frame counter, not an invocation count -- which is what let this probe gain a second role for free. §9
 // ⛔ THE HOOK'S CADENCE IS MEASURED, NEVER ASSUMED: the probe reports how its own invocations fell across frames (`dFrame == 1`, `== 0`, `> 1`) on either role. §9
-// ⛔ GAME THREAD ONLY, ON WHICHEVER ROLE THE OWNER RUNS ON, and each role gets its OWN instance -- never shared, so there is no cross-role synchronization question. §9
+// ⛔ ONE THREAD ONLY (the game thread; the runner on the authority loop, og-input-latency P5-20), ON WHICHEVER ROLE THE OWNER RUNS ON, and each role gets its OWN instance -- never shared, so there is no cross-role synchronization question. §9
 // ⛔ TICK SOURCE IS THE CALLER'S PROBLEM, and there is one right answer on the game thread: the tick-to-physics-frame mapper's atomic offset, never the physics-thread clock. §9
 // ⚠ The two roles emit under DIFFERENT log tags and categories -- a line indistinguishable from the other role's by grep has already cost one mis-attributed analysis. §9
 // ---------------------------------------------------------------------------

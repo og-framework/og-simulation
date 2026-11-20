@@ -21,7 +21,7 @@
 // pragma optimize off — debugger-friendliness; rationale in SimulationManager.h.
 OGSIM_OPTIMIZE_OFF
 
-// NetSyncTelemetry — `SimulationNetSync`'s GAME-THREAD instrument: it owns every
+// NetSyncTelemetry — `SimulationNetSync`'s ARRIVAL-SIDE instrument (the drain's thread): it owns every
 // probe count and every shipped log line that the transport peer's decision and
 // report structs are projected into.
 // Layer: OGSimulation. Adapter-agnostic, UE/Chaos-free.
@@ -41,12 +41,17 @@ OGSIM_OPTIMIZE_OFF
 //     (`m_inputResolutionTelemetry`), not by NetSync and not by this class.
 //     Neither sibling holds a reference to the other.
 //
-//   * EVERY METHOD HERE IS GAME THREAD ONLY. Three call sites, all methods
-//     of `SimulationNetSync`:
+//   * EVERY METHOD HERE IS GAME THREAD ONLY in og-sim-net's frame-locked mode.
+//     Three call sites, all methods of `SimulationNetSync`:
 //
-//       emitRelayArrival        onRelayedInputReceived    replication-dispatched
-//       emitCorrectionArrival   onCorrectionReceived      replication-dispatched
+//       emitRelayArrival        onRelayedInputReceived    og-sim-net ring arrival
+//       emitCorrectionArrival   onCorrectionReceived      og-sim-net correction arrival
 //       forgetOwner             unregisterSimulatable     step 4, lifecycle
+//
+//     On an IMMEDIATE client (og-input-latency P2-15) the client drains at the
+//     start of each step, on the step's thread, so the two arrival rows run there,
+//     and so does forgetOwner for a host that unregisters through the session's
+//     lifecycle queue (P2-17).
 //
 //     `emitCorrectionVerdictClassLine` / `emitCorrectionLandingClassLine` are
 //     reached only from `emitCorrectionArrival`, and
@@ -108,13 +113,13 @@ OGSIM_OPTIMIZE_OFF
 //
 // ⛔ TWO SIBLINGS, TWO OWNERS, NO LINK — `SimulationInputResolution` owns `InputResolutionTelemetry`; neither references the other, and merging them re-crosses a thread boundary. §1
 //
-// ⛔ AN OWNER, NOT A DIAGNOSTICS VIEW — production calls into every public method here on the game thread, so nothing on this class may be grouped behind a `getDiagnostics()`. §2
+// ⛔ AN OWNER, NOT A DIAGNOSTICS VIEW — production calls into every public method here on the drain's thread, so nothing on this class may be grouped behind a `getDiagnostics()`. §2
 // ⛔ Nothing here is reachable from `SimulationNetSync::getDiagnostics()`. The read-seam / write-site rule is stated once in `docs/DiagnosticsConventions.md` §2.
 //
 // ⛔ NO REFERENCE INTO A PRODUCTION CONTAINER IS EVER HANDED IN — `emitRelayArrival` takes a report, not the arriving `RemoteInputCache<InputT>&`. §2
 // ⛔ `shouldLogVersionMismatchOnce`'s latch therefore lives here, id-keyed, rather than on the store. §7
 //
-// ⛔ EVERY METHOD ON THIS CLASS IS GAME THREAD ONLY, so no member here is atomic and none may be made concurrent. §3
+// ⛔ EVERY METHOD ON THIS CLASS RUNS ON ONE THREAD, the drain's (the game thread frame-locked, the step's thread on an immediate client), so no member here is atomic and none may be made concurrent. §3
 // ⛔ `forgetOwner` is the one either-thread member and is never concurrent by construction — see `SimulationNetSync::unregisterSimulatable`'s ordering. §3
 // ⛔ `shouldLogVersionMismatchOnce` is public, but production reaches it only from `emitRelayArrival`; `emitCorrectionArrival` is the sole caller of the two class-line helpers.
 
@@ -244,7 +249,7 @@ public:
     // ⚠ `RemoteInputCache::shouldLogVersionMismatchOnce` no longer exists. §7
     void emitRelayArrival(unsigned int id, const RelayedInputIngestReport& report)
     {
-        // ⛔ PROBE 2 — the GAME-THREAD replication-cadence window, measured in CAPTURE TICKS; a different object from the physics-side read probe, and they must not be merged. §5
+        // ⛔ PROBE 2 — the arrival-side cadence window (GAME thread frame-locked, the step's thread on an immediate client), measured in CAPTURE TICKS; a different object from the physics-side read probe, and they must not be merged. §5
         // ⛔ `report.newestCaptureTick` is the newest tick THIS RING carried, not the newest the store holds.
         if (report.newestCaptureTickValid)
         {
@@ -307,7 +312,7 @@ public:
         if (report.outcome == RelayedInputIngestOutcome::VersionMismatch
             && shouldLogVersionMismatchOnce(id))
         {
-            // ⛔ ONCE per component per session — an incompatible peer re-replicates its ring forever, so an ungated line fires on every replication. §7
+            // ⛔ ONCE per component per session — an incompatible peer's ring keeps arriving, so an ungated line fires on every arrival. §7
             SIMLOG(m_logger,
                 "[Warning][RelayedInput] DROP wire-version mismatch id=%u onWire=%u expected=%u",
                 id,
@@ -454,7 +459,7 @@ public:
             classSummary.discarded, classSummary.atFrontierRatePerMille, windowSamples);
     }
 
-    // ⛔ TRUE EXACTLY ONCE PER ID PER SESSION — an incompatible peer re-replicates its ring forever. Forgotten in `forgetOwner`, same unbounded-memo reason as `m_relayArrivalProbe`. §7
+    // ⛔ TRUE EXACTLY ONCE PER ID PER SESSION — an incompatible peer's ring keeps arriving. Forgotten in `forgetOwner`, same unbounded-memo reason as `m_relayArrivalProbe`. §7
     // ⛔ PUBLIC ON PURPOSE — `NetSyncTelemetryTest.cpp` exercises this latch directly, not only through `emitRelayArrival`'s no-logger path. §7
     bool shouldLogVersionMismatchOnce(unsigned int id)
     {
@@ -464,11 +469,11 @@ public:
 private:
     std::function<void(const char*)> m_logger;
 
-    // ⛔ GAME THREAD ONLY, and pure telemetry — nothing in the resolution path reads it, and every consumer is a SIMLOG. §8
+    // ⛔ THE DRAIN'S THREAD ONLY, and pure telemetry — nothing in the resolution path reads it, and every consumer is a SIMLOG. §8
     // ⛔ Its PHYSICS-thread sibling `RelayReadProbe` is on `InputResolutionTelemetry` — two objects because two threads. §3
-    RelayArrivalProbe m_relayArrivalProbe; // GAME thread only.
+    RelayArrivalProbe m_relayArrivalProbe; // the drain's thread only.
 
-    // ⛔ ONE object because ONE feeder, the GT correction callback; it carries no per-id state, which is why `forgetOwner` forgets `m_relayArrivalProbe` and not this one. §8
+    // ⛔ ONE object because ONE feeder, the correction callback (on the drain's thread); it carries no per-id state, which is why `forgetOwner` forgets `m_relayArrivalProbe` and not this one. §8
     CorrectionVerdictProbe m_correctionVerdictProbe;
 
     // ⛔ A SECOND OBJECT ON THE SAME SITE, DELIBERATELY — a DISCARDED correction is a non-event for the verdict and a first-class observation for the landing site, so merging forces one to adopt the other's sample set. §8
@@ -483,7 +488,7 @@ private:
         return characterClass == PredictedCharacterClass::RemoteProxy ? m_verdictMarginRemote : m_verdictMarginLocal;
     }
 
-    // ⛔ GAME THREAD ONLY, no per-id state (so `forgetOwner` has nothing to forget), and reset only when the verdict window closes. §15
+    // ⛔ THE DRAIN'S THREAD ONLY, no per-id state (so `forgetOwner` has nothing to forget), and reset only when the verdict window closes. §15
     VerdictMarginClassWindow m_verdictMarginLocal;
     VerdictMarginClassWindow m_verdictMarginRemote;
 };

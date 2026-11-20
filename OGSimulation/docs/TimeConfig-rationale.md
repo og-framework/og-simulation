@@ -229,8 +229,9 @@ additive half the multiplicative term collapses on LAN — at a 0.5 ms smoothed 
 would reject an entirely ordinary 10 ms reading. 30 ms sits above any plausible loopback/LAN
 excursion and far below the ~1 s artifacts being filtered.
 
-**Why the cold-start ceiling is absolute rather than relative.** The first sample seeds the smoothed
-RTT VERBATIM, so the relative bound has nothing to compare against. That seed is the single most
+**Why the cold-start ceiling is absolute rather than relative.** The first sample above 0 seeds the
+smoothed RTT VERBATIM (a 0 does not seed, og-input-latency P5-28: §14's "Why a 0 reading does not
+count"), so the relative bound has nothing to compare against. That seed is the single most
 damaging value in the estimator — it is latched, and every subsequent jitter delta is measured
 against it — so it is gated by an absolute ceiling instead, chosen over accept-then-correct. A
 genuinely slow link is not locked out: `rttOutlierConsecutiveLimit` re-seeds it after a short run of
@@ -649,9 +650,12 @@ sessions. The check replaces a comment; no tag is needed.
 
 ## 14. The one-shot re-centre: `recentreSettleSamples`
 
-One field added by og-input-latency task 27, 2026-11-18: `recentreSettleSamples`. Its reader is `ClientPredictionClock`;
-it counts the samples with `NetworkTimeEstimator::getMeasuredRTTSampleCount`, the running total of samples that passed
-`updateRTT`'s validity gate (plausible or not) **and read above 0**. The composition root may override it with the `RecentreSettleSamples`
+One field added by og-input-latency task 27, 2026-11-18: `recentreSettleSamples`. Its reader is `ClientPredictionClock`.
+Since og-input-latency P3-11 it counts the clock's own advances on which the estimator had a reading
+(`NetworkTimeEstimator::hasFirstRTTSample`), a window of ticks; until then it counted samples with
+`NetworkTimeEstimator::getMeasuredRTTSampleCount`, the running total of samples that passed `updateRTT`'s validity gate
+(plausible or not) **and read above 0**, which the decision's line still reports. See "The window is time" below. The
+composition root may override it with the `RecentreSettleSamples`
 key under `[OGNetcode]`, read on both roles (one adapter's binding: `UESimulationSession`'s `readSessionKnobs` and
 `applyLatencyKnobs`, with the start-up line `[ClockRecentre.Config] recentreSettleSamples=… (ini|compiled)`). The key
 exists so the A arm (0) runs on the same binary as the B arm.
@@ -667,9 +671,9 @@ Two joins measured by og-input-latency left one:
 - **An inflated first RTT** (task P4-12's F10, fixed at its trigger by P4-13). A raised first target makes the client skip
   up to it; when the RTT falls back, the client is left above the new target, inside the band.
 
-**The rule.** The re-centre is armed when the clock is constructed and again by every hard resync, with the estimator's
-measured-sample count at that moment. Once `recentreSettleSamples` more measured samples have arrived, the next
-`advancePrediction` past the warm-up guard decides **once** how many ticks the lead is off, and logs one line:
+**The rule.** The re-centre is armed when the clock is constructed and again by every hard resync. Once the clock has made
+`recentreSettleSamples` more advances with a reading (P3-11; measured samples before), that advance, if it is past the
+warm-up guard, decides **once** how many ticks the lead is off, and logs one line:
 
 `[Warning][Clock.Recentre] fromLead=<x> toLead=<y> owed=<n> target=<t> rttMs=<r> samples=<s> cause=<c>`, with
 ` fromTarget=<a> toTarget=<b>` appended when `cause` is `rearm`, then ` skipped=within1` when `owed` is 0. `cause` names
@@ -686,10 +690,11 @@ has made since the arm, and subtracts the current prediction offset; `owed` is t
 (only a run shorter than 15 with an even count has a half). The readings are stored uncorrected so that the graduated
 Stalls of a landing's walk down, which run inside the window, do not move the median. The median is of the lead over the
 authority tick, not of the drift, and the offset is the decision's own: the median filters the authority tick's arrival
-phase, which flickers frame to frame, and an RTT step inside the run counts in full. That matters because the outlier gate
-re-seeds on its `rttOutlierConsecutiveLimit`-th consecutive outlier, which with the default window is the sample that
-fills it: a median of the drift owed 0 there and left the client two ticks low
-(`PCTM.ClientPredictionClock.Recentre.ZeroReadingsDoNotFillTheWindow`).
+phase, which flickers frame to frame, and an RTT step inside the run counts in full. That mattered because the outlier
+gate re-seeds on its `rttOutlierConsecutiveLimit`-th consecutive outlier, which with the default window is the sample that
+fills it, and until og-input-latency P5-28 every join on a link above 30 ms re-seeded there (the estimator seeded on a 0,
+see "Why a 0 reading does not count" below): a median of the drift owed 0 there and left the client two ticks low
+(`PCTM.ClientPredictionClock.Recentre.ZeroReadingsDoNotFillTheWindow`). A real RTT step inside the run still does.
 
 `fromLead` is `toLead + owed`, `toLead` the target minus the last authority tick (the prediction offset), `target` the
 target tick, `rttMs` the smoothed RTT and `samples` the samples since the arm. A non-zero `owed` is a debt of exactly that
@@ -708,8 +713,8 @@ offset (`getPredictionOffsetTicks`, the quantity the target adds to the authorit
 as the prediction offset is; the clock computes it itself (`ClientPredictionClock::recentreRttOffsetTicks`, since rework
 3; floored since rework 4), from its own `TimeConfig`, which is the estimator's. When the two differ by
 `ClientPredictionClock::kRecentreRearmTicks` (2) or more on every one of the last `kRecentreMedianAdvances` (15) advances,
-the re-centre re-arms: any outstanding debt is cleared, the settle window counts `recentreSettleSamples` measured samples
-again from that advance, the median run restarts, and the next decision is made as above, from the state at that moment.
+the re-centre re-arms: any outstanding debt is cleared, the settle window counts `recentreSettleSamples` advances again
+from the next advance, the median run restarts, and the next decision is made as above, from the state at that moment.
 The decision itself still aims at the full prediction offset; only the trigger leaves the jitter out. Both constants are
 `constexpr` in the clock; there is no new `TimeConfig` field and no new ini key. The decision's line then carries
 `cause=rearm fromTarget=<a> toTarget=<b>`: `a` is the RTT-only offset at the previous decision and `b` the RTT-only offset
@@ -744,7 +749,7 @@ correction; every (b) client's decisions, corrections and lead are identical. `P
 rule on a fall to 15 ms: from 90 ms (offset 6) it re-arms and logs `toTarget=4`; from 75 and 55 ms (5 and 4) it does not.
 
 **Why it cannot oscillate on jitter alone** (rewritten in rework 3, after its review's finding R1). The trigger does not
-read the prediction offset. That offset adds `jitterMultiplier` (2) times the smoothed jitter, an exponential average
+read the prediction offset. That offset adds `jitterMultiplier` (2; the engine source's, §17) times the smoothed jitter, an exponential average
 (`jitterSmoothingAlpha`, 0.15) of each sample's distance from the smoothed RTT, and on a heavy-tailed steady link that
 term alone moves it by several ticks. Ten minutes at 70 ms + Exp(30 ms), or on a bursty Wi-Fi profile (75 ms + Exp(5 ms),
 with an Exp(80 ms) burst on 5 % of the samples), one sample and one advance per frame, three seeds each: the offset ranged
@@ -785,12 +790,81 @@ controller can set. The re-arm (rework 2) keeps that shape: each decision is sti
 schedules another one when the target's RTT part (floored, as the target is) has moved by 2 or more ticks. It does not
 follow the lead continuously.
 
-**The window: 30 samples, the size of `rttOutlierConsecutiveLimit`.** A `static_assert` below the struct checks that the
-compiled default spans a whole outlier run, so an inflated reading that the outlier gate is about to re-seed from has
-either been rejected or re-seeded inside the window before the clock re-centres on it. The window counts from the hard
-resync, so the resync frame's catch-up batch and the walk down from it are inside it. With the og-sim-net client's clock
-coalesce (`SimNetClient-rationale.md` §8) a sample is one frame, so 30 samples is about half a second at 60 frames per
-second.
+**The window: 30, the size of `rttOutlierConsecutiveLimit`.** A `static_assert` below the struct checks that the
+compiled default spans a whole outlier run at one reading per tick, so an inflated reading that the outlier gate is about to
+re-seed from has either been rejected or re-seeded inside the window before the clock re-centres on it. The window counts
+from the hard resync, so the resync frame's catch-up batch and the walk down from it are inside it. With the og-sim-net
+client's clock coalesce (`SimNetClient-rationale.md` §8) an engine reading is one frame, so 30 samples were about half a
+second at 60 frames per second; since P3-11 the window is 30 advances, half a second at 60 Hz, whatever the source's rate.
+
+**The window is time, not samples** (og-input-latency P3-11, from P3-10 part B's F3). P3-10 flipped the clock's RTT source to
+SimClock (§15), whose pongs arrive at 20 Hz against the engine's one reading per frame, so a window of 30 samples took 1.5 s
+where it had taken about half a second, and the estimate kept moving during it: in P3-10's flipped smoke two of three joins
+decided `owed=-1` on a smoothed RTT 67 to 69 ms that had started at a first reading of 76 to 87 ms. The window now counts
+`ClientPredictionClock`'s own advances since the arm on which `hasFirstRTTSample()` read true (the advance's one read of the
+flag, §16). An advance is one tick, so 30 is half a second at 60 Hz on either source, and at the engine's one reading per
+authority tick it is the span the sample count gave. Details:
+- **What counts.** An advance with a reading: a Normal advance, a graduated Skip or Stall, an input-delay debt Stall, and the
+  catch-up batch's steps after a resync, all of which are ticks of time. The arm's own advance does not count: a hard resync
+  returns before the count, and a re-arm counts the window before it re-arms, so either starts the window at the next advance.
+  An advance before the estimator's first reading does not count either, so "Why a 0 reading does not count" below still
+  holds: the window starts at the first real reading.
+- **What it spans in samples.** About 10 SimClock samples, under `rttOutlierConsecutiveLimit`: on SimClock the first pong seeds
+  the estimate (it arrives before the world, so before the join's resync), and a step up after it that the gate keeps
+  rejecting re-seeds after 1.5 s, after the decision. The re-arm covers it when the RTT-only offset moves by two ticks or
+  more; a one-tick move stays in the dead band, as before.
+- **The decision reads the median of the window's last 15 advances**, as before; with a window of 30 advances the run is
+  full by then if the advances are past the warm-up guard.
+- **`samples=`** on the decision's line still reports the measured samples since the arm (10 on a 20 Hz SimClock join, 30 on
+  an engine join; at least 8 since P3-12, below), so the line says how many readings the decision rests on.
+- `PCTM.ClientPredictionClock.Recentre.TheSettleWindowIsTimeNotSamples` pins it: one sample every third frame on SimClock and
+  one per frame on the engine source, an 80 ms link, both decide on the 30th frame after the resync with the same line but for
+  `samples=10` and `samples=30`; counted in samples the SimClock join decided on the 90th (seen failing: `90 == 30`).
+- **Two replays moved, each re-pinned with this reason.** `AFlickeringLeadIsDecidedOnItsMedianAndPaidInFull`'s +4 landing
+  runs three catch-up advances in its join frame after the resync, which now count, so it decides three frames sooner
+  (`target=1533 … samples=27`, was `target=1536 … samples=30`; the same `owed=4` and Stalls). `ThePh3cMainClientDoesNotReArmUnderTheOffsetFloor`'s
+  samples carry 0 to 2 advances each, so its re-arm's window fills on its 29th sample (`target=1664 rttMs=52.082 samples=29`,
+  was `target=1665 rttMs=52.080 samples=30`; the same `owed=2`, Stalls and settled reading). Every other case, the two
+  batch-1 flickering joins and every one-sample-per-advance replay, decides on the same advance as before, and no golden in
+  either `[@og]` suite moved.
+
+**The window floors its samples** (og-input-latency P3-12, from the Ph4 gate's finding R3). Counted in advances, the
+window is time only while the clock steps about once per tick of wall time, and a catch-up batch does not. In the Ph4
+gate's shaped rendered shape (b) the join's hard resync landed in a rendered start-up frame whose batch ran 26 more
+advances in 16 ms, every one with a reading, so the 30-advance window filled 0.14 s after the resync, on 1 SimClock
+sample; every shaped (b) and loopback (c) join of that gate decided on 1 to 6 samples, and the (a) joins on 9 to 10.
+The decision measured the lead mid-transient: the start-up frames took 16 to 164 ms, so the client was still stepping
+off its backlog and the authority ticks were still arriving in bursts. One client decided `fromLead=19 toLead=5
+owed=14 target=1891 rttMs=66.706 samples=1 cause=join` and paid its 14 Stalls in 0.9 s, but its 56 advances in that
+time outran the authority's 52 ticks by 4, so the lead fell 10, and with the offset up 2 (5 to 7) it was left at +3.
+The dead band then held it: it acts on drift beyond `softDriftThresholdTicks` (3) from 0, while the re-centre's zero
+is drift 1 (below), so it holds a lead error of −2 to +4. One graduated Stall at +5 took the client to +2 for the
+session (median +2, mean +2.32), and the re-arm never ran (the RTT-only offset never stood 2 ticks off its 5). Three of the four (b)
+clients of the gate's candidate arm sat at +2.
+- **The rule.** The window is also full only once the estimator has taken
+  `ClientPredictionClock::kRecentreMinSamples` (8) measured samples since the arm (`getMeasuredRTTSampleCount`, the
+  count the line's `samples=` reports). Samples arrive in wall time (SimClock's pongs at 20 Hz, the engine source's
+  one reading per frame), so the floor binds only where advances outrun time; in steady state 30 advances hold about
+  10 SimClock samples or 30 engine ones, and the advances still bind. A `static_assert` keeps the floor at or under
+  the default window's advances, so one reading per advance never waits on it. It is a `constexpr` in the clock, as
+  the re-arm's constants are: no new `TimeConfig` field and no new ini key. It applies to every arm (the join, a hard
+  resync, a re-arm), and `evaluateDrift`'s mirror reads the same count.
+- **Why 8.** The gate's 51 clients on the candidate tree, their logged inputs (the samples the smoothed RTT implies,
+  the authority ticks and the advances per tick) replayed through the clock, reproduce every logged decision's advance,
+  target and `owed` (on 6 the line's `samples=` and `rttMs` differ by where one sample landed between two ticks), and every
+  logged target and advance on 45 of them. With a floor of 8 every one of the 36 shape (a) join decisions is
+  byte-identical in the replay (they rested on 9 to 10 samples); every (b) and (c) decision moves to `samples=8`, 0.41 to 0.68 s after its resync; the three +2
+  clients settle at a median of 0 (means +0.32, +0.04, −0.37 from 5 s on), and no client is 2 or more off (3 before).
+  A floor of 6 or 7 left one (b) client at −1, and 9 to 15 one or two at +1. The two mid-session hard resyncs of the
+  gate's warm-up run, whose decisions rested on 1 sample each, decide on 8 too.
+- **Not adopted: a second decision on a lasting residual.** A follow-up decision after a residual of 2 or more ticks
+  held for 1 to 2 s, replayed on the same clients without the floor, re-decided four of them, one by 4 ticks, which
+  took that (b) client from +2 to −1. It would also follow the lead, which is a controller's work (og-time-dilation's
+  src-29), and the lead error it would read swings with the jitter term on a heavy-tailed link (below).
+- `PCTM.ClientPredictionClock.Recentre.TheWindowFloorsItsSamplesSoACatchUpBatchCannotFillIt` replays that client's first
+  600 authority ticks (10 s) from its log. Without the floor it reproduces the logged decision and holds a median of +2
+  (mean +2.31) from 5 s on (seen failing); with it, it decides `fromLead=14 toLead=6 owed=8 target=1925 rttMs=73.472
+  samples=8 cause=join` and holds a median of 0 (mean +0.31). No other case or golden in either `[@og]` suite moved.
 
 ⚠ **What it does not cover.** An RTT step that arrives after the window (for example a re-seed long after the join, or
 the start-up spike settling) is covered since rework 2 when it moves the RTT-only offset by 2 or more ticks: the re-arm
@@ -828,6 +902,23 @@ decision and the dead band keeps the client two ticks low (the float64 model and
 the first real reading; a real round trip, even on loopback, reads above 0 (the smoke's first real readings were 21 to 31 ms: the smoothed RTT one sample after the 0 seed was 3.2 to 4.6 ms,
 which is 0.15 of the reading).
 
+**Nor does a 0 seed the estimator** (og-input-latency P5-28). The source's 0 is its first average, taken on its first ack
+while every bucket is still empty, and it is held until the next bucket closes about a second later (one adapter's
+binding: the engine's player-state ping average closes a bucket once a second has passed since the last close, whose
+time starts at 0, so the first ack closes one, and an average over no pings is 0). Seeded on it, the estimate was 0 and the outlier bound
+`rttOutlierMultiplier * smoothedRTT + rttOutlierMarginSeconds` was 30 ms, so on a link above 30 ms every real reading was
+rejected until the escape hatch re-seeded on the 30th: Ph3's shaped (a) captures log `filtered 29 implausible RTT sample(s)
+and force-re-seeded 1 time(s)` at every join, with the target on its floor until then. Since P5-28 a 0 before the first
+reading above 0 latches nothing (`PCTM.NetworkTimeEstimator.StartUp.TheFirstRealReadingAfterAZeroSeeds`), so the first
+real reading seeds the estimate and the target follows it. The window and the decision are unchanged: the window counted
+the same readings, so the decision lands on the same sample, now about 30 samples after the seed instead of on it.
+⚠ **It does not change the join's `owed`.** The join's hard resync lands on the floor target when the first authority tick
+arrives, before the source has any reading, and a target one or two ticks above the floor is inside the dead band, so the
+clock does not move before the decision, which still owes those ticks (`ZeroReadingsDoNotFillTheWindow`: `owed=-2` on a
+100 ms link, the same line before and after P5-28). The decision's `rttMs` is not smoothed over the run either: the source
+holds each one-second average, so the 30 readings before the decision are usually one value. Since og-input-latency
+P3-10 the join resyncs once more when the first reading moves the offset (§16), and that decision owes 0.
+
 **0 disables it exactly.** With `recentreSettleSamples = 0` the window never fills, so the decision never runs, nothing is
 owed or logged and the dead band is the only correction: the clock is the one before this field (an armed clock still
 stores its readings, and nothing reads them). The re-arm only runs after a decision, so at 0 it never runs either. `PCTM.ClientPredictionClock.Recentre.ZeroDisablesItExactly` compares every
@@ -845,3 +936,246 @@ under the floor).
 fed one sample per queued clock message. At the Ph3 join every first-frame sample carried a smoothed RTT of 0 and the
 floor offset, so the newest gives the same target as the last of them and the landing does not move; an attribution
 arm should still say so.
+
+## 15. The clock RTT source: `clockRttSource`, the switch and the SimClock shadow
+
+One field added by og-input-latency P3-10 (part A), 2026-11-19: `clockRttSource`, `Engine` or `SimClock`, compiled
+default `SimClock` since part B's flip (`Engine` before it; see "The flip" below). Its reader is `NetworkTimeEstimator`. Its one door is `SimulationManager::setClockRttSource`
+(`SimulationManager-rationale.md` §16). P3-10's part B added the Unreal host's key, `[OGNetcode] ClockRttSource`, beside
+`RecentreSettleSamples`, and wired both feeds and the shadow line (in the Unreal host's `UESimulationSession`).
+
+**Why a second source.** The engine ping includes the engine lane's acknowledgement turnaround. og-input-latency P5-27
+measured the client's RTT about 4 ms higher in Ph3 than in Ph2 on every shape. Ph3 took the inputs and corrections off the
+engine lane, so the client's engine packets are mostly acknowledgement replies sent in step with the server's frames, and the
+engine's round trip (from the send to the start of the client frame that processes the acknowledgement) now includes about one
+server frame minus the client's turnaround, against about half a client frame before: 11.4 to 15.4 ms on loopback (one
+adapter's binding: UE's `FNetPing` RoundTrip, read by `UESimNetClientHost::serverRttSeconds`). og-sim-net's SimClock ping/pong
+(`SimNetClock.h`) takes the server's turnaround out: `RTT = (t3 − t0) − (t2 − t1)`. The target offset is
+`ceil((smoothedRTT + m × smoothedJitter) × tickFrequency)`, m the active source's multiplier (§17), so at 60 Hz 4 ms is 0.24 tick, and a whole tick
+on a link whose RTT sits near a tick boundary.
+
+**The routing.** The host hands every engine reading to `noteEngineRttSample` and every SimClock sample to
+`noteSimClockSample`. The active source starts as `Engine`. An engine reading reaches `updateRTT` only while `Engine` is
+active. A valid SimClock sample always feeds the shadow (below). With `clockRttSource == SimClock`, the first valid one
+switches the active source to `SimClock`, calls `noteRttSourceChanged()` and logs `[Warning][ClockSource.Switch]` once;
+from then on every valid SimClock sample reaches `updateRTT`, and engine readings reach nothing. `updateRTT` stays the
+estimate's one door, so the validity gate, the "a 0 does not seed" rule (§14) and the outlier gate (§4) apply to either
+source unchanged. The switch waits for a sample, not for the configuration, because the SimClock source has no reading
+until its first pong returns. Until then the engine ping is the only source. If no pong ever comes (a server without the
+clock), the engine keeps feeding the estimate.
+
+**`noteRttSourceChanged()` never resets the estimator** (P3 design §7.1). The smoothed RTT and jitter,
+`hasFirstRTTSample()` and every count stay. Three things change for the new source's first sample:
+- It moves the RTT EMA but not the jitter EMA. Its distance from the estimate is the step between the two sources' biases,
+  not jitter; read as jitter, `jitterMultiplier` would double it into the offset for tens of samples.
+- If it reads above the estimate and at or under `rttOutlierColdStartCeilingSeconds`, the plausibility gate is **re-based**
+  on it (below).
+- The outlier run restarts: a run of the old source's outliers does not count toward the new source's escape.
+Before the first seed it does nothing: there is no estimate to keep, and the first sample seeds as always (P5-28's 0 makes
+this the usual case: the engine's averaged ping reads 0 for its first second, and a pong arrives sooner).
+
+**A step down needs nothing.** The gate is one-sided (§4), so a lower reading is accepted and the RTT EMA slews to it. At
+`rttSmoothingAlpha` 0.15 the remaining step after k samples is 0.85^k of it, and the 7th sample is the first to have covered
+1 − 1/e of the step (1/α = 6.7): the design's "slews in ~7 samples"
+(`PCTM.NetworkTimeEstimator.ClockSource.AStepDownSlewsInAboutSevenSamples`, 84 to 80 ms).
+
+**The re-base.** A step up beyond `rttOutlierMultiplier × smoothedRTT + rttOutlierMarginSeconds` would be rejected
+`rttOutlierConsecutiveLimit − 1` times and re-seeded on the next (§4): a reset, with 29 samples run on the old level's target.
+Re-based, the gate measures against the larger of the smoothed RTT and the new source's first reading, so that reading and
+the new level after it are plausible and the EMA slews up to it. The re-base lapses once the plain bound admits the reading
+it was re-based on, which takes one sample for 20 to 200 ms and two for 10 to 400 ms, or after `rttOutlierConsecutiveLimit`
+samples, the horizon of the re-seed it stands in for, so a spike on the switch sample cannot leave the gate loose. An
+outlier escape's re-seed ends it too. A first reading above the cold-start ceiling earns no re-base, as it would earn no seed:
+a frame hitch on the switch sample is filtered like any other, and the next accepted reading is the one that skips the jitter
+update (`PCTM.NetworkTimeEstimator.ClockSource.AStepUpBeyondTheBoundDoesNotReSeedAfterTheReBase`,
+`PCTM.NetworkTimeEstimator.ClockSource.AHitchOnTheFirstNewSourceReadingIsNotReBasedOn`).
+
+**At `Engine` nothing changes.** `noteEngineRttSample` is `updateRTT`, a SimClock sample feeds only the shadow, and with no
+switch the gate's reference is the smoothed RTT itself. `PCTM.NetworkTimeEstimator.ClockSource.AtEngineTheShadowNeverMovesTheEstimate`
+compares every output, after every sample, with a twin fed only `updateRTT`.
+
+**The shadow** (`NetworkTimeEstimator::getClockSourceShadow`), for the Unreal host's `[ClockSource.Window]` line (P3 §7.1
+names its fields: the engine RTT, the SimClock RTT, og-net's acknowledgement SRTT, the offset and the one-way delay
+variation):
+- `simClockRttSeconds`: the SimClock RTT's EMA at `rttSmoothingAlpha`, seeded by the first valid sample, with no gate: the
+  shadow is compared, not believed.
+- `offsetSeconds`: theta of the minimum-RTT sample among the last `NetworkTimeEstimator::kClockOffsetSamples` (8, NTP's
+  clock-filter register, RFC 5905 §10); a tie goes to the newest. Theta assumes symmetric one-way delays: on an asymmetric
+  link it is off by (up − down)/2 (og-input-latency P2-20's F3), so the line names it the minimum-RTT sample's offset.
+- `owdVarUpSeconds` and `owdVarDownSeconds`: RFC 3550's interarrival jitter (§6.4.1), `J += (|D| − J) / 16`, with D the
+  change of one direction's transit time (`t1 − t0` up, `t3 − t2` down) between consecutive samples. A transit carries the
+  clock offset, which D cancels. The line logs both, as `owdVarUs=<up>/<down>`.
+- `samples` and `invalidSamples`: a sample with a non-finite stamp or an RTT not above 0 is counted and ignored, and never
+  switches the source.
+The shadow and the switch's bookkeeping are plain members on the estimator's writer thread, like the gate's counters. Read
+the shadow on that thread (the drain that hands the samples over is where the line belongs).
+
+**The re-centre (§14) reads the RTT through the same estimator.** Its re-arm compares the floored RTT-only offset with its
+value at the last decision and re-arms at a move of `ClientPredictionClock::kRecentreRearmTicks` (2). P5-27's ~4 ms is 0.24
+tick at 60 Hz, so at any RTT the floored RTT-only offset moves by at most one tick, and the switch never re-arms it
+(`PCTM.ClientPredictionClock.Recentre.AFourMillisecondSourceStepNeverReArmsIt`: 61 to 120 ms, both directions; a 40 ms
+control re-arms). A one-tick target move stays inside the dead band, as after any one-tick RTT move (§14 "What it does not
+cover"). ⚠ So a switch that lands **after** a decision leaves a client whose target fell one tick one tick above it, and the
+flip's gain does not reach that client. The switch lands at the first pong, which should precede the join's decision (about
+half a second after the first real reading) and, if the pings start with the session, the first authority tick too; then the
+join and its decision see the SimClock RTT from the start. Measured (P3-10 part B, one shaped run, three joins): the switch
+lands 4 to 43 ms after the join's first hard resync and 1.5 s before its decision. The decision counted samples, and SimClock
+delivers 20 a second against the engine's one per client frame, so after the switch the join's decision landed about 1.5 s
+after the first reading rather than about 0.6 s. Since og-input-latency P3-11 both are fixed: the window counts ticks (§14,
+"The window is time"), and one adapter's host holds the newest sample that arrives before its world session binds and feeds
+it ahead of the first authority tick (one adapter's binding: the Unreal client host), so the join's own resync sees the
+SimClock reading and §16's second resync has nothing to wait for.
+
+**The flip** (P3-10 part B, 2026-11-19). Before the default changed, a shadow smoke on Ph3's shape (a) (og-net's shaper, lag
+15-50 ms each way, loss 2/1 %; three joins) logged the SimClock RTT below the engine's in 24 of 25 ten-second windows, by a
+median of 13.1 ms (−19.0 to +1.4): about one server frame, the turnaround the engine's ack round trip carries. In the
+flipped run's three joins the switch came before the engine's first reading above 0 (`hasFirstRTTSample=0` on each
+`[ClockSource.Switch]` line), so the first SimClock sample seeded the estimate and `noteRttSourceChanged()` had nothing to
+keep; the step and the re-base cover a switch after a seed. So the compiled default
+is `SimClock`; `Engine` is the configuration key's other arm, and a host that delivers no SimClock sample stays on the engine
+ping. Whether the flip holds the gate's counts (0 extra Skip, Stall or HardResync, the join's ` cause=firstRtt` resync counted
+apart; (a)/(b) lead and late share at or below Ph2's) is Ph4's gate's measurement, over more runs than one smoke.
+
+## 16. The join's second hard resync, on the first RTT reading
+
+Added by og-input-latency P3-10 (part A, the lead's 07:20 line from P5-28's smoke), 2026-11-19. Its reader is
+`ClientPredictionClock`; it has no field of its own and runs only while `recentreSettleSamples` is not 0.
+
+**The problem.** The join's hard resync fires on the first authority tick, which arrives before the engine's averaged ping has
+any reading (§14: it reads 0 for about a second). So it lands on the floor target, `predOffsetFloorTicks` (4) above the
+authority tick. When the first reading lands, the target rises by one or two ticks on a WAN link, which is inside the dead
+band, so nothing moves the lead until the re-centre's join decision about half a second later, which then owes the gap. P5-28's
+shaped smoke: `owed` −1 on 3 of 6 joins; `PCTM.ClientPredictionClock.Recentre.ZeroReadingsDoNotFillTheWindow`: −2 on a
+100 ms link.
+
+**The rule.** A reading is *settled* on an advance when `NetworkTimeEstimator::hasFirstRTTSample()` read true on that advance
+and on the one before it. A hard resync that lands on the floor offset (`predOffsetFloorTicks`) with no settled reading records
+that offset and waits; with no reading at all the offset is the floor, so every resync before the first reading waits. On the
+first advance past the warm-up guard whose reading is settled, if that reading has moved the offset and the clock is not
+already on the target (drift 1, §14's zero point), the clock hard-resyncs once more, onto the target, and logs the resync line
+with ` cause=firstRtt offset=<landed>-><now>` appended. Either way the wait ends on that advance. Once the estimator has a
+settled reading the clock never waits again, so every later hard resync is unchanged. `evaluateDrift` reports `HardResync` on
+that advance.
+
+**Across threads (rework 1).** Frame-locked, `updateRTT` runs on the game thread and the clock reads the estimator on the
+physics thread through relaxed atomics, which are not a snapshot (`ThreadingCrossings.md` row 10). Every other reader of the
+estimate is re-read on the next advance, so a mixed read costs it one frame. This one acts once, so a mixed read on the advance
+that first sees the reading would end the wait for good. The review (R1) found two: the flag changing between two loads in one
+advance (the due check read it false, then the clear read it true), and the flag visible before its seed, which reads the floor
+offset, equal to the one the resync landed on, so the check read "not moved" and the wait ended. So the clock:
+- reads the flag once per advance, **before** the offset, and computes the target from that one offset read (`readTarget`,
+  the same `authority + offset` sum as `getTargetPredictionTick`), so the due check, the target a resync lands on and the offset
+  it records are one value;
+- decides only on a settled reading: the advance that first sees the flag does neither the second resync nor the clear. The
+  decision lands one advance later than it would on a reading seen at once.
+- treats a resync on the floor offset with an unsettled flag as one with no reading. A flag read before its seed is visible
+  reads the floor, so that resync waits too; when the reading really is at the floor, the next settled advance finds the offset
+  unmoved and the wait ends with no second resync.
+
+The alternative was an acquire/release pair on the flag (release on the seed's store, acquire on the clock's load), which would
+make a flag read true imply a visible seed. It was not taken: it would make this the one acquire/release pair in a class whose
+contract is relaxed on every access, for one reader. The flag changing between two loads needs the single read either way. And
+a test cannot build a read that the memory order rules out, so that fix could not be seen to fail. The settled rule needs only what row 10
+already assumes, that the next read supersedes a mixed one. It is tested through
+`PCTM.ClientPredictionClock.Recentre.TheFirstRttResyncSurvivesAMixedReadOfTheSeed`, with a read probe that is a friend of the
+estimator and is defined only in og-simulation-tests. The probe hides the seed for one advance, or lands the seed between two
+loads. Immediate mode has no mixed read (the writer and the reader are both on the step's thread) and takes the same delay:
+a reading is settled on the second advance that reads it, as in the single-threaded tests.
+
+**Why a second resync and not a held one.** Holding the join's resync until the first reading would leave the client stepping
+its own pre-join ticks for that long (about 0.6 s on P5-28's shaped smoke: the first real reading came 34 to 41 samples after the
+join), sending inputs for ticks the server refuses as late. The second resync keeps the join frame as it is and moves the
+frontier once more, at join time, where a resync's cache wipe costs least. A re-centre debt instead (one graduated correction
+per `gradualCorrectionRate` advances) would leave the decision's window reading a lead that is still being paid.
+
+**With the re-centre.** The second resync is a hard resync: it re-arms the re-centre, still as the join's arm (no decision has
+been made), and the settle window counts from it. The first two readings were counted before the arm (the resync waits for a
+settled reading, rework 1), so the decision lands two advances later (P3-11; two samples when the window counted samples) than with no second resync, on a frontier that is on the target, and owes 0 in every case of
+`PCTM.ClientPredictionClock.Recentre.AJoinBeforeTheFirstRttReadingResyncsOnceMoreWhenItLands`. It also lands on the target
+whatever the first resync's catch-up batch left (the Ph3 landing above), which the re-centre otherwise paid in graduated
+Stalls. It is gated with the re-centre so that `recentreSettleSamples = 0` stays the clock before both, for an A arm.
+Three of §14's join replays changed with it, each re-pinned with this reason: `ZeroReadingsDoNotFillTheWindow` (the
+decision's `owed` −2 to 0, no Skips), the Ph3 (b) replay's second client (`owed` −2 to 0, two Skips fewer; its re-arms are
+unchanged) and the Ph3 (c) replay (`owed` 2 to 0, two Stalls fewer; its re-arm unchanged). The (b) replay's first client
+landed on its first reading's target already (drift 1) and is unchanged. Rework 1 moved each second resync one advance
+later and each join decision's target one tick later in those replays and in the case above; nothing else in them moved.
+
+**With the SimClock source** (§15) the first pongs arrive before the world, so before the first authority tick. P3-10 part B
+measured the estimator's first sample 4 to 43 ms after that tick anyway, because one adapter's host dropped a sample while no
+world session was bound; two of three joins then took the second resync. Since og-input-latency P3-11 that host holds the
+newest such sample and feeds it ahead of the first authority tick (one adapter's binding: the Unreal client host), so the
+join's own resync has the reading. On shape (a) (og-net's shaper, lag 15-50 ms each way, loss 2/1 %) the nine joins of three
+runs on that build all switched to SimClock in the drain of their first authority tick and took no second resync; the same shape on the build
+before P3-11, three joins, took two. The second resync is for a source whose first reading comes late, as the engine's does.
+⚠ The resync's advance still reads the flag for the first time, so it is not settled: a join whose first reading puts the
+offset on the floor (a round trip under about 67 ms with no jitter) still waits, and takes the second resync if the next
+settled advance finds the offset moved. None of those nine did.
+
+⚠ **It is one more `HardResync` per affected join.** A gate reading "0 extra HardResync" (P3-10's flip) counts the
+` cause=firstRtt` lines apart.
+
+## 17. The jitter multipliers: `jitterMultiplier` and `simClockJitterMultiplier`
+
+Added by og-input-latency P3-13, 2026-11-20 (Ph4 gate R2/R15, the user's ruling "tune it in Ph4"). The prediction offset is
+`ceil((smoothedRTT + m × smoothedJitter) × tickFrequency)`, floored at `predOffsetFloorTicks` (§5). Since this task m is the
+**active RTT source's** multiplier (§15): `jitterMultiplier` while the engine ping feeds the estimate (every client before
+its first SimClock sample, and every client at `clockRttSource = Engine`), `simClockJitterMultiplier` once the SimClock ping
+does. Their reader is `NetworkTimeEstimator::getPredictionOffsetTicks`; their one door is
+`SimulationManager::setJitterMultiplier` (`SimulationManager-rationale.md` §17), which sets both to one value (one adapter's
+binding: the Unreal host's `[OGNetcode] JitterMultiplier`, reported on its `[ClockSource.Config]` line). The door clamps to
+0..4 (`clockJitter::clampJitterMultiplier`); both compiled defaults lie inside the clamp (a `static_assert`).
+
+**Why the sources need their own.** The engine ping read almost no jitter (Ph4's gate: `smoothedRTT=84.714ms
+smoothedJitter=0.003ms` on shape (a)), so its offset was in effect `ceil(RTT × 60)`. The SimClock ping reads the link's
+real per-sample variation (`smoothedRTT=66.947ms smoothedJitter=9.221ms` on the same shape), so with the one multiplier of 2
+its offset stayed at 6 ticks: 2 × 9.2 ms took back the 18 ms the RTT gained, while the authority-tick anchor arrived fresher.
+The gate measured (a)'s lead at 3.370 ticks (de-lagged) against Ph2's 2.453, with the late share at 2.6 pp against Ph2's 9.2.
+
+**Across threads.** The offset is read on the client's stepping thread, and the switch happens on the estimator's writer
+thread (the game thread frame-locked). So the active source is a relaxed atomic with the estimate's one writer, like the RTT
+and jitter EMAs: a read that combines a new source with an old EMA is one frame's offset, superseded by the next read. At
+the switch the first SimClock sample does not move the jitter EMA, or seeds it at 0 (§15), so the new multiplier first
+applies to the engine era's jitter, which is about 0.
+
+**The measurement** (P3-13, the Editor Development build with P3-12's sample floor; Ph4's F arm: immediate client traffic,
+the authority loop on; og-net's shaper b0: lag 15-50 ms each way, loss 2/1 %; one value per run through the door, two runs
+per value and shape, interleaved, after a discarded warm-up). Lead = the mean over runs of each run's mean over clients of
+the lead p50, with the loop-on server's log-stamp lag removed; late share = the mean over runs of the pooled relay late
+share; E2E-a (capture to the server's release) de-lagged; E2E-b (capture to its use on the receiver); counts summed over
+runs and clients. Ph2's figures are its gate references.
+
+| shape | multiplier | offset mean (ticks) | lead p50 (ticks) | late share (pp) | E2E-a p50 / p95 (ms) | E2E-b p50 / p95 (ms) | Skip / Stall / HardResync |
+|---|---|---|---|---|---|---|---|
+| (a) | Ph2 | – | 2.453 | 9.21 | 142.0 / 154.0 | 103.5 / 185.0 | 3 / 0 / 6 |
+| (a) | 2.0 | 6.01 | 3.283 | 3.88 | 158.7 / 165.8 | 101.5 / 115.5 | 4 / 5 / 6 |
+| (a) | 1.5 | 5.83 | 2.960 | 6.53 | 149.2 / 159.3 | 104.5 / 185.5 | 3 / 4 / 6 |
+| (a) | 1.0 | 5.38 | 2.760 | 4.37 | 149.7 / 157.0 | 101.0 / 146.5 | 1 / 4 / 6 |
+| (a) | **0.5** | 5.04 | **2.300** | 2.90 | 140.7 / 146.8 | 101.0 / 112.5 | 0 / 5 / 7 |
+| (b) | Ph2 | – | 4.037 | 10.55 | 167.0 / 178.5 | 104.0 / 212.0 | 4 / 14 / 4 |
+| (b) | 2.0 | 6.02 | 3.396 | 1.48 | 156.5 / 164.5 | 102.0 / 108.5 | 1 / 49 / 4 |
+| (b) | 1.5 | 5.83 | 2.960 | 2.59 | 149.3 / 156.8 | 104.5 / 106.5 | 2 / 39 / 4 |
+| (b) | 1.0 | 5.38 | 2.745 | 4.24 | 145.8 / 154.3 | 102.0 / 142.0 | 3 / 58 / 4 |
+| (b) | **0.5** | 5.04 | **2.565** | 18.97 | 144.0 / 156.8 | 121.5 / 153.5 | 1 / 57 / 4 |
+
+- **The lead follows the offset**, and only 0.5 brings (a)'s to Ph2's (2.300 ≤ 2.453; 1.0 reads 2.760). Every arm's clocks
+  sat on their targets (every client's lead − target p50 within ±1 and every arm's pooled mean within ±0.5, from 10 s after
+  the first step); what moved is the target, about 2.9 (0.5) to 3.9 (2.0) ticks ahead of the server (its p50, on server
+  stamps not de-lagged). The extra HardResync at 0.5 on (a) is one join's ` cause=firstRtt` resync (§16).
+- **The late share does not follow the multiplier.** It follows how far apart the clients' leads sit: a relay input is late
+  when its sender runs behind its receiver, and a change of the offset moves both leads alike. Over the 16 runs the late
+  share rises with the spread of the clients' lead − target means (0.06 to 0.26 tick: 0.8 to 1.9 pp; 0.34 to 0.76 tick: 2.0
+  to 6.7 pp), and the one
+  outlier is (b)'s second run at 0.5: its two clients sat 2.0 ticks apart (+1.35 and −0.66 over target), 36.0 pp. Its other
+  run read 1.9 pp, and (a)'s two runs at 0.5 read the lowest late share of any value (3.8 and 2.0 pp). That spread is the
+  clock's landing after a join (the dead band holds a residual, §14), not the margin.
+- **The server's margin holds.** The server-slack p5 stayed at 4 to 6 ticks on every run (Ph2 5 to 6). Resimulations:
+  0.33 to 0.99 a minute on (a) (Ph2 0.31 to 0.94); on (b) none on six runs and 0.72 on two (one at 1.0, one at 0.5; Ph2 none).
+- **So no value meets "lead and late share at or below Ph2's on both shapes" on these means**: 0.5 misses (b)'s late share
+  by its one split run, and every other value misses (a)'s lead. The compiled default is **0.5**, the only value that meets
+  the lead on both shapes, with the late share left to the clock's landing (above). `jitterMultiplier` (the engine source)
+  keeps 2.0: the sweep measured only the SimClock source.
+- ⚠ 0.5 × 9 ms is a 4.5 ms margin over the RTT. On a link whose jitter is heavier than the shaper's, the margin shrinks with
+  the multiplier; the door exists to re-run this sweep there.
+
+`PCTM.NetworkTimeEstimator.ClockSource.EachSourceHasItsOwnJitterMultiplier` pins the offset at 2.0, 1.5, 1.0, 0.5 and 0 for
+each source, on an exact RTT and jitter (1/16 s and 1/32 s): 8, 7, 6, 5 and 4 ticks.

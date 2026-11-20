@@ -4,7 +4,7 @@
 The narrative behind `StepCostSample`, the `DriverStepDoors` concept, the `StepDoors` aggregate and
 `TickDriverStepHooks`, the tick driver's implementation of og-simulation's `StepHooks` concept. The
 header keeps its licence, its docs pointer, its code, its `OG_CHECK`s, its self-check `static_assert`s
-and three guard tags; everything that explains it lives here. Prohibitions:
+and four guard tags; everything that explains it lives here. Prohibitions:
 `TickDriverStepHooks-guards.md`.
 
 **If this file and `TickDriverStepHooks.h` disagree, the header is authoritative and this file is stale.**
@@ -21,8 +21,9 @@ no game engine and no other repository.
 `SimulationStepDriver` calls four hooks once per `runTick`, on the step's thread, and never during a
 replay (`StepHooks-rationale.md`). `TickDriverStepHooks` is the tick driver's set of those hooks. It
 takes the step's three wall-clock times, drains the driver's occupancy commands into the step driver,
-releases the authority's inputs one tick at a time, and hands the step's results to the game, the
-presenter, the world host and the driver's own mailboxes.
+lets a client game receive what arrived for the step before the step reads it, releases the authority's
+inputs one tick at a time, and hands the step's results to the game, the presenter, the world host and
+the driver's own mailboxes.
 
 It is a class template over one `StepDoors` aggregate, which names every collaborator by reference
 (§2). It holds the aggregate by value and owns nothing it names, so the header needs neither the
@@ -42,13 +43,15 @@ inside a hook body:
 | member | concept | what the hooks call |
 |---|---|---|
 | `driver` | `DriverStepDoors` (this header) | the occupancy drain J1, the offset publish J3, the step-cost push J6, the step-context test and the owner-thread test |
-| `game` | `TickDriverGame` | `releaseInputsForAuthorityTick`, `onStepStarted`, `onStepEnded` |
+| `game` | `TickDriverGame` | `releaseInputsForAuthorityTick`, `onStepStarted`, `onStepEnded`; and `receiveForStep` when the game also models `TickDriverReceiveGame` |
 | `presenter` | `TickDriverPresenterSteps` | `captureCorrection_Step`, `publish_Step` |
 | `worldHost` | `TickDriverWorldHost` | `afterTick_Step` |
 | `engine` (const) | `TickDriverEngine` | `nowSeconds` |
 
 `TickDriverStepHooks` accepts only a `StepDoors` specialization (`isStepDoors`), so it cannot be
-instantiated over a single collaborator by mistake.
+instantiated over a single collaborator by mistake. The aggregate names its game type as `Game`, so the hooks
+can test the game's optional concepts with `if constexpr` (`TickDriverReceiveGame<typename DoorsT::Game>`);
+a type alias leaves it an aggregate.
 
 **`DriverStepDoors`** is the part of the driver the hooks reach. The driver supplies it; this header
 only states its shape:
@@ -72,20 +75,32 @@ batch; `afterTick` copies it into the presenter's publish.
 
 | hook | client | authority |
 |---|---|---|
-| `beforeTick(u)` | take `t0`; check the step context; drain J1 | take `t0`; check the step context; drain J1; check the owner thread and that `u.authorityTick` is set; release the inputs of `*u.authorityTick`, one tick (`⛔G-01`) |
+| `beforeTick(u)` | take `t0`; check the step context; drain J1; `receiveForStep()` if the game models `TickDriverReceiveGame` (`⛔G-04`) | take `t0`; check the step context; drain J1; check the owner thread and that `u.authorityTick` is set; release the inputs of `*u.authorityTick`, one tick (`⛔G-01`) |
 | `beforeSimulate(u)` | check the step context; `captureCorrection_Step(u.physicsStep)` (it does work only after a resimulation); take `t1` (`⛔G-03`) | the same; the authority never resimulates, so the capture finds nothing to do; then `t1`, after the release, immediately before the integrate |
 | `beforePhysics(t)` | check the step context; `onStepStarted(t1)` | the same |
 | `afterTick(o)` | take `t2`; check the step context; `onStepEnded()`; `publish_Step(o, currentStepDeadline)`; `afterTick_Step(o)`; publish J3 = `o.tick - o.physicsStep` (`⛔G-02`); push J6 | the same |
 
 `TickDriverStepHooks.CallOrder.AClientTickWithAResimRunsEachHookOnceAroundTheReplay` and
 `TickDriverStepHooks.CallOrder.AnAuthorityTickReleasesBeforeTheCaptureAndPublishesInOrder` pin these
-sequences exactly, interleaved with the step driver's own world and manager calls.
+sequences exactly, interleaved with the step driver's own world and manager calls. Their game does not
+model `TickDriverReceiveGame`, so they show the client `beforeTick` without the receive; the receive's
+position is pinned by the `SimulationTickDriver.ReceiveForStep.*` cases (§7).
 
 ## §4 Why each hook does what it does
 
 - **J1 first.** Occupancy reaches the step driver on the step's thread, before the step reads the
   world and before any replay, so a vacated slot is cleared from every held tick before a replay could
   restore it (`SimulationStepDriver-guards.md` G-05).
+- **The receive, on a client, after J1 (`⛔G-04`).** `beforeTick` is the only hook that runs before the
+  step driver's resimulation check and before the input collect of the step's integrate
+  (`SimulationStepDriver-rationale.md` §2: the client tick's step 1 is where the host drains inbound
+  messages and applies lifecycle commands). So what the game receives in `receiveForStep` is used by this
+  step: a correction by this step's resimulation check, an input by this step's collect. From
+  `beforeSimulate` it would miss the resimulation check; from `beforePhysics` (`onStepStarted`) it would
+  miss the collect too, and everything received would reach the next step only. It follows J1, so the step
+  driver holds the step's occupancy before anything the game receives could ask for a replay. It never runs
+  on the authority, whose inbound work is the release below. Under `if constexpr` on the concept, a game
+  without the hook compiles no call and its trace is unchanged.
 - **The release per step (`⛔G-01`).** Each authority tick releases exactly the inputs due for it,
   immediately before it is simulated. The tick comes from the step driver
   (`UpcomingTick{true, serverTick + 1}`), which checks after the integrate that it simulated exactly
@@ -125,8 +140,8 @@ sequences exactly, interleaved with the step driver's own world and manager call
 - `t2`, the first statement of `afterTick`, after the step, the post-step pass and the ring save.
 
 `afterTick` pushes `StepCostSample{t1 - t0, t2 - t1, replayedTicks, resimRefused}`. So `t2 - t1` is the
-normal step on both roles. `t1 - t0` is, on a client, the J1 drain, the resimulation check, any replay
-and the correction capture after it; on the authority, the J1 drain and the input release. No hook runs
+normal step on both roles. `t1 - t0` is, on a client, the J1 drain, the game's receive, the resimulation
+check, any replay and the correction capture after it; on the authority, the J1 drain and the input release. No hook runs
 during a replay, so a replay adds no sample of its own: it is inside the replaying tick's `t1 - t0`.
 `TickDriverStepHooks.StepCost.SamplesTheThreeInstantsAndTheOutcome` checks both differences against the
 positions of the three clock reads, for a granted and a refused resimulation.
@@ -171,6 +186,17 @@ ordered event list:
 - `TickDriverStepHooks.Replay.NoHookFiresWhileTheStepDriverReplays`;
 - `TickDriverStepHooks.StepCost.SamplesTheThreeInstantsAndTheOutcome`.
 
+The receive hook's cases run a whole `SimulationTickDriver` over the fake kit's `ReceivingGame`
+(SimulationTickDriverReceiveTest.cpp, tag `[TickDriver]`), with a manager whose collect records what its
+inbox held and whose resimulation check records itself:
+- `SimulationTickDriver.ReceiveForStep.WhatAClientStepReceivesIsCollectedByThatSameStep` (the k-th
+  receive's token is collected by the k-th step; with the call in `beforePhysics` each step collects the
+  previous step's token);
+- `SimulationTickDriver.ReceiveForStep.ACorrectionReceivedForAStepIsReplayedByThatSameStep`;
+- `SimulationTickDriver.ReceiveForStep.RunsOncePerClientStepFirstAndNeverOnTheAuthority`;
+- `SimulationTickDriver.ReceiveForStep.AFreeRunningAuthorityNeverReceives`;
+- `SimulationTickDriver.ReceiveForStep.AGameThatReceivesHasTheSameTraceWithTheReceivesRemoved`.
+
 ## §8 Provenance
 
 Transcribed from the brawler's engine-hosted step hooks (the class BrawlerStepHooksUImpl, which called
@@ -187,5 +213,9 @@ its frame host's step doors). The statement order of the four hooks is unchanged
   which lose the hook name the old step-context message printed;
 - the engine-side step-cost record becomes `StepCostSample`, with the same four fields.
 
-The three guards are the successors of the old class's three (`TickDriverStepHooks-guards.md`,
+The three guards G-01…G-03 are the successors of the old class's three (`TickDriverStepHooks-guards.md`,
 "Provenance of the ids").
+
+**2026-11-19, the receive.** The client `beforeTick` gained the optional `receiveForStep` call (`⛔G-04`) and
+`StepDoors` its `Game` alias. Before it, a client game had no hook ahead of the step's collect: one that
+received in `onStepStarted` (`beforePhysics`) fed every arrival to the next step.

@@ -54,7 +54,8 @@ The doors:
 - `publish_Step` (an outcome, a deadline) and `captureCorrection_Step` (a physics step), on the step's thread: the
   shape of `TickDriverPresenterSteps`, which the header's self-check asserts.
 - `present_GameThread` (clock, controls, sink, world host) and `updateVisualization_GameThread` (storage), on the
-  game thread, once per frame, in that order.
+  game thread, once per frame, in that order. A host that keeps its own copy of the state it draws calls
+  `overlayRenderPoses_GameThread<Simulatable>` (an id, a visualization state) in place of the second (§7).
 - `onRegistered` and `onUnregistered` (an id and a slot), on the game thread, for the target table (§11).
 - `renderPoses()`, `renderPosesValid()`, `renderFrame()` and `renderCorrectionFrame()` read the last frame's
   results.
@@ -185,6 +186,14 @@ the root into the visualization state's body state (and the rotation when the bo
 every simulatable in the storage. The visualizations of the non-root bodies follow the drawn character; the
 root keeps the newest tick, because the render sink already moved the engine's root object to the drawn pose.
 
+`overlayRenderPoses_GameThread<Simulatable>(id, vizState)` is the second half alone, on one state the caller owns:
+when poses are valid it writes the same poses into that state's body states, and otherwise it leaves the state as
+it is. It reads no storage. The declarations are the simulatable type's physics composite, walked by type in
+declaration order, so the index of each declaration is the one `updateVisualization_GameThread` counts on the
+stored simulatable's composite instance; both walks call the same per-declaration overlay. A host that copies its
+displayed state from a step-side snapshot instead of from the storage (the Unreal session since og-input-latency
+task P5-16) calls it on that copy.
+
 ## §8 The checks, the windows and the lines
 
 All of this is diagnostics (§9). Every line is formatted with `formatHostLine` into `m_line` and sent to the
@@ -278,8 +287,8 @@ was before the routing. When the unit became fixed the helpers were frozen into 
 
 ## §11 Allocation and the target table
 
-Nothing allocates after construction on the step doors, `present_GameThread` or
-`updateVisualization_GameThread`:
+Nothing allocates after construction on the step doors, `present_GameThread`,
+`updateVisualization_GameThread` or `overlayRenderPoses_GameThread`:
 - the snapshots, the poses, the next copy, the corrections and the smoother are fixed-size members;
 - the displacement samples are reserved at construction for `kWindowFrames` frames of
   `kMaxSimulatableSlots` targets (a target holds a slot), and cleared, not freed, at each window;

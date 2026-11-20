@@ -13,6 +13,11 @@ name-the-physical-quantity rule. The `§N` marks in either header resolve to the
 **If this file and a header disagree, the header is authoritative and this file is stale.**
 Fix this file; do not soften a header to match it.
 
+⚠ **The fenced blocks below are pre-compression text.** Where one says an arrival is "OnRep-bound" or "GAME THREAD
+ONLY": since og-input-latency task P5-7 the relay-ring and correction arrivals reach `NetSyncTelemetry` from og-sim-net's
+client session, in its drain, which runs on the game thread frame-locked and on the step's thread on an immediate client
+(P2-15). `NetSyncTelemetry.h`'s orientation block and fences give the current threads.
+
 ⛔ **Do not move a guard into this file.** Every section below is the *expansion* of a fence that
 still fires at its own line. If you find yourself deleting a one-liner because "it is in the
 rationale doc now", the guard has stopped working — the person about to make the change is

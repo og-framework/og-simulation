@@ -294,7 +294,8 @@ a real gap, and dropping the watermark would silently discard one sample per com
 `kRelayArrivalDiscontinuityTicks` is the same guard, for the same reason, that
 `kFrameHealthDiscontinuityTicks` and `kRelayWriteDiscontinuityTicks` already carry. A capture-tick
 jump larger than it is a **single correlated event** — a connection hiccup, a host stall, a
-relevancy pause, a re-join, the client's game thread blocking so OnReps queue — not `gap - 1`
+relevancy pause, a re-join, the client's draining thread blocking so arrivals queue (OnReps until
+og-input-latency task P5-7) — not `gap - 1`
 independently lost inputs. Charging it to the per-input loss rate mixes two distributions and
 reports catastrophic failure on a working relay.
 
@@ -501,6 +502,11 @@ because a frame in which physics did not step is a real observation here.
 ---
 
 ## 10. PROBE 5 — relay writes per server frame, and the hole it closed
+
+> **History.** Since og-input-latency task P5-7 no adapter feeds `RelayWriteProbe`: the Unreal session's PROBE 5 went
+> with its relay sink (`UESimulationSession-rationale.md` §16), and og-sim-net's server stages each bundle's arrival in
+> its `RelayRingStager` (`SimNetServer::flushRelays`). This section and §11 are the measurement as it stood under Iris and
+> the input RPC; og-simulation-tests still drive the probe.
 
 The elimination chain that motivated this probe concluded *"the loss is in the replication send
 path"*. Its elimination table has a hole, and it is a precise one:

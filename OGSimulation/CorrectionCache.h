@@ -106,7 +106,7 @@ OGSIM_OPTIMIZE_OFF
 // already stored in `m_predictionWasCorrect`. Only its ability to leave the function is new. §10
 //
 // ⛔ AN OUT-POINTER, NOT A RETURN VALUE — the cache is DELIBERATELY ID-AGNOSTIC and cannot
-// attribute a verdict; the OnRep-bound callback in `SimulationNetSync::registerPredictionOwner`
+// attribute a verdict; the correction callback `SimulationNetSync::registerPredictionOwner` binds
 // can. DEFAULTED, so every existing caller stays byte-identical by construction — the same
 // trick that widened `resolveScheduledRelayedInput`. §10
 //
@@ -168,11 +168,19 @@ struct CorrectionInsertVerdict
 //     ⛔ There is no input value and no resim bit in a slot. Both are retired, and what
 //     replaced each read is listed at the two gravestones. §1
 //
-//   * TWO THREADS TOUCH THIS CLASS.
-//       GAME thread     corrections land — `tryInsertingCorrectState`, reached from the
-//                       OnRep_-dispatched lambdas via `SimulationReconciliation::injectCorrectionState`.
+//   * TWO THREADS TOUCH THIS CLASS — in the FRAME-LOCKED mode (og-sim-net's
+//     `SimNetConfig::immediate` false, the shipped default).
+//       GAME thread     corrections land — `tryInsertingCorrectState`, reached via
+//                       `SimulationReconciliation::injectCorrectionState` from og-sim-net's
+//                       frame-locked drain (`SimNetClient::onCorrection`; the OnRep_-dispatched
+//                       lambdas until og-input-latency task P5-7).
 //       PHYSICS thread  everything else: the ring push pair, the replay write, both
 //                       prepare-time captures, `wipeCache`, and every read.
+//     IMMEDIATE (`immediate` true, og-input-latency P2-15): the host calls `SimNetClient::drain`
+//     at the start of each step, before `collectInputAll`, on the step's thread, so corrections
+//     land on the PHYSICS (step) thread too and ONE serialized context touches the class. Every
+//     "GT" in the table below then reads "the drain at step start", and the races it prices do
+//     not occur; the gate atomic stays as it is.
 //
 //     ⭐ EXACTLY ONE WORD IS SYNCHRONIZED — `m_pendingResimAnchorTick` — because it is
 //     CONTROL state with two legitimate writers and exactly one correct value. Every other
@@ -522,6 +530,8 @@ public:
 	//
 	// ⛔ GAME-THREAD-ONLY IN EFFECT — written at composition, read at W1 — which is why it is not
 	// atomic; a runtime cvar would break that. Shipped policy: `SimulationManager.h`. §2
+	// (In og-sim-net's IMMEDIATE mode W1 runs on the step's thread; composition still precedes
+	// the first step, so the read is still ordered after the only write.)
 	//
 	// The read-back moved to `getDiagnostics()`; this setter is production-called and stays. §8
 	void setResimTriggerPolicy(TimeConfig::ResimTriggerPolicy policy)
@@ -614,7 +624,9 @@ public:
 	// ⚠ THE INVARIANT'S HONEST BOUND — it holds UP TO AN ACKNOWLEDGED WORD RACE.
 	// ⛔ `m_containsCorrectTick` IS A TWO-WRITER WORD — the GT `set()` here and the PT clear in
 	// `pushPredictionTick` — so the exposure is a LOST UPDATE OF A DECISION BIT, NOT a torn read,
-	// and the milder description must not be re-adopted. The deliberately-redundant provenance
+	// and the milder description must not be re-adopted. (FRAME-LOCKED mode. In og-sim-net's
+	// IMMEDIATE mode the `set()` runs in the drain at step start, on the same thread as the
+	// clear, so the two writers are serialized and the word race does not occur.) The deliberately-redundant provenance
 	// check (`ReplayedOverCorrection`, WRITE SITE 3 below) catches it ONLY on the
 	// `[ResimProbe.SlotMap]` Verbose surface, never on this decision path. §5
 	//
@@ -1224,7 +1236,11 @@ private:
 	// not travel into `Diagnostics::slotLandingSeqNr`. §8
 	//
 	// ⚠ THREADING — THE ONE NEW CROSS-THREAD SURFACE THE LANDING STAMPS ADD. GT-written (W1), PT-read (the
-	// classifier), PLAIN `uint32`s deliberately:
+	// classifier), PLAIN `uint32`s deliberately. That is the FRAME-LOCKED mode (og-sim-net's
+	// `SimNetConfig::immediate` false, the shipped default). In the IMMEDIATE mode W1 runs in the
+	// drain at step start, on the step's thread, so the stamps, `m_stateBuffer` and
+	// `m_containsCorrectTick` are written and read by one serialized context, and neither race
+	// below occurs. The bullets price the frame-locked mode:
 	//   * THEY RIDE THE PRE-EXISTING `m_stateBuffer` RACE they exist to protect — the same race,
 	//     not a new class of one. §5
 	//   * THEY ARE OBSERVATIONAL: `classifyResimSlotWrite` returns `Written` iff

@@ -24,13 +24,15 @@
 // whether the render-side input echo is muted.
 //
 // OWNERSHIP -- Option A, locked 2026-07-19. THE SERVER OWNS THIS TABLE. The authority
-// derives each connection's tier from its own per-connection RTT and replicates the
-// resulting index to the owning client; clients do NOT run a second instance and do
+// derives each connection's tier from its own per-connection RTT and sends the
+// resulting index to the owning client (og-sim-net's `SimNetServer::publishTier`;
+// a replicated property until og-input-latency P5-7); clients do NOT run a second instance and do
 // NOT derive their own tier. Nothing here enforces that placement -- it is stated so a
 // reader does not mistake the type for a symmetric client/server component.
 //
 // LIVE IN PRODUCTION, by this route:
-//   the per-character adapter component (GAME thread)
+//   og-sim-net's server, once per input bundle (`SimNetServer::receiveBundle`, on the
+//   server's drain thread; the per-character adapter component until P5-7)
 //     -> `ServerReceptionCoordinator::noteRttSample`
 //     -> `ConnectionTierTable::onRttSample`
 // `ServerReceptionCoordinator` owns the only production instance, by value, and reaps

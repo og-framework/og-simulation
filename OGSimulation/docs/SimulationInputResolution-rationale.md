@@ -36,7 +36,10 @@ host-engine type, `USimmableUpdateComponent`, together with a **tier-arrival rep
 The role is what matters and it is engine-neutral: *the game-thread writer of the
 effective-input-delay atomic, whose physics-thread reader is `collectInputAll` — one adapter reaches
 `setClientEffectiveInputDelayTicks` from a replication notification, and another substitutes its own
-arrival signal.* The crossing is the fact; the type is one adapter's binding for the writing side.
+arrival signal.* The crossing is the fact; the type is one adapter's binding for the writing side. (Since og-input-latency
+task P5-7 the Unreal adapter's arrival signal is og-sim-net's tier and floor arrival, which reaches
+`UESimulationSession::applyReplicatedConnectionTier` and `applyReplicatedRelayDelayFloor` on the client session's drain
+thread: the game thread frame-locked, the step's thread on an immediate client. A quoted OnRep below is that arrival.)
 
 ⛔ **F-28-1 — that quotation's QUALIFICATION is false, and it is preserved false.** In the tree as
 read on 2026-08-22 the tier callback `OnRep_ConnectionTier` is declared on

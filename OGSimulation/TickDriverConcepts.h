@@ -274,6 +274,100 @@ static_assert(!TickDriverGame<ManagerByValue>,
 	"TickDriverGame self-check: manager() returns the game's own manager by reference, never a copy");
 } // namespace tickDriverGameSelfCheck
 
+template <typename G>
+concept TickDriverSampleGame = TickDriverGame<G> && requires(G& g)
+{
+	{ g.sampleInput() } -> std::same_as<void>;
+};
+
+namespace tickDriverSampleGameSelfCheck
+{
+struct Conforming : tickDriverGameSelfCheck::Conforming
+{
+	void sampleInput();
+};
+
+struct MissingSampleInput : tickDriverGameSelfCheck::Conforming
+{
+};
+
+struct SampleReturnsBool : tickDriverGameSelfCheck::Conforming
+{
+	bool sampleInput();
+};
+
+struct SampleTakesAnArgument : tickDriverGameSelfCheck::Conforming
+{
+	void sampleInput(double);
+};
+
+struct SamplesButIsNoGame
+{
+	void sampleInput();
+};
+
+static_assert(TickDriverSampleGame<Conforming>,
+	"TickDriverSampleGame self-check: the reference shape must satisfy the concept");
+static_assert(TickDriverGame<MissingSampleInput> && !TickDriverSampleGame<MissingSampleInput>,
+	"TickDriverSampleGame self-check: sampleInput is required, and a game without it is still a TickDriverGame");
+static_assert(!TickDriverSampleGame<SampleReturnsBool>,
+	"TickDriverSampleGame self-check: sampleInput returns void, so it cannot veto or skip the frame");
+static_assert(!TickDriverSampleGame<SampleTakesAnArgument>,
+	"TickDriverSampleGame self-check: sampleInput takes nothing; the frame's time is read after it");
+static_assert(!TickDriverSampleGame<SamplesButIsNoGame>,
+	"TickDriverSampleGame self-check: it refines TickDriverGame, so a sampleInput alone is not a game");
+} // namespace tickDriverSampleGameSelfCheck
+
+template <typename G>
+concept TickDriverReceiveGame = TickDriverGame<G> && requires(G& g)
+{
+	{ g.receiveForStep() } -> std::same_as<void>;
+};
+
+namespace tickDriverReceiveGameSelfCheck
+{
+struct Conforming : tickDriverGameSelfCheck::Conforming
+{
+	void receiveForStep();
+};
+
+struct MissingReceiveForStep : tickDriverGameSelfCheck::Conforming
+{
+};
+
+struct ReceiveReturnsBool : tickDriverGameSelfCheck::Conforming
+{
+	bool receiveForStep();
+};
+
+struct ReceiveTakesAnArgument : tickDriverGameSelfCheck::Conforming
+{
+	void receiveForStep(double);
+};
+
+struct ReceivesButIsNoGame
+{
+	void receiveForStep();
+};
+
+struct SamplesButDoesNotReceive : tickDriverSampleGameSelfCheck::Conforming
+{
+};
+
+static_assert(TickDriverReceiveGame<Conforming>,
+	"TickDriverReceiveGame self-check: the reference shape must satisfy the concept");
+static_assert(TickDriverGame<MissingReceiveForStep> && !TickDriverReceiveGame<MissingReceiveForStep>,
+	"TickDriverReceiveGame self-check: receiveForStep is required, and a game without it is still a TickDriverGame");
+static_assert(!TickDriverReceiveGame<ReceiveReturnsBool>,
+	"TickDriverReceiveGame self-check: receiveForStep returns void, so it cannot veto or skip the step");
+static_assert(!TickDriverReceiveGame<ReceiveTakesAnArgument>,
+	"TickDriverReceiveGame self-check: receiveForStep takes nothing; the step's tick is decided after it");
+static_assert(!TickDriverReceiveGame<ReceivesButIsNoGame>,
+	"TickDriverReceiveGame self-check: it refines TickDriverGame, so a receiveForStep alone is not a game");
+static_assert(TickDriverSampleGame<SamplesButDoesNotReceive> && !TickDriverReceiveGame<SamplesButDoesNotReceive>,
+	"TickDriverReceiveGame self-check: the per-frame sampleInput is not the per-step receiveForStep; each is opted into alone");
+} // namespace tickDriverReceiveGameSelfCheck
+
 enum class IdleWake : uint8_t
 {
 	Deadline,

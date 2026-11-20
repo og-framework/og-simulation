@@ -68,15 +68,25 @@ struct ResimSweepDiagnostics
 // Read this first. Every fence in this file states one invariant at the line
 // it guards; none of them restates this map, and this map states no invariant.
 //
-//   * TWO THREADS TOUCH THIS CLASS, AND ONLY ONE OF THEM TICKS.
+//   * TWO THREADS TOUCH THIS CLASS, AND ONLY ONE OF THEM TICKS — in og-sim-net's
+//     FRAME-LOCKED mode (`SimNetConfig::immediate` false, the shipped default).
 //       GAME thread    corrections arrive — `injectCorrectionState`, from the
-//                      replication-dispatched lambdas — and caches are created
+//                      lambda NetSync binds on the owner's correction callback,
+//                      called from og-sim-net's frame-locked drain
+//                      (`SimNetClient::onCorrection`; replication-dispatched until
+//                      og-input-latency task P5-7) — and caches are created
 //                      and destroyed — `createCacheFor` / `removeCacheFor`,
 //                      from the registration facade.
 //       PHYSICS thread every per-tick sweep in this class, without exception,
 //                      all driven from the adapter's physics callbacks.
 //     That crossing is row 2 of `docs/ThreadingCrossings.md` — accepted debt,
 //     healed by the next correction; not re-argued here.
+//     IMMEDIATE (`immediate` true, og-input-latency P2-15): the host calls
+//     `SimNetClient::drain` at the start of each step, before `collectInputAll`,
+//     on the step's thread, so `injectCorrectionState` runs on the PHYSICS (step)
+//     thread between that step's sweeps and row 2 is same-thread. Cache creation
+//     and destruction stay wherever the registration facade is called
+//     (og-input-latency P2-17 applies them in the drain).
 //
 //   * ⭐ ONE ADAPTER'S BINDING FOR THE CALLBACK COLUMN OF BOTH TABLES BELOW.
 //     That column names the physics-callback ROLE a phase is driven from, never
@@ -272,7 +282,8 @@ public:
         return diagnostics;
     }
 
-    // Correction injection — called from replication-dispatched lambdas (GAME thread).
+    // Correction injection — called from the correction lambda NetSync binds, in og-sim-net's
+    // drain (the GAME thread in the frame-locked mode; the class map above).
 
     // ⛔ `appliedCaptureTick` rides the SAME slot as the state it corrects
     // (`kNoInputCaptureTick` = substituted); one scalar would answer only for the

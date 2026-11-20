@@ -176,7 +176,7 @@ keeping them apart is the whole content of the hop:
 ⛔ **Sending `applied` would double the delay.** The authority applies its own delay to whatever it
 receives; handing it an already-delayed input makes the two ends diverge by exactly `effectiveDelay`
 ticks. The fence for this lives at the branch itself in `SimulationInputResolution.h` and in
-`Network/LocalInputCache.h`'s "WHAT THE OUTBOUND RPC CARRIES" block — the fence is at the site, this
+`Network/LocalInputCache.h`'s "WHAT THE OUTBOUND INPUT BUNDLE CARRIES" block — the fence is at the site, this
 paragraph is only the narrative around it.
 
 Three details worth carrying:
@@ -195,7 +195,8 @@ Three details worth carrying:
    `NeutralInputFor` (`<core>SimulationInputResolution.h`) carries the flag that turns a missed
    injection into a warning at registration rather than a silent poison.
 
-The RPC is **unreliable**, and that is deliberate: instead of one reliable message per tick, one
+The bundle's lane, og-net's SimInput, is **unreliable** (as the input RPC was until og-input-latency task P5-7), and
+that is deliberate: instead of one reliable message per tick, one
 bundle per frame carries the last few captures (`redundancyDepthTicks` at `redundancyFrames = 0`, else
 the count `SimulationNetSync::redundancySlots` returns), so a dropped datagram self-heals
 on the next frame's overlapping bundle. `releaseAllButRecent` keeps the queue bounded to exactly that
@@ -340,19 +341,24 @@ Grouped, because the pattern matters more than the per-row answer:
   sentence is TRUE of `LocalInputCache` and FALSE of `RemoteInputCache`; the fence forbidding the copy
   lives in `Network/RemoteInputCache.h`.
 - **A, GT:** hops 6–8. The send sweep runs from `onPostSimulationGameThread`, reached from the
-  adapter session's `onPostPhysicsStep` — a game-thread hook, which is what makes the RPC legal to fire.
+  adapter session's `onPostPhysicsStep` — a game-thread hook (the RPC needed one until og-input-latency task P5-7).
+  On an immediate client the send runs at capture on the step's thread instead (`SimNetClient::afterCaptureTick_Step`,
+  og-input-latency P2-16), and the game thread's send is refused.
 - **A, PT→GT crossing:** hop 5 → hop 6. `PendingInputQueue` is a Lamport SPSC ring — physics-thread
   producer, game-thread consumer. This is the shape `ThreadingCrossings.md`'s standing rule points
   every *new* crossing at.
-- **S, GT:** hops 9–17 and A1–A5. The RPC handler, the coordinator, the tap, the staging ring and the
-  drain are all game-thread. `releaseDelayedInputsForStep` runs from the host engine's game-thread
+- **S, GT:** hops 9–17 and A1–A5. og-sim-net's server drain (`SimNetServer::receiveBundle`; the RPC handler until
+  og-input-latency task P5-7), the coordinator, the tap, the staging ring and the drain are all on the server's drain
+  thread: the game thread, or the runner on the authority loop (P5-19). `releaseDelayedInputsForStep` runs from the host engine's game-thread
   hook immediately preceding the physics step — one adapter binds that to Chaos's
   `InjectInputs_External`.
 - **S, GT→PT crossing:** hop A5 → A6. `RemoteMoveQueue` is the second staged ring — game-thread
   enqueue, physics-thread dequeue. ⚠ Unlike `PendingInputQueue` it carries **plain** `size_t`
   head/tail/count, not atomics (`<core>SimulationQueues.h`); read the declarations before treating
   the two rings as the same shape.
-- **B, GT:** hops 19–24. The OnRep, the forwarders, the core ingest and the `RemoteInputCache` write.
+- **B, GT:** hops 19–24. og-sim-net's ring arrival (`SimNetClient::onRing`; the relay actor's OnRep until
+  og-input-latency task P5-7), the forwarders, the core ingest and the `RemoteInputCache` write. On an immediate client
+  they run on the step's thread, at step start (`ThreadingCrossings.md` row 1's immediate mode).
 - **B, PT:** hops 25–29. Resolution and integration, entered from the adapter's pre-simulate
   physics callback (one adapter's binding: `OnPreSimulate_Internal`).
 - **B, GT→PT, and it is *not* a queue:** hop 24 → hop 26. `RemoteInputCache` is written on the game
@@ -361,7 +367,8 @@ Grouped, because the pattern matters more than the per-row answer:
   that header's own `THREADING — GAME-THREAD WRITE / PHYSICS-THREAD READ. ACCEPTED DEBT.` block. It is
   not re-derived here.
 - **B, GT→PT, correctly synchronized:** the effective delay itself.
-  `setClientEffectiveInputDelayTicks` writes one `std::atomic<int32>` from the tier OnRep;
+  `setClientEffectiveInputDelayTicks` writes one `std::atomic<int32>` from the tier's arrival (og-sim-net's drain; the
+  tier OnRep until og-input-latency task P5-7);
   `collectInputAll` loads it **once per tick**, so a concurrent tier change cannot split a single tick
   across two different delays. This is row 7 of `ThreadingCrossings.md`.
 

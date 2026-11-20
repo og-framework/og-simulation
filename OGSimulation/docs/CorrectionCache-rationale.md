@@ -9,6 +9,10 @@ rejected alternatives, the measurement records and the migration history.
 **If this file and `CorrectionCache.h` disagree, the header is authoritative and this file
 is stale.** Fix this file; do not soften the header to match it.
 
+⚠ The fenced blocks below are the compressed text as it stood. Where one names "the OnRep-bound correction callback":
+since og-input-latency task P5-7 that callback fires from og-sim-net's client session (`SimNetClient::onCorrection`), in
+its drain.
+
 ⛔ **Do not move a guard into this file.** Every section below is the *expansion* of a fence
 that still fires at its own line. If you find yourself deleting a one-liner because "it is
 in the rationale doc now", the guard has stopped working — the person about to make the

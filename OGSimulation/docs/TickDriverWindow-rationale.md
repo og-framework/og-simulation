@@ -122,9 +122,12 @@ printed before this header existed (§9), so log readers, comparison scripts and
 working:
 - `formatWindowLine(nowSeconds, totals)`: `[SimHost.Window] role=… stepping=… seconds=%.2f frames=…`
   and 24 further fields, 28 in all, up to `sampleOverflow=%u`;
-- `formatFrameLine(dtSeconds, maxCatchUpSteps, idleSlackSeconds = 0.0)`: `[SimHost.Frame] role=…
-  stepping=… dt=%.6f maxCatchUpSteps=%u rateScale=[0.75,1.25] timeBase=worldDelta`. The rate bounds and
-  the time-base word are part of the text, not arguments. These two modes do not print the slack;
+- `formatFrameLine(dtSeconds, maxCatchUpSteps, idleSlackSeconds = 0.0, monotonicTimeBase = false,
+  waitsForThisFramesStep = false)`:
+  `[SimHost.Frame] role=… stepping=… dt=%.6f maxCatchUpSteps=%u rateScale=[0.75,1.25] timeBase=%s`, with
+  `worldDelta` by default and `monotonic` when `monotonicTimeBase` is true (the owner's `Monotonic` time
+  base), then ` frameWait=thisFramesSingleStep` only when `waitsForThisFramesStep` is true (the owner's
+  frame wait, `SimulationTickDriver-rationale.md` §4). The rate bounds are part of the text, not arguments. These two modes do not print the slack;
 - `formatCatchUpCapWarningLine(requestedCap, maxStepsPerFrame, cap)`: `[SimHost.Frame]
   og.Sim.MaxCatchUpSteps=%d is outside [1, %u]; using %u`. The console-variable name is frozen text. It
   is the same in every mode;
@@ -277,5 +280,13 @@ differences:
 On 2026-11-12 the window gained the `FreeRunning` mode (§8): the `StepThreading` constructor, the
 `runner` words, the `monotonic` frame line with its slack, the two suffix series and the three wake
 counts. The `Inline` and `FrameBounded` lines did not change.
+
+On 2026-11-19 `formatFrameLine` gained the `monotonicTimeBase` flag, which prints `timeBase=monotonic` in the
+`Inline` and `FrameBounded` frame line. With the flag false, its default, the line is unchanged; the
+`FreeRunning` line ignores it.
+
+On 2026-11-20 it gained the `waitsForThisFramesStep` flag, which appends ` frameWait=thisFramesSingleStep` to
+the `Inline` and `FrameBounded` frame line. With the flag false, its default, the line is unchanged; the
+`FreeRunning` line ignores it.
 
 Nothing in this file depends on any document outside this submodule.

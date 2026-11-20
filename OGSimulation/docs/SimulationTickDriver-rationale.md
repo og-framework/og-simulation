@@ -6,7 +6,7 @@ the engine- and game-agnostic frame pipeline that pumps the scheduler, runs or d
 batch of steps, waits for it at the end of the frame, and closes the host's telemetry window; in
 `FreeRunning` it runs the same pipeline as the authority's loop on a runner thread of its own. The header
 keeps its licence, its docs pointer, its code, its `OG_CHECK`s, three `static_assert`s (two on the member
-order, one on `isFiniteSeconds`) and eight guard tags; everything that explains it lives here.
+order, one on `isFiniteSeconds`) and nine guard tags; everything that explains it lives here.
 Prohibitions: `SimulationTickDriver-guards.md`.
 
 **If this file and `SimulationTickDriver.h` disagree, the header is authoritative and this file is stale.**
@@ -25,9 +25,11 @@ collaborators, each constrained by its concept from `TickDriverConcepts.h` (`Tic
 `TickDriverWorldHost`, `TickDriverPresenterSteps`, `TickDriverEngine`). In `Inline` and `FrameBounded` an
 engine adapter calls two entry points per frame on the owning thread:
 
-* `startFrame(frameDeltaSeconds)` at the start of the engine's physics phase: it times the frame, pumps the
-  scheduler with the accumulated frame delta, and either runs the frame's steps on this thread (`Inline`)
-  or dispatches them as one executor task chained after the previous frame's (`FrameBounded`);
+* `startFrame(frameDeltaSeconds)` at the start of the engine's physics phase: it lets a game that samples
+  its input take the frame's sample (§6), times the frame, pumps the scheduler with the frame's host time
+  (the accumulated frame delta under the default `HostDelta` time base, the engine clock minus an origin
+  under `Monotonic`, §6), and either runs the frame's steps on this thread (`Inline`) or dispatches them as
+  one executor task chained after the previous frame's (`FrameBounded`);
 * `endFrame(completion, blockMode)` at the end of the physics phase: it waits for the step task the block
   mode names (by holding the engine's completion event open with `deferUntil`, or by a blocking wait when
   there is no event), then runs the post-physics pass.
@@ -40,14 +42,16 @@ In `FreeRunning` (the authority only) a third entry point replaces both for the 
   on the frame thread (§12).
 
 `stop()` ends the session: it clears the running flag, then waits for every outstanding step task; in
-`FreeRunning` it first checks that the loop has returned (§13). The driver owns the scheduler, the window
+`FreeRunning` it first checks that the loop has returned (§13). A `Monotonic` driver has one more entry
+point, `reanchor()`, which the host calls on the owning thread when the game resumes from a pause (§6). The driver owns the scheduler, the window
 and the mailboxes (§5); it borrows the game, the world host, the presenter's step doors and the engine. It
 is header-only and adds no indirect call: every collaborator is a template parameter and every call on it
 is direct.
 
 An engine host instantiates it with its own game binding, world host, presenter and engine. Its behaviour is a
 transcription of the engine-hosted frame host and of the per-step body of the engine-hosted Jolt host (§14), with one
-intended addition, the `beforePump` seam (§6), and the `FreeRunning` mode added after it.
+intended addition, the `beforePump` seam (§6), and three added after it: the `FreeRunning` mode, the
+`sampleInput` hook for a game that models `TickDriverSampleGame` (§6), and the `Monotonic` time base (§6).
 
 ## §2 Ownership and member order
 
@@ -56,7 +60,7 @@ The driver holds raw pointers to its four borrowed collaborators, then, in this 
 | member | what |
 |---|---|
 | `m_config` | the configuration, `const` |
-| `m_running`, `m_loggedFirstStep`, `m_hostTimeSeconds`, `m_lastFrameStartSeconds` | the running flag, the first-step flag, the host time and the previous frame's start |
+| `m_running`, `m_loggedFirstStep`, `m_hostTimeSeconds`, `m_lastFrameStartSeconds`, `m_monotonicOriginSeconds`, `m_frameSteps` | the running flag, the first-step flag, the host time, the previous frame's start, the `Monotonic` origin (the engine clock in `begin()`, §6) and the step count of the frame's own dispatch (§4, the frame wait) |
 | `m_scheduler` | `std::optional<SimulationScheduler>`, built in the constructor after the step driver |
 | `m_window`, `m_firstStepLine` | the telemetry window and the first-step line (`TickDriverWindow.h`) |
 | `m_bodySlotOccupancyCommands` | J1 |
@@ -91,9 +95,11 @@ reach the driver's private members through a pointer.
 
 **Construction** (the old start of play):
 
-1. Five `OG_CHECK`s: a `FreeRunning` client is refused; the authority is `Inline` or `FreeRunning`; the
+1. Seven `OG_CHECK`s: a `FreeRunning` client is refused; the authority is `Inline` or `FreeRunning`; the
    configured role equals the world host's thread-context role; the configured threading equals the
-   thread context's `threading()`; `idleSlackSeconds` is finite and in `[0, dtSeconds)`. Finiteness is read
+   thread context's `threading()`; `idleSlackSeconds` is finite and in `[0, dtSeconds)`; a `Monotonic` time
+   base is refused in `FreeRunning`; and under `Monotonic`, `monotonicFrameClampSeconds` is finite and at
+   least the longest step interval, `dtSeconds / minRateScale` (§6). Finiteness is read
    from the exponent bits (`simulationTickDriver::isFiniteSeconds`, pinned by a `static_assert` over both
    zeros, both largest finite values, the smallest denormal, both infinities and three NaNs), because a comparison can be folded to
    true for a NaN under a fast floating-point model.
@@ -101,14 +107,19 @@ reach the driver's private members through a pointer.
    (`StepDriverConfig{ dt, ResimPolicy::OnRequest, 0 }`). The step driver parks every slot in its
    constructor, a world write, so it is built under J2.
 3. `begin()`: the cap (§6), the cap Warning when it was clamped, the scheduler (`dt`, the cap, the rate
-   bounds, start time 0), the window restarted at `nowSeconds()` with the current totals, the running flag,
-   and the `[SimHost.Frame]` line, which carries the slack in `FreeRunning` (§7).
+   bounds, start time 0), one `nowSeconds()` read that is both the `Monotonic` origin and the time the window
+   is restarted at with the current totals, the running flag, and the `[SimHost.Frame]` line, which carries
+   the slack in `FreeRunning` and the time-base word (§7).
 
-**`startFrame(frameDeltaSeconds)`**, owning thread. In `FreeRunning` it returns at once. Otherwise:
+**`startFrame(frameDeltaSeconds)`**, owning thread. In `FreeRunning` it returns at once. Otherwise, when the
+game models `TickDriverSampleGame`, it first calls `sampleInput()` (§6); a game that does not compiles no
+call there. Then:
 
 1. Take the frame's start time; when there was a previous frame (`m_lastFrameStartSeconds > 0.0`), note
    the period. The window is handed the raw `double` difference.
-2. `m_hostTimeSeconds += frameDeltaSeconds` (`⛔G-04`), then `pumpAndRunSteps`:
+2. The host time. Under `HostDelta`, `m_hostTimeSeconds += frameDeltaSeconds` (`⛔G-04`). Under `Monotonic`,
+   `advanceMonotonicHostTime(start time)`: the start time minus the origin, with the frame clamp applied
+   first when the frame is longer than it (`⛔G-09`, §6). Then `pumpAndRunSteps`:
    1. `m_blockingSteps = m_pendingSteps`: the task dispatched in earlier frames, captured before this frame's
       dispatch, every frame, with steps or not.
    2. `beforePump(m_hostTimeSeconds, rate)`; in `FreeRunning`, publish the rate scale to J8 (§5);
@@ -120,9 +131,10 @@ reach the driver's private members through a pointer.
    6. `Inline` and `FreeRunning` (`⛔G-01`): `runBatch` here, then `afterInlineBatch(firstUpcomingSimTick)`
       once (`⛔G-06`). `FrameBounded`: `dispatchAfter(previous, task)`, where `previous` is the pending task
       when it is still pending and a default handle otherwise; the result becomes `m_pendingSteps`.
-3. Note the frame, its step count and its own duration (`noteStartPhysics`).
+3. Keep the step count in `m_frameSteps` for this frame's `endFrame` (§4, the frame wait); note the frame, its
+   step count and its own duration (`noteStartPhysics`).
 
-`pumpAndRunSteps` takes no argument: it pumps `m_hostTimeSeconds`, which `startFrame` accumulates and the
+`pumpAndRunSteps` takes no argument: it pumps `m_hostTimeSeconds`, which `startFrame` writes and the
 authority loop sets (§6, §10), so both modes share every statement from the capture of `m_blockingSteps`
 to the end of the batch.
 
@@ -147,7 +159,9 @@ it `OG_CHECK`s that this thread is not the role's owner (the runner), calls `onP
 (`⛔G-08`): no wait, no J6 drain, no window. Otherwise:
 
 1. `OG_CHECK` that this thread does not hold J2 (G-05).
-2. The task to wait for: `m_blockingSteps`, or `m_pendingSteps` under block mode 1.
+2. The task to wait for (`waitsForThisFrame`, `⛔G-10`): `m_pendingSteps` under block mode 1, and under
+   `Config::frameWait == ThisFramesSingleStep` when this frame dispatched exactly one step (§4); otherwise
+   `m_blockingSteps`.
 3. Nothing to wait for, or it is complete: run the post-physics pass at once, with no wait sample.
 4. A completion event that accepts the deferral (`deferUntil` returns true): return; the continuation runs
    the pass after the task. It captures the driver and returns at once when `m_running` is false.
@@ -168,7 +182,7 @@ functions in the same statement that cleared the flag).
 | Mode | Who pumps | Who runs the batch | `endFrame` |
 |---|---|---|---|
 | `Inline` | the owning thread, in `startFrame` | the same thread, then `afterInlineBatch` | never waits: the handles stay unset |
-| `FrameBounded` | the owning thread, in `startFrame` | an executor task chained after the previous frame's | waits for earlier frames' task (block mode 0) or also this frame's (1), by deferral or a blocking wait |
+| `FrameBounded` | the owning thread, in `startFrame` | an executor task chained after the previous frame's | waits for earlier frames' task (block mode 0) or also this frame's (1, or a one-step frame under the frame wait `ThisFramesSingleStep`), by deferral or a blocking wait |
 | `FreeRunning` | the runner (the owning thread), in `runAuthorityLoop`, at each wake | the runner, inline, then `afterInlineBatch` | runs `onPostPhysics` only, on the frame thread; never waits (§12) |
 
 `FreeRunning` is the authority's only: the constructor refuses a `FreeRunning` client, as the thread
@@ -176,6 +190,23 @@ context's `configure` does. A client is `FrameBounded`, or `Inline` when it chos
 
 Block mode 0 means the end of a frame waits only for steps dispatched in earlier frames; this frame's task
 may still be stepping while the post-physics pass runs. Block mode 1 (debugging) also waits for this frame's.
+
+**The frame wait, `Config::frameWait`.** `EarlierFrames`, the default, is block mode 0 as above.
+`ThisFramesSingleStep` also waits for this frame's task when the frame dispatched exactly one step, so the
+post-physics pass of that frame runs after the step and shows it. A host draws what that pass presents.
+Under block mode 0 a step still running when the frame reaches the pass is shown by the next frame's pass
+instead, one frame period later. Whether it is still running is a race between the step task and the
+frame thread's work between the dispatch and the end of physics, which the host does not control.
+* **The bound.** The wait is at most one step: a frame that dispatched two or more steps (a catch-up)
+  waits only for earlier frames' task, as block mode 0 does, and its steps are shown by the next frame. A
+  frame that dispatched none has no new task (the pending task is the earlier frames' one), so it waits as
+  block mode 0 does too.
+* **Where it applies.** Block mode 1 still waits for this frame's task whatever its size. In `Inline` and
+  `FreeRunning` the handles stay unset, so the setting changes nothing there.
+* **What it changes.** No hook, task or line is added or removed: only the post-physics pass of a one-step
+  frame moves after that frame's step (§9's `FrameWait` cases). The wait is noted as an end-of-frame wait
+  (`endWaits`, `endWaitUs` in `[SimHost.Window]`), so its cost is in the host's own window. The
+  `[SimHost.Frame]` line names it (§7).
 
 The executor handles are `std::optional<EngineT::Handle>`. An unset optional is the old code's invalid
 event: `stop()` waits for each handle that is set, even one that has completed (a no-op wait), exactly as the
@@ -222,26 +253,85 @@ thread context.
 ## §6 Time base, `beforePump`, the rate door and the cap
 
 **Time base.** `pumpAndRunSteps` pumps `m_hostTimeSeconds` and hands `beforePump` the same value, in every
-mode. What writes it is per mode (`⛔G-04`):
+mode. What writes it is per mode and, in `Inline` and `FrameBounded`, per `Config::frameTimeBase`
+(`⛔G-04`):
 
-* `Inline` and `FrameBounded`: the sum of the frame deltas the engine adapter passes to `startFrame`, never
-  the engine clock. `hostNowSeconds()` returns that sum and `stepIntervalSeconds()` the scheduler's step
-  over its rate scale; both are owning-thread doors (the host time `OG_CHECK`s the owning thread, the
-  interval goes through the scheduler accessor), so a render clock built on them shares the deadlines'
-  time base.
+* `Inline` and `FrameBounded` under `HostDelta`, the default: the sum of the frame deltas the engine adapter
+  passes to `startFrame`, never the engine clock (`timeBase=worldDelta`). `hostNowSeconds()` returns that sum
+  and `stepIntervalSeconds()` the scheduler's step over its rate scale; both are owning-thread doors (the
+  host time `OG_CHECK`s the owning thread, the interval goes through the scheduler accessor), so a render
+  clock built on them shares the deadlines' time base. The engine's pause, slow motion and frame-time clamp
+  reach the pump through the deltas.
+* `Inline` and `FrameBounded` under `Monotonic` (`timeBase=monotonic`): `startFrame` ignores
+  `frameDeltaSeconds` and writes the frame's start time minus the origin, the engine clock read once in
+  `begin()`. It is the same clock read the frame period is taken from, so the frame reads the clock exactly
+  as often as under `HostDelta`. With a scripted clock that reads 0 at the driver's construction and advances
+  by each frame's delta before the frame, the host times are bit for bit the `HostDelta` sums, and with them
+  every pump, step, deadline and line except the frame line's time-base word. The same owning-thread doors
+  serve the render clock. What the engine's delta carried, the time base carries itself:
+  * **The frame clamp.** A frame whose advance (its host time minus the previous frame's) is longer than
+    `Config::monotonicFrameClampSeconds` (0.4 s by default, the length of the frame-time clamp the first
+    engine applies to its own delta) runs only the clamp's worth of steps. Before the pump,
+    `advanceMonotonicHostTime` calls the scheduler's `reanchor` at the next deadline plus the excess
+    (`⛔G-09`): the scheduler skips exactly the excess and counts it as lost time of cause `reanchor`
+    (`SimulationScheduler-guards.md` G-04), and the frame then runs the steps a `HostDelta` frame of the
+    clamp's length runs, on deadlines moved by the excess. A 1 s frame at 60 Hz that starts half a step
+    before a deadline runs 24 steps and counts 0.6 s and 35 steps as `reanchor` loss, where `HostDelta` given
+    the unclamped second runs 60. The step count is the scheduler's: the steps due in the skipped span minus
+    the one at the new anchor, and the test's step, the single-precision 1/60, is a little longer than 1/60,
+    so 36 steps would take 0.60000003 s. The host time itself is not clamped: it stays the clock minus the
+    origin, and the deadlines after the re-anchor
+    are in that base, so the render clock still brackets the render time between them. The constructor
+    requires the clamp to be at least the longest step interval (`dtSeconds / minRateScale`): the next
+    deadline is at most one interval after the previous frame's host time, so the re-anchored deadline is
+    never past the frame's own.
+  * **Resume.** `reanchor()` is the host's call on the owning thread when the game resumes from a pause
+    that stopped its frames. It reads the clock, re-anchors the scheduler at the clock minus the origin
+    (the whole pause, from the next deadline, is `reanchor` loss), and writes that time to
+    `m_hostTimeSeconds`, so the first frame after it runs the step due at the resume and no clamp's worth of
+    catch-up. Without the call the first frame after a pause is a long frame: the clamp's steps run and the
+    rest is counted. The frame period the window notes for that frame still spans the pause.
+    `OG_CHECK`ed to a `Monotonic` driver: under `HostDelta` the engine's pause stops the deltas, and nothing
+    is owed on resume.
+  * **Loss by cause.** `getDiagnostics().lostTimeByCause()` returns the scheduler's split; `lostTime()` and
+    the window line keep the sum, so the window's `lostSteps` and `lostSeconds` include the clamp's and the
+    resume's loss.
+  * **Not in `FreeRunning`.** The constructor refuses `Monotonic` with `FreeRunning`, which already pumps the
+    runner's engine clock minus the loop's origin and has no frame clamp (§10).
 * `FreeRunning`: `engine.nowSeconds()` minus the loop's origin, read on the runner at each wake
   (`timeBase=monotonic`). One clock serves the pump, the idle deadlines, the step hooks' stamps and the
   present clock, which `hostNowSeconds()` and `stepIntervalSeconds()` give to any thread (§12). The
   engine's pause, slow motion and frame-time clamp act on frame deltas and do not reach this pump; a runner
   stall is caught up to the cap and the rest is counted as lost (§10).
 
-**`beforePump(hostNowSeconds, rate)`** is the one addition to the transcribed frame. The game is called on
+**`beforePump(hostNowSeconds, rate)`** is the one addition made to the transcribed frame when it was
+transcribed (`sampleInput`, below, came later). The game is called on
 the owning thread immediately before `pump()`, once per frame (in `FreeRunning` once per wake, a wake that
 runs no step included), with the host time the pump is about to receive and a `TickRateDoor` over the
 scheduler. A rate change made through the door therefore applies to this frame's pump; called after the
 pump, it would apply only from the next frame's. Nothing changes the rate through it yet. With
 `tickOffset()` and the timing samples in the scheduler's time base, it is the seam a time-dilation
 controller plugs into.
+
+**`sampleInput()`** is the input-sample hook of a game that models `TickDriverSampleGame`
+(`TickDriverConcepts-rationale.md` §9). In `Inline` and `FrameBounded` it is the first thing `startFrame` does
+after the `FreeRunning` return: once per `startFrame`, on the owning thread, before the frame's start time
+is read and so before `beforePump`, the pump and the frame's batch, in a frame with no due step too.
+`endFrame` never calls it. `startFrame` calls the private `sampleFrameInput()`, whose whole body is an
+`if constexpr` on the concept, so a game without the hook compiles neither the call nor its check and its
+trace is unchanged; for a game with it, the trace is the same with the `sampleInput` events taken out.
+
+* **Why first.** It makes "sample, then pump, in the same frame" the driver's order rather than the host's:
+  the game publishes the frame's sample here, and `beforePump`, the pump and the batch this frame runs or
+  dispatches all come after it. Before the hook, a host held that order only by running its own sampling in
+  an earlier part of the engine's frame than the driver's start of physics.
+* **Not in the frame's timing.** The frame's start time is read after the sample, so the frame period and
+  `noteStartPhysics`'s duration do not include it.
+* **Never in `FreeRunning`.** `startFrame` returns before the call, and neither `runAuthorityLoop` nor
+  `pumpAndRunSteps` calls it: a free-running authority has no local input to sample, and `pumpAndRunSteps` is
+  shared with the runner, so a call moved into it would run on the runner at every wake. `sampleFrameInput`
+  `OG_CHECK`s the mode before it calls the game, so the check goes wherever the call is moved. The order is
+  pinned by the tests (§9).
 
 **The cap.** `requestedMaxCatchUpSteps` is clamped to `[1, kMaxStepsPerFrame]` (240, the size of the
 batch's deadline array). When the clamp changed it, the driver logs the Warning
@@ -255,7 +345,8 @@ time.
 prints the defaults.
 
 **The idle slack** is `Config::idleSlackSeconds`, 0 by default, read only in `FreeRunning` (§11). The
-constructor checks it in every mode, so a bad value fails where it is configured.
+constructor checks it in every mode, so a bad value fails where it is configured. The frame clamp is
+checked only under `Monotonic`, the one time base that reads it.
 
 ## §7 Lines
 
@@ -263,8 +354,9 @@ Every line goes through `engine.log(HostLogLevel::Warning, …)` with the text f
 window reserved at construction (`TickDriverWindow-rationale.md`):
 
 * `[SimHost.Frame] og.Sim.MaxCatchUpSteps=… is outside [1, 240]; using …`, only when the cap was clamped;
-* `[SimHost.Frame] role=<Authority|Client> stepping=<inline|worker> dt=<s> maxCatchUpSteps=<n> rateScale=[0.75,1.25] timeBase=worldDelta`,
-  once, at the end of construction; in `FreeRunning`,
+* `[SimHost.Frame] role=<Authority|Client> stepping=<inline|worker> dt=<s> maxCatchUpSteps=<n> rateScale=[0.75,1.25] timeBase=<worldDelta|monotonic>`,
+  once, at the end of construction, with `worldDelta` under `HostDelta` and `monotonic` under `Monotonic`,
+  followed by ` frameWait=thisFramesSingleStep` only under that frame wait (§4); in `FreeRunning`,
   `[SimHost.Frame] role=Authority stepping=runner dt=<s> maxCatchUpSteps=<n> rateScale=[0.75,1.25] timeBase=monotonic idleSlackUs=<n>`;
 * `[SimHost.FirstStep] role=… thread=<game|worker|runner> physicsStep=<n> batch=<n>`, once, from the thread that
   runs the first batch;
@@ -276,8 +368,10 @@ window reserved at construction (`TickDriverWindow-rationale.md`):
 `stepping=` reads `inline` for `Inline`, `worker` for `FrameBounded` and `runner` for `FreeRunning`. The
 window builds every word and, in `FreeRunning` only, the window line's suffix (`lateUs`, `activityWakes`,
 `earlyWakes`, `idleFallbacks`, `approachUs`) and the re-timed meaning of its fields
-(`TickDriverWindow-rationale.md` §8). The driver passes the slack to `formatFrameLine` in every mode; the
-`Inline` and `FrameBounded` lines ignore it and stay byte-identical.
+(`TickDriverWindow-rationale.md` §8). The driver passes the slack, the time base and the frame wait to
+`formatFrameLine` in every mode; the `Inline` and `FrameBounded` lines ignore the slack, and under `HostDelta`
+with the default frame wait they stay byte-identical. The `FreeRunning` line ignores the time-base and the
+frame-wait flags.
 
 ## §8 What the compiler and the checks hold
 
@@ -285,15 +379,17 @@ window builds every word and, in `FreeRunning` only, the window line's suffix (`
   and the doors `DriverStepDoors` (both checked where the types are named); the member order is two
   `static_assert`s (§2); `runAuthorityLoop` takes a `TickDriverRunnerHost` and requires
   `TickDriverIdleGame<GameT>`, so a game without `idleUntil` instantiates every other member and cannot
-  call the loop; `isFiniteSeconds` is pinned by a third `static_assert` (§3).
-* **`OG_CHECK`s** (each message names what it replaced): the five construction checks (§3); a full J1;
+  call the loop; `sampleFrameInput` calls `sampleInput` under `if constexpr (TickDriverSampleGame<GameT>)`, so
+  a game without it compiles no call (§6); `isFiniteSeconds` is pinned by a third `static_assert` (§3).
+* **`OG_CHECK`s** (each message names what it replaced, where it replaced one): the seven construction
+  checks (§3); `reanchor()` on a `HostDelta` driver (§6); a full J1;
   `endFrame` and `stop()` with the world lock held (G-05); an inline step off the owning thread; the
   occupancy door outside a step; the scheduler and the host time read off the owning thread; the scheduler
   reached before it was built; and a driver destroyed while a step task is still pending (call `stop()`
   first). For `FreeRunning`: the loop's three entry checks (the mode, the owner thread, not already
   running) and its origin read below zero; `stop()` and the destructor while the loop runs; the
-  frame-thread pass run on the runner; the occupancy push and the world-lock note off the runner; and any
-  shadow restore.
+  frame-thread pass run on the runner; the occupancy push and the world-lock note off the runner; any
+  shadow restore; and, for a sampling game, an input sample taken in `FreeRunning` (§6).
 * **Allocation.** The driver's own state grows no container on the step path or the frame path: the rings
   are fixed, the batch is an array, the window's sample lists and line buffers are reserved at
   construction, and the loop's and the idle's state is locals and atomics. What its collaborators do is
@@ -324,6 +420,61 @@ and manager call, clock read, executor dispatch, wait and deferral, task run, an
 * `SimulationTickDriver.BeforePump.ARateScaleThroughTheDoorChangesTheStepCountsAsTheTranscriptionDoes`: the
   step counts also equal a bare `SimulationScheduler` given the same host times with the rate set before
   the same frame's pump, and differ from one with the rate set a frame later.
+
+The `sampleInput` cases are in `SimulationTickDriverSampleTest.cpp`, over the fake kit's sampling games
+(`TickDriverFakes-rationale.md` §1) and its world host. The first two run 90 frames of 0, 1 or 2 steps over
+an engine that records each clock read, once as an `Inline` authority and once as a `FrameBounded` client:
+
+* `SimulationTickDriver.SampleInput.RunsOncePerStartFrameFirstAndBeforeBeforePump`: each `startFrame`'s first
+  event is `sampleInput`, it has one `sampleInput` and one `beforePump`, the sample comes first, and no
+  `endFrame` samples. With the call moved after `beforePump` the first event is the frame's clock read.
+* `SimulationTickDriver.SampleInput.AGameThatSamplesHasTheSameTraceWithTheSamplesRemoved`: against the same
+  frames with the kit's plain recording game.
+* `SimulationTickDriver.SampleInput.AFreeRunningAuthorityNeverSamples`: a sampling idle game whose loop runs
+  60 steps on the test thread, then 30 `startFrame` and `endFrame` pairs on a second thread, which add 30
+  `onPostPhysics` events and nothing else; no `sampleInput` at all. With the call moved into
+  `pumpAndRunSteps`, before or after `beforePump`, the runner's first wake stops on `sampleFrameInput`'s
+  check.
+
+The time-base cases are in `SimulationTickDriverTimeBaseTest.cpp`, over the fake kit's plain recording game
+and world host and an engine that records each clock read. Each runs as an `Inline` authority and as a
+`FrameBounded` client, at 60 Hz with the cap at 240; every frame advances the scripted clock by its delta
+and then calls `startFrame` and `endFrame`, and a `Monotonic` driver is handed a frame delta of 99 s, which
+it must ignore. Two `static_assert`s pin the defaults, `HostDelta` and a 0.4 s clamp.
+
+* `SimulationTickDriver.TimeBase.MonotonicGivesTheHostDeltaStepsTraceAndLinesForTheSameDeltas`: 900 frames
+  of 0, 1 or 2 steps with one 0.25 s frame (15 steps, under the clamp). The per-frame step counts, the event
+  trace, the host times handed to `beforePump`, the step stamps and the published deadlines are equal, and
+  so are the log lines except the frame line, which reads `timeBase=monotonic` against `timeBase=worldDelta`.
+* `SimulationTickDriver.TimeBase.AOneSecondGapAdvancesTheClampAndCountsTheRestAsReanchorLoss`: after 120
+  frames and a half-step frame, which leaves the next deadline half a step ahead so that no count sits on a
+  rounding boundary, a 1 s frame. The `Monotonic` driver runs 24 steps, as many as a `HostDelta` driver
+  handed the frame clamped to 0.4 s, and counts 0.6 s and 35 steps as `reanchor` loss (§6), none as catch-up;
+  a `HostDelta` driver handed the whole second runs 60. Its host time advances the whole second. The 120
+  frames after it step as the clamped `HostDelta` driver's do. With the clamp dropped, the gap frame runs 60
+  steps.
+* `SimulationTickDriver.TimeBase.AReanchorOnResumeSkipsThePauseAndCountsItAsReanchorLoss`: after 60 frames
+  and a half-step frame, 5 s pass with no frame. With `reanchor()` the host time is the clock's, and 5 s less
+  the half step, 299 steps, is `reanchor` loss; frames of 0.4 steps then run 1, 0 and 1 steps with no
+  further loss. A second driver that is not re-anchored runs the clamp's 24 steps in its first frame and
+  counts the rest, 4.6 s plus that frame, 276 steps.
+
+The `FrameWait` cases (`SimulationTickDriverFrameWaitTest.cpp`) run a `FrameBounded` client over the fake
+engine with no worker thread, for 120 frames of 0, 1 and 2 steps. A frame's task runs only after `endFrame`
+returns (`runAllTasks`, then `runDeferred`), as a worker step that ends after the frame thread reached the
+end of physics but inside the frame does. Each case runs once with a completion event (the pass is deferred)
+and once without (a blocking wait). The game records, at each `onPostPhysics`, how many steps the presenter
+has had published.
+
+* `SimulationTickDriver.FrameWait.AStepPublishedMidFrameIsShownByThatFramesPostPhysics`: under
+  `ThisFramesSingleStep`, a frame of 0 or 1 steps shows every step dispatched so far; a 2-step frame shows
+  all but its own two (the bound); the frame line carries ` frameWait=thisFramesSingleStep`. With
+  `endFrame`'s wait chosen as before the frame wait, every 1-step frame shows one step fewer.
+* `SimulationTickDriver.FrameWait.TheDefaultShowsAFramesStepsInTheNextFrameAsBlockModeZeroDid`: under
+  `EarlierFrames`, every frame shows all but its own steps, and the frame line has no frame-wait word.
+* `SimulationTickDriver.FrameWait.TheSettingAddsNoEventToTheTraceAndOnlyMovesThePostPhysicsPass`: the two
+  settings' traces hold the same events in the same numbers, in a different order, with the same per-frame
+  step counts and the same published steps.
 
 The `FreeRunning` cases run the loop on the test thread in virtual time (the fake engine's clock, which
 only the idle scripts and the fake runner host advance), unless they say otherwise. The fake kit's idle
@@ -409,7 +560,8 @@ hides it.
 
 **Per-frame hooks are per wake.** `onFrameStepsDue` and `afterInlineBatch` run once per stepping wake, on
 the runner, and `beforePump` once per wake. A game's per-frame sample point is a wake in this mode, and
-its hooks run on the runner, not on the frame thread.
+its hooks run on the runner, not on the frame thread. `sampleInput` has no wake counterpart: the loop never
+calls it (§6).
 
 ## §11 The idle
 
@@ -511,3 +663,20 @@ The guards G-01 to G-06 are the old frame host's six, with fresh ids (`Simulatio
 deadlines on the engine clock. `FreeRunning` had been declared and refused by the constructor until then.
 G-01 and G-04 were restated per mode; G-07 and G-08 are new. The default modes' lines and traces are
 unchanged.
+
+**2026-11-18, `sampleInput`.** The optional input-sample hook (§6) was added, called first in `startFrame` in
+`Inline` and `FrameBounded`, so that "sample, then pump, in the same frame" is the driver's rule for every
+host. No guard was added: the `FreeRunning` exclusion is an `OG_CHECK` and the order is pinned by the tests
+(§9). A game without the hook compiles exactly the code it compiled before, so every existing trace, line and
+golden is unchanged.
+
+**2026-11-19, the `Monotonic` time base.** `Config::frameTimeBase` (`HostDelta`, the default, or `Monotonic`),
+`Config::monotonicFrameClampSeconds`, `reanchor()` and `Diagnostics::lostTimeByCause()` were added (§6), for a
+host whose engine delta does not carry a pause and a frame clamp the way the first engine's does. G-04 was
+restated per time base; G-09 is new. `begin()` reads the clock once for the window and the origin, where it read
+it once for the window, so under `HostDelta` every trace, line and golden is unchanged.
+
+**2026-11-20, the frame wait.** `Config::frameWait` (`EarlierFrames`, the default, or `ThisFramesSingleStep`),
+`m_frameSteps` and `waitsForThisFrame` were added (§4), for a client host whose post-physics pass is what it
+draws, and which measured each step shown one frame period late under block mode 0 when the step ended just
+after the pass. G-10 is new. With the default every trace, line and golden is unchanged.

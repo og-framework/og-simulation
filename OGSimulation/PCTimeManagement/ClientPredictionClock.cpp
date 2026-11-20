@@ -52,7 +52,10 @@ static void doNormalAdvance(unsigned int& predictionTick, unsigned int& resimula
 
 ClientPredictionClock::AdvanceResult ClientPredictionClock::advancePrediction()
 {
-    const unsigned int targetTick = m_estimator.getTargetPredictionTick();
+    // [P3-10] The advance's one read of the first-RTT flag, then its one offset (readTarget).
+    const TargetRead   estimate   = readTarget();
+    m_firstRttSeenLastAdvance     = estimate.hasFirstRtt;
+    const unsigned int targetTick = estimate.targetTick;
     const int          drift      = static_cast<int>(targetTick) - static_cast<int>(m_predictionTick);
 
     // Startup guard: skip drift correction until the *authority* clock is past
@@ -79,13 +82,32 @@ ClientPredictionClock::AdvanceResult ClientPredictionClock::advancePrediction()
     //    Stalls, and interleaving them would let a Skip cancel a stall the
     //    tier change requires — the tier delay and the prediction offset are
     //    independent quantities and must not net each other out.
-    if (pastGuard && absDrift > m_config.hardResyncThresholdTicks)
+    //
+    // [P3-10] A hard resync taken before the estimator had any RTT reading landed
+    // on the floor target. When the first reading arrives and moves the offset,
+    // the clock resyncs once more, onto the measured target (firstRttResyncDue).
+    // The wait ends only on an advance whose previous advance already read the
+    // flag true: a flag read before its seed is visible reads the floor.
+    const bool firstRttResync = firstRttResyncDue(estimate, pastGuard, drift);
+    if (m_resyncAwaitsFirstRtt && pastGuard && estimate.firstRttSettled)
+        m_resyncAwaitsFirstRtt = false;
+
+    if (firstRttResync || (pastGuard && absDrift > m_config.hardResyncThresholdTicks))
     {
         const unsigned int oldTick  = m_predictionTick;
         m_predictionTick           = targetTick;
         m_resimulationTick         = targetTick;
         m_gradualCorrectionCounter = 0;
         m_requiredInputDelayIncreaseStallTicks = 0;
+
+        // [P3-10] Only a resync that landed on the floor offset with no settled RTT
+        // reading waits for the first one (with no reading the offset IS the floor;
+        // a flag read before its seed also reads it). Gated with the re-centre: at
+        // recentreSettleSamples == 0 the clock is the one before both.
+        const unsigned int landingOffset = m_resyncOffsetTicks;
+        m_resyncAwaitsFirstRtt = m_config.recentreSettleSamples > 0u && !estimate.firstRttSettled
+            && estimate.offsetTicks == m_config.predOffsetFloorTicks;
+        m_resyncOffsetTicks    = estimate.offsetTicks;
 
         // [task 27] A hard resync clears the re-centre's debt and re-arms it: the
         // settle window counts from here, so it includes this frame's catch-up
@@ -100,10 +122,13 @@ ClientPredictionClock::AdvanceResult ClientPredictionClock::advancePrediction()
 
         if (m_logger)
         {
+            char cause[64] = "";
+            if (firstRttResync)
+                std::snprintf(cause, sizeof(cause), " cause=firstRtt offset=%u->%u", landingOffset, m_resyncOffsetTicks);
             char buf[192];
             std::snprintf(buf, sizeof(buf),
-                "[Warning] PCTM CPC: hard resync oldTick=%u -> newTick=%u drift=%d",
-                oldTick, targetTick, drift);
+                "[Warning] PCTM CPC: hard resync oldTick=%u -> newTick=%u drift=%d%s",
+                oldTick, targetTick, drift, cause);
             m_logger(buf);
         }
 
@@ -114,6 +139,9 @@ ClientPredictionClock::AdvanceResult ClientPredictionClock::advancePrediction()
     // [task 27] Every other advance of an armed re-centre is one reading of its
     // median run, taken before any branch below moves the frontier. A decided
     // one re-arms first if the RTT-only offset has moved away from its decision.
+    // [P3-11] The advance counts in the settle window first, so a re-arm on it
+    // starts the window at the next advance, as a hard resync's does.
+    countRecentreWindow(estimate.hasFirstRtt);
     trackRecentreRearm(pastGuard);
     recordRecentreReading(pastGuard);
 
@@ -338,7 +366,8 @@ bool ClientPredictionClock::isResimulating() const
 
 ClientPredictionClock::DriftAction ClientPredictionClock::evaluateDrift() const
 {
-    const unsigned int targetTick = m_estimator.getTargetPredictionTick();
+    const TargetRead   estimate   = readTarget();
+    const unsigned int targetTick = estimate.targetTick;
     const int          drift      = static_cast<int>(targetTick) - static_cast<int>(m_predictionTick);
 
     // Startup guard: authority-only form — MUST match advancePrediction()'s guard
@@ -356,7 +385,7 @@ ClientPredictionClock::DriftAction ClientPredictionClock::evaluateDrift() const
     // contract is "what advancePrediction() would do right now", so a pending
     // stall has to be visible here too or the two answers diverge for every
     // tick between a tier transition and its last paid-down Stall.
-    if (pastGuard && absDrift > m_config.hardResyncThresholdTicks)
+    if (firstRttResyncDue(estimate, pastGuard, drift) || (pastGuard && absDrift > m_config.hardResyncThresholdTicks))
         return DriftAction::HardResync;
 
     if (m_requiredInputDelayIncreaseStallTicks > 0)
@@ -368,13 +397,38 @@ ClientPredictionClock::DriftAction ClientPredictionClock::evaluateDrift() const
     if (absDrift <= m_config.softDriftThresholdTicks)
     {
         // [task 27] Inside the band only a re-centre's debt corrects, in its own direction.
-        const int pending = recentrePendingTicks();
+        const int pending = recentrePendingTicks(estimate.hasFirstRtt);
         if (pending == 0)
             return DriftAction::None;
         return pending > 0 ? DriftAction::Stall : DriftAction::Skip;
     }
 
     return drift > 0 ? DriftAction::Skip : DriftAction::Stall;
+}
+
+// [P3-10] The advance's estimator read: the first-RTT flag once, BEFORE the offset,
+// and the target from that one offset, so the due check, the target a resync lands
+// on and the offset it records are one value (getTargetPredictionTick's arithmetic).
+// Rationale: docs/TimeConfig-rationale.md §16; ThreadingCrossings.md row 10.
+ClientPredictionClock::TargetRead ClientPredictionClock::readTarget() const
+{
+    TargetRead estimate;
+    estimate.hasFirstRtt     = m_estimator.hasFirstRTTSample();
+    estimate.firstRttSettled = estimate.hasFirstRtt && m_firstRttSeenLastAdvance;
+    estimate.offsetTicks     = m_estimator.getPredictionOffsetTicks();
+    estimate.targetTick      = m_estimator.getLastAuthorityTick() + estimate.offsetTicks;
+    return estimate;
+}
+
+// [P3-10] Due on the first advance past the guard whose previous advance already
+// read the estimator's first RTT flag, when that reading moved the prediction offset
+// off the one the resync landed with and the clock is not already on the target
+// (drift 1). Only one try: advancePrediction clears the wait on that advance either way.
+// Rationale: docs/TimeConfig-rationale.md §16.
+bool ClientPredictionClock::firstRttResyncDue(const TargetRead& estimate, bool pastGuard, int drift) const
+{
+    return m_resyncAwaitsFirstRtt && pastGuard && estimate.firstRttSettled
+        && estimate.offsetTicks != m_resyncOffsetTicks && drift != 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -391,10 +445,23 @@ bool ClientPredictionClock::isRecentring() const
     return m_recentreOwedTicks > 0u;
 }
 
-bool ClientPredictionClock::recentreWindowFull() const
+// [P3-11] The settle window is time, not samples: recentreSettleSamples advances
+// since the arm on which the estimator had a reading. One advance is one tick, so
+// at the engine source's one reading per authority tick it spans what the sample
+// count did; at SimClock's 20 Hz pongs it no longer takes three times as long.
+// [P3-12] It also needs kRecentreMinSamples measured samples since the arm: a
+// catch-up batch runs many advances in one frame, so there advances are not time.
+// Rationale: docs/TimeConfig-rationale.md §14.
+bool ClientPredictionClock::recentreWindowFull(unsigned int windowAdvances) const
 {
-    return m_config.recentreSettleSamples > 0u
-        && m_estimator.getMeasuredRTTSampleCount() - m_recentreBaseSamples >= m_config.recentreSettleSamples;
+    return m_config.recentreSettleSamples > 0u && windowAdvances >= m_config.recentreSettleSamples
+        && m_estimator.getMeasuredRTTSampleCount() - m_recentreBaseSamples >= kRecentreMinSamples;
+}
+
+void ClientPredictionClock::countRecentreWindow(bool hasReading)
+{
+    if (m_recentreArmed && hasReading)
+        ++m_recentreWindowAdvances;
 }
 
 // Arms a re-centre: no debt, the settle window counting from the estimator's
@@ -406,6 +473,7 @@ void ClientPredictionClock::armRecentre(RecentreCause cause, unsigned int fronti
     m_recentreCause           = cause;
     m_recentreOwedTicks       = 0;
     m_recentreBaseSamples     = m_estimator.getMeasuredRTTSampleCount();
+    m_recentreWindowAdvances  = 0;
     m_recentreUncorrectedTick = frontierTick;
     m_recentreReadingCount    = 0;
     m_recentreReadingNext     = 0;
@@ -516,14 +584,15 @@ int ClientPredictionClock::recentreCorrectionTicks(unsigned int uncorrectedTick,
 
 // What a re-centre would make the next advance correct, signed as a lead error
 // (> 0: the client is ahead, Stall). The owed debt if one runs; otherwise, on
-// the advance that decides, the decision itself; otherwise 0.
-int ClientPredictionClock::recentrePendingTicks() const
+// the advance that decides, the decision itself; otherwise 0. hasReading is the
+// advance's flag read, which that advance counts in the window (P3-11).
+int ClientPredictionClock::recentrePendingTicks(bool hasReading) const
 {
     if (recentreRearmDue())
         return 0;
     if (m_recentreOwedTicks > 0u)
         return m_recentreAhead ? static_cast<int>(m_recentreOwedTicks) : -static_cast<int>(m_recentreOwedTicks);
-    if (!m_recentreArmed || !recentreWindowFull())
+    if (!m_recentreArmed || !recentreWindowFull(m_recentreWindowAdvances + (hasReading ? 1u : 0u)))
         return 0;
     const unsigned int uncorrectedTick = m_recentreUncorrectedTick + 1u;
     const int          readingNow      = static_cast<int>(uncorrectedTick - m_estimator.getLastAuthorityTick());
@@ -532,7 +601,7 @@ int ClientPredictionClock::recentrePendingTicks() const
 
 void ClientPredictionClock::decideRecentre(unsigned int targetTick)
 {
-    if (!m_recentreArmed || !recentreWindowFull())
+    if (!m_recentreArmed || !recentreWindowFull(m_recentreWindowAdvances))
         return;
 
     const int owed = recentreCorrectionTicks(m_recentreUncorrectedTick, /*extraReading=*/nullptr);

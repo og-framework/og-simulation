@@ -96,9 +96,11 @@ using PCClockLoggerFn = std::function<void(const char*)>;
 
     // Register the effective-input-delay change produced by an authoritative
     // RTT tier transition, as reported by `tierDelayDeltaTicks(oldTier, newTier)`
-    // (ConnectionTierTable.h). Called on the CLIENT from the replicated-tier
-    // OnRep handler — under Option A that OnRep delta is the only transition
-    // signal the client has.
+    // (ConnectionTierTable.h). Called on the CLIENT when the connection tier
+    // arrives (og-sim-net's ConnectionTier message, through
+    // UESimulationSession::onConnectionTierReceived) — under Option A that tier
+    // delta is the only tier-transition signal the client has. The relay-delay
+    // floor's arrival calls it too.
     //
     // WHY A STALL AT ALL. An upward transition RAISES the effective input
     // delay: an input captured at tick T now lands at T + newDelay instead of
@@ -154,8 +156,10 @@ using PCClockLoggerFn = std::function<void(const char*)>;
     // -----------------------------------------------------------------------
     // One-shot re-centre (og-input-latency task 27; TimeConfig::recentreSettleSamples)
     //
-    // Armed at construction and by every hard resync. Once the estimator has
-    // taken recentreSettleSamples measured RTT samples since the arm, the next
+    // Armed at construction and by every hard resync. Once the clock has made
+    // recentreSettleSamples advances with an RTT reading since the arm (a time
+    // window, og-input-latency P3-11) and the estimator has taken
+    // kRecentreMinSamples measured samples since it (P3-12), the next
     // advancePrediction() past the warm-up guard decides ONCE and logs one
     // [Clock.Recentre] line. It owes N graduated corrections, N the rounded
     // median lead error of the last kRecentreMedianAdvances advances, and pays
@@ -179,6 +183,13 @@ using PCClockLoggerFn = std::function<void(const char*)>;
     static_assert(kRecentreRearmTicks >= 2u,
         "ClientPredictionClock: a re-arm on a 1-tick offset move would chase the offset's ceil() wobble on a steady "
         "link (og-input-latency task 27 rework 2, Ph3 R10)");
+
+    // [P3-12] The settle window's sample floor. Rationale: docs/TimeConfig-rationale.md §14.
+    static constexpr unsigned int kRecentreMinSamples = 8u;
+    static_assert(kRecentreMinSamples <= TimeConfig{}.recentreSettleSamples,
+        "ClientPredictionClock: the re-centre's sample floor must not exceed the default window's advances, so at one "
+        "reading per advance (the engine source) the advances still bind and the floor binds only when advances outrun "
+        "time, as in a catch-up batch (og-input-latency P3-12, Ph4 gate R3: joins decided on 1-6 samples)");
 
     // True while a re-centre is armed and has not yet decided.
     OGSIMULATION_API bool isRecentreArmed() const;
@@ -260,14 +271,29 @@ using PCClockLoggerFn = std::function<void(const char*)>;
 private:
     void fireResyncCallbacks(unsigned int newTick);
 
+    // [P3-10] One advance's estimator read (readTarget) and the resync onto the first
+    // RTT reading's target. See advancePrediction.
+    struct TargetRead
+    {
+        bool         hasFirstRtt     = false;  // the flag, read once
+        bool         firstRttSettled = false;  // ... and already true on the previous advance
+        unsigned int offsetTicks     = 0;
+        unsigned int targetTick      = 0;
+    };
+    TargetRead readTarget() const;
+    bool firstRttResyncDue(const TargetRead& estimate, bool pastGuard, int drift) const;
+
     // [task 27] The re-centre's pieces. With recentreSettleSamples == 0 the
     // window is never full, so the decision never fires and nothing corrects.
     // A reading is the lead over the authority tick, stored UNCORRECTED (as if
     // the clock had taken no Skip or Stall since the arm), so the clock's own
     // corrections inside the run do not move its median.
+    // [P3-11] The window is time: it counts the advances since the arm on which
+    // the estimator had a reading (hasFirstRtt), not the samples it took.
     enum class RecentreCause { Join, Resync, Rearm };
 
-    bool recentreWindowFull() const;
+    bool recentreWindowFull(unsigned int windowAdvances) const;
+    void countRecentreWindow(bool hasReading);
     void armRecentre(RecentreCause cause, unsigned int frontierTick);
     unsigned int recentreRttOffsetTicks() const;
     bool recentreOffsetMoved() const;
@@ -275,7 +301,7 @@ private:
     void trackRecentreRearm(bool pastGuard);
     void recordRecentreReading(bool pastGuard);
     int  recentreCorrectionTicks(unsigned int uncorrectedTick, const int* extraReading) const;
-    int  recentrePendingTicks() const;
+    int  recentrePendingTicks(bool hasReading) const;
     void decideRecentre(unsigned int targetTick);
 
     const TimeConfig&           m_config;
@@ -289,12 +315,21 @@ private:
     // advancePrediction() call (as a Stall), cleared by a hard resync.
     unsigned int m_requiredInputDelayIncreaseStallTicks = 0;
 
+    // [P3-10] Set by a hard resync that landed on the floor offset with no settled RTT
+    // reading (with the re-centre on), with the offset it landed on; cleared on the
+    // first advance past the guard whose reading is settled. The flag as the last
+    // advance read it: a reading is settled once two advances in a row read it.
+    bool         m_resyncAwaitsFirstRtt    = false;
+    unsigned int m_resyncOffsetTicks       = 0;
+    bool         m_firstRttSeenLastAdvance = false;
+
     // [task 27] The one-shot re-centre: armed at construction and by a hard
     // resync, with the estimator's measured-sample count at that moment.
     bool         m_recentreArmed       = true;
     bool         m_recentreAhead       = false;  // the debt's direction: true = client ahead, Stall
     unsigned int m_recentreOwedTicks   = 0;      // corrections still owed; only a correction or a hard resync lowers it
-    unsigned int m_recentreBaseSamples = 0;
+    unsigned int m_recentreBaseSamples = 0;      // for the line's samples= field
+    unsigned int m_recentreWindowAdvances = 0;   // [P3-11] advances with a reading since the arm
     unsigned int m_recentreUncorrectedTick = 0;  // the frontier had every advance since the arm been Normal
     std::array<int, kRecentreMedianAdvances> m_recentreReadings{};
     unsigned int m_recentreReadingCount = 0;

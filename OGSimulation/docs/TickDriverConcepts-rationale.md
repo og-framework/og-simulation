@@ -1,9 +1,9 @@
 <!-- SPDX-License-Identifier: MPL-2.0 -->
 # `TickDriverConcepts.h` — rationale
 
-The narrative behind `TickRateDoor`, `IdleWake` and the seven tick-driver concepts:
-`TickDriverEngine`, `TickDriverGame`, `TickDriverIdleGame`, `TickDriverPresenterSteps`, `TickDriverWorldHost`,
-`TickDriverRenderSink` and `TickDriverRunnerHost`, and the helper concept `OptionalVec3Result` (§5). The header keeps its licence,
+The narrative behind `TickRateDoor`, `IdleWake` and the nine tick-driver concepts:
+`TickDriverEngine`, `TickDriverGame`, `TickDriverSampleGame`, `TickDriverReceiveGame`, `TickDriverIdleGame`, `TickDriverPresenterSteps`,
+`TickDriverWorldHost`, `TickDriverRenderSink` and `TickDriverRunnerHost`, and the helper concept `OptionalVec3Result` (§5). The header keeps its licence,
 its docs pointer, its code and its self-check `static_assert`s; everything that explains it lives here. It has no guards (`TickDriverConcepts-guards.md`
 says why): every rule it carries is a `static_assert`.
 
@@ -38,6 +38,11 @@ adds no indirect call to the step path.
 Two more concepts serve the `FreeRunning` mode, where a runner thread of its own pumps and steps (§8):
 `TickDriverIdleGame` refines `TickDriverGame` with the hook the runner waits in, and `TickDriverRunnerHost`
 supplies the runner's fallback sleep.
+
+`TickDriverSampleGame` refines `TickDriverGame` with an optional input-sample hook, for a game whose
+host-side input must be sampled once per frame before the pump (§9). `TickDriverReceiveGame` refines it with an
+optional per-step receive hook, for a client game that takes in what arrived from its authority at the start of
+each step, before the step reads it (§10).
 
 The driver that uses these concepts is not in this header. This file states what each requirement is
 for; the driver's own documentation states when it calls each one.
@@ -131,6 +136,13 @@ except the one property it names, so each assertion stays tied to that property.
   clock and a move-only `Handle` are refused;
 - `tickDriverGameSelfCheck`: a missing `beforePump`, a missing `afterInlineBatch`, a hook returning
   `bool` and a manager returned by value are refused;
+- `tickDriverSampleGameSelfCheck`: every game shape derives from `tickDriverGameSelfCheck::Conforming`. A game
+  without `sampleInput` is refused as a sample game and is still a `TickDriverGame`; a `sampleInput` returning
+  `bool` and one taking an argument are refused, and so is a type that has `sampleInput` but is not a
+  `TickDriverGame`;
+- `tickDriverReceiveGameSelfCheck`: the same four refusals for `receiveForStep` (missing, returning `bool`, taking an
+  argument, on a type that is not a `TickDriverGame`), and a game that samples but does not receive is a sample game and
+  not a receive game: each hook is opted into alone;
 - `tickDriverIdleGameSelfCheck`: every shape derives from `tickDriverGameSelfCheck::Conforming`, so it is
   a `TickDriverGame` and differs from the reference only in `idleUntil`. A game without `idleUntil` is
   refused as an idle game and is still a `TickDriverGame`; an `idleUntil` returning `void` is refused;
@@ -191,11 +203,74 @@ runner host's, and the thread's priority belongs to whoever creates the runner t
 requires neither. The runner thread is dedicated to one loop and ends with it
 (`TickDriverThreadContext-rationale.md` §8).
 
-## §9 Provenance
+## §9 `TickDriverSampleGame`
+
+`TickDriverSampleGame` gives a game one more hook: `void sampleInput()`. It refines `TickDriverGame`, so a game
+that does not sample does not declare it and is still a `TickDriverGame` (the self-check pins both), and a
+driver that calls it checks the concept with `if constexpr` first.
+
+**The hook contract.**
+- The driver calls it once per frame, on the frame's owning thread, before anything else in that frame's
+  pass: before the frame's clock read, the rate door (`beforePump`), the pump and the frame's steps
+  (`SimulationTickDriver-rationale.md` §6). It is called in a frame with no due step too.
+- It is where the game publishes what its host sampled for this frame (for example its input state) to
+  wherever the steps read it. Everything the frame then pumps and steps sees that sample.
+- It takes nothing and returns `void`: it cannot veto or skip the frame, and it is not handed the frame's
+  time, which is read after it.
+- It is never called in `FreeRunning`. A free-running authority has no local input, and its runner wakes
+  per step deadline, not per frame.
+
+## §10 `TickDriverReceiveGame`
+
+`TickDriverReceiveGame` gives a client game one more hook: `void receiveForStep()`. It refines `TickDriverGame`, so a
+game that does not model it does not declare it and is still a `TickDriverGame` (the self-check pins both), and the
+step hooks that call it check the concept with `if constexpr` first, so such a game compiles neither the call nor its
+branch (`TickDriverStepHooks-rationale.md` §3).
+
+**What it means to a game author.** "Take in, now, everything that has arrived for this step, so that this step uses
+it." A networked client's arrivals (remote inputs, corrections, clock samples, membership and lifecycle changes) are
+applied in this hook, and the step that follows reads all of them: its resimulation check sees a correction received
+here, and its input collect (og-simulation's `collectInputAll`) reads the inputs received here. Whatever a game applies
+anywhere later in the step reaches only the next step.
+
+**The hook contract.**
+- It is called once per client step (each `runTick`, whatever kind of step it turns out to be), on the step's
+  thread, at the step's start: after the step's occupancy drain and before its resimulation check, any replay,
+  its correction capture, its clock advance and its input collect. It is never called during a replay; the step
+  hooks are not.
+- It is never called on an authority step. An authority's inbound work has its own hooks: the per-tick input release
+  (`releaseInputsForAuthorityTick`) and, in `FreeRunning`, the idle wait (`idleUntil`, §8).
+- It takes nothing and returns `void`: it cannot veto or skip the step, and it is not told the step's tick, which the
+  step decides after it.
+- Its cost is part of the step's pre-step time (`TickDriverStepHooks-rationale.md` §5).
+
+**Beside `sampleInput`.** The two hooks are independent (the self-check pins it). `sampleInput` (§9) is the frame's
+*local* sample, once per frame on the frame's owning thread before the pump; `receiveForStep` is the step's *remote*
+arrivals, once per client step on the step's thread.
+
+<!-- lint-external-ref: collectInput -- a candidate name for receiveForStep that was weighed and not chosen; it names nothing -->
+<!-- lint-external-ref: beforeCollectInput -- a candidate name for receiveForStep that was weighed and not chosen; it names nothing -->
+**The name.** Three were weighed, for what each tells a game author:
+- `beforeTick`: says only where it runs. It is also the name of the step-hook moment that calls it
+  (`StepHooks::beforeTick(const UpcomingTick&)`), which runs on both roles, so a game author would expect it on the
+  authority too, and every reading of "beforeTick" in this library would need a qualifier.
+- `collectInput` / `beforeCollectInput`: input-specific. `collectInput` reads as the collect itself, so an author would
+  put the step's input gathering in it, which is og-simulation's `collectInputAll`, not the game's job; and it sits
+  beside `sampleInput`, a different, per-frame hook. `beforeCollectInput` is right about the order but narrower than
+  the hook: corrections, clock samples and lifecycle changes arrive here too, and a correction's effect (the
+  resimulation check) comes before the collect.
+- `receiveForStep` (chosen): it names the job (receive) and its contract (for this step, so this step uses it), it
+  covers every kind of arrival, it reads as the remote counterpart of `sampleInput`, and it collides with no name in
+  this library.
+
+## §11 Provenance
 
 Written on 2026-10-16 from the og-tickdriver design, as the contracts the brawler's Unreal frame host
 and Jolt backend host fulfil today. `IdleWake`, `TickDriverIdleGame`, `TickDriverRunnerHost` and §8 were
 added on 2026-11-12 for the `FreeRunning` mode; `StepThreading` moved to `TickDriverThreadContext.h` the
 same day. `OptionalVec3Result` was added on 2026-11-13, when the Android build (libc++) failed on the render sink's
-return-type requirements (§5). Nothing in this file depends on any document outside this
-submodule.
+return-type requirements (§5). `TickDriverSampleGame` and §9 were added on 2026-11-18, so that taking the
+input sample before the pump is the driver's rule rather than each host's. `TickDriverReceiveGame` and §10 were
+added on 2026-11-19, so that a client step's receive precedes the step's resimulation check and input collect, rather
+than following the collect in `onStepStarted`, where what it received reached only the next step. Nothing in this
+file depends on any document outside this submodule.

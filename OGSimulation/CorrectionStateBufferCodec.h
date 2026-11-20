@@ -110,7 +110,7 @@
 // Move{}), not something a client ever captured. There is therefore no capture
 // tick to name, and any real-looking number we invented would be a lie the
 // relay's capture-tick join key would then act on. The sentinel says so
-// explicitly: T4 replicates it on the correction state, and T6 resolves those
+// explicitly: T4 carries it on the correction state's wire, and T6 resolves those
 // ticks to the proxy's last-known / game-zero input rather than to a capture the
 // client can look up.
 //

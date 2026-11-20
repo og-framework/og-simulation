@@ -12,8 +12,8 @@
 OGSIM_OPTIMIZE_OFF
 
 // ---------------------------------------------------------------------------
-// DeferredLifecycleQueue — A GAME->PHYSICS MARSHALLING POINT FOR LIFECYCLE,
-// BUILT AND TESTED BUT NOT WIRED. ⚠ Read the ruling below before you use it.
+// DeferredLifecycleQueue — A GAME->PHYSICS MARSHALLING POINT FOR LIFECYCLE.
+// ⚠ Read who uses it, and the ruling that binds every other caller, below.
 //
 // Layer: OGSimulation. Adapter-agnostic, UE/Chaos-free.
 //
@@ -28,40 +28,51 @@ OGSIM_OPTIMIZE_OFF
 // concurrent `unordered_map` rehash under a reader is undefined behaviour
 // whatever the ordering.
 //
-// THE RULE THIS OBJECT IMPOSES ON A CALLER THAT ADOPTS IT — a CONTRACT on how
-// it is to be called, NOT a description of anything happening in this tree
-// today: the game thread ENQUEUES, the physics thread APPLIES, and it applies
+// THE RULE THIS OBJECT IMPOSES ON A CALLER THAT ADOPTS IT: the game thread
+// ENQUEUES, the thread that steps the simulation APPLIES, and it applies
 // BETWEEN STEPS — before the step's collect, never during it. A registration
 // is therefore invisible on the step it was queued and whole on the next.
 // ⚠ THAT IS THE WHOLE OF WHAT IT BUYS, AND IT IS LESS THAN SINGLE-THREADED
-// ACCESS. It does NOT make the containers single-threaded, even once adopted:
-// registration also mutates `m_authorityWriters` (SimulationNetSync.h:477) and
-// `m_localInputSenders` (:379), which the GAME thread range-fors every tick at
-// :599 and :656 — so adopting this queue would put a physics-thread insert
-// under a live game-thread iteration. That is the held ruling below, and it is
-// the reason this class has no consumer.
+// ACCESS. It does NOT make the containers single-threaded by itself:
+// registration also mutates SimulationNetSync's `m_authorityWriters`,
+// `m_localInputSenders` and `m_redundancyCadences`, which `sendCorrectionAll`
+// and `sendLocalInputToAuthorityAll` walk once per frame. Applying here is
+// sound only where those walks run on the applying thread too.
 //
 // -------------------------------------------------------------------------
-// ⛔⛔ NOTHING IN THIS REPOSITORY USES THIS CLASS YET, AND THAT IS A RULING,
-// NOT AN OVERSIGHT. Read this before wiring it into an adapter.
+// WHO USES IT (og-input-latency task P2-17). og-sim-net's sessions each own
+// one (`SimNetClient`, `SimNetServer`): the host enqueues a character's
+// registration and unregistration there (`registerCharacter`,
+// `unregisterCharacter`), and the session applies them at the top of its
+// `drain()`, through `registerSimulatable` / `unregisterSimulatable`, with the
+// session's own channel as the owner — no game-thread object is touched by the
+// apply. On an IMMEDIATE client (`SimNetConfig::immediate`) that drain runs at
+// step start on the step's thread and the input send runs at capture on the
+// same thread (og-input-latency P2-16), so the apply point and every walk of
+// the sender maps share one thread: the precondition below is met there. The
+// server session applies at its drain too, which runs where the server drains
+// (the game thread when frame-locked, the runner on the authority loop,
+// og-input-latency P5-19). Hosts that do not enqueue keep calling the facades
+// directly, as before; the Unreal host's wiring to the sessions' queues is
+// og-input-latency P5-17 (the client) and P5-19 (the server on the loop).
 //
-// It was written, wired into the og-brawler-unreal composition root, built and
-// measured for og-netcode-v2-field-defects task 3, and then HELD at the user's
-// direction, because adopting it INVERTS the game/physics crossing instead of
-// closing it. Making the physics thread the sole writer of storage and the
-// resolver's containers moves the exposure onto the GAME-thread readers — and
-// two of those ITERATE rather than look up: SimulationNetSync::sendCorrectionAll
-// walks m_authorityWriters and sendLocalInputToAuthorityAll walks
-// m_localInputSenders, both once per tick. An insert under a live iteration is
-// a worse failure than the find it would replace.
+// ⛔ THE EARLIER RULING STILL BINDS EVERY OTHER CALLER. The class was written
+// for og-netcode-v2-field-defects task 3, wired into the og-brawler-unreal
+// composition root, measured and then HELD at the user's direction, because
+// adopting it on a client whose GAME thread still sent INVERTS the
+// game/physics crossing instead of closing it: the physics thread becomes the
+// sole writer of storage and the resolver's containers while the game-thread
+// send ITERATES the sender maps, and an insert under a live iteration is a
+// worse failure than the find it would replace.
 //
-// ⭐ THE PRECONDITION FOR ADOPTING IT: marshal or snapshot the game-thread send
-// path first, then the adapter's per-frame visualization and HUD readers. The
-// full reader list and the ruling are in docs/ThreadingCrossings.md, row 11.
+// ⭐ THE PRECONDITION FOR ADOPTING IT: move or snapshot every game-thread reader
+// of what registration writes first — the send path (og-input-latency P2-16)
+// and the adapter's per-frame visualization, HUD and input-history readers
+// (the display snapshot, og-input-latency P2-18 and P5-16). The reader list
+// and the ruling are in docs/ThreadingCrossings.md, row 11.
 //
-// The class ships anyway, with its semantics pinned by og-simulation-tests
-// (RegistrationLifecycleTest.cpp), so the adoption step is a wiring change
-// against a tested primitive rather than a design task done twice.
+// Its semantics are pinned by og-simulation-tests (RegistrationLifecycleTest.cpp),
+// and the sessions' use of it by og-sim-net's tests (SimNetLifecycleQueueTest.cpp).
 // -------------------------------------------------------------------------
 //
 // ⛔ IT IS NOT A LOCK, AND MUST NOT BECOME ONE. A mutex over the containers was
@@ -72,8 +83,9 @@ OGSIM_OPTIMIZE_OFF
 // compare-exchange to push, one atomic exchange to take the whole chain — so
 // neither thread can wait on the other at all.
 //
-// ⛔ ONE PRODUCER, BUT NOT BECAUSE THE PUSH NEEDS IT. Both enqueue sites are
-// game-thread lifecycle calls. The push is a CAS loop and would tolerate more
+// ⛔ ONE PRODUCER, BUT NOT BECAUSE THE PUSH NEEDS IT. The enqueue sites are the
+// host's game-thread lifecycle calls (the sessions' `registerCharacter` and
+// `unregisterCharacter`). The push is a CAS loop and would tolerate more
 // producers; the single CONSUMER is the load-bearing half, because
 // `applyPending` takes the entire chain and each node is thereafter owned
 // exclusively by the caller. Taking the whole chain is also what makes ABA
@@ -140,8 +152,8 @@ public:
                                              std::memory_order_relaxed));
     }
 
-    // CALL THIS ON THE PHYSICS THREAD, BETWEEN STEPS — a precondition on the
-    // caller, not a claim about one. (No caller exists; see the banner.)
+    // CALL THIS ON THE THREAD THAT STEPS, BETWEEN STEPS — a precondition on the
+    // caller. og-sim-net's sessions call it at the top of drain(); see the banner.
     // Returns how many jobs ran.
     // ⛔ THE ACQUIRE PAIRS WITH enqueue's RELEASE and is the whole synchronisation.
     unsigned int applyPending()

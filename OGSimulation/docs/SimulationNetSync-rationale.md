@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: MPL-2.0 -->
+<!-- lint-external-ref: OnRep -- Unreal Engine replication hook name, outside every scan root -->
 <!-- lint-external-ref: FInputRedundancyBundle -- deleted by og-input-latency task P5-9 (the relay actors, their listeners, the Iris sim buffers, serializers and proofs, and UEConnectionHandle); kept in the history -->
 <!-- lint-external-ref: USimulatableNetSyncComponent -- deleted by og-input-latency task P5-8 (the net-sync component, the pawn's subobject, the bundle builder and the owner binding's net half); kept in the history -->
 # `SimulationNetSync.h` — rationale archive
@@ -43,7 +44,8 @@ through it.
 | `FRelayedInputRing` | was one adapter's **wire type for the relay ring** — the replicated carrier that moved a connection's relayed inputs to observing peers (deleted by og-input-latency task P5-9; since P5-7 og-sim-net's `RelayRingBuffer`) | the core sees only the accessor/callback pair; §-numbered blocks below say so explicitly |
 | `FInputRedundancyBundle` | was one adapter's **wire type for the local-input RPC**, carrying the most-recent `redundancyDepth` ticks in one unreliable send (deleted by og-input-latency task P5-9; since P5-7 og-sim-net's `InputBundleBuffer` on the SimInput lane) | the core handles only its decoded contents |
 | `USimmableUpdateComponent` | one adapter's **per-character component**: it registers the character with the core and is the owner the core's callbacks are bound to | since og-ue-simulationcomponentandmanagersplit task 20a the replicated correction-state buffer behind those callbacks is held by a sibling component, `USimulatableNetSyncComponent` (deleted by og-input-latency task P5-8), which this one forwarded to; since task 20b the relayed-ring link behind the relayed-input callbacks is held there too; since task 29 its registration loop is the generic skeleton of its binding base, `UESimulatableOwnerBinding` |
-| `Iris` | that engine's **replication system** — the party that batches, drops and rolls back property writes | role words: *the replication system* / *the replication poll* |
+| `Iris` | that engine's **replication system** (the sim traffic's until og-input-latency task P5-7; og-net's sim lanes since) — the party that batches, drops and rolls back property writes | role words: *the replication system* / *the replication poll* |
+| `OnRep` / `OnRep_*`, `RPC` | that engine's **property notification** and **remote call**: the arrival of a replicated value on a client, and a client-to-server call | the sim traffic's until og-input-latency task P5-7. Since then a correction, a relay ring and an input bundle arrive through og-sim-net's sessions, in their drain (`SimNetClient::onCorrection`, `SimNetClient::onRing`, `SimNetServer::receiveBundle`): on the game thread frame-locked, on the step's thread on an immediate client. A quoted OnRep or RPC below is that arrival |
 | `Config/DefaultEngine.ini` | one adapter's **host-application configuration surface**, where shipped policy and log values are set | another adapter supplies the same values under its own keys |
 
 ⛔ **None of these is a dependency of this core**, and none of them appears in `SimulationNetSync.h`
@@ -1699,11 +1701,14 @@ quarter of a second at 30 fps).
   forward jump samples at most `kMaxSlots`, so one resync cannot hold the window at the cap for longer than the EMA's
   memory.
 
-**Lifetime.** `m_redundancyCadences` is touched only by the send, on the game thread, and by
+**Lifetime.** `m_redundancyCadences` is touched only by the send (on the game thread frame-locked; on an immediate client
+on the step's thread, `SimNetClient::afterCaptureTick_Step`), and by
 `unregisterSimulatableContainers` step 2, which erases the entry beside the sender maps. A re-registration therefore
 starts a fresh cadence. ⚠ It is a third game-thread container in step 2. The deferral fence on `clearOwnerCallbacks`
 names the two sender maps; the cadence map adds to the same blocker, because the send looks it up with
 `operator[]` every frame and inserts on a sender's first send. Adopting `DeferredLifecycleQueue` would have to marshal it with them.
+og-sim-net's immediate client does (og-input-latency P5-17): its lifecycle queue applies the unregistration on the step's
+thread, the send's thread there. A frame-locked client still sends and unregisters on the game thread.
 
 **The log line.** `[SendLocalInputToServer] id=… tick=… depth=… slots=…`: `slots=` is appended, so existing greps on
 `depth=` still match. At the default, every line reads `depth=3 slots=3` on a 60 Hz tick.

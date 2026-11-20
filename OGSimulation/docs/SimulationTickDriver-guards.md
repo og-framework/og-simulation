@@ -17,20 +17,21 @@ true and actionable to a reader with no game engine and no other repository.
 
 The rules the compiler or a runtime check holds need no entry (rationale §8): the member order is two
 `static_assert`s; a `FreeRunning` client, a `FrameBounded` authority, a role or threading that disagrees
-with the world host's thread context, and an idle slack that is not finite or not in `[0, dt)` are
-refused by `OG_CHECK`s in the constructor; a full occupancy ring, both waits taken while the world lock
+with the world host's thread context, an idle slack that is not finite or not in `[0, dt)`, a `Monotonic`
+time base in `FreeRunning`, and a `Monotonic` frame clamp that is not finite or shorter than the longest step
+interval are refused by `OG_CHECK`s in the constructor; a full occupancy ring, both waits taken while the world lock
 is held, an inline step off the owning thread, the occupancy door outside a step, the scheduler and the
-host time read off the owning thread, and a driver destroyed with a step task outstanding are
-`OG_CHECK`s. In `FreeRunning`, the loop run in another mode, off the owner thread or twice, `stop()` and
+host time read off the owning thread, `reanchor()` on a `HostDelta` driver, and a driver destroyed with a
+step task outstanding are `OG_CHECK`s. In `FreeRunning`, the loop run in another mode, off the owner thread or twice, `stop()` and
 the destructor while the loop runs, the frame-thread pass run on the runner, the occupancy push and the
-world-lock note off the runner, and a shadow restore are `OG_CHECK`s too. That `beforePump` runs
-immediately before the pump, and that the block mode chooses this frame's task only under 1, are
-ordinary rationale (§3, §6), pinned by the tests: a reorder or a swapped pair of operands is not typed on
-a line a tag could cover.
+world-lock note off the runner, a shadow restore, and a game's input sample taken in `FreeRunning` are
+`OG_CHECK`s too. That `beforePump` runs immediately before the pump and that `sampleInput` runs first in
+`startFrame`, before `beforePump`, are ordinary rationale (§3, §6), pinned by the tests: a reorder is not typed on a line a tag
+could cover. Which task `endFrame` waits for is G-10.
 
 **Provenance of the ids.** G-01 to G-06 are the successors, with fresh ids, of the six guards of the
 engine-hosted frame host this header was transcribed from (rationale §14). G-07 and G-08 are new with the
-`FreeRunning` mode and succeed nothing. Each of the first six ids succeeds the
+`FreeRunning` mode, G-09 with the `Monotonic` time base, and G-10 with the frame wait; they succeed nothing. Each of the first six ids succeeds the
 same number there: G-01 (the authority steps inline), G-02 (one per-frame call, before the steps, only
 when steps are due), G-03 (no `+ 1` on the frame's first tick), G-04 (the scheduler is pumped with the
 accumulated frame delta), G-05 (no wait while the world lock is held) and G-06 (one call after the
@@ -101,16 +102,18 @@ exactly the server tick plus one, because every earlier step has completed and p
 **What breaks if it moves.** It must stay after the batch is built and before both per-frame calls,
 which take it unchanged.
 
-## G-04 — The pump time is the accumulated frame delta in `Inline` and `FrameBounded`, and the runner's engine clock in `FreeRunning`
+## G-04 — The pump time is the accumulated frame delta under `HostDelta`, and an engine clock minus an origin under `Monotonic` and in `FreeRunning`
 
-**Tag site:** `SimulationTickDriver.h`, in `startFrame`, immediately above
+**Tag site:** `SimulationTickDriver.h`, in `startFrame`'s `HostDelta` branch (the `else`), immediately above
 `m_hostTimeSeconds += frameDeltaSeconds;`.
 
-**The prohibition.** In `Inline` and `FrameBounded`, do not set `m_hostTimeSeconds` here from the engine
-clock (`nowSeconds`) or from any source other than the accumulated `frameDeltaSeconds`. `pumpAndRunSteps`
-pumps `m_hostTimeSeconds`, and hands `beforePump` the same value, in every mode. In `FreeRunning`,
-`startFrame` returns before this statement and `runAuthorityLoop` sets the value from the engine clock
-minus the loop's origin: do not add frame deltas to it.
+**The prohibition.** Under `HostDelta`, the default time base, do not set `m_hostTimeSeconds` here from the
+engine clock (`nowSeconds`) or from any source other than the accumulated `frameDeltaSeconds`. A host that
+wants the engine clock in `Inline` or `FrameBounded` sets `Config::frameTimeBase` to `Monotonic`, which takes
+the other branch; it does not edit this statement. `pumpAndRunSteps` pumps `m_hostTimeSeconds`, and hands
+`beforePump` the same value, in every mode. In `FreeRunning`, `startFrame` returns before this statement and
+`runAuthorityLoop` sets the value from the engine clock minus the loop's origin: do not add frame deltas to
+it.
 
 **The consequence.** The engine's frame delta is what the engine's pause, its slow motion and its
 frame-time clamp act on: a paused world runs no frames and accumulates nothing, and a clamped hitch
@@ -119,14 +122,15 @@ catches up a hitch the engine meant to drop. The render clock reads the same tim
 (`hostNowSeconds` returns `m_hostTimeSeconds`, and the step deadlines come from this scheduler), so a
 second clock would also drift the render interpolation from the deadlines.
 `SimulationTickDriver.Inline.AnAuthoritySessionMatchesTheFrameHostTranscription` fails when the pump
-reads the engine clock. In `FreeRunning` the runner wakes at the deadlines on the engine clock, and the
-idle deadlines, the step hooks' stamps and the present clock read that clock: frame deltas would stop the
-pump whenever the frame thread stalls, the stall the mode exists to isolate the steps from, and would
-drift the pump from the deadlines the runner idles to.
+reads the engine clock. `Monotonic` is the configured alternative for a host whose frame delta carries no
+such meaning: it brings its own frame clamp (G-09) and its own resume (`reanchor()`). In `FreeRunning` the
+runner wakes at the deadlines on the engine clock, and the idle deadlines, the step hooks' stamps and the
+present clock read that clock: frame deltas would stop the pump whenever the frame thread stalls, the stall
+the mode exists to isolate the steps from, and would drift the pump from the deadlines the runner idles to.
 
-**What breaks if it moves.** The accumulation stays in `startFrame`, after the `FreeRunning` return and
-before `pumpAndRunSteps`, on the owning thread; inside `pumpAndRunSteps`, `beforePump` and then the pump
-read it, after `m_blockingSteps` captures the earlier frames' task.
+**What breaks if it moves.** The accumulation stays in `startFrame`'s `HostDelta` branch, after the
+`FreeRunning` return and before `pumpAndRunSteps`, on the owning thread; inside `pumpAndRunSteps`,
+`beforePump` and then the pump read it, after `m_blockingSteps` captures the earlier frames' task.
 
 ## G-05 — The owning thread never waits for a step task while it holds the world lock
 
@@ -198,3 +202,48 @@ stops on the scheduler's owner check with a pump here.
 
 **What breaks if it moves.** It must stay inside the `FreeRunning` branch, after its owner check and
 before its `return`; the default modes' post-physics pass below the branch is unchanged.
+
+## G-09 — A `Monotonic` frame longer than the clamp re-anchors the next deadline by exactly the excess
+
+**Tag site:** `SimulationTickDriver.h`, in `advanceMonotonicHostTime`, immediately above
+`scheduler.reanchor(scheduler.nextDeadline() + excessSeconds);`.
+
+**The prohibition.** Do not delete this call, and do not change its argument: not to the frame's own time
+minus the clamp (`hostSeconds - m_config.monotonicFrameClampSeconds`), and not to the frame's own time
+(`hostSeconds`).
+
+**The consequence.** The clamp is `Monotonic`'s stand-in for the engine's frame-time clamp, and the
+scheduler's `reanchor` is what counts it: the steps it skips are recorded as lost time of cause `reanchor`
+(`SimulationScheduler-guards.md` G-04). Without the call a long frame is caught up in full, up to the cap,
+and nothing is counted: `SimulationTickDriver.TimeBase.AOneSecondGapAdvancesTheClampAndCountsTheRestAsReanchorLoss`
+fails with the gap frame running 60 steps instead of 24. Re-anchored at `nextDeadline() + excess`, the skipped
+span is exactly the excess, and the deadlines after it are the `HostDelta` deadlines for the clamped delta,
+moved by the excess: the frame runs the steps `HostDelta` runs for a frame of `monotonicFrameClampSeconds`.
+Measured back from the frame's own time, the count is short of the excess by the part of the previous step
+interval that had not yet elapsed (`nextDeadline()` minus the previous frame's host time), and the frames
+after it no longer step as the clamped `HostDelta` frames do: in the same case, with that part half a step,
+0.5917 s is counted instead of 0.6. At the frame's own time, the frame runs one step and the clamp's span is
+counted as lost too: 1 step and 0.9917 s.
+
+**What breaks if it moves.** It must stay before `pumpAndRunSteps`, which pumps the frame: after the pump,
+`nextDeadline()` is past the frame's time and the steps the clamp meant to skip have run.
+
+## G-10 — The frame wait waits for this frame's task only when the frame dispatched exactly one step
+
+**Tag site:** `SimulationTickDriver.h`, in `waitsForThisFrame`, immediately above its `return`.
+
+**The prohibition.** Do not widen `m_frameSteps == 1u` to every frame with steps (`>= 1u`, `> 0u`), and do
+not drop the condition: the frame wait must never wait for a frame that dispatched two or more steps. Do not
+drop the `blockMode == 1 ||` operand either.
+
+**The consequence.** The wait is the owning thread's: under `ThisFramesSingleStep` the end of physics holds
+the frame until this frame's task completes. A catch-up frame dispatches up to the cap (`kMaxStepsPerFrame`,
+240) steps in one task; waiting for it puts the whole catch-up on the owning thread, the stall the
+`FrameBounded` task exists to keep off it, in exactly the frames that are already late.
+`SimulationTickDriver.FrameWait.AStepPublishedMidFrameIsShownByThatFramesPostPhysics` fails on its 2-step
+frames (each shows its own two steps). Without the block-mode operand, block mode 1 stops waiting for this
+frame's task under the default frame wait, and the `FrameBounded` transcription case's block-mode-1 frames
+fail.
+
+**What breaks if it moves.** `startFrame` writes `m_frameSteps` from the pump's count of the same frame;
+the condition must be read in `endFrame`, after it. Read before the pump, it is the previous frame's count.

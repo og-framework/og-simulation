@@ -19,7 +19,7 @@ OGSIM_OPTIMIZE_OFF
 // Layer: OGSimulation. Engine-agnostic — no UE, no Chaos, no game types.
 //
 // This header ships the BOUNDARY only. There is deliberately NO production
-// consumer yet: the hash-broadcast wire hookup (the replication-arrival handler
+// consumer yet: the hash-broadcast wire hookup (the correction-arrival handler
 // that compares the authoritative checksum against the local one and fires these
 // callbacks)
 // belongs to the Stage 4 observability initiative. Landing the interface first

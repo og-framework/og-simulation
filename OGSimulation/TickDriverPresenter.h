@@ -501,23 +501,18 @@ public:
 
 		storage.forEachSimulatable([this](unsigned int id, auto& simulatable)
 		{
-			auto& vizState = simulatable.editVizState().editState();
-			uint8_t declarationIndex = 0u;
-			simulatable.getPhysicsComposite().forEach([&](const auto& declaration)
-			{
-				using D = std::decay_t<decltype(declaration)>;
-				using S = typename D::StateType;
-				const uint8_t index = declarationIndex++;
-				const RenderBody* const pose = findRenderBody(m_renderPoses, static_cast<uint32_t>(id), index);
-				if (pose == nullptr || index == m_config.rootDeclarationIndex)
-					return;
-
-				auto& bodyState = D::bodyStateOf(vizState.template edit<S>());
-				bodyState.position = pose->position;
-				if constexpr (std::is_same_v<std::remove_cvref_t<decltype(bodyState)>, PhysicsBodyState>)
-					bodyState.rotation = pose->rotation;
-			});
+			overlayDeclarations(id, &simulatable.getPhysicsComposite(), simulatable.editVizState().editState());
 		});
+	}
+
+	template <typename SimulatableT, typename VizStateT>
+	void overlayRenderPoses_GameThread(unsigned int id, VizStateT& vizState) const
+	{
+		if (!m_renderPosesValid)
+			return;
+
+		using Composite = std::remove_cvref_t<decltype(std::declval<const SimulatableT&>().getPhysicsComposite())>;
+		overlayDeclarations(id, static_cast<const Composite*>(nullptr), vizState.editState());
 	}
 
 	void onRegistered(unsigned int id, uint32_t slot)
@@ -536,6 +531,27 @@ public:
 	const RenderCorrectionFrame& renderCorrectionFrame() const { return m_correctionFrame; }
 
 private:
+	template <typename... Declarations, typename StateT>
+	void overlayDeclarations(unsigned int id, const SimulationComposite<Declarations...>*, StateT& vizState) const
+	{
+		uint8_t declarationIndex = 0u;
+		(overlayDeclaration<Declarations>(id, declarationIndex++, vizState), ...);
+	}
+
+	template <typename D, typename StateT>
+	void overlayDeclaration(unsigned int id, uint8_t index, StateT& vizState) const
+	{
+		using S = typename D::StateType;
+		const RenderBody* const pose = findRenderBody(m_renderPoses, static_cast<uint32_t>(id), index);
+		if (pose == nullptr || index == m_config.rootDeclarationIndex)
+			return;
+
+		auto& bodyState = D::bodyStateOf(vizState.template edit<S>());
+		bodyState.position = pose->position;
+		if constexpr (std::is_same_v<std::remove_cvref_t<decltype(bodyState)>, PhysicsBodyState>)
+			bodyState.rotation = pose->rotation;
+	}
+
 	struct Target
 	{
 		uint32_t   slot = 0u;

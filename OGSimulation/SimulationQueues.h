@@ -29,8 +29,9 @@ enum class QueueMoveResult
     IdNotRegistered,
 };
 
-// Generic circular move queue — physics thread writes on RPC arrival (game thread),
-// integration reads on physics thread. Mirrors the concrete RemoteMoveQueue pattern
+// Generic circular move queue — written on remote-input arrival (og-sim-net's server
+// drain, on the game thread in the frame-locked mode; the input RPC until og-input-latency
+// task P5-7), integration reads on physics thread. Mirrors the concrete RemoteMoveQueue pattern
 // but is templated on InputType so SimulationNetSync can instantiate one per type.
 template <typename InputType>
 class RemoteMoveQueue
@@ -112,7 +113,9 @@ private:
 };
 
 // SPSC queue for buffering locally-produced inputs between the physics thread
-// (producer: collectInputAll) and the game thread (consumer: sendLocalInputToAuthorityAll).
+// (producer: collectInputAll) and its consumer, sendLocalInputToAuthorityAll: the game
+// thread once per frame, frame-locked; the step's own thread at capture on an immediate
+// og-sim-net client (og-input-latency P2-16), so both ends on one thread there.
 // Lamport ring: head/tail are atomic, no count. Full = next(tail)==head (wastes
 // one slot, hence RingSize = Capacity + 1 to preserve 60 usable entries).
 template <typename InputType>
@@ -152,9 +155,10 @@ public:
     // Does NOT advance head/tail — used by the redundancy-bundle producer
     // (og-sim-net's SimNetChannel::sendLocalInputToAuthority; the Unreal
     // buildRedundancyBundle until og-input-latency task P5-8 deleted it) to re-send
-    // the last N ticks every frame so a
+    // the last N ticks on every send so a
     // dropped unreliable datagram self-heals on the next send. Consumer-thread only
-    // (the game thread that also calls dequeue / releaseAllButRecent).
+    // (the thread that also calls dequeue / releaseAllButRecent: the game thread
+    // frame-locked, the step's thread on an immediate og-sim-net client).
     template <typename Callback>
     void forEachRecent(uint32 upToTick, size_t maxSlots, Callback&& cb) const
     {

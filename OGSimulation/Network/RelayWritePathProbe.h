@@ -33,9 +33,12 @@
 // ---------------------------------------------------------------------------
 // ONE ADAPTER'S BINDING FOR THE REPLICATION NAMES. This header names ROLES --
 // replication system, replication poll, replication writer, game-thread frame
-// identity. For one adapter (Unreal) those are Iris, its once-per-frame property
-// poll, `FReplicationWriter` and `GFrameCounter`. Another adapter substitutes its
-// own; nothing here depends on them. Transport roles: their own block at PROBE 6.
+// identity. For one adapter (Unreal) those were Iris, its once-per-frame property
+// poll, `FReplicationWriter` and `GFrameCounter`, until og-input-latency P5-7 moved
+// the sim traffic to og-sim-net; since then no adapter feeds `RelayWriteProbe` (the
+// Unreal session's PROBE 5 is gone, and only og-simulation-tests drive it). Another
+// adapter substitutes its own; nothing here depends on them. Transport roles: their
+// own block at PROBE 6, which the Unreal session still feeds.
 //
 // ⭐ WHY IT EXISTS AND WHAT IT FOUND: an elimination chain blamed the replication send path without testing whether two relay writes can share one server frame. They can: the answer was COALESCING, ~11.6 % of relayed inputs. §10
 // ⛔ THAT WRITE PATH IS GONE: flush-on-poll staging replaced replace-latest, so the probe now measures the STAGE-OVERFLOW ceiling and `observableX1000` is that ceiling's acceptance gate. §11

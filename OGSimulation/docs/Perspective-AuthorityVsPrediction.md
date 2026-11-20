@@ -1,6 +1,5 @@
 <!-- SPDX-License-Identifier: MPL-2.0 -->
 <!-- lint-external-ref: OnRep -- Unreal Engine replication hook name, outside every scan root -->
-<!-- lint-external-ref: Plugins/OGSimulation/Source/OGSimulationUnreal/SimulatableNetSyncComponent.h -- deleted by og-input-latency task P5-8 (the net-sync component, the pawn's subobject, the bundle builder and the owner binding's net half); kept in the history -->
 # Perspective: the authority simulation vs the prediction simulation
 
 **One class, two behaviours.** `SimulationManager` is instantiated with a single `bool`, and that
@@ -33,7 +32,8 @@ four ship in this directory.
 A process runs **one** `SimulationManager` per role, constructed with `shouldRunPrediction`. That
 flag is stored once as `m_runsPrediction` and is never rewritten; every role difference in the whole
 core descends from it. On the authority the manager owns a `ServerTickClock`, advances one tick per
-physics step, reads each character's input out of an inbound queue fed by RPC, integrates once, and
+physics step, reads each character's input out of an inbound queue fed by the clients' input bundles (og-sim-net's
+server since og-input-latency task P5-7; an RPC before), integrates once, and
 publishes state. On a predicting client it owns a `ClientPredictionClock` and a
 `NetworkTimeEstimator`, runs *ahead* of the authority, keeps a `StateCorrectionCache` per character
 so that any tick it predicted can be re-run, and — when a correction disagrees with what it
@@ -77,7 +77,7 @@ identical is the point — the common mistake is to imagine a separate "proxy pa
 | 5 | `preparePredictionSimulationStep` — the collect+allocate door | ⛔ | ✅ | ✅ | `<core>SimulationStepSequencing.h` :: `preparePredictionSimulationStep` |
 | 6 | `collectInputAll` | ✅ | ✅ | ✅ | `<core>SimulationInputResolution.h` :: `collectInputAll` |
 | 7 | …its **provider** branch (local capture + delay line) | ⛔ | ✅ | ⛔ | `<core>SimulationInputResolution.h` :: `collectInputForCharacter` |
-| 8 | …its **remote-queue** branch (dequeue what the RPC delivered) | ✅ | ⛔ | ⛔ | `<core>SimulationQueues.h` :: `dequeueMove` |
+| 8 | …its **remote-queue** branch (dequeue what the input bundle delivered) | ✅ | ⛔ | ⛔ | `<core>SimulationQueues.h` :: `dequeueMove` |
 | 9 | …its **simulated-proxy** branch (the scheduled relay read) | ⛔ | ⛔ | ✅ | `<core>SimulationInputResolution.h` :: `collectInputForCharacter` |
 | 10 | `collectResimInputAll` | ⛔ | ✅ | ✅ | `<core>SimulationInputResolution.h` :: `collectResimInputAll` |
 | 11 | `allocateFrontierSlotsAll` — the pair's opening half | ⛔ | ✅ | ✅ | `<core>SimulationReconciliation.h` :: `allocateFrontierSlotsAll` |
@@ -99,8 +99,8 @@ identical is the point — the common mistake is to imagine a separate "proxy pa
 | 27 | `setAuthorityGuardContext` | ✅ | ⛔ | ⛔ | `<core>SimulationNetSync.h` :: `setAuthorityGuardContext` |
 | 28 | `createCacheFor` — a correction cache is allocated | ⛔ | ✅ | ✅ | `<core>SimulationReconciliation.h` :: `createCacheFor` |
 | 29 | `injectCorrectionState` — a correction is applied | ⛔ | ✅ | ✅ | `<core>SimulationReconciliation.h` :: `injectCorrectionState` |
-| 30 | `onCorrectionReceived` — **bound** on both, **fires** only on a client | ∅ | ✅ | ✅ | `<core>SimulationNetSync.h` :: `onCorrectionReceived`; `Plugins/OGSimulation/Source/OGSimulationUnreal/SimulatableNetSyncComponent.h` :: `OnRep_CorrectionState` |
-| 31 | `queueRemoteMove` — inbound RPC lands in the authority queue | ✅ | ⛔ | ⛔ | `<core>SimulationInputResolution.h` :: `queueRemoteMove` |
+| 30 | `onCorrectionReceived` — **bound** on both, **fires** only on a client | ∅ | ✅ | ✅ | `<core>SimulationNetSync.h` :: `onCorrectionReceived`; `Plugins/OGSimulation/Source/OGSimulationNet/og-sim-net/OGSimNet/SimNetChannel.h` :: `storeCorrection` (from `SimNetClient::onCorrection`; an OnRep until og-input-latency task P5-7) |
+| 31 | `queueRemoteMove` — an inbound input bundle lands in the authority queue | ✅ | ⛔ | ⛔ | `<core>SimulationInputResolution.h` :: `queueRemoteMove` |
 | 32 | `wipeAllForResync` (resolution peer) | ⛔ | ✅ | ✅ | `<core>SimulationInputResolution.h` :: `wipeAllForResync` |
 | 33 | `wipeAllForResync` (reconciliation peer) | ⛔ | ✅ | ✅ | `<core>SimulationReconciliation.h` :: `wipeAllForResync` |
 | 34 | `stepAllocatesFrontierSlot` — the shared step-kind predicate | ⛔ | ✅ | ✅ | `<core>SimulationTimeContext.h` :: `stepAllocatesFrontierSlot` |
@@ -147,17 +147,17 @@ running sweep, and §5 is about the consequence of that being the only one.
 ⛔ **A fifth thing that looks like a gate and is not: a bound callback.** `registerPredictionOwner`
 binds the correction-state callback **unconditionally**, on both roles
 (`<core>SimulationNetSync.h`). On the authority that callback is dead, because the buffer that
-drives it is a **replicated property whose change notification fires on the receiving side only** —
+drives it **fires on the receiving side only** —
 and the authority is the *writer* of that buffer, in `sendCorrectionAll`, so its own write never
-notifies it. One adapter's binding for that property is
-`UPROPERTY(ReplicatedUsing = OnRep_CorrectionState)` on
-`Plugins/OGSimulation/Source/OGSimulationUnreal/SimulatableNetSyncComponent.h` (the per-character
-component's replicated sibling since og-ue-simulationcomponentandmanagersplit task 20a), whose `OnRep` the engine raises only where the
-value arrived; an adapter without receive-side notifications has to establish this differently or
-gate the callback itself. The core states the
+notifies it. Since og-input-latency task P5-7 the binding is og-sim-net's: the callback fires from
+`SimNetChannel::storeCorrection`, whose only caller is the client session's `SimNetClient::onCorrection`; the
+authority runs `SimNetServer`, which sends corrections and never stores one. Until then it was a replicated property,
+`UPROPERTY(ReplicatedUsing = OnRep_CorrectionState)` on the per-character net-sync component (deleted by P5-8), whose
+`OnRep` the engine raised only where the value arrived. An adapter without receive-side notifications has to
+establish this differently or gate the callback itself. The core states the
 same property in its own words for the sibling relay-ring callback, in the provider-absent branch of
 `registerPredictionOwner`: *"On the AUTHORITY … the callback it binds can never fire there, because
-OnRep is a client-only notification."* **Role safety here rests on an engine property, not on a
+OnRep is a client-only notification."* **Role safety here rests on the transport's role split (an engine property until P5-7), not on a
 test in this code.**
 
 ---
@@ -371,7 +371,10 @@ provider. Read the table row, not that paragraph, for the current order.
 
 ⛔ **The ordering IS still the only thing holding the invariant, and the alternative was measured and
 rejected.** `DeferredLifecycleQueue` exists in the core as a game→physics marshalling point — enqueue
-on the game thread, apply between physics steps — and **no adapter in this tree uses it.** Adopting it
+on the game thread, apply between physics steps. Since og-input-latency P5-17 and P5-19 og-sim-net's client and server
+sessions apply registrations through it on an **immediate client** and on the **authority loop**, where the sends that
+iterate these maps run on the queue's own thread (the step's thread, the runner). **A frame-locked client and an inline
+server do not use it**, and there adopting it
 inverts the crossing rather than closing it: it makes the physics thread the sole writer, and the
 readers that then sit on the far side include two per-tick game-thread ITERATIONS,
 `sendCorrectionAll` over `m_authorityWriters` and `sendLocalInputToAuthorityAll` over

@@ -596,7 +596,8 @@ struct CorrectionLandingWindowSummary
 };
 
 // ---------------------------------------------------------------------------
-// CorrectionLandingProbe — GAME THREAD ONLY.
+// CorrectionLandingProbe — ONE THREAD ONLY: the correction arrival's (the game thread
+// frame-locked, the step's thread on an immediate client, og-input-latency P2-15).
 // ---------------------------------------------------------------------------
 class CorrectionLandingProbe
 {

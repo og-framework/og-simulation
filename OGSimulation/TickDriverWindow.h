@@ -313,7 +313,8 @@ public:
 			requestedCap, maxStepsPerFrame, cap);
 	}
 
-	const char* formatFrameLine(double dtSeconds, uint32_t maxCatchUpSteps, double idleSlackSeconds = 0.0)
+	const char* formatFrameLine(double dtSeconds, uint32_t maxCatchUpSteps, double idleSlackSeconds = 0.0,
+		bool monotonicTimeBase = false, bool waitsForThisFramesStep = false)
 	{
 		if (m_threading == StepThreading::FreeRunning)
 			return formatHostLine(m_frameLine,
@@ -322,10 +323,11 @@ public:
 				roleWord(),
 				dtSeconds, maxCatchUpSteps, tickDriverWindow::roundedMicroseconds(idleSlackSeconds));
 		return formatHostLine(m_frameLine,
-			"[SimHost.Frame] role=%s stepping=%s dt=%.6f maxCatchUpSteps=%u rateScale=[0.75,1.25] timeBase=worldDelta",
+			"[SimHost.Frame] role=%s stepping=%s dt=%.6f maxCatchUpSteps=%u rateScale=[0.75,1.25] timeBase=%s%s",
 			roleWord(),
 			steppingWord(),
-			dtSeconds, maxCatchUpSteps);
+			dtSeconds, maxCatchUpSteps, monotonicTimeBase ? "monotonic" : "worldDelta",
+			waitsForThisFramesStep ? " frameWait=thisFramesSingleStep" : "");
 	}
 
 private:

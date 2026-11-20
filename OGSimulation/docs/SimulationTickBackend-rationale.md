@@ -89,14 +89,15 @@ unchanged.
   (BL1), so the query adapter gets this role's access predicate and an inline host's owning thread may register without
   the lock; og-simulation-jolt's world host also `OG_CHECK`s that. The backend never touches an adapter optional: it
   passes the caller's.
-* **`start(dtSeconds, isAuthority, requestedMaxCatchUpSteps, idleSlackSeconds = 0)`**, once, at the end of the
+* **`start(dtSeconds, isAuthority, requestedMaxCatchUpSteps, idleSlackSeconds = 0, frameWait = EarlierFrames)`**, once, at the end of the
   session's start of play (in `FreeRunning`, on the runner, from `runAuthorityLoop`: §8):
   1. `bindIntegratedTickSource(game.manager())`;
   2. the presenter, with the manager's `runsPrediction()`, `dtSeconds` as a `float` and the world host's
      `rootDeclarationIndex()`;
   3. an `OG_CHECK` that the presenter exists (§4);
   4. the driver, with `dtSeconds`, `isAuthority`, the threading and `requestedMaxCatchUpSteps`, and
-     `idleSlackSeconds` as its configuration's idle slack (used only in `FreeRunning`; the driver checks it). The
+     `idleSlackSeconds` as its configuration's idle slack (used only in `FreeRunning`; the driver checks it) and
+     `frameWait` as its frame wait (used only in `FrameBounded`, `SimulationTickDriver-rationale.md` §4). The
      threading is the world host's context's `threading()`, the mode its `build` configured: `Inline`,
      `FrameBounded` or `FreeRunning`. For the first two it is the value the former `stepsInline()` choice gave,
      because a context configured with a bool reports exactly those two. The driver's constructor takes the world host's `lockForStep()` (J2 and the access
@@ -124,8 +125,10 @@ unchanged.
   clock's `noteShadowRestore`: so the restore's time and its refusals reach the driver's window
   (`shadowRestores`/`shadowRestoreUs`/`shadowRefused` of `[SimHost.Window]`).
 * **`updateVisualization()`**: the presenter's `updateVisualization_GameThread` with the game's storage.
+* **`overlayRenderPoses(id, vizState)`**: the presenter's `overlayRenderPoses_GameThread`, for the backend's simulatable
+  type, on a state the host owns, for a host that draws from its own copy (the presenter's §7).
 * **`editVizQuery()`, `getVizReader()`, `registerVizVolume(...)`** forward to the world host's doors of the same names.
-  In `FreeRunning` these four are refused (§9).
+  In `FreeRunning` these five are refused (§9).
 * **`driver()` and `presenter()`** are the adapter's and the tests' doors; each `OG_CHECK`s that `start` built it.
 
 ## §4 The member order
@@ -234,7 +237,7 @@ The frame thread keeps the presenter and the queues and snapshots it reads.
 | `build`, `start`, `runAuthorityLoop` | runner | `runAuthorityLoop` calls `build` and `start` itself, on its thread, and checks the mode; the driver's loop `OG_CHECK`s that this thread is the owner |
 | `acquireAndBind`, `releaseSlot`, `onRegistered`, `forgetPresenterTarget` | runner | an `OG_CHECK` of the owner thread, first |
 | `present` | frame thread | drains J9, then presents with the driver as the clock (its two present-clock doors are readable off the runner) |
-| `updateVisualization`, `editVizQuery`, `getVizReader`, `registerVizVolume` | none | refused by an `OG_CHECK`: a `FreeRunning` authority has no game-thread viz world |
+| `updateVisualization`, `overlayRenderPoses`, `editVizQuery`, `getVizReader`, `registerVizVolume` | none | refused by an `OG_CHECK`: a `FreeRunning` authority has no game-thread viz world |
 | `stop` | frame thread, after the join | the driver's check that the loop returned |
 | `driver()`, `presenter()` | either | doors; what is called through them keeps its own thread rule |
 

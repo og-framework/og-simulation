@@ -70,10 +70,10 @@ OGSIM_OPTIMIZE_OFF
 //
 //   what                              GAME thread         PHYSICS thread
 //   --------------------------------  ------------------  ------------------
-//   m_clientEffectiveInputDelayTicks  write OnRep_Conn-   read once per tick
-//     (atomic, relaxed)               ectionTier          (both collects)
-//   m_remoteInputCaches               write OnRep_Rel-    read (both collects)
-//                                     ayedInputRing
+//   m_clientEffectiveInputDelayTicks  write: the drain's  read once per tick
+//     (atomic, relaxed)               tier receipt (*)    (both collects)
+//   m_remoteInputCaches               write: the drain's  read (both collects)
+//                                     ring receipt (*)
 //   m_remoteInputCaches               read getLastRelay-  --
 //                                     edInput -- THE ONE
 //   m_lastUsedCaptureTicks            read sendCorrec-    write collectInputAll
@@ -85,6 +85,16 @@ OGSIM_OPTIMIZE_OFF
 //   m_inputResolutionTelemetry        --                  write (every emit*)
 //   registration / unregistration     all of it           --
 //
+// (*) og-sim-net's FRAME-LOCKED mode (`SimNetConfig::immediate` false, the
+//   shipped default): the client's drain runs on the GAME thread
+//   (`SimNetClient::onTier` -> the host's tier receipt, `SimNetClient::onRing`;
+//   the OnRep_ConnectionTier / OnRep_RelayedInputRing callbacks until
+//   og-input-latency task P5-7), and the table reads as written. In the
+//   IMMEDIATE mode (P2-15) the host drains at the start of each step, before
+//   `collectInputAll`, on the step's thread: both writes move to the PHYSICS
+//   (step) thread and are same-thread with their reads, and the game-thread
+//   read below then reads a store the step writes (og-input-latency P2-18's
+//   display snapshot carries it for the game thread).
 // ⛔ getLastRelayedInput is THE ONE game-thread reader of a store the physics
 //   thread also reads -- and is same-thread with that store's WRITER, which is
 //   why it alone does not participate in the accepted tear. §14
@@ -683,8 +693,8 @@ public:
     // ---------------------------------------------------------------------------
     // ⛔ ONE SCALAR, NOT A PER-ID MAP: a delay is a property of the local CONNECTION
     //   and a client has exactly one. §14
-    // ⛔ GAME->PHYSICS CROSSING: written by OnRep_ConnectionTier (GT), read ONCE per
-    //   tick (PT). An atomic suffices because it is a lone independent scalar -- the
+    // ⛔ GAME->PHYSICS CROSSING: written by the drain's tier receipt (GT in the
+    //   frame-locked mode, the table's (*)), read ONCE per tick (PT). An atomic suffices because it is a lone independent scalar -- the
     //   worst a stale read does is apply a tier change a tick late. EMPHATICALLY NOT
     //   `ServerInputDelayQueue`'s case, whose shared thing was an unordered_map with
     //   rehash UB, not a stale value. RELAXED is deliberate. §14
@@ -984,10 +994,11 @@ public:
     //   only the unregistration ordering kept it out of UB. §7
     // ---------------------------------------------------------------------------
 
-    // Replaces the OnRep-bound relay-arrival callback's body AND the registration-time
-    // catch-up read, both by id.
+    // Replaces the relay-arrival callback's body (the callback NetSync binds on the
+    // owner, which og-sim-net's ring receipt calls; an OnRep's until og-input-latency
+    // task P5-7) AND the registration-time catch-up read, both by id.
     // ⛔ NetSync's catch-up call DISCARDS the returned report (the
-    //   not-fed-to-the-cadence-probe rule); only its OnRep thin-call emits. §7
+    //   not-fed-to-the-cadence-probe rule); only its arrival thin-call emits. §7
     template <typename SimulatableT, typename RingT>
     RelayedInputIngestReport ingestRelayRing(unsigned int id, const RingT& ring)
     {
@@ -1013,7 +1024,9 @@ public:
         return report;
     }
 
-    // Replaces the RPC-bound remote-move callback's queueing call, by id.
+    // Replaces the remote-move callback's queueing call, by id (the callback NetSync
+    // binds on the authority owner, which og-sim-net's delayed-input delivery calls;
+    // the input RPC's until og-input-latency task P5-7).
     // ⛔ GUARD CONTEXT CROSSES BY VALUE from NetSync's own members -- the guard stays
     //   NetSync's and this door only ever sees copies. The too-far-future warning and
     //   the `[ReceiveLocalInput]` SIMLOG stay at NetSync's lambda. §7
@@ -1109,7 +1122,7 @@ public:
         ResolvedInputs<SimulatableTs...> inputs;
 
         // ⛔ ONE LOAD PER TICK for every locally-controlled simulatable. Reading it
-        //   once rather than per id is what makes a concurrent OnRep_ConnectionTier write
+        //   once rather than per id is what makes a concurrent tier-receipt write
         //   unable to split a single tick across two different delays. §14
         const int32 effectiveDelay = getClientEffectiveInputDelayTicks();
 
@@ -1695,7 +1708,7 @@ private:
 
     // The client's relayed-input stores, one per REMOTE character
     // (provider-ABSENT ids -- the complement of m_localInputCaches).
-    // ⛔ WRITTEN ON THE GAME THREAD (OnRep_RelayedInputRing), READ ON THE PHYSICS
+    // ⛔ WRITTEN ON THE GAME THREAD (the drain's ring receipt, frame-locked mode), READ ON THE PHYSICS
     //   THREAD (both collects). The crossing is INHERITED from the correction path and
     //   its full rationale is the THREADING section of Network/RemoteInputCache.h.
     //   DO NOT RESTATE IT HERE; DO NOT WEAKEN IT THERE. §14
@@ -1720,7 +1733,7 @@ private:
     InputResolutionTelemetry m_inputResolutionTelemetry;
 
     // Client effective input delay.
-    // ⛔ Written on the GAME thread (OnRep_ConnectionTier, via the adapter calling this
+    // ⛔ Written on the GAME thread (the drain's tier receipt, frame-locked mode, via the adapter calling this
     //   class directly -- there is no `SimulationNetSync` forwarder), read once per
     //   tick on the PHYSICS thread. ATOMIC -- AND ONLY ATOMIC -- for the reasons at
     //   setClientEffectiveInputDelayTicks. 0 = no delay. §14

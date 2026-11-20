@@ -19,6 +19,7 @@ Line numbers are into `SimulationManager.h` **as it stood before this sweep**
 (1,331 lines, nested-submodule working tree at 2026-08-22). They do not resolve against
 the shipped file and are not intended to.
 
+<!-- lint-external-ref: OnRep -- Unreal Engine replication hook name, outside every scan root -->
 <!-- lint-external-ref: prepareSimulationStep -- retired identifier: collectInputAll was renamed to this at item 90 and back at item 94; quoted verbatim in the archived blocks -->
 <!-- lint-external-ref: editTimeConfig -- an alternative that deliberately does not exist -- the narrow-setter fence at :357 names the mutable accessor it refuses to provide -->
 <!-- lint-external-ref: setResimCooldownTicks -- D4 absence fence at :450: the name is unresolvable BECAUSE the setter was never built -->
@@ -44,6 +45,7 @@ A reader with no engine can read every quoted block through it.
 | `Chaos` | that adapter's **physics engine** — the party that accepts or refuses a rewind request and owns the resim loop | role words: *the physics engine* / *a physics rewind* |
 | `AOGBrawlerSimulationManager` | one adapter's **composition root**: constructs the per-role manager and exposes the two narrow passthroughs the callback reaches it through | |
 | `UObject` | that engine's **base object type**; "a game-thread `UObject` callback" means a replication notification delivered on the game thread | |
+| `OnRep`, `RPC` | that engine's **property notification** and **remote call**: the arrival of a replicated value on a client (the floor, the tier) and a client-to-server call (the input that `queueMove` checks) | the sim traffic's until og-input-latency task P5-7. Since then those values arrive through og-sim-net's sessions, in their drain: on the game thread frame-locked, on the step's thread on an immediate client (and on the runner for the server on the authority loop). A quoted OnRep or RPC, or "a game-thread `UObject` callback", is that arrival |
 | `FMath::Min` | that engine's **math utility**, here the engine-side merge that can only DEEPEN a requested rewind | the directional argument is the fact; the utility is not |
 | `Config/DefaultEngine.ini` | one adapter's **host-application configuration surface**, where the shipped log level and policy values are set | another adapter supplies the same values under its own keys |
 
@@ -1519,8 +1521,9 @@ The send's arithmetic and its default (0 = today's `redundancyDepthTicks`, the s
 
 Not archived prose; the header's `§15` pointers at `setRecentreSettleSamples` land here.
 
-`setRecentreSettleSamples` is the one writable location for `TimeConfig::recentreSettleSamples`, the number of measured
-RTT samples the client clock waits after a join or a hard resync before its one-shot re-centre
+`setRecentreSettleSamples` is the one writable location for `TimeConfig::recentreSettleSamples`, the number of advances
+with an RTT reading (a window of ticks since og-input-latency P3-11) the client clock waits after a join or a hard resync
+before its one-shot re-centre
 (`TimeConfig-rationale.md` §14). It follows the latency knobs' setters (§13): a narrow setter, not a mutable
 `TimeConfig`. It has no clamp: every `uint32_t` is a valid window, and 0 is the documented "off".
 
@@ -1532,3 +1535,41 @@ arm would need a second build.
 every `advancePrediction`, which runs on the client's stepping thread. The composition root calls the setter on the game
 thread before stepping starts and never again, so the read needs no synchronization; a `cvar` or any later write would
 race it. Both roles call it (the field has no reader on the authority), keeping one `TimeConfig` shape for both roles.
+
+## 16. Additions after the archive: the clock RTT source's setter (og-input-latency P3-10, 2026-11-19)
+
+Not archived prose; the header's `§16` pointers at `setClockRttSource` land here.
+
+`setClockRttSource` is the one writable location for `TimeConfig::clockRttSource`, the client clock's RTT source
+(`TimeConfig-rationale.md` §15). It follows the re-centre window's setter (§15): a narrow setter, not a mutable
+`TimeConfig`, and no clamp (the enum has two values, both valid).
+
+**The configuration key** (P3-10 part B). The Unreal host's `[OGNetcode] ClockRttSource=Engine|SimClock` (case-insensitive,
+read on both roles beside `RecentreSettleSamples`) calls the setter from its session's `applyClockRttSource`; an
+unrecognised value is reported and the compiled default kept. The start-up line is `[ClockSource.Config] clockRttSource=<Engine|SimClock>
+(<ini|compiled>)`.
+
+**One-shot at composition.** `NetworkTimeEstimator` reads the field live from `m_timeConfig` (the re-read rule, §4) on every
+SimClock sample, on the estimator's writer thread (the game thread in og-sim-net's frame-locked mode, the step's thread in
+its immediate mode). The composition root calls the setter before samples flow and never again, so the read needs no
+synchronization; a later write would race it. Both roles may call it; the field has no reader on the authority.
+
+## 17. Additions after the archive: the jitter multipliers' setter (og-input-latency P3-13, 2026-11-20)
+
+Not archived prose; the header's `§17` pointers at `setJitterMultiplier` land here.
+
+`setJitterMultiplier` is the one writable location for `TimeConfig::jitterMultiplier` and
+`TimeConfig::simClockJitterMultiplier`, the prediction offset's jitter margin for the engine ping and for the SimClock ping
+(`TimeConfig-rationale.md` §17). It follows the clock RTT source's setter (§16): a narrow setter, not a mutable `TimeConfig`.
+It sets both fields to one value: the door is one session-wide multiplier, and only the compiled defaults differ by source.
+It clamps with `clockJitter::clampJitterMultiplier` (0 to 4; a NaN reads as 0), as the latency knobs' setters clamp (§13);
+the two compiled defaults lie inside the clamp (a `static_assert` in `TimeConfig.h`).
+
+**The configuration key** (one adapter's binding: the Unreal host's `[OGNetcode] JitterMultiplier`, read beside
+`RecentreSettleSamples` and `ClockRttSource` and reported on the `[ClockSource.Config]` line). It exists so the multiplier's
+measurement (P3-13) ran every value on one binary.
+
+**One-shot at composition.** `NetworkTimeEstimator::getPredictionOffsetTicks` reads the active source's field live from `m_timeConfig`
+(the re-read rule, §4) on the client's stepping thread. The composition root calls the setter before stepping starts and never
+again, so the read needs no synchronization; a `cvar` or any later write would race it. Both roles may call it; neither
+field has a reader on the authority.

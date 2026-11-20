@@ -65,10 +65,11 @@ left it at 2.
 
 The **inbound** (client → server) redundancy bundle (`InputRedundancyBundleCodec.h`) is append-only and
 immutable per capture tick: `inputRedundancyBundle::appendSlot` checks against a duplicate capture tick,
-and the payload hard-caps at `inputRedundancyBundle::kMaxSlots` (8). That is right for an RPC argument
-that is rebuilt from scratch every send.
+and the payload hard-caps at `inputRedundancyBundle::kMaxSlots` (8). That is right for a message that is
+rebuilt from scratch every send (an RPC argument until og-input-latency task P5-7; og-sim-net's input bundle since).
 
-The outbound relay payload is the opposite shape: a **persistent** replicated property, written again
+The outbound relay payload is the opposite shape: a **persistent** ring (a replicated property until og-input-latency task
+P5-7; since then the ring og-sim-net's `RelayRingStager` publishes and the server re-sends), written again
 on every newer capture tick for the whole session. Driven the bundle's way it would overflow its slot
 budget within 8 ticks and then assert. So the two directions use two payloads, and this one:
 

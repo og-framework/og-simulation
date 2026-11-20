@@ -90,6 +90,8 @@ template <DriverStepDoors DriverT, TickDriverGame GameT, TickDriverPresenterStep
 	TickDriverEngine EngineT>
 struct StepDoors
 {
+	using Game = GameT;
+
 	DriverT& driver;
 	GameT& game;
 	PresenterT& presenter;
@@ -119,7 +121,14 @@ public:
 		checkInStep();
 		m_doors.driver.applyBodySlotOccupancyCommands_Step();
 		if (!upcoming.authority)
+		{
+			if constexpr (TickDriverReceiveGame<typename DoorsT::Game>)
+			{
+				// ⛔G-04  docs/TickDriverStepHooks-guards.md
+				m_doors.game.receiveForStep();
+			}
 			return;
+		}
 
 		OG_CHECK(m_doors.driver.isOwnerThread(),
 			"TickDriverStepHooks::beforeTick: an authority step ran off the owner thread. The authority's input release "

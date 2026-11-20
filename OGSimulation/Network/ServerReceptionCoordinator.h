@@ -42,7 +42,7 @@
 //
 //   * THE FOUR ENTRY POINTS, and the cadence each is driven at:
 //
-//       noteRttSample         per arriving BUNDLE   the RPC receive path
+//       noteRttSample         per arriving BUNDLE   SimNetServer's input receive path
 //       receiveInputBundle    per arriving BUNDLE   the same path, after it
 //       releaseDelayedInputs  per SIM TICK          the authority's pre-step hook
 //       reapConnections       per PHYSICS FRAME     the host, after the frame's steps
