@@ -60,7 +60,7 @@ The driver holds raw pointers to its four borrowed collaborators, then, in this 
 | member | what |
 |---|---|
 | `m_config` | the configuration, `const` |
-| `m_running`, `m_loggedFirstStep`, `m_hostTimeSeconds`, `m_lastFrameStartSeconds`, `m_monotonicOriginSeconds`, `m_frameSteps` | the running flag, the first-step flag, the host time, the previous frame's start, the `Monotonic` origin (the engine clock in `begin()`, §6) and the step count of the frame's own dispatch (§4, the frame wait) |
+| `m_running`, `m_loggedFirstStep`, `m_hostTimeSeconds`, `m_lastFrameStartSeconds`, `m_monotonicOriginSeconds`, `m_frameSteps`, `m_refusedRateChanges` | the running flag, the first-step flag, the host time, the previous frame's start, the `Monotonic` origin (the engine clock in `begin()`, §6), the step count of the frame's own dispatch (§4, the frame wait) and the count of rate changes the rate door refused (§6) |
 | `m_scheduler` | `std::optional<SimulationScheduler>`, built in the constructor after the step driver |
 | `m_window`, `m_firstStepLine` | the telemetry window and the first-step line (`TickDriverWindow.h`) |
 | `m_bodySlotOccupancyCommands` | J1 |
@@ -244,6 +244,8 @@ the same module.
   `afterTick` stores `outcome.tick − outcome.physicsStep`; `pumpAndRunSteps` adds it to `batch.first`, with
   no `+ 1`, because `outcome.tick` is the tick the step integrated (`⛔G-03`). Before the first step the
   offset is 0. `tickOffset()` is a relaxed load of it, the time-dilation seam's third door (§6).
+  `pumpAndRunSteps` loads it the same way when it builds the rate door, which carries the value to
+  `beforePump` as the door's `tickOffset()`.
 * **J4, the batch** (owning thread → task): first step, count, and one deadline per step in a
   `std::array<double, 240>`, copied into the task by value.
 * **J6, the step cost** (step → owning thread): `SpscRing<StepCostSample, 256>`; the hooks push one sample
@@ -318,9 +320,25 @@ transcribed (`sampleInput`, below, came later). The game is called on
 the owning thread immediately before `pump()`, once per frame (in `FreeRunning` once per wake, a wake that
 runs no step included), with the host time the pump is about to receive and a `TickRateDoor` over the
 scheduler. A rate change made through the door therefore applies to this frame's pump; called after the
-pump, it would apply only from the next frame's. Nothing changes the rate through it yet. With
-`tickOffset()` and the timing samples in the scheduler's time base, it is the seam a time-dilation
-controller plugs into.
+pump, it would apply only from the next frame's. With `tickOffset()` and the timing samples in the
+scheduler's time base, it is the seam a time-dilation controller plugs into.
+
+**The rate door.** `pumpAndRunSteps` builds a new `TickRateDoor` for each pump, with the scheduler, the
+published tick offset J3 (loaded relaxed, §5), the role (`m_config.isAuthority`) as the door's refusal
+flag, and `m_refusedRateChanges` as its counter (`TickDriverConcepts-rationale.md` §7). So the game's
+`beforePump` reads the scheduler's `nextDeadline()` and `currentInterval()` and the offset the steps last
+published from the door it is handed, with no further hook.
+* **An authority's door refuses.** On an authority `setRateScale` changes nothing and counts one refusal
+  (`⛔G-11`). The authority's tick rate is the time reference its clients' prediction clocks follow, so a
+  rate it applied would move every client's target at once. On a client the call applies, clamped to the
+  rate bounds.
+* **The count.** `m_refusedRateChanges` is a plain count on the driver, written only through the door and
+  so only on the scheduler's owning thread (the runner in `FreeRunning`). The door holds it by pointer,
+  so it outlives each door and counts the session's refusals. `getDiagnostics().refusedRateChanges()`
+  reads it, under the threading rule of every other `Diagnostics` read (§12). It is not printed on any
+  line: `[SimHost.Window]` is unchanged.
+* **In `FreeRunning`**, which is the authority's only, the door always refuses, so J8 publishes the
+  scheduler's rate of 1.0 at every wake (§5).
 
 **`sampleInput()`** is the input-sample hook of a game that models `TickDriverSampleGame`
 (`TickDriverConcepts-rationale.md` §9). In `Inline` and `FrameBounded` it is the first thing `startFrame` does
@@ -349,9 +367,10 @@ batch's deadline array). When the clamp changed it, the driver logs the Warning
 first line intact until it is logged). The scheduler drops the rest of a longer frame and counts it as lost
 time.
 
-**The rate bounds** are `Config::minRateScale` and `maxRateScale`, 0.75 and 1.25 by default. The
-`[SimHost.Frame]` line prints the literal `rateScale=[0.75,1.25]`, so a configuration with other bounds
-prints the defaults.
+**The rate bounds** are `Config::minRateScale` and `maxRateScale`, 0.75 and 1.25 by default. `begin()`
+passes them to the scheduler and to `formatFrameLine`, so the `[SimHost.Frame]` line prints the configured
+bounds to two decimals: `rateScale=[0.75,1.25]` at the defaults, byte for byte the text the line carried
+when the bounds were a literal in its format, and `rateScale=[0.90,1.10]` at 0.9 and 1.1.
 
 **The idle slack** is `Config::idleSlackSeconds`, 0 by default, read only in `FreeRunning` (§11). The
 constructor checks it in every mode, so a bad value fails where it is configured. The frame clamp is
@@ -363,10 +382,11 @@ Every line goes through `engine.log(HostLogLevel::Warning, …)` with the text f
 window reserved at construction (`TickDriverWindow-rationale.md`):
 
 * `[SimHost.Frame] og.Sim.MaxCatchUpSteps=… is outside [1, 240]; using …`, only when the cap was clamped;
-* `[SimHost.Frame] role=<Authority|Client> stepping=<inline|worker> dt=<s> maxCatchUpSteps=<n> rateScale=[0.75,1.25] timeBase=<worldDelta|monotonic>`,
+* `[SimHost.Frame] role=<Authority|Client> stepping=<inline|worker> dt=<s> maxCatchUpSteps=<n> rateScale=[<min>,<max>] timeBase=<worldDelta|monotonic>`,
   once, at the end of construction, with `worldDelta` under `HostDelta` and `monotonic` under `Monotonic`,
   followed by ` frameWait=thisFramesSingleStep` only under that frame wait (§4); in `FreeRunning`,
-  `[SimHost.Frame] role=Authority stepping=runner dt=<s> maxCatchUpSteps=<n> rateScale=[0.75,1.25] timeBase=monotonic idleSlackUs=<n>`;
+  `[SimHost.Frame] role=Authority stepping=runner dt=<s> maxCatchUpSteps=<n> rateScale=[<min>,<max>] timeBase=monotonic idleSlackUs=<n>`.
+  `<min>` and `<max>` are the configured rate bounds to two decimals, `0.75` and `1.25` at the defaults (§6);
 * `[SimHost.FirstStep] role=… thread=<game|worker|runner> physicsStep=<n> batch=<n>`, once, from the thread that
   runs the first batch;
 * `[SimHost.Window] …`, once per due window (`tickDriverWindow::kWindowSeconds`, by the engine clock), at
@@ -378,8 +398,8 @@ window reserved at construction (`TickDriverWindow-rationale.md`):
 window builds every word and, in `FreeRunning` only, the window line's suffix (`lateUs`, `activityWakes`,
 `earlyWakes`, `idleFallbacks`, `approachUs`) and the re-timed meaning of its fields
 (`TickDriverWindow-rationale.md` §8). The driver passes the slack, the time base and the frame wait to
-`formatFrameLine` in every mode; the `Inline` and `FrameBounded` lines ignore the slack, and under `HostDelta`
-with the default frame wait they stay byte-identical. The `FreeRunning` line ignores the time-base and the
+`formatFrameLine` in every mode, with the rate bounds; the `Inline` and `FrameBounded` lines ignore the slack, and under `HostDelta`
+with the default frame wait and the default bounds they stay byte-identical. The `FreeRunning` line ignores the time-base and the
 frame-wait flags.
 
 ## §8 What the compiler and the checks hold
@@ -410,7 +430,7 @@ frame-wait flags.
 
 The `[TickDriver]` cases in og-simulation-tests run the driver and a transcription of the engine-hosted
 frame host (the old frame host's code with its engine types swapped for the fake kit's executor, clock and
-log, and with the same `beforePump` addition) on the same scripted frames, each over its own copy of the
+log, and with the same `beforePump` addition and the same rate door, refusal included) on the same scripted frames, each over its own copy of the
 fakes, and compare one ordered event trace of each: every game hook, presenter and world-host door, world
 and manager call, clock read, executor dispatch, wait and deferral, task run, and log line.
 
@@ -426,9 +446,26 @@ and manager call, clock read, executor dispatch, wait and deferral, task run, an
 * `SimulationTickDriver.TwoDrivers.AnAuthorityAndAClientInOneProcessMatchTheTranscription`: both role bits
   on one thread.
 * `SimulationTickDriver.BeforePump.RunsOncePerFrameBeforeThePumpWithTheHostTime`.
-* `SimulationTickDriver.BeforePump.ARateScaleThroughTheDoorChangesTheStepCountsAsTheTranscriptionDoes`: the
-  step counts also equal a bare `SimulationScheduler` given the same host times with the rate set before
-  the same frame's pump, and differ from one with the rate set a frame later.
+* `SimulationTickDriver.BeforePump.ARateScaleThroughTheDoorChangesTheStepCountsAsTheTranscriptionDoes`: an
+  `Inline` client sets 1.1 through the door; the step counts also equal a bare `SimulationScheduler` given the
+  same host times with the rate set before the same frame's pump, and differ from one with the rate set a frame
+  later. No refusal is counted.
+* `SimulationTickDriver.BeforePump.TheDoorReadsTheSchedulerAndTheOffsetTheStepsPublished`: an `Inline` client
+  whose clock starts one tick ahead, so its steps publish an offset of 2, sets 1.01 at frame 40 of 120. In
+  every frame the door's `nextDeadline()` and `currentInterval()` equal a bare `SimulationScheduler`'s read
+  before the same pump, and its `tickOffset()` is 0 up to the first frame with steps and 2 after it; the rate
+  is 1.01 at the end and no refusal is counted. With the door built with an offset of 0, every frame after the
+  first step reads 0.
+* `SimulationTickDriver.BeforePump.AnAuthoritysRateChangeIsRefusedCountedAndChangesNothing`: an `Inline`
+  authority sets 1.01 at frame 40. The door reports one refusal right after the call, the rate stays 1.0, the
+  door's interval stays `dt` in every frame, the driver's count is 1, and the event trace equals both a run
+  that never calls the door and the transcription's. With the refusal dropped from the door, the rate becomes
+  1.01.
+* `SimulationTickDriver.Begin.TheFrameLinePrintsTheConfiguredRateBounds`: the default configuration's frame
+  line, whole, reads `rateScale=[0.75,1.25]`, and a `FrameBounded` client configured with 0.9 and 1.1 reads
+  `rateScale=[0.90,1.10]`. With the bounds a literal in the format again, the second fails.
+* `SimulationTickDriver.FreeRunning.ThePresentClockIsReadableOffTheRunner` (§12) has its authority set 1.25 at
+  wake 11: the call is refused and counted, and the present clock's interval stays `dt` on every wake.
 
 The `sampleInput` cases are in `SimulationTickDriverSampleTest.cpp`, over the fake kit's sampling games
 (`TickDriverFakes-rationale.md` §1) and its world host. The first two run 90 frames of 0, 1 or 2 steps over
@@ -711,3 +748,10 @@ display snapshot in `onPostPhysics`, which `EarlierFrames`, and `ThisFramesSingl
 run while the frame's own batch may be stepping. No guard was added: the step-context check is an `OG_CHECK`, the
 one-per-batch placement is pinned by the tests (§9), and a game without the hook compiles exactly the code it compiled
 before, so every existing trace, line and golden is unchanged.
+
+**2026-11-20, the rate door's reads and the authority's refusal.** The rate door is built with J3 and the role, and
+`m_refusedRateChanges` and `Diagnostics::refusedRateChanges()` were added (§6), so that a rate controller reads the
+scheduler's next deadline and interval and the published offset through the door, and an authority's rate change is
+refused. G-11 is new. The `[SimHost.Frame]` line prints the configured rate bounds instead of a literal (§6, §7), the
+same text at the defaults. A game that never calls `setRateScale` has the same trace as before, so every golden is
+unchanged; the two tests that set a rate on an authority were changed with it (§9).

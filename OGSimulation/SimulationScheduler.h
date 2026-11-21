@@ -141,6 +141,8 @@ public:
 
 	double nextDeadline() const { return deadlineAt(physicsSteps_); }
 
+	double currentStepInterval() const { return currentInterval(); }
+
 	double stepDeadline(uint64_t step) const { return deadlineAt(step); }
 
 	uint64_t physicsStepCount() const { return physicsSteps_; }

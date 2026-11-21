@@ -39,7 +39,7 @@ inline constexpr size_t   kPercentileFieldReserve  = 160u;
 inline constexpr size_t   kReplayDepthFieldReserve = 64u;
 inline constexpr size_t   kWindowLineReserve       = 4096u;
 inline constexpr size_t   kWindowSuffixReserve     = 512u;
-inline constexpr size_t   kFrameLineReserve        = 512u;
+inline constexpr size_t   kFrameLineReserve        = 1536u;
 inline constexpr size_t   kFirstStepLineReserve    = 256u;
 
 static_assert(kSeriesCount == 10u, "the window line carries eight sample series, and FreeRunning's suffix two more");
@@ -313,20 +313,20 @@ public:
 			requestedCap, maxStepsPerFrame, cap);
 	}
 
-	const char* formatFrameLine(double dtSeconds, uint32_t maxCatchUpSteps, double idleSlackSeconds = 0.0,
-		bool monotonicTimeBase = false, bool waitsForThisFramesStep = false)
+	const char* formatFrameLine(double dtSeconds, uint32_t maxCatchUpSteps, double minRateScale, double maxRateScale,
+		double idleSlackSeconds = 0.0, bool monotonicTimeBase = false, bool waitsForThisFramesStep = false)
 	{
 		if (m_threading == StepThreading::FreeRunning)
 			return formatHostLine(m_frameLine,
-				"[SimHost.Frame] role=%s stepping=runner dt=%.6f maxCatchUpSteps=%u rateScale=[0.75,1.25] timeBase=monotonic "
+				"[SimHost.Frame] role=%s stepping=runner dt=%.6f maxCatchUpSteps=%u rateScale=[%.2f,%.2f] timeBase=monotonic "
 				"idleSlackUs=%u",
 				roleWord(),
-				dtSeconds, maxCatchUpSteps, tickDriverWindow::roundedMicroseconds(idleSlackSeconds));
+				dtSeconds, maxCatchUpSteps, minRateScale, maxRateScale, tickDriverWindow::roundedMicroseconds(idleSlackSeconds));
 		return formatHostLine(m_frameLine,
-			"[SimHost.Frame] role=%s stepping=%s dt=%.6f maxCatchUpSteps=%u rateScale=[0.75,1.25] timeBase=%s%s",
+			"[SimHost.Frame] role=%s stepping=%s dt=%.6f maxCatchUpSteps=%u rateScale=[%.2f,%.2f] timeBase=%s%s",
 			roleWord(),
 			steppingWord(),
-			dtSeconds, maxCatchUpSteps, monotonicTimeBase ? "monotonic" : "worldDelta",
+			dtSeconds, maxCatchUpSteps, minRateScale, maxRateScale, monotonicTimeBase ? "monotonic" : "worldDelta",
 			waitsForThisFramesStep ? " frameWait=thisFramesSingleStep" : "");
 	}
 

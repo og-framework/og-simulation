@@ -1036,6 +1036,15 @@ is `SimClock`; `Engine` is the configuration key's other arm, and a host that de
 ping. Whether the flip holds the gate's counts (0 extra Skip, Stall or HardResync, the join's ` cause=firstRtt` resync counted
 apart; (a)/(b) lead and late share at or below Ph2's) is Ph4's gate's measurement, over more runs than one smoke.
 
+**The server-tick estimator** (og-time-dilation task 3, 2026-11-20). `SimClockRttSample` also carries the pong's
+`serverTick` and `serverTickAgeSeconds` (appended after `t3Seconds`, so a positional copy of the first six is unchanged), and
+every valid sample, at either source and before and after the switch, ends `noteSimClockSample` in the estimator's
+`ServerTickEstimator`, after `updateRTT`, so its RTT gate reads the smoothed RTT that sample produced. A sample whose tick is
+`SimClockRttSample::kNoServerTick` (what a host that copies no tick delivers) is ignored there, and the estimator's other
+outputs never read it (`PCTM.NetworkTimeEstimator.ServerTick.AValidSampleReachesTheServerTickEstimatorAndMovesNothingElse`).
+`activeJitterMultiplier()` exposes the multiplier the offset uses (§17). The sensor, its formula and its limits:
+`ServerTickEstimator-rationale.md`.
+
 ## 16. The join's second hard resync, on the first RTT reading
 
 Added by og-input-latency P3-10 (part A, the lead's 07:20 line from P5-28's smoke), 2026-11-19. Its reader is
@@ -1179,3 +1188,115 @@ runs and clients. Ph2's figures are its gate references.
 
 `PCTM.NetworkTimeEstimator.ClockSource.EachSourceHasItsOwnJitterMultiplier` pins the offset at 2.0, 1.5, 1.0, 0.5 and 0 for
 each source, on an exact RTT and jitter (1/16 s and 1/32 s): 8, 7, 6, 5 and 4 ticks.
+
+## 18. The clock's published correction phase
+
+Added by og-time-dilation task 5, 2026-11-21. Its writer is `ClientPredictionClock`; it has no field of its own. Its reader is
+the dilation controller (og-time-dilation task 6), which holds its rate scale at 1.0 while the clock's own corrections run:
+the re-centre armed or owing ticks (§14), a stall debt owed, the wait for the first RTT reading (§16), and a while after any
+hard resync. That reader runs once per frame on the scheduler's owning thread (the client's game thread), and the clock
+advances on the step's thread, so the clock publishes what the reader needs as one atomic word.
+
+**The word.** `ClientPredictionClock::publishedCorrectionPhase()` returns a `ClockCorrectionPhase`, decoded from one relaxed
+load of a `std::atomic<uint32_t>` (lock-free, a `static_assert`):
+
+| bits | field | what the clock reads |
+|---|---|---|
+| 0 | `recentreArmed` | `isRecentreArmed()` |
+| 1 | `recentring` | `isRecentring()` |
+| 2 | `stallDebt` | `getRequiredInputDelayIncreaseStallTicks() > 0` |
+| 3 | `awaitsFirstRtt` | the hard resync's wait for the first settled reading (§16) |
+| 8–31 | `hardResyncs` | the clock's hard resyncs, modulo 2²⁴ |
+
+Bits 4–7 are 0. The count is the clock's own production counter, not the event seam's `hardResyncCount` (the seam is
+diagnostic only and no production code may read it). It wraps after 16.7 million resyncs; the reader only compares it for a
+change, so the wrap costs nothing.
+
+**When it is written.** One relaxed store, built from the accessors in the table, as the last statement of
+`advancePrediction()`, of `requestInputDelayIncreaseStall()` (its no-op path for a delta of 0 or less too) and of the
+constructor (the re-centre is armed from construction, so a reader before the first advance sees the arm). The store is not
+"remembered" at each return: `advancePrediction()` calls the advance's body, `advanceAndCorrect()`, and publishes after it,
+so every return of the body (the hard resync, the stall debt's Stall, the warm-up guard, the dead band, the graduated Skip,
+the graduated Stall, the graduated zone's normal advance) and any return added later reach the one store. A hard resync's
+callbacks run inside the body, so they run before its store: a reader on the callbacks' thread sees the phase from before
+the resync until the advance returns.
+
+**The contract: one writer, any reader, write-only for the clock.**
+- **One writer**, the clock's thread. Every write is a whole word, so a reader sees one store's value and never a mix of
+  two. ⚠ The stall request is called by the tier receipt (one adapter's binding: the Unreal host's connection-tier and
+  relay-floor handlers). In immediate mode that runs in the step's drain, on the clock's thread, and the contract holds as
+  stated. Frame-locked, it runs on the game thread while the clock advances on the physics thread, so the request is a second
+  writer, as it already is of the stall debt itself. Its store then encodes the re-centre's flags as the game thread reads
+  them, and may land after a newer advance's store; the clock's next advance stores the word again, so it is wrong for at
+  most one advance.
+- **Any reader**, from any thread. The load is relaxed and the word is ordered with nothing else: a reader that also reads
+  the estimator or the prediction tick may combine values one advance apart. The freeze is re-evaluated every frame, so that
+  mix costs at most one frame's freeze decision, the same posture as the estimator's relaxed fields (`ThreadingCrossings.md`
+  row 10).
+- **Write-only for the clock.** No clock decision reads the word: every decision reads the clock's own members, and the word
+  is an output, not state. A decision that read it would make the clock depend on a value another thread can see stale (or a
+  test can overwrite), and the clean and the overwritten clock would diverge. `ClientPredictionClockPhaseProbe`, a friend
+  declared in the header and defined only in og-simulation-tests (the pattern of §16's estimator probe), overwrites the word
+  for the fence below. ⚠ The crossing is not yet in `ThreadingCrossings.md`: it has no off-thread reader until the controller
+  is wired in, and that task adds the row.
+
+**Tests.** `PCTM.ClientPredictionClock.Phase.ThePublishedWordFollowsEveryAdvanceThroughAJoinADebtAndAResync` drives a join
+whose first frame has no RTT reading (a hard resync onto the floor target that waits for the first reading, then a
+four-advance catch-up batch), the settle window, a decision that owes 3 and their payment, a 2-tick stall debt and its
+payment, and a second hard resync with its re-armed decision; after every advance and every stall request the word equals the
+accessors and an independently counted resync total, and every flag is seen both ways. It also poisons the event seam's
+resync count and checks the published count does not follow. Seen failing with the store skipped on the stall-debt path:
+the word still read `debt=1` after the debt's last Stall.
+`PCTM.ClientPredictionClock.Phase.ThePublishedWordCannotReachAnyClockDecision` is the fence, in the event seam's pattern:
+the same lifecycle with the word overwritten before every advance and every request (every field wrong, all ones, zero)
+leaves every `AdvanceResult`, both cursors, `evaluateDrift`, the stall debt, the re-centre's accessors, the resync
+callbacks' ticks and every log line identical to the clean run, and one more tick of real stall debt moves the trace. Seen
+failing with the debt branch also requiring `publishedCorrectionPhase().stallDebt`.
+
+### 18.1 The published target read (og-time-dilation task 10c)
+
+The dilation controller's band guard bounds `P − (A + O)`: the stage's deadline tick against the target tick the clock
+reads, `A + O`, at its next advance (`ClockDilationController-rationale.md` §5.4). The stage cannot read that target itself:
+an immediate client drains its authority ticks at each step's start, after the stage, so the stage's own `A` predates every
+arrival since the clock's last read. So the clock publishes the target it read.
+
+**The word.** `ClientPredictionClock::publishedTargetRead()` returns a `ClockTargetRead {advances, targetTick}`, decoded from
+one relaxed load of a `std::atomic<uint64_t>` (lock-free, a `static_assert`): `advances` in the high 32 bits, `targetTick`
+in the low 32.
+- `targetTick` is `readTarget()`'s `targetTick`, `getLastAuthorityTick() + getPredictionOffsetTicks()`, the one value the
+  advance's drift, its hard-resync landing and its re-centre reading are computed from. `advanceAndCorrect()` copies it into
+  `m_lastReadTargetTick` right after its `readTarget()`.
+- `advances` counts `advancePrediction()` calls, modulo 2³². A reader compares it only for a change: a new count is a new
+  read, the same count is the read it already saw. Before the first advance the word is `{0, 0}`.
+- One 64-bit word, so a reader never pairs one advance's count with another advance's target.
+
+**When it is written.** `advancePrediction()` stores it with one relaxed store after the phase word's, as its last statement:
+`publishTargetRead()` increments the count and stores `(advances << 32) | m_lastReadTargetTick`. Every path of the body (the
+hard resync, the first-RTT resync, the stall debt's Stall, the warm-up guard, the dead band, the graduated Skip and Stall, the
+re-centre's payment) returns into it, as for the phase word. `requestInputDelayIncreaseStall()` does **not** store it: it
+reads no target. The constructor does not either: `{0, 0}` already says "no read".
+
+**The contract** is the phase word's: one writer, any reader, write-only for the clock.
+- **One writer**: `advancePrediction()`'s caller, the step's thread. Unlike the phase word there is no second writer: the
+  frame-locked tier receipt calls the stall request, which does not store this word.
+- **Any reader**, relaxed, ordered with nothing else. The stage reads it once per frame on the scheduler's owning thread. A
+  read that lands inside a batch running on another thread sees the batch's latest advance so far; the controller pairs it
+  with its previous call, a one-sample approximation `ClockDilationController-rationale.md` §5.4 accepts.
+- **Write-only for the clock.** No clock decision reads the word; it is an output. `ClientPredictionClockPhaseProbe` (the
+  friend of task 5, defined only in og-simulation-tests) also overwrites and reads this word for the fence below.
+
+⚠ Neither word has a `ThreadingCrossings.md` row yet. Task 5 left the row to the task that wired the reader; og-time-dilation
+task 8 wired the stage into the Unreal host without adding it. Recorded for the initiative's lead (task 10c's notes).
+
+**Tests.** `PCTM.ClientPredictionClock.Read.ThePublishedReadIsEveryAdvancesOwnTarget` drives the phase cases' lifecycle (the
+join's hard resync onto the floor target, the settle window, a decision paying 3, a 2-tick stall debt, a second hard resync
+with its re-armed decision) plus a graduated Skip and a graduated Stall: after each of its 406 advances the word equals the
+advance's own count and the `A + O` the estimator held when it ran, and both stall requests leave the word unchanged. Seen
+failing with the store moved before the body (the previous advance's target): 391 of 406 advances mismatched, the first
+`published {1, 0}, read {1, 1506}`.
+`PCTM.ClientPredictionClock.Read.ThePublishedReadCannotReachAnyClockDecision` is the fence: the same lifecycle with the word
+overwritten before every advance and every request (both fields wrong, all ones, zero) leaves every `AdvanceResult`, both
+cursors, `evaluateDrift`, the stall debt, the re-centre's accessors, both published words after each advance, the resync
+callbacks' ticks and every log line identical to the clean run; one more tick of real stall debt moves the trace. Seen
+failing with the advance taking its target from the word whenever the word's count differs from its own: all three
+overwrites moved the trace.

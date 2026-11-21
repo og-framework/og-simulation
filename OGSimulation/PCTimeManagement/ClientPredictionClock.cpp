@@ -30,6 +30,8 @@ ClientPredictionClock::ClientPredictionClock(const TimeConfig& config, const Net
     , m_recentreBaseSamples(estimator.getMeasuredRTTSampleCount())
     , m_logger(std::move(logger))
 {
+    // [og-time-dilation task 5] The re-centre is armed from here, so publish before any advance. §18
+    publishCorrectionPhase();
 }
 
 // ---------------------------------------------------------------------------
@@ -50,10 +52,21 @@ static void doNormalAdvance(unsigned int& predictionTick, unsigned int& resimula
 // Prediction
 // ---------------------------------------------------------------------------
 
+// [og-time-dilation task 5] The single exit: every return of advanceAndCorrect() reaches
+// the two stores below, which are this advance's last statements. §18
 ClientPredictionClock::AdvanceResult ClientPredictionClock::advancePrediction()
+{
+    const AdvanceResult result = advanceAndCorrect();
+    publishCorrectionPhase();
+    publishTargetRead();  // [og-time-dilation task 10c] after the body: this advance's read. §18
+    return result;
+}
+
+ClientPredictionClock::AdvanceResult ClientPredictionClock::advanceAndCorrect()
 {
     // [P3-10] The advance's one read of the first-RTT flag, then its one offset (readTarget).
     const TargetRead   estimate   = readTarget();
+    m_lastReadTargetTick          = estimate.targetTick;  // [og-time-dilation task 10c] for the published read, §18
     m_firstRttSeenLastAdvance     = estimate.hasFirstRtt;
     const unsigned int targetTick = estimate.targetTick;
     const int          drift      = static_cast<int>(targetTick) - static_cast<int>(m_predictionTick);
@@ -114,6 +127,7 @@ ClientPredictionClock::AdvanceResult ClientPredictionClock::advancePrediction()
         // steps, and the median run restarts at the new frontier. Before the
         // first decision it is still the join's arm.
         armRecentre(m_recentreDecidedOnce ? RecentreCause::Resync : RecentreCause::Join, targetTick);
+        ++m_hardResyncCount;  // [og-time-dilation task 5] the published phase's count, §18
 
         // ⛔ Event seam - the two ticks before the count, in that order.
         m_eventSeamDiagnostics.lastHardResyncFromTick = oldTick;
@@ -265,19 +279,22 @@ ClientPredictionClock::AdvanceResult ClientPredictionClock::advancePrediction()
 void ClientPredictionClock::requestInputDelayIncreaseStall(int32_t deltaDelayTicks)
 {
     // Downward / no-change transitions need no correction — see the header.
-    if (deltaDelayTicks <= 0)
-        return;
-
-    m_requiredInputDelayIncreaseStallTicks += static_cast<unsigned int>(deltaDelayTicks);
-
-    if (m_logger)
+    if (deltaDelayTicks > 0)
     {
-        char buf[192];
-        std::snprintf(buf, sizeof(buf),
-            "[Log] PCTM CPC: input delay increase stall requested delta=%d totalPending=%u predTick=%u",
-            static_cast<int>(deltaDelayTicks), m_requiredInputDelayIncreaseStallTicks, m_predictionTick);
-        m_logger(buf);
+        m_requiredInputDelayIncreaseStallTicks += static_cast<unsigned int>(deltaDelayTicks);
+
+        if (m_logger)
+        {
+            char buf[192];
+            std::snprintf(buf, sizeof(buf),
+                "[Log] PCTM CPC: input delay increase stall requested delta=%d totalPending=%u predTick=%u",
+                static_cast<int>(deltaDelayTicks), m_requiredInputDelayIncreaseStallTicks, m_predictionTick);
+            m_logger(buf);
+        }
     }
+
+    // [og-time-dilation task 5] The single exit publishes, the no-op too. §18
+    publishCorrectionPhase();
 }
 
 unsigned int ClientPredictionClock::getRequiredInputDelayIncreaseStallTicks() const
@@ -443,6 +460,62 @@ bool ClientPredictionClock::isRecentreArmed() const
 bool ClientPredictionClock::isRecentring() const
 {
     return m_recentreOwedTicks > 0u;
+}
+
+// ---------------------------------------------------------------------------
+// The published correction phase (og-time-dilation task 5). Encoded from the
+// clock's own accessors, so the word cannot disagree with them; one relaxed
+// store, one relaxed load. Rationale: docs/TimeConfig-rationale.md §18.
+// ---------------------------------------------------------------------------
+
+void ClientPredictionClock::publishCorrectionPhase()
+{
+    uint32_t word = (m_hardResyncCount & kPhaseHardResyncMask) << kPhaseHardResyncShift;
+    if (isRecentreArmed())
+        word |= kPhaseRecentreArmedBit;
+    if (isRecentring())
+        word |= kPhaseRecentringBit;
+    if (m_requiredInputDelayIncreaseStallTicks > 0u)
+        word |= kPhaseStallDebtBit;
+    if (m_resyncAwaitsFirstRtt)
+        word |= kPhaseAwaitsFirstRttBit;
+    m_publishedPhase.store(word, std::memory_order_relaxed);
+}
+
+ClockCorrectionPhase ClientPredictionClock::publishedCorrectionPhase() const
+{
+    const uint32_t word = m_publishedPhase.load(std::memory_order_relaxed);
+    ClockCorrectionPhase phase;
+    phase.recentreArmed  = (word & kPhaseRecentreArmedBit) != 0u;
+    phase.recentring     = (word & kPhaseRecentringBit) != 0u;
+    phase.stallDebt      = (word & kPhaseStallDebtBit) != 0u;
+    phase.awaitsFirstRtt = (word & kPhaseAwaitsFirstRttBit) != 0u;
+    phase.hardResyncs    = word >> kPhaseHardResyncShift;
+    return phase;
+}
+
+// ---------------------------------------------------------------------------
+// The published target read (og-time-dilation task 10c). The count and the
+// target share one word, so a reader never pairs one advance's count with
+// another's target; one relaxed store, one relaxed load. The count wraps at
+// 2^32, which a reader comparing it for a change never notices.
+// Rationale: docs/TimeConfig-rationale.md §18.
+// ---------------------------------------------------------------------------
+
+void ClientPredictionClock::publishTargetRead()
+{
+    ++m_advances;
+    const uint64_t word = (static_cast<uint64_t>(m_advances) << 32u) | static_cast<uint64_t>(m_lastReadTargetTick);
+    m_publishedTargetRead.store(word, std::memory_order_relaxed);
+}
+
+ClockTargetRead ClientPredictionClock::publishedTargetRead() const
+{
+    const uint64_t word = m_publishedTargetRead.load(std::memory_order_relaxed);
+    ClockTargetRead read;
+    read.advances   = static_cast<uint32_t>(word >> 32u);
+    read.targetTick = static_cast<uint32_t>(word & 0xFFFFFFFFull);
+    return read;
 }
 
 // [P3-11] The settle window is time, not samples: recentreSettleSamples advances

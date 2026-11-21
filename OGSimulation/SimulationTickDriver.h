@@ -351,6 +351,7 @@ public:
 		LostTimeByCause lostTimeByCause() const { return m_driver.m_scheduler->lostTimeByCause(); }
 		uint64_t physicsStepCount() const { return m_driver.m_scheduler->physicsStepCount(); }
 		double rateScale() const { return m_driver.m_scheduler->rateScale(); }
+		uint64_t refusedRateChanges() const { return m_driver.m_refusedRateChanges; }
 		bool isRunning() const { return m_driver.m_running; }
 		bool hasPendingSteps() const { return m_driver.isPendingHandle(m_driver.m_pendingSteps); }
 
@@ -409,8 +410,9 @@ private:
 
 		m_running = true;
 
-		m_engine->log(HostLogLevel::Warning, m_window.formatFrameLine(m_config.dtSeconds, cap, m_config.idleSlackSeconds,
-			m_config.frameTimeBase == FrameTimeBase::Monotonic, m_config.frameWait == FrameWait::ThisFramesSingleStep));
+		m_engine->log(HostLogLevel::Warning, m_window.formatFrameLine(m_config.dtSeconds, cap, m_config.minRateScale,
+			m_config.maxRateScale, m_config.idleSlackSeconds, m_config.frameTimeBase == FrameTimeBase::Monotonic,
+			m_config.frameWait == FrameWait::ThisFramesSingleStep));
 	}
 
 	void advanceMonotonicHostTime(double clockSeconds)
@@ -443,7 +445,8 @@ private:
 		m_blockingSteps = m_pendingSteps;
 
 		SimulationScheduler& scheduler = schedulerOnOwningThread();
-		TickRateDoor rate(scheduler);
+		// ⛔G-11  docs/SimulationTickDriver-guards.md
+		TickRateDoor rate(scheduler, m_tickOffset.load(std::memory_order_relaxed), m_config.isAuthority, m_refusedRateChanges);
 		m_game->beforePump(m_hostTimeSeconds, rate);
 		if (m_config.threading == StepThreading::FreeRunning)
 			m_publishedRateScale.store(scheduler.rateScale(), std::memory_order_release);
@@ -680,6 +683,7 @@ private:
 	double       m_lastFrameStartSeconds = 0.0;
 	double       m_monotonicOriginSeconds = 0.0;
 	uint32_t     m_frameSteps            = 0u;
+	uint64_t     m_refusedRateChanges    = 0u;
 
 	std::optional<SimulationScheduler>                                         m_scheduler;
 	TickDriverWindow                                                           m_window;

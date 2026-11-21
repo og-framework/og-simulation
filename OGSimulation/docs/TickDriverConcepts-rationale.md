@@ -165,10 +165,28 @@ except the one property it names, so each assertion stays tied to that property.
 
 ## §7 `TickRateDoor` and `StepThreading`
 
-`TickRateDoor` is the only part of the scheduler a game reaches: `setRateScale`, `rateScale`,
-`lostTime` and `physicsStepCount`, each forwarding to the same-named `SimulationScheduler` member. It
-holds a pointer to the scheduler, which must outlive it. The scheduler has no synchronization, so the
-door is used only on the scheduler's owning thread, which is where `beforePump` runs.
+`TickRateDoor` is the only part of the scheduler a game reaches. `setRateScale`, `rateScale`,
+`lostTime`, `physicsStepCount` and `nextDeadline` forward to the same-named `SimulationScheduler`
+members, and `currentInterval` to `SimulationScheduler::currentStepInterval`, the interval of the
+scheduler's newest deadline segment: the spacing from `nextDeadline()` to the deadline after it, and
+exactly `dtSeconds / rateScale()` (a rate change applies from the next deadline on,
+`SimulationScheduler-rationale.md` §5). It holds a pointer to the scheduler, which must outlive it. The
+scheduler has no synchronization, so the door is used only on the scheduler's owning thread, which is
+where `beforePump` runs.
+
+The constructor takes three more arguments, and the door's owner passes all of them; none has a
+default:
+- `tickOffset`, returned by `tickOffset()`: the offset from a physics step to the sim tick that step
+  integrates, as the owner last saw it. The door copies the value when it is built, so it stays the
+  same for the door's lifetime. A tick driver passes its published offset (`SimulationTickDriver-rationale.md` §5, J3);
+- `refusesRateChange`: when true, `setRateScale` changes nothing. The scheduler's rate, interval and
+  deadlines stay as they were, and the call only adds one to the refusal counter. Every call counts:
+  a value equal to the current scale, or a NaN, is refused and counted too. A tick driver passes its
+  role, so an authority's door refuses and a client's applies (`SimulationTickDriver-guards.md` G-11);
+- `refusedRateChanges`, a counter the door holds by pointer and reads back in `refusedRateChanges()`.
+  It belongs to the owner and must outlive the door. A driver builds a new door for each pump, and the
+  count carries over from one door to the next, so it covers the whole session. A door that applies
+  its calls never writes the counter.
 
 `StepThreading` names the three ways a driver can run its steps: `Inline` (on the thread that pumps),
 `FrameBounded` (on an engine task, waited for within the frame) and `FreeRunning` (on a thread of its
@@ -317,5 +335,8 @@ input sample before the pump is the driver's rule rather than each host's. `Tick
 added on 2026-11-19, so that a client step's receive precedes the step's resimulation check and input collect, rather
 than following the collect in `onStepStarted`, where what it received reached only the next step.
 `TickDriverDisplayGame` and §11 were added on 2026-11-20, so that a client's display copy is taken after its batch on the
-step's thread, rather than on the frame's thread while the frame's own batch could still be stepping. Nothing in this
-file depends on any document outside this submodule.
+step's thread, rather than on the frame's thread while the frame's own batch could still be stepping. Also on
+2026-11-20 `TickRateDoor` gained `nextDeadline`, `currentInterval`, `tickOffset` and `refusedRateChanges`, and the
+constructor's offset, refusal flag and counter (§7), so that a rate controller reads the scheduler's timing through the
+door it already receives and an authority's door refuses its rate changes. Nothing in this file depends on any document
+outside this submodule.

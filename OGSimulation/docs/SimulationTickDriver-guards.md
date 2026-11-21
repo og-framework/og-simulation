@@ -31,7 +31,8 @@ could cover. Which task `endFrame` waits for is G-10.
 
 **Provenance of the ids.** G-01 to G-06 are the successors, with fresh ids, of the six guards of the
 engine-hosted frame host this header was transcribed from (rationale §14). G-07 and G-08 are new with the
-`FreeRunning` mode, G-09 with the `Monotonic` time base, and G-10 with the frame wait; they succeed nothing. Each of the first six ids succeeds the
+`FreeRunning` mode, G-09 with the `Monotonic` time base, G-10 with the frame wait, and G-11 with the rate door's
+authority refusal; they succeed nothing. Each of the first six ids succeeds the
 same number there: G-01 (the authority steps inline), G-02 (one per-frame call, before the steps, only
 when steps are due), G-03 (no `+ 1` on the frame's first tick), G-04 (the scheduler is pumped with the
 accumulated frame delta), G-05 (no wait while the world lock is held) and G-06 (one call after the
@@ -247,3 +248,28 @@ fail.
 
 **What breaks if it moves.** `startFrame` writes `m_frameSteps` from the pump's count of the same frame;
 the condition must be read in `endFrame`, after it. Read before the pump, it is the previous frame's count.
+
+## G-11 — The rate door refuses on the authority: its refusal flag is the driver's role, and nothing else
+
+**Tag site:** `SimulationTickDriver.h`, in `pumpAndRunSteps`, immediately above
+`TickRateDoor rate(scheduler, m_tickOffset.load(std::memory_order_relaxed), m_config.isAuthority, m_refusedRateChanges);`.
+
+**The prohibition.** Do not replace the door's third argument, `m_config.isAuthority`, with `false`, with a
+configuration flag or with any other condition: an authority's door must refuse every `setRateScale`, and a client's
+must apply it. Do not pass a counter other than `m_refusedRateChanges` either, and do not replace the second argument
+with a constant.
+
+**The consequence.** The authority's tick rate is the time reference its clients' prediction clocks follow. A rate the
+authority applied would move every client's target at once and change the step rate of the whole session. With the
+refusal lifted, `SimulationTickDriver.BeforePump.AnAuthoritysRateChangeIsRefusedCountedAndChangesNothing`
+fails with the authority's rate at 1.01 and no refusal counted, and
+`SimulationTickDriver.FreeRunning.ThePresentClockIsReadableOffTheRunner` fails with the runner's interval at
+`dt / 1.25`. A counter other than the driver's member is not the one `getDiagnostics().refusedRateChanges()` reads,
+and a local one starts at 0 for each door, so the session's count is lost. The second argument is the offset the
+door's `tickOffset()` returns: with 0 there,
+`SimulationTickDriver.BeforePump.TheDoorReadsTheSchedulerAndTheOffsetTheStepsPublished` reads 0 where the steps
+published 2.
+
+**What breaks if it moves.** The door must be built after `schedulerOnOwningThread()`, which checks the thread, and
+handed to `beforePump` before the pump, so that a client's rate change applies to this frame's pump
+(rationale §6).

@@ -8,6 +8,7 @@
 #include <functional>
 
 #include "TimeConfig.h"
+#include "ServerTickEstimator.h"
 
 #include "OGSimulation/CompilerControl.h"
 
@@ -83,15 +84,23 @@ OGSIM_OPTIMIZE_OFF
 // One SimClock ping/pong, in seconds: the RTT with the server's turnaround removed,
 // the NTP offset theta, and the four stamps (t0/t3 on the client's clock, t1/t2 on
 // the server's). og-sim names no og-sim-net type: the host copies its sample in.
+// Since og-time-dilation task 3 also the pong's server tick and that tick's age at
+// the pong's send (server seconds); a host that copies no tick leaves kNoServerTick,
+// which the server-tick estimator ignores. The new fields stay last, so a positional
+// copy of the first six is unchanged.
 // Rationale: docs/TimeConfig-rationale.md §15.
 struct SimClockRttSample
 {
-    double rttSeconds   = 0.0;
-    double thetaSeconds = 0.0;
-    double t0Seconds    = 0.0;
-    double t1Seconds    = 0.0;
-    double t2Seconds    = 0.0;
-    double t3Seconds    = 0.0;
+    static constexpr uint32_t kNoServerTick = ServerTickEstimator::kNoServerTick;
+
+    double   rttSeconds           = 0.0;
+    double   thetaSeconds         = 0.0;
+    double   t0Seconds            = 0.0;
+    double   t1Seconds            = 0.0;
+    double   t2Seconds            = 0.0;
+    double   t3Seconds            = 0.0;
+    uint32_t serverTick           = kNoServerTick;
+    double   serverTickAgeSeconds = 0.0;
 };
 
 // The SimClock shadow, the [ClockSource.Window] line's reading. §15
@@ -233,6 +242,16 @@ using LoggerFn = std::function<void(const char*)>;
     // window (og-input-latency task 27).
     OGSIMULATION_API unsigned int  getMeasuredRTTSampleCount() const;
 
+    // The multiplier getPredictionOffsetTicks applies to the smoothed jitter: the
+    // active RTT source's (jitterMultiplier or simClockJitterMultiplier). §17
+    OGSIMULATION_API double        activeJitterMultiplier() const;
+
+    // The server-tick estimate (og-time-dilation task 3), fed every valid SimClock
+    // sample at either source, after updateRTT. Its accessors read relaxed atomics:
+    // safe from the owner thread like the PT accessors above. §15,
+    // docs/ServerTickEstimator-rationale.md
+    OGSIMULATION_API const ServerTickEstimator& serverTickEstimator() const;
+
 private:
     // True when `rawRTTSeconds` is plausible given the current estimate. Cold
     // start (no first sample yet) uses the absolute ceiling; afterwards the
@@ -298,6 +317,10 @@ private:
     unsigned int      m_shadowOffsetNext   = 0;
     double            m_shadowLastUpTransit   = 0.0;
     double            m_shadowLastDownTransit = 0.0;
+
+    // og-time-dilation task 3: one writer, noteSimClockSample; default config with
+    // this estimator's tickFrequency. docs/ServerTickEstimator-rationale.md
+    ServerTickEstimator m_serverTickEstimator;
 
     LoggerFn m_logger;
 

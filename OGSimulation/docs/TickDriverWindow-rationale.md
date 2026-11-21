@@ -122,12 +122,16 @@ printed before this header existed (§9), so log readers, comparison scripts and
 working:
 - `formatWindowLine(nowSeconds, totals)`: `[SimHost.Window] role=… stepping=… seconds=%.2f frames=…`
   and 24 further fields, 28 in all, up to `sampleOverflow=%u`;
-- `formatFrameLine(dtSeconds, maxCatchUpSteps, idleSlackSeconds = 0.0, monotonicTimeBase = false,
-  waitsForThisFramesStep = false)`:
-  `[SimHost.Frame] role=… stepping=… dt=%.6f maxCatchUpSteps=%u rateScale=[0.75,1.25] timeBase=%s`, with
+- `formatFrameLine(dtSeconds, maxCatchUpSteps, minRateScale, maxRateScale, idleSlackSeconds = 0.0,
+  monotonicTimeBase = false, waitsForThisFramesStep = false)`:
+  `[SimHost.Frame] role=… stepping=… dt=%.6f maxCatchUpSteps=%u rateScale=[%.2f,%.2f] timeBase=%s`, with
   `worldDelta` by default and `monotonic` when `monotonicTimeBase` is true (the owner's `Monotonic` time
   base), then ` frameWait=thisFramesSingleStep` only when `waitsForThisFramesStep` is true (the owner's
-  frame wait, `SimulationTickDriver-rationale.md` §4). The rate bounds are part of the text, not arguments. These two modes do not print the slack;
+  frame wait, `SimulationTickDriver-rationale.md` §4). The rate bounds are arguments with no default: the
+  owner passes its configured bounds, so a configuration with other bounds cannot print the defaults by
+  omission. At 0.75 and 1.25 the field reads `rateScale=[0.75,1.25]`, the text it had when the bounds were
+  a literal in the format, and at 0.9 and 1.1 it reads `rateScale=[0.90,1.10]`. Two decimals round a bound
+  that needs more, so 1.005 prints `1.00`. These two modes do not print the slack;
 - `formatCatchUpCapWarningLine(requestedCap, maxStepsPerFrame, cap)`: `[SimHost.Frame]
   og.Sim.MaxCatchUpSteps=%d is outside [1, %u]; using %u`. The console-variable name is frozen text. It
   is the same in every mode;
@@ -144,19 +148,23 @@ otherwise `game` when the caller says the batch runs on the owning thread and `w
 not. The window does not decide which thread that is; its owner asks its thread context.
 
 Every numeric conversion is the old one, with the argument type it expects: 64-bit counts are cast to
-`unsigned long long` for `%llu`, and 32-bit counts go to `%u` as `uint32_t`. The log level of each line
-is the owner's choice; the window only formats.
+`unsigned long long` for `%llu`, and 32-bit counts go to `%u` as `uint32_t`. The one exception is the
+frame line's rate bounds, two `double`s for `%.2f` where the old line had the literal text; at the
+default bounds the printed line is the old one byte for byte. The log level of each line is the owner's
+choice; the window only formats.
 
-**A planned change.** A time-dilation controller will add a `rateScale=` field to the window line in
-its own change, with new goldens. Until then the field is absent.
+**No rate on the window line.** The window line carries no `rateScale=` field: the configured bounds are
+on the frame line, and the window does not see the rate the scheduler runs at.
 
 **Goldens.** `TickDriverWindow.WindowLine.Goldens` pins three complete window lines (authority inline
 with every kind of sample, client worker with waits, replays, refusals and restores, and an empty
 window), and `TickDriverWindow.FrameAndFirstStepLines.Goldens` pins the frame, cap-warning and
 first-step lines. Byte equality with the engine formatter the lines replace is pinned on the Unreal
 side by its own test, TickDriverFormatParity.FStringPrintfEqualsFormatHostLine, over at least twenty
-value sets; this submodule's standalone build does not compile it. The `FreeRunning` lines have their
-own goldens (§8).
+value sets; this submodule's standalone build does not compile it. It formats the frame line at the
+default bounds, the only bounds the engine formatter printed. The frame-line goldens also pin
+`rateScale=[0.90,1.10]` at 0.9 and 1.1 and the two-decimal rounding of 0.99 and 1.005. The `FreeRunning`
+lines have their own goldens (§8).
 
 ## §5 Buffers, reservations and allocation
 
@@ -168,7 +176,7 @@ count every allocation it makes. The constructor reserves:
   are reserved in every mode, so a door never allocates whatever the mode;
 - one field buffer per series (`kPercentileFieldReserve`, 160 characters), one for `replayDepth`
   (`kReplayDepthFieldReserve`, 64), the window line (`kWindowLineReserve`, 4,096), the `FreeRunning`
-  suffix (`kWindowSuffixReserve`, 512) and the frame lines (`kFrameLineReserve`, 512); the first-step
+  suffix (`kWindowSuffixReserve`, 512) and the frame lines (`kFrameLineReserve`, 1,536); the first-step
   line reserves `kFirstStepLineReserve` (256).
 
 Each reservation holds the longest text its formats can produce from any argument values. A `%.2f` of
@@ -177,7 +185,11 @@ Each reservation holds the longest text its formats can produce from any argumen
 - the window line is 2,226 characters in `Inline` and `FrameBounded`, and 2,574 in `FreeRunning`, whose
   suffix is 348 of them. (The figure written on 2026-10-16, 2,249, counted every field at 131; the
   microsecond fields are at most 128.)
-- the frame line with `dt = -DBL_MAX` is 436, and 458 in `FreeRunning` with the slack at its maximum;
+- the frame line with `dt = -DBL_MAX` was 436, and 458 in `FreeRunning` with the slack at its maximum,
+  while the rate bounds were literal text. Computed on 2026-11-20 for the bounds as `%.2f` arguments, with
+  `dt` and both bounds at `-DBL_MAX` (317 characters for `dt`, 313 for each bound): 1,085 with
+  ` frameWait=thisFramesSingleStep`, 1,054 without it, and 1,076 in `FreeRunning` with the slack at its
+  maximum. `kFrameLineReserve` went from 512 to 1,536 then;
 - the cap warning is at most 95 and the first-step line 98 (computed 2026-10-16; `runner` is as long as
   `worker`).
 
@@ -225,7 +237,7 @@ a template over the allocator and lives in the header.
 In `FreeRunning` the authority's steps run on a dedicated runner thread that wakes at step deadlines
 on a monotonic clock, instead of once per engine frame. The window keeps the same lines and fields, so
 tools that read them keep working, and adds what only that mode has:
-- `[SimHost.Frame] role=… stepping=runner dt=%.6f maxCatchUpSteps=%u rateScale=[0.75,1.25]
+- `[SimHost.Frame] role=… stepping=runner dt=%.6f maxCatchUpSteps=%u rateScale=[%.2f,%.2f]
   timeBase=monotonic idleSlackUs=%u`. `idleSlackUs` is the `idleSlackSeconds` argument in whole
   microseconds, rounded to the nearest: a slack below 0.5 µs (a negative one included) prints 0, and one
   at or above 4,294,967,294.5 µs prints 4294967295 (`tickDriverWindow::roundedMicroseconds`);
@@ -288,5 +300,10 @@ On 2026-11-19 `formatFrameLine` gained the `monotonicTimeBase` flag, which print
 On 2026-11-20 it gained the `waitsForThisFramesStep` flag, which appends ` frameWait=thisFramesSingleStep` to
 the `Inline` and `FrameBounded` frame line. With the flag false, its default, the line is unchanged; the
 `FreeRunning` line ignores it.
+
+Also on 2026-11-20 `formatFrameLine` gained the `minRateScale` and `maxRateScale` arguments, with no default,
+and every frame line prints them as `rateScale=[%.2f,%.2f]` where it printed the literal `rateScale=[0.75,1.25]`
+(§4, §8). A configuration with other bounds had printed the defaults. At 0.75 and 1.25 every line is unchanged.
+`kFrameLineReserve` went from 512 to 1,536 to keep the longest frame line within its reservation (§5).
 
 Nothing in this file depends on any document outside this submodule.

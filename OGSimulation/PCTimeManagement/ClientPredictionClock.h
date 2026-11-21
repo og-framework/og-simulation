@@ -3,6 +3,7 @@
 
 #include "OGSimulation/OGExport.h"
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <limits>
@@ -45,6 +46,31 @@ struct EventSeamDiagnostics
     unsigned int hardResyncCount        = 0;
     unsigned int lastHardResyncFromTick = 0;
     unsigned int lastHardResyncToTick   = 0;
+};
+
+// [og-time-dilation task 5] The clock's correction phase, as one off-thread reader sees it
+// (ClientPredictionClock::publishedCorrectionPhase). A production output for the dilation
+// controller's freeze, not a diagnostic. Rationale: docs/TimeConfig-rationale.md §18.
+struct ClockCorrectionPhase
+{
+    bool     recentreArmed  = false;  // isRecentreArmed()
+    bool     recentring     = false;  // isRecentring()
+    bool     stallDebt      = false;  // getRequiredInputDelayIncreaseStallTicks() > 0
+    bool     awaitsFirstRtt = false;  // a hard resync waits for the first RTT reading (§16)
+    uint32_t hardResyncs    = 0;      // the clock's hard resyncs, modulo 2^24
+
+    bool operator==(const ClockCorrectionPhase&) const = default;
+};
+
+// [og-time-dilation task 10c] The clock's last target read, as one off-thread reader sees it
+// (ClientPredictionClock::publishedTargetRead): the dilation controller's guard centre input.
+// Rationale: docs/TimeConfig-rationale.md §18.
+struct ClockTargetRead
+{
+    uint32_t advances   = 0;  // advancePrediction() calls so far, modulo 2^32: a new read changes it
+    uint32_t targetTick = 0;  // getLastAuthorityTick() + getPredictionOffsetTicks() as that advance read it
+
+    bool operator==(const ClockTargetRead&) const = default;
 };
 
 // ClientPredictionClock — client-only tick counter with graduated drift correction
@@ -198,6 +224,30 @@ using PCClockLoggerFn = std::function<void(const char*)>;
     OGSIMULATION_API bool isRecentring() const;
 
     // -----------------------------------------------------------------------
+    // The published correction phase (og-time-dilation task 5)
+    //
+    // One relaxed atomic word: the re-centre's arm and debt, the stall debt, the
+    // wait for the first RTT reading and the hard-resync count, as of the last
+    // advancePrediction() or requestInputDelayIncreaseStall() (and construction).
+    // Each of those stores it as its last statement; this decodes it with one
+    // relaxed load, from any thread. No clock decision reads it: it is the
+    // dilation controller's freeze input. Rationale: docs/TimeConfig-rationale.md §18.
+    // -----------------------------------------------------------------------
+    OGSIMULATION_API ClockCorrectionPhase publishedCorrectionPhase() const;
+
+    // -----------------------------------------------------------------------
+    // The published target read (og-time-dilation task 10c)
+    //
+    // One relaxed 64-bit atomic word: the number of advances and the target tick
+    // (authority tick + prediction offset) the last advancePrediction() read.
+    // Every advance stores it after the phase word, on every path; nothing else
+    // stores it. This decodes it with one relaxed load, from any thread. No clock
+    // decision reads it: it is the dilation controller's guard centre input.
+    // Rationale: docs/TimeConfig-rationale.md §18.
+    // -----------------------------------------------------------------------
+    OGSIMULATION_API ClockTargetRead publishedTargetRead() const;
+
+    // -----------------------------------------------------------------------
     // Resync callbacks
     // Called with the new predictionTick when a hard resync fires, in
     // registration order.
@@ -270,6 +320,23 @@ using PCClockLoggerFn = std::function<void(const char*)>;
 
 private:
     void fireResyncCallbacks(unsigned int newTick);
+
+    // [og-time-dilation task 5] advancePrediction()'s body. advancePrediction() is its one
+    // caller and publishes after it returns, so no return path here can skip the store. §18
+    AdvanceResult advanceAndCorrect();
+    void          publishCorrectionPhase();
+    void          publishTargetRead();  // [og-time-dilation task 10c] advancePrediction() only. §18
+
+    // [og-time-dilation task 5] The word's layout. §18
+    static constexpr uint32_t kPhaseRecentreArmedBit  = 1u << 0;
+    static constexpr uint32_t kPhaseRecentringBit     = 1u << 1;
+    static constexpr uint32_t kPhaseStallDebtBit      = 1u << 2;
+    static constexpr uint32_t kPhaseAwaitsFirstRttBit = 1u << 3;
+    static constexpr uint32_t kPhaseHardResyncShift   = 8u;
+    static constexpr uint32_t kPhaseHardResyncMask    = (1u << (32u - kPhaseHardResyncShift)) - 1u;
+    static_assert((kPhaseAwaitsFirstRttBit << 1u) <= (1u << kPhaseHardResyncShift),
+        "ClientPredictionClock: the correction phase's flag bits must sit below its hard-resync count "
+        "(og-time-dilation task 5)");
 
     // [P3-10] One advance's estimator read (readTarget) and the resync onto the first
     // RTT reading's target. See advancePrediction.
@@ -355,6 +422,35 @@ private:
 
     // ⛔ THE EVENT SEAM, whole and behind its own type; the contract is at `EventSeamDiagnostics`.
     EventSeamDiagnostics m_eventSeamDiagnostics;
+
+    // [og-time-dilation task 5] The hard resyncs, counted for the published phase. Its own
+    // count: the event seam's is diagnostic only and has no production reader. §18
+    uint32_t m_hardResyncCount = 0;
+
+    // [og-time-dilation task 5] The published correction phase: one writer (the clock's
+    // thread), relaxed, read by publishedCorrectionPhase() from any thread. No clock
+    // decision reads it. §18
+    static_assert(std::atomic<uint32_t>::is_always_lock_free,
+        "ClientPredictionClock: the published correction phase is read off the clock's thread, so it must be a lock-free "
+        "atomic (og-time-dilation task 5)");
+    std::atomic<uint32_t> m_publishedPhase{0};
+
+    // [og-time-dilation task 10c] The published target read: the target tick the last
+    // advance read (set right after its readTarget()), the advances so far, and the word
+    // they are stored into, (advances << 32) | target. Same contract as the phase word. §18
+    unsigned int m_lastReadTargetTick = 0;
+    uint32_t     m_advances           = 0;
+    static_assert(std::atomic<uint64_t>::is_always_lock_free,
+        "ClientPredictionClock: the published target read is read off the clock's thread, so it must be a lock-free "
+        "atomic, one 64-bit word so a reader never sees a count from one advance and a target from another "
+        "(og-time-dilation task 10c)");
+    std::atomic<uint64_t> m_publishedTargetRead{0};
+
+    // [og-time-dilation task 5] The fence test's instrument: declared here, defined ONLY in
+    // og-simulation-tests (the NetworkTimeEstimatorReadProbe pattern), so it adds no surface
+    // a consumer can call. It overwrites and reads both published words and reads the
+    // first-RTT wait. §18
+    friend struct ClientPredictionClockPhaseProbe;
 };
 
 OGSIM_OPTIMIZE_ON

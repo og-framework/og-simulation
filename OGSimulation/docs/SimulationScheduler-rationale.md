@@ -49,6 +49,7 @@ The public surface:
 | `SchedulerConfig` | `dtSeconds`, `maxCatchUpSteps` (no default, §4), `minRateScale`, `maxRateScale` |
 | `pump(now)` | steps due now, at most the cap; advances `physicsStepCount` by the returned count (§3) |
 | `nextDeadline()` | the wall time the next step falls due; a runner sleeps until it |
+| `currentStepInterval()` | the newest segment's interval: the spacing after `nextDeadline()`, exactly `dtSeconds / rateScale()` (§5, §11) |
 | `stepDeadline(step)` | the wall time a step was (or will be) scheduled for (§6) |
 | `setRateScale(s)` / `rateScale()` | the clock-dilation seam (§5) |
 | `reanchor(now)` | pause/resume: skip the gap, count it (§7) |
@@ -239,7 +240,10 @@ Its semantics are those of the `std::deque` it replaced:
   the oldest index: the same as the deque's append followed by dropping its front once it held more
   than `kDeadlineHistorySegments`.
 - `segmentFor` scans from the newest to the oldest and falls back to the oldest kept (§6).
-- `currentInterval()` is the newest segment's interval.
+- `currentInterval()` is the newest segment's interval. The public `currentStepInterval()` returns it,
+  read-only. Every segment is begun with `dtSeconds` (the first) or `dtSeconds / rateScale_` (a rate
+  change), and a drop or a `reanchor` begins its segment with `currentInterval()`, so the value is always
+  exactly `dtSeconds / rateScale()`.
 
 **No allocation, at construction or after.** The ring lives inside the scheduler object, so
 `pump`, `reanchor` and `setRateScale` never reach the heap. A `std::deque` stores its elements in
@@ -265,3 +269,6 @@ material that is **not distributed with this submodule**; nothing above depends 
 
 2026-11-12: lost time split by cause (§10), and the segment history moved from a `std::deque` to a
 fixed ring (§11).
+
+2026-11-20: `currentStepInterval()`, a public read of the newest segment's interval (§11), for a rate
+controller that reads the step interval through the tick driver's rate door.

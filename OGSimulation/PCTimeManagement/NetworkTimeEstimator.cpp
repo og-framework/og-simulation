@@ -11,11 +11,23 @@
 // pragma optimize off — debugger-friendliness; rationale in SimulationManager.h.
 OGSIM_OPTIMIZE_OFF
 
+namespace
+{
+    // The server-tick estimator's defaults, on this estimator's tick rate (og-time-dilation task 3).
+    ServerTickEstimatorConfig serverTickEstimatorConfigFor(const TimeConfig& config)
+    {
+        ServerTickEstimatorConfig serverTickConfig;
+        serverTickConfig.tickFrequency = config.tickFrequency;
+        return serverTickConfig;
+    }
+}
+
 NetworkTimeEstimator::NetworkTimeEstimator(const TimeConfig& config, LoggerFn logger)
     : m_config(config)
     , m_smoothedRTT(0.0)
     , m_smoothedJitter(0.0)
     , m_hasFirstSample(false)
+    , m_serverTickEstimator(serverTickEstimatorConfigFor(config))
     , m_logger(std::move(logger))
 {
 }
@@ -364,26 +376,32 @@ void NetworkTimeEstimator::noteSimClockSample(const SimClockRttSample& sample)
         }
     }
 
-    if (m_config.clockRttSource != TimeConfig::ClockRttSource::SimClock)
-        return;
-
-    if (m_activeRttSource.load(std::memory_order_relaxed) != TimeConfig::ClockRttSource::SimClock)
+    if (m_config.clockRttSource == TimeConfig::ClockRttSource::SimClock)
     {
-        m_activeRttSource.store(TimeConfig::ClockRttSource::SimClock, std::memory_order_relaxed);
-        noteRttSourceChanged();
-        if (m_logger)
+        if (m_activeRttSource.load(std::memory_order_relaxed) != TimeConfig::ClockRttSource::SimClock)
         {
-            char buf[256];
-            std::snprintf(buf, sizeof(buf),
-                "[Warning][ClockSource.Switch] NetworkTimeEstimator RTT source Engine -> SimClock "
-                "hasFirstRTTSample=%d smoothedRTT=%.3fms firstSimClockRtt=%.3fms",
-                m_hasFirstSample.load(std::memory_order_relaxed) ? 1 : 0,
-                m_smoothedRTT.load(std::memory_order_relaxed) * 1000.0,
-                sample.rttSeconds * 1000.0);
-            m_logger(buf);
+            m_activeRttSource.store(TimeConfig::ClockRttSource::SimClock, std::memory_order_relaxed);
+            noteRttSourceChanged();
+            if (m_logger)
+            {
+                char buf[256];
+                std::snprintf(buf, sizeof(buf),
+                    "[Warning][ClockSource.Switch] NetworkTimeEstimator RTT source Engine -> SimClock "
+                    "hasFirstRTTSample=%d smoothedRTT=%.3fms firstSimClockRtt=%.3fms",
+                    m_hasFirstSample.load(std::memory_order_relaxed) ? 1 : 0,
+                    m_smoothedRTT.load(std::memory_order_relaxed) * 1000.0,
+                    sample.rttSeconds * 1000.0);
+                m_logger(buf);
+            }
         }
+        updateRTT(sample.rttSeconds);
     }
-    updateRTT(sample.rttSeconds);
+
+    // og-time-dilation task 3: every valid sample, at either source, before and after
+    // the switch; after updateRTT, so the estimator's RTT gate reads the smoothed RTT
+    // this sample produced. A sample with no server tick is ignored there. §15
+    m_serverTickEstimator.noteSample(sample.serverTick, sample.serverTickAgeSeconds, sample.rttSeconds,
+                                     sample.t3Seconds, m_smoothedRTT.load(std::memory_order_relaxed));
 }
 
 void NetworkTimeEstimator::noteRttSourceChanged()
@@ -554,10 +572,7 @@ unsigned int NetworkTimeEstimator::getPredictionOffsetTicks() const
 
     // Each RTT source has its own jitter multiplier (og-input-latency P3-13;
     // docs/TimeConfig-rationale.md §17).
-    const double jitterMultiplier =
-        m_activeRttSource.load(std::memory_order_relaxed) == TimeConfig::ClockRttSource::SimClock
-            ? m_config.simClockJitterMultiplier
-            : m_config.jitterMultiplier;
+    const double jitterMultiplier = activeJitterMultiplier();
     const double rawOffset = (m_smoothedRTT.load(std::memory_order_relaxed)
                               + jitterMultiplier * m_smoothedJitter.load(std::memory_order_relaxed))
                              * m_config.tickFrequency;
@@ -623,6 +638,18 @@ unsigned int NetworkTimeEstimator::getOutlierEscapeCount() const
 unsigned int NetworkTimeEstimator::getMeasuredRTTSampleCount() const
 {
     return m_measuredRTTSamples.load(std::memory_order_relaxed);
+}
+
+double NetworkTimeEstimator::activeJitterMultiplier() const
+{
+    return m_activeRttSource.load(std::memory_order_relaxed) == TimeConfig::ClockRttSource::SimClock
+               ? m_config.simClockJitterMultiplier
+               : m_config.jitterMultiplier;
+}
+
+const ServerTickEstimator& NetworkTimeEstimator::serverTickEstimator() const
+{
+    return m_serverTickEstimator;
 }
 
 OGSIM_OPTIMIZE_ON
