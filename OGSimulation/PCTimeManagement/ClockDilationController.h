@@ -19,7 +19,7 @@ enum class ClockDilationMode : uint8_t { Off, Shadow, On };
 
 enum class ClockDilationSetpoint : uint8_t { OwnRtt, Common };
 
-enum class DilationFreeze : uint8_t { None, ModeOff, SensorInvalid, Recentre, StallDebt, AwaitFirstRtt, AfterResync };
+enum class DilationFreeze : uint8_t { None, ModeOff, SensorInvalid, Recentre, TransitionDebt, AwaitFirstRtt, AfterResync };
 
 struct ClockDilationConfig
 {
@@ -35,14 +35,24 @@ struct ClockDilationConfig
     double                guardLowTicks            = -0.5;
     double                guardHighTicks           = 2.5;
     double                freezeAfterResyncSeconds = 1.0;
-    double                commonLeadTicks          = 2.5;
+    double                commonLeadTicks          = 3.65;
     double                targetOffsetTicks        = 0.0;
 };
 
 namespace clockDilation
 {
-inline constexpr double kMaxFrameTicks = 3.0;
+inline constexpr double   kMaxFrameTicks   = 3.0;
+inline constexpr uint32_t kFramePeakFrames = 4u;
+inline constexpr uint32_t kFramePeakWindow = 8u;
 } // namespace clockDilation
+
+static_assert(clockDilation::kFramePeakFrames >= 1u && clockDilation::kFramePeakFrames <= clockDilation::kFramePeakWindow,
+    "clockDilation::kFramePeakFrames: a frame period enters the frame peak once this many of the last kFramePeakWindow "
+    "frames reach it, so it must be a count inside the window (rationale section 5.1)");
+static_assert(clockDilation::kFramePeakFrames <= TimeConfig{}.gradualCorrectionRate,
+    "clockDilation::kFramePeakFrames: a run of fewer long frames than this never enters the frame peak. Each long frame "
+    "raises at most one clock read (its first advance), so such a run alone must stay below the clock's graduated count, "
+    "gradualCorrectionRate out-of-band reads per correction (rationale section 5.1)");
 
 static_assert(ClockDilationConfig{}.maxDeviation < 0.2,
     "ClockDilationConfig: the bracket bound. A render snapshot pair brackets the render time while "
@@ -172,7 +182,10 @@ private:
     double rawTargetTicks(const ClockDilationInputs& in) const
     {
         if (m_config.setpoint == ClockDilationSetpoint::Common)
+        {
+            // ⛔G-09  docs/ClockDilationController-guards.md
             return m_config.commonLeadTicks + m_config.targetOffsetTicks;
+        }
 
         const double f          = in.tickFrequency;
         const double floorTicks = static_cast<double>(in.predOffsetFloorTicks);
@@ -244,13 +257,15 @@ private:
                 {
                     m_framePeakTicks = frameTicks;
                     m_frameMeanTicks = frameTicks;
+                    m_recentFrameTicks.fill(frameTicks);
                     m_frameSeeded    = true;
                 }
                 else
                 {
                     const double frameSeconds = frameTicks / in.tickFrequency;
                     const double gain         = 1.0 - std::exp(-frameSeconds / m_config.guardTauSeconds);
-                    m_framePeakTicks = std::max(frameTicks, m_framePeakTicks + gain * (frameTicks - m_framePeakTicks));
+                    const double sustained    = sustainedFrameTicks(frameTicks);
+                    m_framePeakTicks = std::max(sustained, m_framePeakTicks + gain * (sustained - m_framePeakTicks));
                     const double meanGain = 1.0 - std::exp(-frameSeconds / m_config.targetTauSeconds);
                     m_frameMeanTicks += meanGain * (frameTicks - m_frameMeanTicks);
                 }
@@ -258,6 +273,17 @@ private:
         }
         m_hasLastCall     = true;
         m_lastCallSeconds = in.clockNowSeconds;
+    }
+
+    double sustainedFrameTicks(double frameTicks)
+    {
+        m_recentFrameTicks[m_nextRecentFrame] = frameTicks;
+        m_nextRecentFrame = (m_nextRecentFrame + 1u) % clockDilation::kFramePeakWindow;
+        std::array<double, clockDilation::kFramePeakWindow> ranked = m_recentFrameTicks;
+        const auto reached = ranked.begin() + (clockDilation::kFramePeakWindow - clockDilation::kFramePeakFrames);
+        std::nth_element(ranked.begin(), reached, ranked.end());
+        // ⛔G-08  docs/ClockDilationController-guards.md
+        return std::min(frameTicks, *reached);
     }
 
     double meanFirstReadPhaseTicks() const
@@ -278,8 +304,8 @@ private:
             return DilationFreeze::SensorInvalid;
         if (in.phase.recentreArmed || in.phase.recentring)
             return DilationFreeze::Recentre;
-        if (in.phase.stallDebt)
-            return DilationFreeze::StallDebt;
+        if (in.phase.transitionDebt)
+            return DilationFreeze::TransitionDebt;
         if (in.phase.awaitsFirstRtt)
             return DilationFreeze::AwaitFirstRtt;
         if (m_sawHardResync && in.clockNowSeconds - m_hardResyncSeconds < m_config.freezeAfterResyncSeconds)
@@ -301,6 +327,8 @@ private:
     bool                m_frameSeeded       = false;
     double              m_framePeakTicks    = 0.0;
     double              m_frameMeanTicks    = 0.0;
+    std::array<double, clockDilation::kFramePeakWindow> m_recentFrameTicks{};
+    uint32_t            m_nextRecentFrame   = 0u;
     double              m_lastGuardSeconds  = 0.0;
     bool                m_hasPreviousCall      = false;
     bool                m_previousSensorValid  = false;
@@ -528,7 +556,7 @@ private:
         {
         case DilationFreeze::SensorInvalid: ++m_frozenBySensor; break;
         case DilationFreeze::Recentre: ++m_frozenByRecentre; break;
-        case DilationFreeze::StallDebt: ++m_frozenByDebt; break;
+        case DilationFreeze::TransitionDebt: ++m_frozenByDebt; break;
         case DilationFreeze::AwaitFirstRtt: ++m_frozenByFirstRtt; break;
         case DilationFreeze::AfterResync: ++m_frozenByResync; break;
         case DilationFreeze::None:

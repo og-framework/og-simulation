@@ -426,6 +426,13 @@ public:
 
 	void release_GameThread(const SnapshotT* snapshot) { m_channel.release(snapshot); }
 
+	const SnapshotT* refreshView_GameThread(const SnapshotT* held)
+	{
+		if (held != nullptr)
+			m_channel.release(held);
+		return m_channel.peekNewest(0u);
+	}
+
 	uint64_t drops() const { return m_channel.drops(); }
 
 private:

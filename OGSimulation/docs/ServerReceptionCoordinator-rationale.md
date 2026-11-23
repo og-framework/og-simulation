@@ -170,8 +170,14 @@ whichever owner's sample happened to cross the dwell gate. A sibling that did no
 transition still sees `newTierIndex` equal to the new tier and, having last been told 0, must be
 published to. Gating the publish on "did *this* sample transition" starves that sibling.
 
-A missing map entry means "never told", whose baseline is the far side's default of 0 — so a first
-sample that derives tier 0 correctly publishes nothing.
+A missing map entry means "never told", and the first sample publishes whatever tier it derives, tier 0
+included (og-input-latency P6-2). Until then this paragraph said the far side's baseline was 0, "so a first
+sample that derives tier 0 correctly publishes nothing". That premise was false: a client that has never
+been told a tier does not run tier 0, it runs the no-tier fallback, the worst tier's delay
+(`ReplicatedTierConsumer::effectiveInputDelayTicks`), while this table answers tier 0 for the wire from its
+first sample. At a relay delay floor of 4 or more both ends collapse to the floor and the gap was invisible;
+below it the owning client applied its own inputs at the fallback while the server applied them at the
+tier's delay, and the client never learned of the server's switch, so it could not pay for it.
 
 ### The sink is a concept, and what one adapter binds it to
 

@@ -237,7 +237,8 @@ public:
     // and a per-Address key would starve the second sibling forever. §4
     // ⛔ COMPARE `result.newTierIndex`, NEVER "did THIS sample transition" - that
     // starves the sibling whose sample did not cross the dwell gate. §4
-    // ⚠ A missing entry means never told, baseline 0 - so tier 0 publishes nothing. §4
+    // ⛔ A MISSING ENTRY MEANS NEVER TOLD, SO THE FIRST SAMPLE PUBLISHES, TIER 0 TOO -
+    // the client runs the worst-tier fallback until told (og-input-latency P6-2). §4
     template <ConnectionTierSink Sink>
     void noteRttSample(const Address& addr, unsigned int ownerId, int32_t serverTick,
                        double rttMs, Sink&& sink)
@@ -250,8 +251,7 @@ public:
         const int32_t newTier = result.newTierIndex;
 
         const auto it = m_lastPublishedTier.find(ownerId);
-        const int32_t lastPublished = (it == m_lastPublishedTier.end()) ? 0 : it->second;
-        if (newTier == lastPublished)
+        if (it != m_lastPublishedTier.end() && newTier == it->second)
         {
             return;         // unchanged for this owner — do not dirty the wire
         }

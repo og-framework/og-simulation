@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: MPL-2.0 -->
+<!-- lint-external-ref: stallDebt -- the phase bit's field name until og-input-latency P6-2 renamed it transitionDebt; kept in the history -->
 <!-- lint-external-ref: ASimulationTimingRelay -- deleted by og-input-latency task P5-9 (the relay actors, their listeners, the Iris sim buffers, serializers and proofs, and UEConnectionHandle); kept in the history -->
 # `TimeConfig.h` — rationale
 
@@ -703,7 +704,7 @@ direction (ahead: Stall; behind: Skip). Outside the dead band the drift sets the
 correction fired while a debt is owed pays one tick of it, so the debt ends after exactly `|owed|` corrections; an
 opposite one can only come from outside the band, where the drift disagrees with the debt by more than the band, and
 counting it too keeps the episode bounded. No later reading ends the debt; a hard resync or a re-arm clears it and
-re-arms. Otherwise it does not fire again. A hard resync or an input-delay stall debt keeps its priority over it (hard
+re-arms. Otherwise it does not fire again. A hard resync or an input-delay transition debt (Stalls, or Skips since og-input-latency P6-2) keeps its priority over it (hard
 resync, then debt, then drift correction), and `evaluateDrift` reports the correction it owes.
 
 **The re-arm: a target that moves after the decision** (og-input-latency task 27, rework 2, from the Ph3 gate's finding
@@ -1193,7 +1194,7 @@ each source, on an exact RTT and jitter (1/16 s and 1/32 s): 8, 7, 6, 5 and 4 ti
 
 Added by og-time-dilation task 5, 2026-11-21. Its writer is `ClientPredictionClock`; it has no field of its own. Its reader is
 the dilation controller (og-time-dilation task 6), which holds its rate scale at 1.0 while the clock's own corrections run:
-the re-centre armed or owing ticks (§14), a stall debt owed, the wait for the first RTT reading (§16), and a while after any
+the re-centre armed or owing ticks (§14), an input-delay transition debt owed (Stalls or, since og-input-latency P6-2, Skips), the wait for the first RTT reading (§16), and a while after any
 hard resync. That reader runs once per frame on the scheduler's owning thread (the client's game thread), and the clock
 advances on the step's thread, so the clock publishes what the reader needs as one atomic word.
 
@@ -1204,7 +1205,7 @@ load of a `std::atomic<uint32_t>` (lock-free, a `static_assert`):
 |---|---|---|
 | 0 | `recentreArmed` | `isRecentreArmed()` |
 | 1 | `recentring` | `isRecentring()` |
-| 2 | `stallDebt` | `getRequiredInputDelayIncreaseStallTicks() > 0` |
+| 2 | `transitionDebt` | `getPendingInputDelayTransitionTicks() != 0`: Stalls or Skips owed. Named `stallDebt` and read as `getRequiredInputDelayIncreaseStallTicks() > 0` until og-input-latency P6-2 made the debt signed; a Skip debt must freeze the controller as a Stall debt does |
 | 3 | `awaitsFirstRtt` | the hard resync's wait for the first settled reading (§16) |
 | 8–31 | `hardResyncs` | the clock's hard resyncs, modulo 2²⁴ |
 
@@ -1213,10 +1214,10 @@ diagnostic only and no production code may read it). It wraps after 16.7 million
 change, so the wrap costs nothing.
 
 **When it is written.** One relaxed store, built from the accessors in the table, as the last statement of
-`advancePrediction()`, of `requestInputDelayIncreaseStall()` (its no-op path for a delta of 0 or less too) and of the
+`advancePrediction()`, of `requestInputDelayTransition()` (its no-op path for a delta of 0 too; `requestInputDelayIncreaseStall()` forwards to it, with a non-positive delta as 0, since og-input-latency P6-2) and of the
 constructor (the re-centre is armed from construction, so a reader before the first advance sees the arm). The store is not
 "remembered" at each return: `advancePrediction()` calls the advance's body, `advanceAndCorrect()`, and publishes after it,
-so every return of the body (the hard resync, the stall debt's Stall, the warm-up guard, the dead band, the graduated Skip,
+so every return of the body (the hard resync, the transition debt's Stall and Skip, the warm-up guard, the dead band, the graduated Skip,
 the graduated Stall, the graduated zone's normal advance) and any return added later reach the one store. A hard resync's
 callbacks run inside the body, so they run before its store: a reader on the callbacks' thread sees the phase from before
 the resync until the advance returns.
@@ -1226,7 +1227,7 @@ the resync until the advance returns.
   two. ⚠ The stall request is called by the tier receipt (one adapter's binding: the Unreal host's connection-tier and
   relay-floor handlers). In immediate mode that runs in the step's drain, on the clock's thread, and the contract holds as
   stated. Frame-locked, it runs on the game thread while the clock advances on the physics thread, so the request is a second
-  writer, as it already is of the stall debt itself. Its store then encodes the re-centre's flags as the game thread reads
+  writer, as it already is of the transition debt itself (a lock-free atomic since og-input-latency P6-2, consumed by compare-exchange: `ThreadingCrossings.md` row 12). Its store then encodes the re-centre's flags as the game thread reads
   them, and may land after a newer advance's store; the clock's next advance stores the word again, so it is wrong for at
   most one advance.
 - **Any reader**, from any thread. The load is relaxed and the word is ordered with nothing else: a reader that also reads
@@ -1272,13 +1273,13 @@ in the low 32.
 
 **When it is written.** `advancePrediction()` stores it with one relaxed store after the phase word's, as its last statement:
 `publishTargetRead()` increments the count and stores `(advances << 32) | m_lastReadTargetTick`. Every path of the body (the
-hard resync, the first-RTT resync, the stall debt's Stall, the warm-up guard, the dead band, the graduated Skip and Stall, the
-re-centre's payment) returns into it, as for the phase word. `requestInputDelayIncreaseStall()` does **not** store it: it
-reads no target. The constructor does not either: `{0, 0}` already says "no read".
+hard resync, the first-RTT resync, the transition debt's Stall and Skip, the warm-up guard, the dead band, the graduated Skip and Stall, the re-centre's
+payment) returns into it, as for the phase word. `requestInputDelayTransition()` (and `requestInputDelayIncreaseStall()`, which forwards to it) does **not** store it:
+it reads no target. The constructor does not either: `{0, 0}` already says "no read".
 
 **The contract** is the phase word's: one writer, any reader, write-only for the clock.
 - **One writer**: `advancePrediction()`'s caller, the step's thread. Unlike the phase word there is no second writer: the
-  frame-locked tier receipt calls the stall request, which does not store this word.
+  frame-locked tier receipt calls the transition request, which does not store this word.
 - **Any reader**, relaxed, ordered with nothing else. The stage reads it once per frame on the scheduler's owning thread. A
   read that lands inside a batch running on another thread sees the batch's latest advance so far; the controller pairs it
   with its previous call, a one-sample approximation `ClockDilationController-rationale.md` §5.4 accepts.

@@ -21,7 +21,7 @@ OGSIM_OPTIMIZE_OFF
 // THE CLOCK'S EVENT SEAM - seven plain words the clock owns as ONE member, written PER EVENT
 // on the physics thread and read as `clock.getDiagnostics().skipCount()` and its six siblings.
 //
-// ⛔ DIAGNOSTIC ONLY: four write sites in `advancePrediction`, no production reader, no decision.
+// ⛔ DIAGNOSTIC ONLY: five write sites in `advancePrediction` (four until og-input-latency P6-2), no production reader, no decision.
 //
 // ⭐ STRUCTURAL, not merely asserted: clock logic cannot name a word without `m_eventSeamDiagnostics.`.
 //
@@ -34,7 +34,7 @@ OGSIM_OPTIMIZE_OFF
 //
 // ⛔ EVERY BRANCH WRITES ITS TICK BEFORE ITS COUNT - a count-then-tick reader tears one way only.
 //
-// ⚠ Both stall branches write, debt and graduated; instrumenting one under-counts silently.
+// ⚠ Both stall branches and both skip branches write, debt and graduated; instrumenting one under-counts silently.
 //
 // ⛔ Nothing here reaches the wire, the correction payload or `compute_checksum`.
 struct EventSeamDiagnostics
@@ -55,7 +55,7 @@ struct ClockCorrectionPhase
 {
     bool     recentreArmed  = false;  // isRecentreArmed()
     bool     recentring     = false;  // isRecentring()
-    bool     stallDebt      = false;  // getRequiredInputDelayIncreaseStallTicks() > 0
+    bool     transitionDebt = false;  // getPendingInputDelayTransitionTicks() != 0: Stalls or Skips owed (P6-2)
     bool     awaitsFirstRtt = false;  // a hard resync waits for the first RTT reading (§16)
     uint32_t hardResyncs    = 0;      // the clock's hard resyncs, modulo 2^24
 
@@ -112,43 +112,56 @@ using PCClockLoggerFn = std::function<void(const char*)>;
     OGSIMULATION_API SimulationTimeStep getPredictionStep() const;
 
     // -----------------------------------------------------------------------
-    // Input-delay-increase stall (T11, D5.3)
+    // Input-delay transition debt (T11, D5.3; signed since og-input-latency P6-2)
     //
     // NOTE ON THE NAME: this mechanism never resimulates anything — it only
     // declines to advance the prediction frontier for N calls (an AdvanceResult
-    // Stall). It is unrelated to the resimulation-depth machinery in TimeConfig,
-    // which owns the codebase's other vocabulary for "give ticks back".
+    // Stall), or advances it by two (an AdvanceResult Skip). It is unrelated to
+    // the resimulation-depth machinery in TimeConfig, which owns the codebase's
+    // other vocabulary for "give ticks back".
     // -----------------------------------------------------------------------
 
-    // Register the effective-input-delay change produced by an authoritative
-    // RTT tier transition, as reported by `tierDelayDeltaTicks(oldTier, newTier)`
-    // (ConnectionTierTable.h). Called on the CLIENT when the connection tier
-    // arrives (og-sim-net's ConnectionTier message, through
-    // UESimulationSession::onConnectionTierReceived) — under Option A that tier
-    // delta is the only tier-transition signal the client has. The relay-delay
-    // floor's arrival calls it too.
+    // Register a change in the client's effective input delay, in ticks: the
+    // value `UESimulationSession::recomputeAndPublishEffectiveInputDelay`
+    // returns when the relay-delay floor or the connection tier arrives (the
+    // effective delay after the arrival minus the one before it, the no-tier
+    // fallback included). Positive means Stalls are owed, negative Skips; the
+    // debt is ONE signed counter, so opposite requests net. 0 is a no-op.
     //
-    // WHY A STALL AT ALL. An upward transition RAISES the effective input
+    // WHY A STALL FOR A RAISE. An upward transition RAISES the effective input
     // delay: an input captured at tick T now lands at T + newDelay instead of
     // T + oldDelay. Every already-predicted tick ahead of the frontier was
     // computed against the OLD, smaller delay, so the frontier now sits
     // `delta` ticks further ahead of where the new delay says it should. The
     // client must give those ticks back.
     //
-    // POSITIVE DELTAS ONLY. `deltaDelayTicks <= 0` is a no-op: a DOWNWARD
-    // transition lets the client predict FURTHER ahead, which the ordinary
-    // drift path reaches on its own by advancing normally. There is nothing to
-    // undo, so forcing a forward jump here would be an unnecessary
-    // discontinuity.
-    //
-    // ACCUMULATES. Consecutive upward transitions add their deltas: two
-    // unpaid transitions owe the sum, never just the most recent one.
+    // WHY A SKIP FOR A DECREASE — A REVERSAL (og-input-latency P6-2). Until P6-2
+    // this block said a downward transition was a no-op "which the ordinary
+    // drift path reaches on its own by advancing normally". That was false: the
+    // drift path's target is the authority tick plus the prediction offset
+    // (NetworkTimeEstimator::getPredictionOffsetTicks: the RTT, its jitter term
+    // and the floor), which never reads the input delay, so no drift Skip ever
+    // comes. Meanwhile the server re-times its parked inputs to the smaller
+    // delay, and its drain releases ONE input per slot per tick, oldest first
+    // (ServerInputDelayQueue::tryDequeueForTick): at the switch two are due, and
+    // with a gap-free capture stream the drain then stays `-delta` ticks late
+    // for the rest of the session. Each Skip leaves one capture tick
+    // unproduced; that gap drains one tick of the backlog when the release
+    // front reaches it. Pinned by og-simulation-tests' DelayTransitionTest.
+    OGSIMULATION_API void requestInputDelayTransition(int32_t deltaDelayTicks);
+
+    // The T11 entry point, kept: POSITIVE DELTAS ONLY (`deltaDelayTicks <= 0`
+    // is a no-op); a positive delta is forwarded to requestInputDelayTransition.
     OGSIMULATION_API void requestInputDelayIncreaseStall(int32_t deltaDelayTicks);
 
-    // Ticks of stall still owed. Nonzero means advancePrediction() will
-    // return Stall on the next call(s) instead of applying ordinary drift
-    // correction. Exposed for tests and telemetry.
+    // Ticks of stall still owed: max(0, the signed debt). Nonzero means
+    // advancePrediction() will return Stall on the next call(s) instead of
+    // applying ordinary drift correction. 0 while Skips are owed. Exposed for
+    // tests and telemetry.
     OGSIMULATION_API unsigned int getRequiredInputDelayIncreaseStallTicks() const;
+
+    // The signed debt itself: > 0 Stalls owed, < 0 Skips owed, 0 none.
+    OGSIMULATION_API int32_t getPendingInputDelayTransitionTicks() const;
 
     // -----------------------------------------------------------------------
     // Resimulation
@@ -226,9 +239,10 @@ using PCClockLoggerFn = std::function<void(const char*)>;
     // -----------------------------------------------------------------------
     // The published correction phase (og-time-dilation task 5)
     //
-    // One relaxed atomic word: the re-centre's arm and debt, the stall debt, the
+    // One relaxed atomic word: the re-centre's arm and debt, the input-delay
+    // transition debt (either sign, og-input-latency P6-2), the
     // wait for the first RTT reading and the hard-resync count, as of the last
-    // advancePrediction() or requestInputDelayIncreaseStall() (and construction).
+    // advancePrediction() or input-delay transition request (and construction).
     // Each of those stores it as its last statement; this decodes it with one
     // relaxed load, from any thread. No clock decision reads it: it is the
     // dilation controller's freeze input. Rationale: docs/TimeConfig-rationale.md §18.
@@ -330,7 +344,7 @@ private:
     // [og-time-dilation task 5] The word's layout. §18
     static constexpr uint32_t kPhaseRecentreArmedBit  = 1u << 0;
     static constexpr uint32_t kPhaseRecentringBit     = 1u << 1;
-    static constexpr uint32_t kPhaseStallDebtBit      = 1u << 2;
+    static constexpr uint32_t kPhaseTransitionDebtBit = 1u << 2;
     static constexpr uint32_t kPhaseAwaitsFirstRttBit = 1u << 3;
     static constexpr uint32_t kPhaseHardResyncShift   = 8u;
     static constexpr uint32_t kPhaseHardResyncMask    = (1u << (32u - kPhaseHardResyncShift)) - 1u;
@@ -378,9 +392,20 @@ private:
     unsigned int m_resimulationTick         = 0;
     unsigned int m_gradualCorrectionCounter = 0;  // cycles 0 .. gradualCorrectionRate-1
 
-    // [T11] Unpaid input-delay-increase stall, in ticks. Paid down one tick per
-    // advancePrediction() call (as a Stall), cleared by a hard resync.
-    unsigned int m_requiredInputDelayIncreaseStallTicks = 0;
+    // [T11, signed since og-input-latency P6-2] The unpaid input-delay transition:
+    // > 0 Stalls owed, < 0 Skips owed. Paid one tick per advancePrediction() call
+    // toward 0 by compare-exchange, cleared by a hard resync. Atomic because the
+    // request runs where the floor and the tier arrive: the game thread on a
+    // frame-locked client, the step thread on an immediate one
+    // (docs/ThreadingCrossings.md row 12).
+    static_assert(std::atomic<int32_t>::is_always_lock_free,
+        "ClientPredictionClock: the input-delay transition debt is requested off the clock's thread on a frame-locked "
+        "client, so it must be a lock-free atomic (og-input-latency P6-2; it was a plain unsigned before)");
+    std::atomic<int32_t> m_pendingInputDelayTransitionTicks{0};
+
+    // [P6-2] Pays one tick of the debt toward 0 and returns the sign it paid:
+    // +1 a Stall, -1 a Skip, 0 nothing owed.
+    int32_t consumeOneInputDelayTransitionTick();
 
     // [P3-10] Set by a hard resync that landed on the floor offset with no settled RTT
     // reading (with the re-centre on), with the offset it landed on; cleared on the

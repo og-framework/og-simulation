@@ -2,9 +2,9 @@
 # `ClockDilationController.h` — guards
 
 Every prohibition that governs `ClockDilationController`. Each entry has an **opaque, stable id**. A single line
-`// ⛔G-nn  docs/ClockDilationController-guards.md` sits exactly where the forbidden edit would be typed. Six sites are in
-`ClockDilationController::update` and its private `rawTargetTicks` and `noteFrame`; the seventh is in the client stage,
-`clockDilation::beforeClientPump`.
+`// ⛔G-nn  docs/ClockDilationController-guards.md` sits exactly where the forbidden edit would be typed. Eight sites are in
+`ClockDilationController::update` and its private `rawTargetTicks`, `noteFrame` and `sustainedFrameTicks`; the ninth is in
+the client stage, `clockDilation::beforeClientPump`.
 
 **If this file and `ClockDilationController.h` disagree, the header is authoritative and this file is stale.** Fix this
 file; do not soften the header to match it.
@@ -22,7 +22,9 @@ Two prohibitions are compile-time checks, not guards: the default `maxDeviation`
 default guard edges inside the clock's quiet band: the low edge with one offset quantum and half a tick of headroom above
 its capped mean read, the high edge with half a tick of margin, and the two edges never crossing at the longest sampled
 frame (rationale §5.3). Each is a `static_assert` beside `ClockDilationConfig`, as is the default change hysteresis's range,
-at least half a quantum and at most one slew step (rationale §6). A third is a runtime check, not a guard: never apply a scale on the authority. The controller has
+at least half a quantum and at most one slew step (rationale §6), and the sustained frame filter's count: inside its window,
+and at most the clock's `gradualCorrectionRate`, so that a run it rejects stays below the clock's graduated count (rationale
+§5.1, §5.3; task 7c). A third is a runtime check, not a guard: never apply a scale on the authority. The controller has
 no role input, so the stage enforces it with `OG_CHECK(manager.runsPrediction(), …)` as its first statement (rationale
 §10, §13).
 
@@ -39,7 +41,7 @@ unless the stability and drift argument of rationale §8 is re-derived for the n
 **Consequence.** The loop is first order with no transport delay because the correction is a pure function of this call's
 error. Under a constant clock-rate mismatch δ its steady error is δ/K_p: 0.02 tick at 100 ppm. An integral term makes the
 loop second order: it can overshoot, and it winds up while a freeze (rationale §9) holds the scale at 1.0 with a non-zero
-error, so every re-centre, stall debt or resync would end in an overshoot the clock's graduated corrections may then fight.
+error, so every re-centre, input-delay transition debt or resync would end in an overshoot the clock's graduated corrections may then fight.
 Test (b), a +1 tick error that must settle at exactly 0.995 and stay, fails under any integrator.
 
 **What breaks if it moves.** The statement must read this call's `out.errorTicks`, after the guard has clamped the target.
@@ -60,7 +62,7 @@ make the frozen branch anything but 1.0.
   it. Unclamped, a large error (a hitch's lost time) asks for a scale the scheduler would clamp at 0.75–1.25, whose ratio of
   1.667 makes `beyondOldest` render frames.
 - The clamp is also the saturation the tests pin: ±3 ticks must give exactly 0.990 / 1.010 (test (c)).
-- A frozen value other than 1.0 keeps dilating while the clock moves the lead by whole ticks (re-centre, stall debt, resync),
+- A frozen value other than 1.0 keeps dilating while the clock moves the lead by whole ticks (re-centre, input-delay transition debt, resync),
   so the two corrections add.
 
 **What breaks if it moves.** It must read this call's `correction` and feed the slew below it. A freeze reaches the scale
@@ -150,6 +152,46 @@ hold a scale off 1.0 through ten or more frozen calls after a 600 ms hitch.
 
 **What breaks if it moves.** `frozen` must be this call's freeze, computed above from `freezeCause`; the condition must stay
 the guard of the one statement that assigns `m_scale`, so every frozen call assigns it.
+
+## G-08 — a run of fewer than `kFramePeakFrames` long frames must not enter the frame peak
+
+**Tag site:** `ClockDilationController::sustainedFrameTicks`, immediately above
+`return std::min(frameTicks, *reached);`, the value `noteFrame` feeds the peak.
+
+**The prohibition.** Do not return `frameTicks` alone, do not feed `frameTicks` into `m_framePeakTicks` past this function,
+and do not replace the order statistic with a running mean or any other filter that takes a single long frame at once or
+follows a sustained one only after seconds. (How large `kFramePeakFrames` may be is a `static_assert`: at most the clock's
+`gradualCorrectionRate`.)
+
+**Consequence.** Without the filter one frame of 25–40 ms at 100 fps, a frame a loaded host makes every few seconds, lifts the
+low edge by 1.2–1.5 tick for the peak's 2 s decay (rationale §5.1). The guard clamps the target above the lead, and the
+controller drives the lead up and back for a correction the clock was not about to make: in the closed loop
+`IsolatedLongFramesLeaveTheGuardUnbound` fails with 4,378 bound calls, |err| p95 0.477 and 5.64 door changes per second
+on one client, and `AShortRunOfLongFramesIsNotSampled` with the edge at 3.4 instead of 1.8 after one 40 ms frame. On the
+Unreal host this was G-DIL-1's finding F2 (errAbsMax up to 2.39, 63 changes in one window). A filter that follows the 10 s
+mean instead misses a real frame-rate drop: `ASustainedFrameDropStillLiftsTheEdge` fails, with graduated corrections after
+a drop from 100 to 30 fps.
+
+**What breaks if it moves.** The frame must be written into `m_recentFrameTicks` before the order statistic is taken, so a
+sustained period enters on its `kFramePeakFrames`-th frame; the `std::min` with this frame must stay, so a shorter frame
+enters at its own length and the peak decays as task 7b specified (`TheFramePeakDecaysAtTheGuardTau`); and the ring must
+hold sampled frames only, after G-06's hitch test, seeded with the first sampled frame.
+
+## G-09 — the `Common` target carries no jitter term
+
+**Tag site:** `ClockDilationController::rawTargetTicks`, immediately above
+`return m_config.commonLeadTicks + m_config.targetOffsetTicks;`.
+
+**The prohibition.** Do not add the estimator's jitter, its multiplier or any other per-client link term to the `Common`
+target. It is one session constant (plus the test knob `targetOffsetTicks`).
+
+**Consequence.** `Common` exists so that every client of a session holds the same lead; a per-client term makes the leads
+differ again by `m·J·f`, the split `OwnRtt` already has, and a jittery client's lead would rise past its guard's high edge
+first. og-time-dilation's design keeps the jitter multiplier inside `OwnRtt` and drops it under `Common` (its Q5, for the
+user's ruling). `TheCommonTargetCarriesNoJitterTerm` fails: the target 3.7 instead of 2.5 at J 10 ms, m 2 (rationale §3).
+
+**What breaks if it moves.** Nothing else reads the branch; the guard's clamp and the step lag are added after it, in
+`update`, for both setpoints.
 
 ---
 

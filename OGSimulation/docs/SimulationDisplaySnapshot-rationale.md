@@ -30,7 +30,7 @@ by `SimulationDisplayPublisher` through a `SnapshotChannel` (`Mailbox.h`). The d
 reads values it holds, never the simulation's containers.
 
 The header does not call itself: a host owns one publisher, calls `publish_Step` at the end of each
-step batch, and points its drawing-side readers at `acquire_GameThread` (§5).
+step batch, and points its drawing-side readers at `refreshView_GameThread` or `acquire_GameThread` (§5).
 
 ## §2 What it carries
 
@@ -144,6 +144,25 @@ lets the writer recycle the newest unheld snapshot before the reader has seen it
 all four leaves the writer without a slot: `publish_Step` then fails an `OG_CHECK` and returns `false`
 without publishing.
 
+**A view that follows the publishes.** A reader that keeps one snapshot from pass to pass, and swaps it
+for the newest once per pass, calls `refreshView_GameThread(held)`: it releases `held` (when not null)
+and then acquires the newest, and the reader keeps the pointer it returns until its next call. The
+order is the channel's read rule (`Mailbox-rationale.md`, the reader paragraphs of `SnapshotChannel`): a
+read runs from a peek made while the reader holds nothing to the release that leaves it holding nothing,
+and within a read a peek with `back = 0` returns the read's anchor, never a later commit. Acquiring
+first and then releasing the old pointer if it differs therefore never ends the read: the peek returns
+the held snapshot itself, the two pointers are equal, nothing is released, and the reader stays on its
+first snapshot for good while the writer keeps recycling the slots it does not hold. That was the
+Unreal session's refresh from og-input-latency task P5-16 to P6-1: every client's game-thread view stayed
+on the first snapshot it acquired, published before any character registered, so the brawler's
+visualization found no entry and drew nothing. Releasing first is also safe for a writer on another
+thread: between the two calls the reader holds nothing, a slot the writer has open is not listed, so the
+peek returns the newest committed snapshot, and a re-acquired slot is marked held again. The case
+`SimulationDisplaySnapshot.ARefreshedViewFollowsEveryPublish` pins it: each publish is seen at the next
+refresh (sequence 1, then 2 with its entries, then each of 17 more), a refresh with no publish keeps the
+same snapshot, and the writer is never refused. With the old order it fails at the second publish
+(`1 == 2`).
+
 The stress case `SimulationDisplaySnapshot.StressAReaderHoldingTwoNeverSeesATornSnapshot` runs 100,000
 publishes against a reader that holds the newest and the previous snapshot at once, and checks that
 every stamped field of both agrees with its `publishSequence` before and after a yield, that the pair is
@@ -183,4 +202,5 @@ Added by og-input-latency task P2-18, with the inventory of drawing-thread reade
 The Unreal session's game-thread readers moved to it in og-input-latency task P5-16, which filled it on the game
 thread in the frame's post-physics pass, while the frame's own batch could still be stepping. og-input-latency task
 P5-36 moved the client's fill to the stepping thread after the batch (§3) and added the relay source, the relay stage
-and `stageDisplayRelay`, for a host that drains on the drawing thread.
+and `stageDisplayRelay`, for a host that drains on the drawing thread. og-input-latency task P6-1 added
+`refreshView_GameThread` (§5), the Unreal session's refresh moved into the publisher with its order fixed.

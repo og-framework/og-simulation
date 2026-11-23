@@ -54,8 +54,10 @@
 // record in RN-12, ReviewNotes.md), floored by `relayDelayFloorTicks` since the
 // 2026-08-03 C2 amendment — is used
 // instead. This is deliberately keyed on ARRIVAL, not on the tier VALUE: the
-// carried value defaults to 0, which is also a perfectly legal tier (the server
-// sends nothing while a connection stays at tier 0, `SimNetServer::publishTier`), so a
+// carried value defaults to 0, which is also a perfectly legal tier (until
+// og-input-latency P6-2 the server sent nothing while a connection stayed at tier 0;
+// since P6-2 `SimNetServer::publishTier` sends a connection's first tier, tier 0
+// included, so the client leaves this fallback once told), so a
 // value test could not tell "server says tier 0" from "server has not spoken
 // yet", and a client that had never heard from the server would silently adopt
 // tier-0 timing.

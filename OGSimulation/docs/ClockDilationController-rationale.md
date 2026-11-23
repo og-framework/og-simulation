@@ -1,11 +1,12 @@
 <!-- SPDX-License-Identifier: MPL-2.0 -->
+<!-- lint-external-ref: StallDebt -- the freeze cause's name until og-input-latency P6-2 renamed it TransitionDebt; kept in the history -->
 # `ClockDilationController.h` — rationale
 
 The narrative behind `ClockDilationController`, the client's rate law: from the client's deadline lead over its estimate of
 the server's tick, it computes the scheduler rate scale that holds that lead at a target. The same header holds the
 per-frame client stage that feeds the law, `clockDilation::beforeClientPump` (§13), and its window statistics,
 `ClockDilationWindow` (§14). The header keeps its licence, its docs pointer, its code, its `static_assert`s, one `OG_CHECK`,
-seven guard tags and three derivation tags (§5.1, §3.1, §5.4); everything that explains it lives here. The prohibitions are in
+nine guard tags and three derivation tags (§5.1, §3.1, §5.4); everything that explains it lives here. The prohibitions are in
 `ClockDilationController-guards.md`.
 
 **If this file and `ClockDilationController.h` disagree, the header is authoritative and this file is stale.** Fix this
@@ -25,8 +26,8 @@ scheduler, right before the scheduler pumps. It returns a `ClockDilationOutput`:
 should apply it, and the lead, target, error, freeze cause and guard flag it used.
 
 Added by og-time-dilation task 6 (2026-11-21). The per-frame stage that reads the door, the sensor, the estimator and the
-clock and calls `update` (§13), and the window that summarises its calls (§14), were added by task 7 the same day. **No
-production code calls the stage yet**; the host that builds the config and calls it once per client frame is a later task.
+clock and calls `update` (§13), and the window that summarises its calls (§14), were added by task 7 the same day. A host
+builds the config and calls the stage once per client frame; the Unreal host has done so since og-time-dilation task 8.
 
 The controller does not know the scheduler, the door, the estimator or the clock: the caller copies what they hold into
 `ClockDilationInputs`. That keeps the law testable value by value (§12) and keeps og-simulation's types out of it except
@@ -42,6 +43,7 @@ State, all owned by the one caller thread (§11):
 | `m_hasPreviousCall`, `m_previousSensorValid`, `m_previousServerTick`, `m_previousReadAdvances` | the previous non-Off call's sensor validity, sensor value and the clock read's count it saw, for the guard sample (§5.4; task 10c) |
 | `m_hardResyncs`, `m_hardResyncSeconds`, `m_sawHardResync` | the last hard-resync count seen and when it changed (§9) |
 | `m_hasLastCall`, `m_lastCallSeconds`, `m_frameSeeded`, `m_framePeakTicks` | the previous call's clock time and the peak-held host frame period in ticks, for the frame-aware low edge (§5.1; task 7b) |
+| `m_recentFrameTicks`, `m_nextRecentFrame` | the last `kFramePeakWindow` (8) sampled frame periods in ticks, a ring, and its next slot: a frame enters the peak only at the period `kFramePeakFrames` (4) of them reach (§5.1; task 7c) |
 | `m_frameMeanTicks` | the mean host frame period in ticks, time-weighted at `targetTauSeconds`, for the step lag (§3.1; task 10b) |
 
 ## §2 The quantity it controls: the deadline lead, and the error's sign
@@ -98,8 +100,20 @@ uplink and downlink one-way times (`ServerTickEstimator-rationale.md` §4). Hold
 true lead of `u·f + m·J·f + c`: the uplink plus a margin. Every client's inputs then reach the server with the same margin,
 which is what the clock's RTT-based offset aims at today.
 
-`Common` (a deviation from today's behaviour, for a later task's ruling): `L* = commonLeadTicks + targetOffsetTicks`, one
-session constant. The sensor then holds a true lead of `commonLeadTicks + (u − d)/2·f`.
+`Common` (a deviation from today's behaviour, for the user's ruling; og-time-dilation task 14 enabled it in the Unreal host):
+`L* = commonLeadTicks + targetOffsetTicks`, one session constant. The sensor then holds a true lead of `commonLeadTicks +
+(u − d)/2·f`.
+- **No jitter term** (og-time-dilation design Q5): the target reads neither the jitter nor its multiplier, which stay
+  `OwnRtt`'s. `TheCommonTargetCarriesNoJitterTerm` pins it (§12); guard G-09.
+- **The default, 3.65 ticks,** is og-time-dilation task 13's pick (its report §4.5, §5). Every client of a session must hold
+  the same lead without its guard binding (§5), and the guard's centre moves with the lead on a jitter-free link, so the
+  window for the constant is where no client's edge binds: the farthest client's low edge and the lowest-centre client's
+  high edge. On task 13's captured shape (10, 30 and 60 ms each way) that window is [3.56, 3.71], and 3.65 is its centre.
+  Task 6's 2.5 bound the far client and every loopback client. §21 has task 14's closed-loop measurement of it.
+- **What a constant does not cover** (task 13's report §5 item 7): a farthest client past about 133 ms of RTT plus jitter
+  margin binds its low edge, and a floored client near 67 ms keeps only about 0.15 tick below its high edge before the
+  spreads; a binding client is clamped back toward its own lead, which is graceful but no longer common. At 30 fps the low edge sits a tick higher (§5.1) and task 13's shape binds at
+  3.65 (§21).
 
 `targetOffsetTicks` (default 0) shifts either target: a test knob to prove a gate can see a mean-lead change.
 
@@ -205,11 +219,49 @@ drift₁ − (F − 1). The frame's **first** advance reads the highest drift.
 - **Values.** 30 fps (F = 2): `low = c + 1.0`. 100 fps (F = 0.6): `c − 0.2`. 144 fps (F = 0.42): `c − 0.29`.
 
 **F, the frame period in ticks,** comes from the calls themselves: `(clockNowSeconds − the previous call's) · f` (no new
-input; `noteFrame`). It is **peak-held**. A longer frame is taken at once; a shorter one pulls the held value toward itself
-by `1 − exp(−Δt / guardTauSeconds)` per call, with Δt the frame's own length, so the hold decays at 2 s. A switch from 30 to
-100 fps leaves F at `0.6 + 1.4/e` = 1.115 after 2 s. The edge follows the worst recent frame because a frame-paced host
-jitters: a ±20 % jittered 30 fps host runs some 3-step frames, and their first read sets the Skips. In the research harness,
-the peak gave 2 steady corrections over 16 clients against Off's 9, where a plain low-pass of F gave 5.
+input; `noteFrame`). It is the **peak-held sustained** frame period. Each sampled frame first passes the sustained filter
+(`sustainedFrameTicks`, task 7c): it enters as `min(frame, the kFramePeakFrames-th largest of the last kFramePeakWindow
+sampled frames)`, this one included, i.e. at most at the period that 4 of the last 8 frames reached (guard G-08). Then a
+longer value is taken at once; a shorter one pulls the held value toward itself by `1 − exp(−Δt / guardTauSeconds)` per
+call, with Δt the frame's own length, so the hold decays at 2 s. A switch from 30 to 100 fps leaves F at `0.6 + 1.4/e` =
+1.115 after 2 s: a shorter frame always enters at its own length, so the decay is the one task 7b specified. The edge
+follows the worst recent sustained period because a frame-paced host jitters: a ±20 % jittered 30 fps host runs some
+3-step frames, and their first read sets the Skips. In the research harness, the peak gave 2 steady corrections over 16
+clients against Off's 9, where a plain low-pass of F gave 5; the sustained filter keeps the 2 (§20).
+
+**Why a short run of long frames does not move the edge, while a sustained period does** (og-time-dilation task 7c, from
+G-DIL-1's finding F2):
+- **One long frame raises one read.** A frame due F steps runs them at one A and one O, so only its first advance reads
+  the frame's raised phase φ ∈ [F, F + 1); each later advance reads one tick lower (above). At 100 fps the edge holds the
+  1-step frames' φ̄ = 1.3. A 25–40 ms frame (1.5–2.4 ticks, 1 to 3 steps due, mostly 2) raises that one read to about
+  φ̄(2) = 2.5, 1.2 ticks higher. The `OwnRtt` target sits about half a tick above the 100 fps edge (c + 0.31 against c − 0.2,
+  §5.2), so the clock's mean first read is about 1.0 there and the long frame's about 2.2: inside the band (|drift| ≤ 3).
+  It leaves the band only when an O step or an age-tail read lands on the same advance.
+- **A correction needs four of them.** The clock fires one graduated correction per `gradualCorrectionRate` (4)
+  out-of-band advances (§5). A run of fewer than 4 long frames gives the clock at most 3 raised reads, so on its own it
+  cannot complete a correction. It can only add to a count already held (the counter is never reset inside the band),
+  and each of its reads leaves the band only on that coincidence.
+- **A sustained period raises every read.** When most frames are long, every frame's first read is raised, so four
+  out-of-band reads accrue in four frames: that is the period the edge must follow. The filter takes such a period
+  once 4 of the last 8 frames reach it, a delay of at most 4 frames. That costs nothing measurable, because the controller
+  moves the lead at most 0.6 tick/s, so its answer to a frame-rate drop takes seconds either way: a drop from 100 to 30
+  fps gives 0 corrections and nearly the same guard binding as the unfiltered peak (20,198 against 20,246 bound calls,
+  §20). A filter that follows the 10 s mean
+  instead is too slow for it (§12's `mean_fed` probe: 4 clients correct during the drop).
+- **What the unfiltered peak did.** It took every frame under the 3-tick cap at once, so one 25–40 ms frame lifted the
+  edge by φ̄(F_long) − φ̄(F) ≈ 1.2–1.5 tick for the peak's 2 s decay. The guard clamped the target above the lead and
+  the controller drove the lead up and back down: in the closed loop, a frame every 3 s bound the guard on 74,084 calls
+  over 16 clients, with |err| p95 up to 0.54 and 6.03 door changes per second, for no correction the clock was about to
+  make (0 with the filter, 0 without it). G-DIL-1 saw the same in UE under host load (errAbsMax up to 2.39, 63 changes in
+  a window).
+- **Why 4 of the last 8.** `kFramePeakFrames` = 4 is the clock's own count, and a `static_assert` keeps it at or below
+  `TimeConfig{}.gradualCorrectionRate`: a rejected run (at most 3 long frames) must stay below the count. A window of
+  twice that lets an alternating period (every other frame long) enter. G-DIL-1's client logs held runs of up to 3
+  multi-step frames within 8 frames, so a filter of 2 or 3 would still take some of them (§12's `count2` and `count3`
+  probes).
+- **Its limit.** Isolated long frames that come four times a second are a jittered frame period, not isolated: none
+  enters, and the closed loop counts 7 corrections over 16 clients × 120 s, against the unfiltered peak's 1 and Off's 6
+  (§20). A run of 4 or more long frames enters, by design.
 
 **A frame longer than `clockDilation::kMaxFrameTicks` (3 ticks, 50 ms, below 20 fps) is a hitch, not a frame rate, and is
 not sampled** (guard G-06). The cap also bounds the edge: at F = 3 the low edge is `c + 2.0`, below the high edge `c + 2.5`.
@@ -225,8 +277,22 @@ period of the step lag (§3.1).
 The high edge is fps-independent. The frame's **last** advance reads `φ − (F − 1) − e + δc`, with `φ − (F − 1) ∈ [1, 2)`
 at every F. So at `high = c + 2.5` that read's mean is 1.5 − 2.5 = −1, two ticks inside the band's −3. A `static_assert`
 keeps `guardHighTicks ≤ 1 + soft − ½`. The research harness also found it marginal under a `Common` target
-above the clock's lead: 6 steady corrections at `commonLeadTicks` 6 at 100 fps, from the age tail (up to 6–7.5 ticks). It
-is not re-derived here, because under `OwnRtt` it never binds.
+above the clock's lead: 6 steady corrections at `commonLeadTicks` 6 at 100 fps, from the age tail (up to 6–7.5 ticks).
+
+**Re-derived for `Common` (og-time-dilation task 14): the edge stays 2.5.** Under `OwnRtt` it never binds; under `Common`
+it binds on a client whose centre is low (a floored client at a mid RTT, task 13's 30 ms one).
+- **Its range.** The edges must not cross at the longest sampled frame (§5.3): `guardHighTicks ≥ kMaxFrameTicks + ½ − 1 +
+  guardLowTicks` = 2.0. So without a new low edge the high edge can move only within [2.0, 2.5]; 1.5 does not compile.
+- **Where the clock corrects.** The edge holds the mean of the frame's last read two ticks inside the band (−1 against −3,
+  above); the clock corrects only when single reads leave it often enough (every `gradualCorrectionRate`-th out-of-band read, §5). That depends on the read's
+  tail, not on the mean: measured at the edge in the closed loop (§21), a jitter-free link with b0's loss makes 0
+  corrections, og-net's shaper b0 (uniform 15–50 ms) 0 without loss and 0.37 Stalls a minute with it, and the harness's
+  exponential b0 1.7–1.8 a minute. No edge in [2.0, 2.5] separates them: at 2.0 the jittered links still correct at the edge,
+  and task 13's 30 ms client binds at the compiled 3.65, so `Common` no longer holds that shape.
+- **At the compiled 3.65 no client of task 13's shape reaches the edge** at 100 or 60 fps, on fixed or shaper-b0 links, and
+  the clock makes 0 corrections. The exponential-tail link corrects even below the edge (0.24 Stalls a minute at 3.65, 0.005
+  under `OwnRtt`): a cost of a high common lead on a heavy-tailed link, which only an edge that reads the link's tail could
+  remove, and such an edge needs the low edge re-derived with it (og-time-dilation's task 16 list).
 
 Under `OwnRtt` the setpoint is the clock's own objective de-quantized (§3). In the harness it lands between about c − 0.06
 (30 fps) and c + 0.01 (100 fps), whatever the frame rate; the step lag (§3.1) then raises the target by F̄/2, to about
@@ -251,7 +317,10 @@ without the other fails to compile:
 - `kMaxFrameTicks + ½ − 1 + guardLowTicks ≤ guardHighTicks`: the edges never cross;
 - `guardHighTicks ≤ 1 + soft − ½`;
 - `guardLowTicks < guardHighTicks`. The second assert implies it at the defaults; it is kept for any change to
-  `kMaxFrameTicks`.
+  `kMaxFrameTicks`;
+- `1 ≤ kFramePeakFrames ≤ kFramePeakWindow` and `kFramePeakFrames ≤ TimeConfig{}.gradualCorrectionRate`: the sustained
+  filter's count is a count inside its window, and a run it rejects stays below the clock's graduated count (§5.1;
+  og-time-dilation task 7c).
 
 They check defaults only. A host that sets the guard edges at runtime must keep them inside the same inequalities.
 
@@ -324,8 +393,8 @@ slow limit cycle of 0.08–0.17 changes per second. One quantum already meets th
 2 quanta is the smallest that holds every unjittered 30 fps client under 2/s. Against it, a dead band on ε barely helps and
 raises the drift error ×1.8, a minimum hold breaks the hitch law, a coarser quantum raises the drift error ×1.65 and an ε
 filter limit-cycles (the research's candidates). The hysteresis also biases the hitch law's check slightly (§19). At 30 fps
-with ±20 % frame jitter churn stays near 3.9/s: its source is the low edge's peak-held frame period, not the sensor
-(recorded, not gated).
+with ±20 % frame jitter churn stayed near 3.9/s: its source is the low edge's peak-held frame period, not the sensor
+(recorded, not gated). Task 7c's sustained frame filter brings it to 3.3/s (§20).
 
 **Why the freeze is exempt.** Without the exemption a frozen controller near 1.0 stops one quantum short (0.9999 stays
 0.9999: the unit case's seen-failing probe), and in the closed loop the research saw a scale held off 1.0 through ten or more
@@ -383,7 +452,7 @@ reported, in this order:
 |---|---|---|
 | `SensorInvalid` | `!sensorValid` | the server-tick estimate is unseeded or stale (the estimator is valid after 20 accepted samples and stale after 1 s with none). With no server tick there is no lead. App pauses land here: samples stop. |
 | `Recentre` | `phase.recentreArmed \|\| phase.recentring` | the clock's one-shot re-centre is reading its median lead or paying whole ticks through Skips and Stalls. A rate change inside its reading window would move the median it decides on; during payment the clock is moving the lead itself. |
-| `StallDebt` | `phase.stallDebt` | the clock owes input-delay-increase Stalls: it is deliberately moving the lead back by whole ticks. |
+| `TransitionDebt` | `phase.transitionDebt` | the clock owes an input-delay transition: Stalls for a raised delay, Skips for a lowered one (og-input-latency P6-2). Either way it is deliberately moving the lead by whole ticks. Named `StallDebt` / `phase.stallDebt` until P6-2, when the clock's debt became signed and the bit came to mean "owed, either sign". |
 | `AwaitFirstRtt` | `phase.awaitsFirstRtt` | a hard resync waits for the first RTT reading; the next advance may snap the clock. |
 | `AfterResync` | the hard-resync count changed less than `freezeAfterResyncSeconds` (1 s) of `clockNowSeconds` ago | a hard resync snaps the clock and re-arms the re-centre; the 1 s lets the post-resync estimates settle before the re-centre's own phase freezes take over. |
 
@@ -394,7 +463,7 @@ freeze, never a missed one). The count is tracked on every non-Off call, whichev
 at the call that first saw the change: frozen while `now − t_change < 1.0`, released at exactly 1.0 s (test (d)).
 
 The freeze stops the controller from fighting a mechanism that moves the lead by whole ticks. Those mechanisms stay in
-priority: hard resync, the stall debt, the re-centre, the graduated Skips and Stalls beyond the band, and the band itself.
+priority: hard resync, the input-delay transition debt (Stalls or Skips), the re-centre, the graduated Skips and Stalls beyond the band, and the band itself.
 
 ## §10 Mode, Shadow, `apply`, and the authority
 
@@ -435,7 +504,10 @@ of scale before the slew, which the slew limits to 0.2 % and the next frame undo
 task's acceptance criteria plus the freeze order and the target filter, task 7b's three frame-period cases (the low
 edge at 30, 100 and 144 fps, the peak's decay, the hitch skip) and task 10b's step-lag case (F/2 at four frame periods, a
 40 ms frame moving the mean by less than 0.01, an over-cap frame leaving it unchanged, Off's zero) and task 10c's two
-cases (the guard centre in both drain orders, §5.4; the change hysteresis and its freeze exemption, §6). Each seen-failing probe was a temporary edit of this
+cases (the guard centre in both drain orders, §5.4; the change hysteresis and its freeze exemption, §6) and task 7c's
+`AShortRunOfLongFramesIsNotSampled` (runs of 1, 2 and 3 frames of 40 ms at 100 fps leave the low edge at c − 0.2; the 4th
+consecutive one, or 4 alternating ones in 8, lift it to c + 1.4; §5.1) and task 14's `TheCommonTargetCarriesNoJitterTerm`
+(§3). Each seen-failing probe was a temporary edit of this
 header, restored byte-identical:
 
 | probe | result |
@@ -454,11 +526,21 @@ header, restored byte-identical:
 | task 10c: the hysteresis without the freeze exemption | `TheScaleHoldsUnderTwoQuantaExceptWhileFrozen` red, 3 assertions: a frozen call from 0.9999 returns `0.9999 == 1.0`, apply false |
 | task 10c: `changeHysteresisQuanta = 0.5` (the rule inert) | the closed loop's `QuantumChangesStayUnderTheBound` red, 69 assertions: 3.37 door changes per client per second at 100 fps (worst client 3.70), 7.89 at 30 fps (§19) |
 | task 10c: `changeHysteresisQuanta = 25` | compile error: `error C2338: static_assert failed: 'ClockDilationConfig: the scale holds until the slewed value is changeHysteresisQuanta quanta away. …'` |
+| task 7c: `raw_frame`, the sustained filter removed (`return frameTicks;`, task 7b's peak) | 2 cases red, 202 assertions: `AShortRunOfLongFramesIsNotSampled` (one 40 ms frame: the edge 3.4 against 1.8) and the closed loop's `IsolatedLongFramesLeaveTheGuardUnbound` (client 1/101: 4,378 bound calls, \|err\| p95 0.477, 5.64 changes per second; §20, guard G-08) |
+| task 7c: `count2` / `count3` (`kFramePeakFrames = 2` / `3`) | 2 cases red, 102 / 99 assertions: the runs of 2 and 3 enter (`AShortRunOfLongFramesIsNotSampled`), and the closed loop's runs-of-3 arm binds the guard (4,239 / 2,626 calls, \|err\| p95 0.41 / 0.22) |
+| task 7c: `mean_fed`, the frame clipped at the 10 s mean (`std::min(frameTicks, m_frameMeanTicks)`) | 2 cases red, 28 assertions: `ASustainedFrameDropStillLiftsTheEdge` (a drop from 100 to 30 fps: 16 of the 32 On clients bind the guard on fewer than 180 frames, and 4 make a graduated correction, 2 in each drain order) and `AShortRunOfLongFramesIsNotSampled` (the 4-frame arms never lift the edge, and the short-run arms see it drift with the mean) |
+| task 7c: `kFramePeakFrames = 5` | compile error: `error C2338: static_assert failed: 'clockDilation::kFramePeakFrames: a run of fewer long frames than this never enters the frame peak. …'` |
+| task 7c: `kFramePeakFrames = 0` | compile error: `error C2338: static_assert failed: 'clockDilation::kFramePeakFrames: a frame period enters the frame peak once this many of the last kFramePeakWindow frames reach it, …'` |
+| task 14: OwnRtt's jitter term added to `Common`'s target | `TheCommonTargetCarriesNoJitterTerm` red: the target 3.7 against 2.5 (§3) |
+| task 14: `commonLeadTicks = 2.5` (task 6's) | the closed loop's `TheCompiledCommonLeadHoldsEveryClientOfTheHeterogeneousShape` red, 56 assertions: the far 50 and 60 ms and the loopback clients bound on every steady call (§21) |
+| task 14: `guardHighTicks = 2.0` | the same case red, 40 assertions: the 30 ms client bound on every steady call, the shaper-b0 one on some; the finding case `TheHighEdgeCorrectsWhereTheReadTailReachesTheBand_Finding` stays green (§5.2) |
+| task 14: `guardHighTicks = 1.5` | compile error: `error C2338: static_assert failed: 'ClockDilationConfig: the frame-aware low edge at the longest sampled frame, … must not cross the high edge, …'` (§5.3) |
 
 The closed loop is pinned by `ClockDilationLoopTest.cpp` (og-simulation-tests, `[PCTM][Dilation][ClockDilationLoop]`):
 a test-only harness runs a real `SimulationScheduler`, `NetworkTimeEstimator` and `ClientPredictionClock` per client behind a
 `TickRateDoor`, calls the stage every frame and steps the clock once per scheduler step, against a 60 Hz server on its own
-clock, under link jitter, a clock-rate offset and a hitch. §16 records what it measured.
+clock, under link jitter, a clock-rate offset, a hitch and (task 7c) isolated long frames or a frame-rate drop. §16 records
+what it measured; §17–§21 what each later task measured.
 
 ## §13 The per-frame client stage: `clockDilation::beforeClientPump`
 
@@ -788,3 +870,76 @@ from then on its target is unbound with `target − stepLag` = **3.497**, the se
 windows above 0.2/s, both while the clamp released or moved: client1's eighth (10 changes, 158 of 300 calls bound, the
 unbinding) and client2b's last (5). `stepLag` 0.992–1.000 from the third window. Every 10-second check passed (check_dil0
 117/117, parity, check_ph2 33/33, stepclock).
+
+## §20 What the sustained frame filter measured (task 7c)
+
+In the closed loop (og-simulation-tests `ClockLoopHarness.h`), 8 seed pairs (`kGuardPairs`, 16 clients × 120 s of steady
+state), UE's step-start drain order unless a row says otherwise. The long frames come from the harness's `LongFrames`
+knob: runs of 1 to 4 frames of 25–40 ms, one run every 1.5–4.5 s (mean 3 s) from 5 s, about 44 runs per client. "Before" is
+the unfiltered peak of task 7b (the header before task 7c), "after" this header. Each cell: corrections over the 16
+clients / guard-bound calls / the worst client's steady |err| p95 / mean door changes per second / mean lead.
+
+| scenario | before | after |
+|---|---|---|
+| 100 fps, no long frames | 0 / 0 / 0.066 / 0.29 / 2.666 | identical |
+| 100 fps, single long frames | 0 / 74,084 / 0.543 / 6.03 / 2.801 | **0 / 0 / 0.069 / 0.28 / 2.674** |
+| the same, frame-start order | 0 / 74,121 / 0.544 / 6.03 / 2.802 | 0 / 0 / 0.068 / 0.26 / 2.675 |
+| runs of 2 | 0 / 87,775 / 0.576 / 7.34 / 2.856 | 1 / 0 / 0.127 / 0.30 / 2.685 |
+| runs of 3 | 0 / 93,055 / 0.577 / 7.93 / 2.888 | **0 / 0 / 0.069 / 0.27 / 2.690** |
+| runs of 4 (enter by design) | 0 / 97,917 / 0.594 / 8.45 / 2.921 | 1 / 38,572 / 0.348 / 3.01 / 2.740 |
+| single long frames at 60 / 144 fps | 0 / 74,594 / 0.628 / 7.97 / 3.142; 0 / 110,182 / 0.598 / 7.04 / 2.727 | 0 / 0 / 0.069 / 0.28 / 2.878; 0 / 0 / 0.069 / 0.28 / 2.583 |
+| single long frames 4 times a second | 1 / 175,175 / 0.426 / 15.57 / 3.374 | 7 / 0 / 0.176 / 0.37 / 2.763 (Off: 6) |
+| a drop from 100 to 30 fps at 60 s | 0 / 20,246 / 0.111 / 0.73 / 2.879 | 0 / 20,198 / 0.110 / 0.74 / 2.879 (Off: 7) |
+| a drop from 100 to 45 fps at 60 s | 0 / 596 / 0.083 / 0.29 / 2.788 | 0 / 582 / 0.083 / 0.29 / 2.788 |
+| 30 fps, ±5 % frame jitter | 0 / 46,100 / 0.120 / 1.49 / 3.446 | 0 / 36,127 / 0.108 / 1.24 / 3.420 (Off: 6) |
+| 30 fps, ±20 % frame jitter | 2 / 57,588 / 0.148 / 3.93 / 3.696 | 2 / 55,111 / 0.160 / 3.31 / 3.550 (Off: 9) |
+
+- On a held-out set (24 other pairs, 48 clients) single long frames give, after: 0 corrections, 0 bound calls, the worst
+  client's |err| p95 0.067, at most 0.41 changes per second (before: 1 correction, 215,914 bound calls, 0.560, 7.07/s).
+- The isolated runs leave the lead at the no-long-frame value (2.674–2.690 against 2.666); before, they raised it by
+  0.13–0.26 tick. The correction in the runs-of-2 row is one over 16 clients × 120 s, as Off's one with single long frames.
+- At 30 fps the filter lowers the edge slightly under jitter (a 3-step frame among 2-step ones enters only once 4 of the
+  last 8 reach it). The corrections stay at 2 and 0; the door changes drop (3.93 → 3.31 per second at ±20 %, the 30 fps
+  wobble that og-time-dilation's research topic `on-readiness` recorded as F3) and the lead drops 0.15 tick.
+- Every `[Dilation]` case of tasks 7, 7b, 10b and 10c passes unchanged in both drain orders. At a constant frame period
+  the filter returns the frame to within the rounding of the clock differences; the no-long-frame row above is identical
+  to three decimals.
+
+## §21 What the `Common` setpoint measured (task 14)
+
+In the closed loop (og-simulation-tests `ClockLoopHarness.h`), one client per run, 100 fps, UE's step-start drain order,
+seeds 14001 + 17k, steady state from 10 s after the join settles. The links: og-time-dilation task 13's fixed lags each way
+with b0's loss (2 % up, 1 % down), og-net's shaper b0 as the harness's uniform lag (15–50 ms each way, with and without
+b0's loss), the harness's exponential b0 (28 ms + 7.5 ms mean tail each way) and loopback. Each cell: steady corrections
+(Skips, Stalls and hard resyncs) per minute / the share of unfrozen calls the guard bound (the client-minutes). `OwnRtt` is
+the client's own target; the others are `Common` targets in ticks, 6.00 binding the high edge where the centre is low.
+
+| link | `OwnRtt` | 3.30 | 3.65 | 3.80 | 4.00 | 6.00 |
+|---|---|---|---|---|---|---|
+| near 10 ms | 0.00 / 0.0 % (200 min) | 0.00 / 0.0 % (200 min) | 0.00 / 0.0 % (200 min) | 0.00 / 0.0 % (200 min) | 0.00 / 0.0 % (200 min) | 0.00 / 100.0 % (15 min) |
+| mid 30 ms | 0.00 / 0.0 % (200 min) | 0.00 / 0.0 % (200 min) | 0.00 / 0.0 % (200 min) | 0.00 / 0.8 % (200 min) | 0.00 / 100.0 % (200 min) | 0.00 / 100.0 % (15 min) |
+| far 50 ms | 0.00 / 0.0 % (200 min) | 0.00 / 0.0 % (200 min) | 0.00 / 0.0 % (200 min) | 0.00 / 0.0 % (200 min) | 0.00 / 0.0 % (200 min) | 0.00 / 100.0 % (15 min) |
+| far 60 ms | 0.00 / 0.0 % (15 min) | 0.00 / 0.7 % (15 min) | 0.00 / 0.0 % (15 min) | 0.00 / 0.0 % (15 min) | 0.00 / 0.0 % (15 min) | 0.00 / 1.8 % (15 min) |
+| loopback | 0.00 / 0.0 % (200 min) | 0.00 / 0.0 % (200 min) | 0.00 / 0.0 % (200 min) | 0.00 / 0.0 % (200 min) | 0.00 / 0.0 % (200 min) | 0.00 / 100.0 % (15 min) |
+| shaper b0, no loss | 0.00 / 0.0 % (200 min) | 0.00 / 0.0 % (200 min) | 0.00 / 0.0 % (200 min) | 0.00 / 0.0 % (200 min) | 0.00 / 0.1 % (200 min) | 0.00 / 100.0 % (200 min) |
+| shaper b0, loss | 0.00 / 0.0 % (200 min) | 0.00 / 0.0 % (200 min) | 0.00 / 0.0 % (200 min) | 0.00 / 0.0 % (200 min) | 0.04 / 0.1 % (200 min) | 0.37 / 100.0 % (200 min) |
+| exponential b0, no loss | 0.01 / 0.0 % (200 min) | 0.12 / 0.0 % (200 min) | 0.23 / 0.0 % (200 min) | 0.40 / 0.0 % (200 min) | 0.63 / 0.0 % (200 min) | 1.73 / 100.0 % (15 min) |
+| exponential b0, loss | 0.01 / 0.0 % (200 min) | 0.14 / 0.0 % (200 min) | 0.26 / 0.0 % (200 min) | 0.42 / 0.0 % (200 min) | 0.69 / 0.0 % (200 min) | 1.80 / 100.0 % (15 min) |
+
+- **At the compiled 3.65** no link binds and none corrects but the exponential one. The 60 fps cells and the frame-start
+  order (10 seeds × 600 s per cell) agree: 0 corrections and 0 binding at 3.65 on every link of task 13's shape. The nearest
+  edge is the 30 ms client's high one (0.11 % of its calls bound at 3.70, 0.8 % at 3.80, all at 4.00), then the 60 ms
+  client's low one (0.33 % at 3.30, all at 2.50).
+- **At 30 fps** 3.65 binds: the 60 ms client at its low edge and the 30 ms client at its high edge on every call, and the
+  shaper-b0 client on 6–7 % of its calls, with 0 corrections. The 30 fps frame-aware low edge and step lag (§5.1, §3.1) move
+  both edges by about a tick against 100 fps, so one constant does not equalise this shape at 30 fps.
+- **The leads are common.** At 3.65 and 100 fps the per-link runs' mean execution leads are 3.599–3.637 ticks (eight seeds
+  × 120 s per link, both orders); `TheCompiledCommonLeadHoldsEveryClientOfTheHeterogeneousShape` asserts the six clients of
+  one session within the 100 fps stair's 0.2 of each other.
+- **The high edge** (§5.2) corrects at the edge only where the read's tail reaches the band: 0 on the jitter-free and the
+  lossless shaper-b0 links, 0.37 a minute on the lossy shaper-b0 one, 1.7–1.8 on the exponential ones. At `guardHighTicks`
+  2.0, the lowest value that compiles, the closed loop's finding case still sees the jittered links correct at the edge,
+  and the 30 ms client binds on every steady call at 3.65.
+- **The exponential tail corrects below the edge** too: 0.12 a minute at 3.30 up to 0.63–0.69 at 4.00, against 0.01 under
+  `OwnRtt`. Task 7b's F-a (6 corrections at `Common` 6) and `on-readiness`'s F1 (3 at `Common` 4)
+  were measured on this harness's exponential b0, not on og-net's. On og-net's shaper b0 (a bounded tail) 3.65 costs nothing measurable here.

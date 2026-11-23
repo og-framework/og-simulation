@@ -596,7 +596,7 @@ public:
     //
     // ⛔ NOT A GENERAL MUTABLE HANDLE — a counter sink read by no gate, clock, cache or
     // integrator; a game-thread call corrupts a window (`ResimGateProbe.h`'s two-object rule).
-    // The adapter uses two narrow passthroughs, as `requestInputDelayIncreaseStall` does. §5
+    // The adapter uses two narrow passthroughs, as `requestInputDelayTransition` does (`requestInputDelayIncreaseStall` until og-input-latency P6-2). §5
     //
     // ⛔ `editResimGateProbe()` STAYS EXACTLY HERE — a production WRITE handle is not a
     // diagnostic read seam (`docs/DiagnosticsConventions.md` §2). §5

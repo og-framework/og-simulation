@@ -82,19 +82,22 @@ ClientPredictionClock::AdvanceResult ClientPredictionClock::advanceAndCorrect()
 
     const unsigned int absDrift = drift >= 0 ? static_cast<unsigned int>(drift) : static_cast<unsigned int>(-drift);
 
-    // [T11] PRIORITY ORDER: hard resync > input-delay-increase stall debt >
-    // ordinary graduated drift correction. Hoisted above the guard/dead-band
-    // chain so the three cannot fight each other:
+    // [T11] PRIORITY ORDER: hard resync > input-delay transition debt (Stalls
+    // or, since og-input-latency P6-2, Skips) > ordinary graduated drift
+    // correction. Hoisted above the guard/dead-band chain so the three cannot
+    // fight each other:
     //
     //  * A hard resync TELEPORTS the frontier onto authority and wipes the
-    //    caches through the resync callbacks. Any stall debt describes the
+    //    caches through the resync callbacks. Any transition debt describes the
     //    PRE-teleport frontier, which no longer exists, so it is discarded
     //    rather than applied on top of the jump (applying both would overshoot
-    //    backwards past authority).
+    //    past authority, backwards for Stalls, forwards for Skips). The jump
+    //    itself breaks the capture stream the debt was meant to shift.
     //  * Otherwise debt is paid BEFORE drift correction. Both are expressed as
-    //    Stalls, and interleaving them would let a Skip cancel a stall the
-    //    tier change requires — the tier delay and the prediction offset are
-    //    independent quantities and must not net each other out.
+    //    Stalls and Skips, and interleaving them would let a drift correction
+    //    cancel one the delay change requires — the input delay and the
+    //    prediction offset are independent quantities and must not net each
+    //    other out.
     //
     // [P3-10] A hard resync taken before the estimator had any RTT reading landed
     // on the floor target. When the first reading arrives and moves the offset,
@@ -111,7 +114,7 @@ ClientPredictionClock::AdvanceResult ClientPredictionClock::advanceAndCorrect()
         m_predictionTick           = targetTick;
         m_resimulationTick         = targetTick;
         m_gradualCorrectionCounter = 0;
-        m_requiredInputDelayIncreaseStallTicks = 0;
+        m_pendingInputDelayTransitionTicks.store(0, std::memory_order_relaxed);
 
         // [P3-10] Only a resync that landed on the floor offset with no settled RTT
         // reading waits for the first one (with no reading the offset IS the floor;
@@ -159,7 +162,7 @@ ClientPredictionClock::AdvanceResult ClientPredictionClock::advanceAndCorrect()
     trackRecentreRearm(pastGuard);
     recordRecentreReading(pastGuard);
 
-    // [T11] Pay down one tick of input-delay-increase stall. The mechanism is the
+    // [T11] Pay down one tick of an input-delay increase. The mechanism is the
     // SAME Stall the soft-drift path uses: do not advance this call, so the
     // frontier falls one tick further behind where it would otherwise have been.
     //
@@ -170,10 +173,15 @@ ClientPredictionClock::AdvanceResult ClientPredictionClock::advanceAndCorrect()
     // would leave already-populated slots ahead of the frontier that the resim
     // path would then consume as if they were fresh. Stalling reaches the same
     // relative position without ever breaking that invariant.
-    if (m_requiredInputDelayIncreaseStallTicks > 0)
+    //
+    // [P6-2] Pay down one tick of an input-delay DECREASE as a Skip: the SAME
+    // shape as the graduated Skip below (one extra advance, then the normal
+    // one), so the tick in between is never stepped and no input is captured
+    // for it. That missing capture tick is what drains the server's backlog
+    // (see requestInputDelayTransition in the header).
+    const int32_t paid = consumeOneInputDelayTransitionTick();
+    if (paid > 0)
     {
-        --m_requiredInputDelayIncreaseStallTicks;
-
         // ⛔ Event seam - tick before count. This is a Stall like the graduated one.
         m_eventSeamDiagnostics.lastStallTick = m_predictionTick;
         ++m_eventSeamDiagnostics.stallCount;
@@ -182,11 +190,32 @@ ClientPredictionClock::AdvanceResult ClientPredictionClock::advanceAndCorrect()
         {
             char buf[192];
             std::snprintf(buf, sizeof(buf),
-                "[Log] PCTM CPC: input delay increase Stall predTick=%u remainingStalls=%u",
-                m_predictionTick, m_requiredInputDelayIncreaseStallTicks);
+                "[Log] PCTM CPC: input delay increase Stall predTick=%u remainingStalls=%d",
+                m_predictionTick, m_pendingInputDelayTransitionTicks.load(std::memory_order_relaxed));
             m_logger(buf);
         }
         return AdvanceResult::Stall;
+    }
+    if (paid < 0)
+    {
+        if (m_predictionTick == m_resimulationTick)
+            ++m_resimulationTick;
+        ++m_predictionTick;
+        doNormalAdvance(m_predictionTick, m_resimulationTick, &m_logger);
+
+        // ⛔ Event seam - tick before count; the tick is the one JUMPED TO, as the graduated Skip's.
+        m_eventSeamDiagnostics.lastSkipTick = m_predictionTick;
+        ++m_eventSeamDiagnostics.skipCount;
+
+        if (m_logger)
+        {
+            char buf[192];
+            std::snprintf(buf, sizeof(buf),
+                "[Log] PCTM CPC: input delay decrease Skip predTick=%u remainingSkips=%d",
+                m_predictionTick, -m_pendingInputDelayTransitionTicks.load(std::memory_order_relaxed));
+            m_logger(buf);
+        }
+        return AdvanceResult::Skip;
     }
 
     if (!pastGuard)
@@ -273,22 +302,23 @@ ClientPredictionClock::AdvanceResult ClientPredictionClock::advanceAndCorrect()
 }
 
 // ---------------------------------------------------------------------------
-// Input-delay-increase stall (T11)
+// Input-delay transition debt (T11; signed since og-input-latency P6-2)
 // ---------------------------------------------------------------------------
 
-void ClientPredictionClock::requestInputDelayIncreaseStall(int32_t deltaDelayTicks)
+void ClientPredictionClock::requestInputDelayTransition(int32_t deltaDelayTicks)
 {
-    // Downward / no-change transitions need no correction — see the header.
-    if (deltaDelayTicks > 0)
+    if (deltaDelayTicks != 0)
     {
-        m_requiredInputDelayIncreaseStallTicks += static_cast<unsigned int>(deltaDelayTicks);
+        const int32_t total =
+            m_pendingInputDelayTransitionTicks.fetch_add(deltaDelayTicks, std::memory_order_relaxed) + deltaDelayTicks;
 
         if (m_logger)
         {
             char buf[192];
             std::snprintf(buf, sizeof(buf),
-                "[Log] PCTM CPC: input delay increase stall requested delta=%d totalPending=%u predTick=%u",
-                static_cast<int>(deltaDelayTicks), m_requiredInputDelayIncreaseStallTicks, m_predictionTick);
+                "[Log] PCTM CPC: input delay %s requested delta=%d totalPending=%d predTick=%u",
+                deltaDelayTicks > 0 ? "increase stall" : "decrease skip",
+                static_cast<int>(deltaDelayTicks), static_cast<int>(total), m_predictionTick);
             m_logger(buf);
         }
     }
@@ -297,9 +327,37 @@ void ClientPredictionClock::requestInputDelayIncreaseStall(int32_t deltaDelayTic
     publishCorrectionPhase();
 }
 
+void ClientPredictionClock::requestInputDelayIncreaseStall(int32_t deltaDelayTicks)
+{
+    // Positive deltas only (the T11 contract); the signed entry point is
+    // requestInputDelayTransition, which this forwards to. A non-positive delta
+    // still publishes, as the no-op always did.
+    requestInputDelayTransition(deltaDelayTicks > 0 ? deltaDelayTicks : 0);
+}
+
 unsigned int ClientPredictionClock::getRequiredInputDelayIncreaseStallTicks() const
 {
-    return m_requiredInputDelayIncreaseStallTicks;
+    const int32_t pending = m_pendingInputDelayTransitionTicks.load(std::memory_order_relaxed);
+    return pending > 0 ? static_cast<unsigned int>(pending) : 0u;
+}
+
+int32_t ClientPredictionClock::getPendingInputDelayTransitionTicks() const
+{
+    return m_pendingInputDelayTransitionTicks.load(std::memory_order_relaxed);
+}
+
+// One tick toward 0 by compare-exchange, so a request landing between the load
+// and the store (a frame-locked client requests on the game thread) is never lost.
+int32_t ClientPredictionClock::consumeOneInputDelayTransitionTick()
+{
+    int32_t pending = m_pendingInputDelayTransitionTicks.load(std::memory_order_relaxed);
+    while (pending != 0)
+    {
+        const int32_t step = pending > 0 ? 1 : -1;
+        if (m_pendingInputDelayTransitionTicks.compare_exchange_weak(pending, pending - step, std::memory_order_relaxed))
+            return step;
+    }
+    return 0;
 }
 
 unsigned int ClientPredictionClock::getPredictionTick() const
@@ -398,15 +456,19 @@ ClientPredictionClock::DriftAction ClientPredictionClock::evaluateDrift() const
     const unsigned int absDrift = drift >= 0 ? static_cast<unsigned int>(drift) : static_cast<unsigned int>(-drift);
 
     // [T11] Mirror advancePrediction()'s priority order EXACTLY — hard resync,
-    // then stall debt, then the guard/dead-band chain. This query's whole
-    // contract is "what advancePrediction() would do right now", so a pending
-    // stall has to be visible here too or the two answers diverge for every
-    // tick between a tier transition and its last paid-down Stall.
+    // then the transition debt, then the guard/dead-band chain. This query's
+    // whole contract is "what advancePrediction() would do right now", so a
+    // pending Stall or Skip (P6-2) has to be visible here too or the two
+    // answers diverge for every tick between a delay transition and its last
+    // paid-down correction.
     if (firstRttResyncDue(estimate, pastGuard, drift) || (pastGuard && absDrift > m_config.hardResyncThresholdTicks))
         return DriftAction::HardResync;
 
-    if (m_requiredInputDelayIncreaseStallTicks > 0)
+    const int32_t pendingTransition = m_pendingInputDelayTransitionTicks.load(std::memory_order_relaxed);
+    if (pendingTransition > 0)
         return DriftAction::Stall;
+    if (pendingTransition < 0)
+        return DriftAction::Skip;
 
     if (!pastGuard)
         return DriftAction::None;
@@ -475,8 +537,8 @@ void ClientPredictionClock::publishCorrectionPhase()
         word |= kPhaseRecentreArmedBit;
     if (isRecentring())
         word |= kPhaseRecentringBit;
-    if (m_requiredInputDelayIncreaseStallTicks > 0u)
-        word |= kPhaseStallDebtBit;
+    if (m_pendingInputDelayTransitionTicks.load(std::memory_order_relaxed) != 0)
+        word |= kPhaseTransitionDebtBit;
     if (m_resyncAwaitsFirstRtt)
         word |= kPhaseAwaitsFirstRttBit;
     m_publishedPhase.store(word, std::memory_order_relaxed);
@@ -488,7 +550,7 @@ ClockCorrectionPhase ClientPredictionClock::publishedCorrectionPhase() const
     ClockCorrectionPhase phase;
     phase.recentreArmed  = (word & kPhaseRecentreArmedBit) != 0u;
     phase.recentring     = (word & kPhaseRecentringBit) != 0u;
-    phase.stallDebt      = (word & kPhaseStallDebtBit) != 0u;
+    phase.transitionDebt = (word & kPhaseTransitionDebtBit) != 0u;
     phase.awaitsFirstRtt = (word & kPhaseAwaitsFirstRttBit) != 0u;
     phase.hardResyncs    = word >> kPhaseHardResyncShift;
     return phase;
