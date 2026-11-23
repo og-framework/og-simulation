@@ -156,9 +156,11 @@ concept SimulationSystemsExecutorConcept = requires(
 //     `m_resimGateProbe` is physics-thread-only, which is why it holds no
 //     atomics.
 //     ⭐ ONE ADAPTER'S BINDING FOR THE CALLBACK COLUMN BELOW: it names the
-//     physics-callback ROLE, never an engine type. One adapter binds those
-//     roles on the async callback of the Chaos-scheduled host (a game's
-//     engine adapter, outside this library), where that one adapter's names are
+//     physics-callback ROLE, never an engine type. On the tick driver the step
+//     driver (`SimulationStepDriver.h`) drives those roles in its tick. The former
+//     Chaos adapter (removed by og-session-runtime tasks 3-6) bound them on the
+//     async callback of its Chaos-scheduled host (a game's engine adapter,
+//     outside this library), where its names were
 //     `OnPreSimulate_Internal` (pre-simulate step), `OnPostSolve_Internal`
 //     (post-solve step),
 //     `TriggerRewindIfNeeded_Internal` (rewind request) and
@@ -484,9 +486,9 @@ public:
 
                 // Apply-resim edge: the physics engine still resimulating, clock already caught up
                 // (`advanceResimulation`). ⛔ Unique to the last resim sub-step's `PostSolve`. §7
-                const bool chaosIsResim = updateInfo.isResimulation();
+                const bool engineIsResim = updateInfo.isResimulation();
                 const bool clockIsResim = m_clientClock->isResimulating();
-                if (chaosIsResim && !clockIsResim)
+                if (engineIsResim && !clockIsResim)
                 {
                     SIMLOG(m_logger, "[Resim.Finish] predictionTick=%u",
                         m_clientClock->getPredictionTick());

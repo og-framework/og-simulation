@@ -1,4 +1,6 @@
 <!-- SPDX-License-Identifier: MPL-2.0 -->
+<!-- lint-external-ref: editStorage -- the Unreal session's accessor, deleted by og-session-runtime task 7b; kept in the verbatim pre-compression record -->
+<!-- lint-external-ref: FSimulationManagerAsyncCallback::OnPreSimulate_Internal -- deleted by og-session-runtime task 3 (the brawler's Chaos backend arm: the Chaos host, the Chaos binding and their four docs); kept in the history -->
 # `CorrectionCache.h` — rationale
 
 The header keeps a one-line guard at every site that has one, plus an orientation block
@@ -28,9 +30,11 @@ sites** in the header; what is quoted below is the record, not the fence.
 is engine-free: it names no game-engine type and is reached from a host engine only through
 `concept`s. Three names in the quoted blocks belong to one adapter's host stack rather than to this
 core, and the quotations are byte-verbatim, so their ROLES are given here instead of edited in:
-**`Chaos`** is that adapter's **physics engine** — the party handed a tick to restore at, and the
-owner of the rewind loop; **`FSimulationManagerAsyncCallback::OnPreSimulate_Internal`** is one
-adapter's **pre-simulate physics callback**, where the core's step is entered before the solve; and
+**`Chaos`** was that adapter's **physics engine** — the party handed a tick to restore at, and the
+owner of the rewind loop; **`FSimulationManagerAsyncCallback::OnPreSimulate_Internal`** was that
+adapter's **pre-simulate physics callback**, where the core's step is entered before the solve (both the
+former Chaos adapter's, removed by og-session-runtime tasks 3–6; on the tick driver the step driver
+takes both roles); and
 **`FSimulationStateSyncBuffer`** was one adapter's **replicated state buffer** (deleted by
 og-input-latency task P5-9) — the wire-side type whose `writeToBuffer<T>` / `readFromBuffer<T>` surface
 `ChecksumByteBuffer` deliberately mirrors so the same serializers can target both. Since task P5-7 the

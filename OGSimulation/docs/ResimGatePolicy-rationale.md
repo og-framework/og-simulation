@@ -90,8 +90,10 @@ The argument is about correctness, not cost:
    constant.
 2. **The throttle is already structural**, and it is demand-driven rather than arbitrary: the gate is
    consulted only on non-resim physics frames — the host physics engine asks whether to rewind on
-   solver advances only, never from inside its own rewind loop (one adapter's binding: Chaos calling
-   `TriggerRewindIfNeeded_Internal`) — and the anchor is consumed only on the completion edge.
+   solver advances only, never from inside its own rewind loop (on the tick driver the step driver's
+   `resimulateIfRequested`, once per client tick before the step; the former Chaos adapter, removed by
+   og-session-runtime task 3, had Chaos calling TriggerRewindIfNeeded_Internal) — and the anchor is consumed
+   only on the completion edge.
    So at most one resim can be in flight, and at most one more can be pending. Corrections arriving
    during a replay coalesce into the pending anchor via the CAS-max and fire once, as a single deeper
    replay, instead of N shallow ones. The bound is "one resim per completed resim", which scales with

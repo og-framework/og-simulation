@@ -44,7 +44,8 @@
 //   ResimGateProbe          `[ResimProbe.Gate]` `[ResimProbe.Chaos]` `[ResimProbe.Apply]`
 //   CorrectionLandingProbe  `[ResimProbe.Landing]`, one per character class
 // Five lines per window per category against a commissioned budget of six. Verbose adds
-// `[ResimProbe.Request]`, `[ResimProbe.Stranded]` and a per-correction landing line.
+// `[ResimProbe.Stranded]` and a per-correction landing line (and `[ResimProbe.Request]`,
+// until og-session-runtime task 3 removed its only emitter, the former Chaos host).
 //
 // ⛔ BEFORE READING ANY NUMBER BELOW, ESTABLISH WHICH TRIGGER POLICY THE RUN USED. The
 // compiled default and the shipped configuration DIFFER; every archived baseline quoted on
@@ -123,16 +124,18 @@ struct ResimGateWindowSummary
 // --- I3: THE PHYSICS-REWIND REQUEST / REFUSAL LEDGER. ---------------------
 // ⭐ ONE ADAPTER'S BINDING, stated once here and inherited by I3, I4 and I5. Another adapter
 // substitutes its own, and the engine-free Catch2 suite drives the same door with no physics
-// engine at all (`ResimGatePolicyTest.cpp`). For one adapter — Unreal/Chaos — the request hook
-// is `FSimulationManagerAsyncCallback::TriggerRewindIfNeeded_Internal`, the grant hook
+// engine at all (`ResimGatePolicyTest.cpp`). On the tick driver the request, the refusal floor
+// (the world's `hasTick`) and the grant are all in `SimulationStepDriver::resimulateIfRequested`.
+// The former Unreal/Chaos adapter (removed by og-session-runtime tasks 3-6) used the request hook
+// `FSimulationManagerAsyncCallback::TriggerRewindIfNeeded_Internal`, the grant hook
 // `::FirstPreResimStep_Internal`, the rewind-frame search `FRewindData::FindValidResimFrame`,
 // the depth merge `FMath::Min`, and the refusal floor `BlockResimFrame`.
 // ⇒ Those are ONE adapter's names. EVERYTHING BELOW NAMES THE ROLE.
-// ⚠ The `…ChaosFrame` parameters and fields are named for that one adapter's fixed-step frame
-// index: read "chaos frame" as PHYSICS FRAME throughout.
+// ⚠ The `…ChaosFrame` parameters and fields are named for that former adapter's fixed-step frame
+// index: read "chaos frame" as PHYSICS FRAME throughout (the step driver passes sim ticks).
 //
-// ⛔ WHY WE COUNT THIS OURSELVES: one adapter compiles its refusal diagnostics out (`DEBUG_REWIND_DATA` / `DEBUG_NETWORK_PHYSICS`),
-//   so a refused rewind is COMPLETELY SILENT and we just retry next frame. These four fields end that silence. §8
+// ⛔ WHY WE COUNT THIS OURSELVES: the former Chaos adapter compiled its refusal diagnostics out (`DEBUG_REWIND_DATA` / `DEBUG_NETWORK_PHYSICS`),
+//   so a refused rewind was COMPLETELY SILENT and we just retried next frame. These four fields end that silence. §8
 //
 // Frames on which our rewind-request callback returned a physics frame, i.e. the request
 // actually crossed into the physics engine.

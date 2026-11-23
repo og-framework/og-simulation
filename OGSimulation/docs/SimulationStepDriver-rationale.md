@@ -277,23 +277,24 @@ quaternion-to-matrix-to-quaternion round trip, which can change rotation bits.
 
 **Which read of the restored body.** Both uses above (the skip's comparison and a linear
 declaration's rotation) take one value per declaration. It must be the state the first replayed step
-will start integrating from. When the adapter models the optional `PhysicsBodyStartOfStepReader`
-capability (`PhysicsBodyAdapter.h`), the push reads it with `captureStartOfStepBodyState`; otherwise
-with `captureBodyState`. The branch is an `if constexpr`, so an adapter without the capability runs
-exactly the code it ran before the capability existed.
-- On the Jolt backend `captureBodyState` is already that state: the world's `restoreTick` put back the
-  snapshot, and the capture reads it.
-- On the Chaos backend it is not. `captureBodyState` reads the solved pose (P/Q), which the
-  post-solve capture needs, while the engine's rewind restores X/R/V/W and leaves P/Q stale; the replay
-  integrates from X/R. Comparing with P/Q could skip a corrected body whose stale P happens to equal
-  the cache, and a linear declaration would get the stale rotation. The Chaos adapter therefore
-  models the capability and reads X/R/V/W.
+will start integrating from. The push reads it with `captureBodyState` (`captureRestoredBodyState`). On
+the Jolt backend that is already that state: the world's `restoreTick` put back the snapshot, and the
+capture reads it.
 
-**The skip runs on every backend.** For an adapter whose writes are exact (Chaos: the same
-centimetres, and float-to-double copies) the skip only saves a write that would change nothing og-sim
-can read back, so no "lossless" flag exists to turn it off. On Chaos it does change something below
-float precision: the engine keeps doubles, so a skipped body keeps its full double state and is not
-woken, where a write would round it to float and wake it.
+Until og-session-runtime task 6 an adapter could model an optional start-of-step reader capability
+(PhysicsBodyStartOfStepReader, in `PhysicsBodyAdapter.h`), and the push then read the body with
+captureStartOfStepBodyState, behind an `if constexpr`. The former Chaos adapter (removed by
+og-session-runtime task 4) modelled it: its `captureBodyState` read the solved pose (P/Q), which the
+post-solve capture needs, while the engine's rewind restored X/R/V/W and left P/Q stale, and the replay
+integrated from X/R. Comparing with P/Q could have skipped a corrected body whose stale P happened to
+equal the cache, and a linear declaration would have got the stale rotation. The Jolt adapter never
+modelled the capability, and task 6 removed it with the branch.
+
+**The skip runs on every backend.** For an adapter whose writes are exact the skip only saves a write
+that would change nothing og-sim can read back, so no "lossless" flag exists to turn it off. On the
+former Chaos backend (exact: the same centimetres, and float-to-double copies) it did change something
+below float precision: the engine kept doubles, so a skipped body kept its full double state and was not
+woken, where a write would have rounded it to float and woken it.
 
 **The wire shape decides the fields.** The rule that a `LinearBodyState` declaration writes position
 and linear velocity (plus its own restored rotation through `setBodyPose`) and a full
@@ -304,9 +305,9 @@ This is the engine-free port of an engine adapter's direct writes of position, v
 and angular velocity at the first resim step. It goes through the `PhysicsBodyAdapter` seam
 (`setBodyTransform` or `setBodyPose`, `setBodyLinearVelocity`, `setBodyAngularVelocity`), so any backend
 receives it. It has one production caller, `SimulationManager::prepareResimulation`, which calls it
-last, after the cache restore. Both kinds of host reach it there: the step driver (§3, step 3 of a
-granted resim, after it restored its world), and on the Chaos backend the engine host's
-first-resim-step hook, which calls `prepareResimulation` after the engine's own rewind.
+last, after the cache restore. The step driver reaches it there (§3, step 3 of a granted resim, after it
+restored its world). Until og-session-runtime tasks 3–6 removed the Chaos backend, its engine host's
+first-resim-step hook reached it the same way, calling `prepareResimulation` after the engine's own rewind.
 
 ## §10 The physics step handed to the manager
 

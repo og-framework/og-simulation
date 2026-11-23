@@ -210,8 +210,8 @@ The search cannot see a tag assembled at run time (a `"%s"` that prints a tag); 
 
 og-tickdriver task 12 (2026-10-16). The rows, their order, routes and levels, and both checks' messages
 were moved from the brawler game's adapter table, where all 39 rows of the host's table were kept together.
-The adapter now puts this block first and its own 14 rows after it; the routing of every line is unchanged
-(the adapter's rationale records the proof).
+The adapter put this block first and its own 14 rows after it (13 since og-session-runtime task 7b); the routing
+of every line is unchanged (the adapter's rationale records the proof).
 
 og-input-latency task 5b (2026-11-11) added the `[InputArrival.Window]` row after `[InputStats]`, so the
 coordinator's arrival-margin line takes the `Net` route like its window sibling. 25 rows became 26.

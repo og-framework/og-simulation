@@ -198,17 +198,19 @@ configuration* does. See §20.
 ## 8. I3 — the physics-rewind request / refusal ledger
 
 **One adapter's binding, and why the header states it once.** The request and grant hooks, the
-rewind-frame search, the depth merge and the refusal floor are all engine-side. For one adapter —
-Unreal/Chaos — they are `FSimulationManagerAsyncCallback::TriggerRewindIfNeeded_Internal`,
+rewind-frame search, the depth merge and the refusal floor are all engine-side. On the tick driver
+they are og-simulation's `SimulationStepDriver::resimulateIfRequested`: the request, then the world's
+`hasTick` as the refusal floor, then the grant and the restore. For the former Unreal/Chaos adapter
+(removed by og-session-runtime tasks 3–6) they were `FSimulationManagerAsyncCallback::TriggerRewindIfNeeded_Internal`,
 `::FirstPreResimStep_Internal`, `FRewindData::FindValidResimFrame`, `FMath::Min` and
 `BlockResimFrame`. Another adapter substitutes its own, and the engine-free Catch2 suite drives the
 same door with no physics engine at all (`ResimGatePolicyTest.cpp`). The header declares that pair
 once at the head of I3 and names roles everywhere below it.
 
-**Why we count refusals ourselves.** One adapter compiles its own refusal diagnostics out of any
-normal build (behind `DEBUG_REWIND_DATA` / `DEBUG_NETWORK_PHYSICS`), so a refused rewind is
-**completely silent** and our side simply retries next frame, because nothing cleared
-`needsResimulation()`. Four fields end that silence: `requests`, `grants`, `refusedFrames`,
+**Why we count refusals ourselves.** The former Chaos adapter (removed by og-session-runtime tasks
+3–6) compiled its own refusal diagnostics out of any normal build (behind `DEBUG_REWIND_DATA` /
+`DEBUG_NETWORK_PHYSICS`), so a refused rewind was **completely silent** and our side simply retried
+next frame, because nothing cleared `needsResimulation()`. Four fields end that silence: `requests`, `grants`, `refusedFrames`,
 `repeatRequests`.
 
 **`requests` versus `requested` is a free wiring self-check.** The two differ only by the adapter's
@@ -275,7 +277,10 @@ body starting to move our rewind depth — and never a tuning signal.
 ~1.7-tick mean replay span of §11. A **negative** depth is clamped to 0 rather than stored: it would
 mean we asked to rewind to a frame at or ahead of the last completed one, which the ±1 skew in the
 tick↔physics-frame mapper produces transiently. It is visible as `depthMin=0` beside a nonzero
-`refusedFrames` — the skewed request lands on the engine's refusal paths, not on a moved grant.
+`refusedFrames` — the skewed request lands on the engine's refusal paths, not on a moved grant. That
+mapper was the former Chaos adapter's (removed by og-session-runtime task 4); the step driver passes the
+prediction tick and the anchor as the two frames, so its depth is the replay span in ticks and it has
+no skew.
 
 ⚠ **The two domains are separate parameters on purpose.** `lastCompletedStep` and
 `requestedChaosFrame` are physics-domain frames and are signed, because the engine's are;
@@ -287,7 +292,7 @@ prevent, and it is the mistake the ±1 skew makes cheap to commit.
 `prepares` counts `SimulationManager::prepareResimulation` calls, one per granted rewind, so
 `prepares` and `grants` must agree; they are counted on opposite sides of the adapter boundary for
 the same reason `requests` / `requested` are. `finishes` counts the `[Resim.Finish]` edge —
-`chaosIsResim && !clockIsResim` in `onPostGameSimulation` — the sub-step on which the clock's resim
+`engineIsResim && !clockIsResim` in `onPostGameSimulation` — the sub-step on which the clock's resim
 cursor caught up to the frontier and `applyResimAll` ran.
 
 `abandoned` is `prepares - finishes`: **granted resims whose apply edge never ran**, measured at

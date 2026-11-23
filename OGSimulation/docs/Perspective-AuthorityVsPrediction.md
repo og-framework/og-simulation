@@ -214,11 +214,11 @@ by the literal `findCorrectionCache<T>(id) == nullptr`.)
 
 ⇒ **If any of those eight ran on the authority, it would throw on the first character.** They do not
 run there because of gate **G1** alone — one `if (m_runsPrediction)` in `onPostGameSimulation`, plus
-two early returns on `runsPrediction()` in the adapter's own physics callback: the one that decides
-whether to ask for a rewind, and the one that runs on the first replayed step.
-(One adapter's binding: `FSimulationManagerAsyncCallback::TriggerRewindIfNeeded_Internal`
-and `FSimulationManagerAsyncCallback::FirstPreResimStep_Internal`, both in
-`Source/OGBrawlerUnreal/ChaosTickBackendUImpl.cpp`.) There is no second line of defence inside the
+the adapter's own role split: og-simulation's step driver asks whether to rewind, and replays, only in
+`SimulationStepDriver::runClientTick`, which it runs when the manager `runsPrediction()`.
+(The former Chaos adapter's binding, removed by og-session-runtime task 3, was two early returns on
+`runsPrediction()` in its physics callback, FSimulationManagerAsyncCallback::TriggerRewindIfNeeded_Internal
+and FirstPreResimStep_Internal, in the brawler's Chaos host.) There is no second line of defence inside the
 sweeps themselves, and that is a deliberate, stated position rather than an oversight: the audit
 that considered adding a capture-side check and **rejected** it is recorded above `postPredictionAll`
 in `<core>SimulationReconciliation.h`.
@@ -285,7 +285,8 @@ disagree. The fence saying so is at both sites.
 
 Every one of those is `⛔` on the authority (§2 rows 16–23). The cycle is driven from the physics
 thread through the adapter's rewind hooks — the callbacks by which a host physics engine asks the
-core whether to rewind and then drives the replay (one adapter binds these to Chaos's rewind hooks)
+core whether to rewind and then drives the replay (on the tick driver the step driver's
+`resimulateIfRequested`; the former Chaos adapter, removed by og-session-runtime task 3, bound them to Chaos's rewind hooks)
 — and the manager's three entry points map onto it as follows:
 
 | phase | manager entry | reconciliation / executor call |

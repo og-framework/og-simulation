@@ -58,8 +58,9 @@ the number that lets a peer be early.**
 ## 2. The trace table
 
 Every row is one hop. `thread` is **GT** (game thread) or **PT** (physics thread); the physics thread
-is whichever thread the host engine runs its asynchronous physics callback on — one adapter's binding
-is Chaos's async-callback thread under `bTickPhysicsAsync`. `machine` is A (the sender), S (the
+is whichever thread the host engine runs its steps on — on the tick driver the step's thread (a worker
+client's task, or the authority loop's runner). The former Chaos adapter's binding (removed by
+og-session-runtime tasks 3–6) was Chaos's async-callback thread under `bTickPhysicsAsync`. `machine` is A (the sender), S (the
 authority) or B (an observing peer). Paths are relative to the repository root; `<core>` abbreviates
 `Plugins/OGSimulation/Source/OGSimulation/og-simulation/OGSimulation/`.
 
@@ -113,7 +114,7 @@ input the authority is still holding. That held copy travels its own short path.
 
 | # | hop | machine · thread | file | symbol |
 |---:|---|---|---|---|
-| A1 | Once per physics frame, the drain runs for the tick(s) about to be simulated | S · GT | `Plugins/OGSimulation/Source/OGSimulationUnreal/UESimulationSession.h` | `releaseDelayedInputsForStep` |
+| A1 | Before each authority step, the drain runs for the tick about to be simulated (once per physics frame, for the frame's ticks, in the former Chaos configuration) | S · GT | `Plugins/OGSimulation/Source/OGSimulationUnreal/UESimulationSession.h` | `releaseDelayedInputsForStep` |
 | A2 | Every claimed slot releases what is due, or overdue | S · GT | `<core>Network/ServerReceptionCoordinator.h` | `releaseDelayedInputs` |
 | A3 | …surfacing the entry's **stored** capture tick, not a reconstructed one | S · GT | `<core>Network/ServerInputDelayQueue.h` | `tryDequeueForTick` |
 | A4 | Delivery routes id → the character's channel → core (og-sim-net's server since og-input-latency task P5-7; id → component before) | S · GT | `Plugins/OGSimulation/Source/OGSimulationNet/og-sim-net/OGSimNet/SimNetServer.h` | `deliverRemoteInput` |
@@ -349,9 +350,10 @@ Grouped, because the pattern matters more than the per-row answer:
   every *new* crossing at.
 - **S, GT:** hops 9–17 and A1–A5. og-sim-net's server drain (`SimNetServer::receiveBundle`; the RPC handler until
   og-input-latency task P5-7), the coordinator, the tap, the staging ring and the drain are all on the server's drain
-  thread: the game thread, or the runner on the authority loop (P5-19). `releaseDelayedInputsForStep` runs from the host engine's game-thread
-  hook immediately preceding the physics step — one adapter binds that to Chaos's
-  `InjectInputs_External`.
+  thread: the game thread, or the runner on the authority loop (P5-19). `releaseDelayedInputsForStep` runs from the host's
+  hook immediately preceding each authority step — on the tick driver the game's `releaseInputsForAuthorityTick`, in each
+  authority step's `beforeTick`; the former Chaos adapter (removed by og-session-runtime task 3) bound it to Chaos's
+  InjectInputs_External.
 - **S, GT→PT crossing:** hop A5 → A6. `RemoteMoveQueue` is the second staged ring — game-thread
   enqueue, physics-thread dequeue. ⚠ Unlike `PendingInputQueue` it carries **plain** `size_t`
   head/tail/count, not atomics (`<core>SimulationQueues.h`); read the declarations before treating

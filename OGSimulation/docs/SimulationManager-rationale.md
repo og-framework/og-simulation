@@ -1,4 +1,6 @@
 <!-- SPDX-License-Identifier: MPL-2.0 -->
+<!-- lint-external-ref: FSimulationManagerAsyncCallback -- deleted by og-session-runtime task 3 (the brawler's Chaos backend arm: the Chaos host, the Chaos binding and their four docs); kept in the history -->
+<!-- lint-external-ref: FSimulationManagerAsyncCallback::TriggerRewindIfNeeded_Internal -- deleted by og-session-runtime task 3 (the brawler's Chaos backend arm: the Chaos host, the Chaos binding and their four docs); kept in the history -->
 
 # `SimulationManager.h` — relocation history, retired rationale, archived records
 
@@ -51,6 +53,11 @@ A reader with no engine can read every quoted block through it.
 
 ⛔ **None of these is a dependency of this core**, and none appears in `SimulationManager.h` as code.
 Where a section below uses one bare, it is this table that scopes it.
+
+The physics callback object, its hooks and the Chaos engine in this table were the former Chaos adapter's,
+removed by og-session-runtime tasks 3–6. On the tick driver og-simulation's step driver
+(`SimulationStepDriver.h`) plays the callback's roles: it calls the manager's step, resim and post-step entry
+points in its own tick. The quoted blocks keep the old names as history.
 
 ---
 
