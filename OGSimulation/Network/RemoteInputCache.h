@@ -46,11 +46,10 @@
 //   capacity             64 slots -- and the number is load-bearing for the relay
 //                        delay floor's hard cap.
 //
-// THREADING: GAME-thread write, PHYSICS-thread read, NO SEAM, in og-sim-net's FRAME-LOCKED
-// mode (`SimNetConfig::immediate` false, `SimNetConfig`'s default; Jolt clients ship immediate). Accepted, priced,
-// correction-healed debt -- `docs/ThreadingCrossings.md` row 1, analysis of record in
-// `docs/RemoteInputCache-rationale.md` §6. The PROHIBITIONS stay here. In the IMMEDIATE mode
-// the write runs on the step's thread and is same-thread with the read (the block below).
+// THREADING: ONE THREAD, NO SEAM. The ingest and both collects run on the step's thread,
+// serialized (the block below). NOT thread-safe: a writer on another thread reopens
+// `docs/ThreadingCrossings.md` row 1, whose history and analysis of record are
+// `docs/RemoteInputCache-rationale.md` §6. The PROHIBITIONS stay here.
 //
 // WHAT PINS WHAT, so a reader knows which test breaks on a change:
 //   no wipe surface exists       `RemoteInputCacheTest.cpp` -- the `HasClearMethod`
@@ -124,33 +123,22 @@
 // ⛔ `!findLatest().valid` MEANS NO SCHEDULED PROBE AT ALL, never a probe at `dA` 0. §4
 //
 // ---------------------------------------------------------------------------
-// THREADING -- GAME-THREAD WRITE / PHYSICS-THREAD READ. ACCEPTED DEBT.
-// (Ruling 2026-08-04, option (a); source-verified at the time, stated as fact.)
+// THREADING -- ONE THREAD, BY THE HOST'S CONTRACT, NOT BY CONSTRUCTION.
 //
-// WRITER: the adapter's relayed-ring arrival callback, on the GAME thread, routed into
-// `populateRemoteInputCache`. READER: `SimulationInputResolution::collectInputAll` and
-// `SimulationInputResolution::collectResimInputAll`, on the PHYSICS thread, i.e. only
-// where the host ticks physics asynchronously. ONE ADAPTER'S BINDING FOR BOTH ENDS:
-// the async-physics switch is `bTickPhysicsAsync`; the arrival callback is og-sim-net's
-// ring receipt (`SimNetClient::onRing` -> `SimNetChannel::storeRing`), run in the
-// frame-locked drain the og-net driver calls on the game thread at the end of its
-// `PostTickDispatch`, which hands the ring to the core callback `registerPredictionOwner`
-// installed. Until og-input-latency task P5-7 it was the relay actor's OnRep,
-// `ASimulationInputRelay::OnRep_RelayedInputRing` (deleted by P5-9).
-// `docs/ThreadingCrossings.md` row 1 cites this block as authoritative.
-//
-// TWO MODES (og-input-latency P2-15). Everything above is the FRAME-LOCKED mode
-// (og-sim-net's `SimNetConfig::immediate` false, `SimNetConfig`'s default; Jolt clients ship immediate): the GAME-thread write
-// is accepted debt. In the IMMEDIATE mode the host calls `SimNetClient::drain` at the start
-// of each step, before `collectInputAll`, on the step's thread (a FrameBounded client's chain
-// of worker tasks), so the writer and both readers are one serialized context: no crossing,
-// no torn slot. The three fences below price the frame-locked mode.
+// WRITER: the relayed-ring arrival callback `registerPredictionOwner` installs, routed into
+// `populateRemoteInputCache`. READERS: `SimulationInputResolution::collectInputAll` and
+// `SimulationInputResolution::collectResimInputAll`. All three run on the step's thread: the
+// ring is fed through the port before the step's collect, so the writer and both readers are
+// one serialized context, with no crossing and no torn slot. Until og-session-runtime task 13
+// a frame-locked client wrote it on another thread than its reads: the accepted debt
+// `docs/ThreadingCrossings.md` row 1 priced (ruling 2026-08-04, option (a)).
 //
 // ⛔⛔ DO NOT COPY LocalInputCache's "not thread-safe; single-threaded by construction"
 //   claim with the ring mechanics: TRUE of the delay line (its push and read are two
-//   statements in one `collectInputAll` call), FALSE here. Reject a copied one. §6
-// ⛔ ACCEPTED, NOT OVERLOOKED -- inherited, torn-slot-bounded, correction-healed. §6
-// ⛔ THE DEFERRED FIX IS AN SPSC RING at `collectInputAll`, as `RemoteMoveQueue` does. §6
+//   statements in one `collectInputAll` call), NOT here: this store is single-threaded only
+//   because its feed runs on the step's thread. Reject a copied one. §6
+// ⛔ A FEED ON ANOTHER THREAD REOPENS ROW 1 (torn-slot-bounded, correction-healed). §6
+// ⛔ ITS FIX WOULD BE AN SPSC RING at `collectInputAll`, as `RemoteMoveQueue` does. §6
 // ---------------------------------------------------------------------------
 
 // Slot count of a default-constructed RemoteInputCache.

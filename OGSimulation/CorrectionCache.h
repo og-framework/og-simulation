@@ -168,26 +168,22 @@ struct CorrectionInsertVerdict
 //     ⛔ There is no input value and no resim bit in a slot. Both are retired, and what
 //     replaced each read is listed at the two gravestones. §1
 //
-//   * TWO THREADS TOUCH THIS CLASS — in the FRAME-LOCKED mode (og-sim-net's
-//     `SimNetConfig::immediate` false, `SimNetConfig`'s default; Jolt clients ship immediate).
-//       GAME thread     corrections land — `tryInsertingCorrectState`, reached via
-//                       `SimulationReconciliation::injectCorrectionState` from og-sim-net's
-//                       frame-locked drain (`SimNetClient::onCorrection`; the OnRep_-dispatched
-//                       lambdas until og-input-latency task P5-7).
-//       PHYSICS thread  everything else: the ring push pair, the replay write, both
-//                       prepare-time captures, `wipeCache`, and every read.
-//     IMMEDIATE (`immediate` true, og-input-latency P2-15): the host calls `SimNetClient::drain`
-//     at the start of each step, before `collectInputAll`, on the step's thread, so corrections
-//     land on the PHYSICS (step) thread too and ONE serialized context touches the class. Every
-//     "GT" in the table below then reads "the drain at step start", and the races it prices do
-//     not occur; the gate atomic stays as it is.
+//   * ONE THREAD TOUCHES THIS CLASS: the step's thread. Corrections land there —
+//     `tryInsertingCorrectState`, reached via `SimulationReconciliation::injectCorrectionState`,
+//     fed through the port before the step's collect — and so does everything else: the ring
+//     push pair, the replay write, both prepare-time captures, `wipeCache`, and every read.
+//     One serialized context, so no race in the table below occurs. In this file "GT" and the
+//     "GAME thread" name the landing side and "PT" and the "PHYSICS thread" the step side, as
+//     in `docs/ThreadingCrossings.md`; both run on the step's thread. Until og-session-runtime
+//     task 13 a frame-locked client landed corrections on its frame thread, and the table is
+//     that history's price list, and the price of any future feed on another thread.
 //
 //     ⭐ EXACTLY ONE WORD IS SYNCHRONIZED — `m_pendingResimAnchorTick` — because it is
 //     CONTROL state with two legitimate writers and exactly one correct value. Every other
-//     crossing below is unsynchronized and rides the pre-existing `m_stateBuffer` GT/PT race:
-//     row 2 of `docs/ThreadingCrossings.md`, accepted debt, not re-argued here.
+//     word below is unsynchronized: on two threads each would ride the `m_stateBuffer`
+//     GT/PT race, row 2 of `docs/ThreadingCrossings.md`, not re-argued here.
 //
-//       word / column                crossing              what a race COSTS
+//       word / column                if on two threads     what a race would COST
 //       m_pendingResimAnchorTick     GT set / PT consume   nothing — atomic CAS. §2
 //       m_containsCorrectTick        GT set / PT clear     ⛔ a LOST UPDATE of a whole
 //                                                          DECISION BIT — not a torn value. §5
@@ -624,9 +620,9 @@ public:
 	// ⚠ THE INVARIANT'S HONEST BOUND — it holds UP TO AN ACKNOWLEDGED WORD RACE.
 	// ⛔ `m_containsCorrectTick` IS A TWO-WRITER WORD — the GT `set()` here and the PT clear in
 	// `pushPredictionTick` — so the exposure is a LOST UPDATE OF A DECISION BIT, NOT a torn read,
-	// and the milder description must not be re-adopted. (FRAME-LOCKED mode. In og-sim-net's
-	// IMMEDIATE mode the `set()` runs in the drain at step start, on the same thread as the
-	// clear, so the two writers are serialized and the word race does not occur.) The deliberately-redundant provenance
+	// and the milder description must not be re-adopted. (On the step's thread the `set()` and the
+	// clear are serialized and the word race does not occur; it occurs only if the landing runs on
+	// another thread, as a frame-locked client's did until og-session-runtime task 13.) The deliberately-redundant provenance
 	// check (`ReplayedOverCorrection`, WRITE SITE 3 below) catches it ONLY on the
 	// `[ResimProbe.SlotMap]` Verbose surface, never on this decision path. §5
 	//
@@ -1236,11 +1232,10 @@ private:
 	// not travel into `Diagnostics::slotLandingSeqNr`. §8
 	//
 	// ⚠ THREADING — THE ONE NEW CROSS-THREAD SURFACE THE LANDING STAMPS ADD. GT-written (W1), PT-read (the
-	// classifier), PLAIN `uint32`s deliberately. That is the FRAME-LOCKED mode (og-sim-net's
-	// `SimNetConfig::immediate` false, `SimNetConfig`'s default; Jolt clients ship immediate). In the IMMEDIATE mode W1 runs in the
-	// drain at step start, on the step's thread, so the stamps, `m_stateBuffer` and
-	// `m_containsCorrectTick` are written and read by one serialized context, and neither race
-	// below occurs. The bullets price the frame-locked mode:
+	// classifier), PLAIN `uint32`s deliberately. W1 runs on the step's thread, so the
+	// stamps, `m_stateBuffer` and `m_containsCorrectTick` are written and read by one serialized
+	// context, and neither race below occurs. The bullets price a landing on another thread (a
+	// frame-locked client's, until og-session-runtime task 13):
 	//   * THEY RIDE THE PRE-EXISTING `m_stateBuffer` RACE they exist to protect — the same race,
 	//     not a new class of one. §5
 	//   * THEY ARE OBSERVATIONAL: `classifyResimSlotWrite` returns `Written` iff

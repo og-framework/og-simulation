@@ -47,7 +47,7 @@ A reader with no engine can read every quoted block through it.
 | `Chaos` | that adapter's **physics engine** — the party that accepts or refuses a rewind request and owns the resim loop | role words: *the physics engine* / *a physics rewind* |
 | `AOGBrawlerSimulationManager` | one adapter's **composition root**: constructs the per-role manager and exposes the two narrow passthroughs the callback reaches it through | |
 | `UObject` | that engine's **base object type**; "a game-thread `UObject` callback" means a replication notification delivered on the game thread | |
-| `OnRep`, `RPC` | that engine's **property notification** and **remote call**: the arrival of a replicated value on a client (the floor, the tier) and a client-to-server call (the input that `queueMove` checks) | the sim traffic's until og-input-latency task P5-7. Since then those values arrive through og-sim-net's sessions, in their drain: on the game thread frame-locked, on the step's thread on an immediate client (and on the runner for the server on the authority loop). A quoted OnRep or RPC, or "a game-thread `UObject` callback", is that arrival |
+| `OnRep`, `RPC` | that engine's **property notification** and **remote call**: the arrival of a replicated value on a client (the floor, the tier) and a client-to-server call (the input that `queueMove` checks) | the sim traffic's until og-input-latency task P5-7. Since then those values arrive through og-sim-net's sessions, in their drain, on the step's thread (until og-session-runtime tasks 13 and 14 a frame-locked client and the in-frame server drained on the game thread). A quoted OnRep or RPC, or "a game-thread `UObject` callback", is that arrival |
 | `FMath::Min` | that engine's **math utility**, here the engine-side merge that can only DEEPEN a requested rewind | the directional argument is the fact; the utility is not |
 | `Config/DefaultEngine.ini` | one adapter's **host-application configuration surface**, where the shipped log level and policy values are set | another adapter supplies the same values under its own keys |
 
@@ -1511,6 +1511,10 @@ drives a mock-peered manager through in-range, negative and too-large requests.
 
 Not archived prose; the header's `§14` pointer at `onPostSimulationGameThread` lands here.
 
+Only an authority calls `onPostSimulationGameThread` (a client sends at capture since og-input-latency P2-16 and
+og-session-runtime task 13), once after each step batch, on the step's thread, despite its name (the rename waits for
+og-session-runtime task 22).
+
 `onPostSimulationGameThread` now passes a third value to `SimulationNetSync::sendLocalInputToAuthorityAll`:
 `m_timeConfig.redundancyFrames`, read on every call like `correctionRotationK` and `redundancyDepthTicks`. That makes
 four values under the re-read rule in the orientation block (the depth fold off `resimTriggerPolicy` is the fourth),
@@ -1557,8 +1561,7 @@ unrecognised value is reported and the compiled default kept. The start-up line 
 (<ini|compiled>)`.
 
 **One-shot at composition.** `NetworkTimeEstimator` reads the field live from `m_timeConfig` (the re-read rule, §4) on every
-SimClock sample, on the estimator's writer thread (the game thread in og-sim-net's frame-locked mode, the step's thread in
-its immediate mode). The composition root calls the setter before samples flow and never again, so the read needs no
+SimClock sample, on the estimator's writer thread (the step's, which receives the samples). The composition root calls the setter before samples flow and never again, so the read needs no
 synchronization; a later write would race it. Both roles may call it; the field has no reader on the authority.
 
 ## 17. Additions after the archive: the jitter multipliers' setter (og-input-latency P3-13, 2026-11-20)
@@ -1595,7 +1598,7 @@ interpret the number; the host chooses the clock (one adapter's binding: the Unr
 passes to the coordinator's `[Release]` lines, `ServerReceptionCoordinator-rationale.md` §8).
 
 **Why.** A host may stamp a log line later than it was written. The Unreal dedicated server has no log thread, so a line
-the authority runner logs is stamped when the game thread next flushes the log queue, up to one server frame late. The
+the authority runner logs is stamped when the server's frame next flushes the log queue, up to one server frame late. The
 field is the step's own time, written with the line, so a tool that reads the server's step timeline needs no estimate
 of that lag.
 

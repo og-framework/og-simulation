@@ -24,17 +24,16 @@
 //     PROBES 1, B, 3            two scheduled-read emitters,  TICK advancing
 //                               off SimulationInputResolution past the window
 //                               collectInputAll / collectResimInputAll
-//   RelayArrivalProbe  GAME     NetSyncTelemetry::            120 GAP SAMPLES
-//     PROBE 2                   emitRelayArrival, off the     (the game thread
-//                               ring arrival callback         has no sim tick)
+//   RelayArrivalProbe  DRAIN    NetSyncTelemetry::            120 GAP SAMPLES
+//     PROBE 2                   emitRelayArrival, off the     (arrivals are not
+//                               ring arrival callback         paced by the tick)
 //                               registerPredictionOwner binds
-//   FrameHealthProbe   GAME     the adapter's per-frame hook, 120 SAMPLES
+//   FrameHealthProbe   PUMP     the adapter's per-frame hook, 120 SAMPLES
 //     PROBE 4                   on EITHER role
 //
-//   ⚠ GAME is the frame-locked thread. PROBE 2 runs where the client session
-//   drains: on an immediate client that is the step's thread (og-input-latency
-//   P2-15). PROBE 4 runs on the runner on the authority loop (P5-20). Each object
-//   still has one thread.
+//   ⚠ DRAIN is the thread that delivers the ring arrival (the step's thread on a
+//   client); PUMP is the thread that pumps the tick driver (the frame thread on a
+//   client, the runner on a FreeRunning authority). Each object has one thread.
 //
 //   PROBE 1 which rung of the scheduled-read ladder replied; PROBE B why a miss
 //   missed; PROBE 3 how long one character was served stale; PROBE 2 how often
@@ -52,7 +51,7 @@
 // ONE ADAPTER'S BINDING FOR EVERY ENGINE NAME BELOW. The body names ROLES ONLY:
 // the physics engine, the replication system, the replicated-ring arrival
 // callback, the server frame-rate cap, the global game-thread frame counter. For
-// one adapter (Unreal/Chaos) those are Chaos; og-net's sim lanes since
+// the Unreal adapter those are Jolt (Chaos until og-session-runtime tasks 3-6); og-net's sim lanes since
 // og-input-latency task P5-7 (Iris before); og-sim-net's ring arrival
 // (`SimNetClient::onRing` -> `SimNetChannel::storeRing`; until P5-7 the relay
 // actor's OnRep `ASimulationInputRelay::OnRep_RelayedInputRing`, deleted by P5-9);
@@ -595,7 +594,7 @@ inline constexpr std::uint32_t kRelayArrivalMaxTrackedGap = 64u;
 inline constexpr std::size_t   kGapOverflowBucket         = kRelayArrivalMaxTrackedGap + 1u;
 
 // One summary per this many GAP SAMPLES -- sample-driven, not tick-driven, because
-// the game thread has no simulation tick. At depth 1 on a healthy wire that is ~2 s
+// arrivals are not paced by the simulation tick. At depth 1 on a healthy wire that is ~2 s
 // per component, the same feel as the physics-side window. §6
 inline constexpr std::uint32_t kRelayArrivalProbeWindowSamples = 120u;
 
@@ -893,19 +892,20 @@ private:
 // PROBE 4 -- SIM TICKS PER GAME-THREAD FRAME, i.e. FRAME HEALTH.
 //
 // Built server-only, to measure the CAUSE of what PROBE 2 measures the EFFECT of:
-// the server sends once per server GAME-THREAD FRAME (Iris's property replication
-// until og-input-latency P5-7; og-sim-net's frame-locked flush since), so a 60 Hz sim
-// on a 30 fps server advances TWO sim ticks per send. Later extended to the
+// the server sent once per server GAME-THREAD FRAME (Iris's property replication
+// until og-input-latency P5-7; og-sim-net's frame-point flush until og-session-runtime
+// task 15), so a 60 Hz sim on a 30 fps server advanced TWO sim ticks per send. A
+// FreeRunning authority sends after each batch, and its probe frame is one wake. Later extended to the
 // CLIENT, where the same ratio plus `meanFrameMicros` is frame health under resim
 // load. §9
 //
 // ⛔ THE SERVER FRAME-RATE SETTING IS A CAP ON THAT RATE, NEVER A FLOOR -- the load-bearing half of the relation every measured number falls out of. §9
-// ⛔ TWO ROUTES TO A RATIO ABOVE 1, AND NOT THE SAME DEFECT: the physics engine may sub-step, or the game thread may be slow. The sub-step count rides ALONGSIDE the ratio, never inside it. §9
+// ⛔ TWO ROUTES TO A RATIO ABOVE 1, AND NOT THE SAME DEFECT: the physics engine may sub-step, or the pumping thread may be slow. The sub-step count rides ALONGSIDE the ratio, never inside it. §9
 // ⛔ ON A RESIMMING CLIENT THAT SEPARATION IS THE WHOLE POINT: a resim burst folds extra ticks into `numSteps` at the SAME hook, so `numStepsAboveOne > 0` means resim, not a hitch. §9
 // ⛔ HOOK-INDEPENDENT BY CONSTRUCTION: the caller supplies a GLOBAL frame counter, not an invocation count -- which is what let this probe gain a second role for free. §9
 // ⛔ THE HOOK'S CADENCE IS MEASURED, NEVER ASSUMED: the probe reports how its own invocations fell across frames (`dFrame == 1`, `== 0`, `> 1`) on either role. §9
-// ⛔ ONE THREAD ONLY (the game thread; the runner on the authority loop, og-input-latency P5-20), ON WHICHEVER ROLE THE OWNER RUNS ON, and each role gets its OWN instance -- never shared, so there is no cross-role synchronization question. §9
-// ⛔ TICK SOURCE IS THE CALLER'S PROBLEM, and there is one right answer on the game thread: the tick-to-physics-frame mapper's atomic offset, never the physics-thread clock. §9
+// ⛔ ONE THREAD ONLY (the PUMP thread: the frame thread on a client, the runner on a FreeRunning authority), ON WHICHEVER ROLE THE OWNER RUNS ON, and each role gets its OWN instance -- never shared, so there is no cross-role synchronization question. §9
+// ⛔ TICK SOURCE IS THE CALLER'S PROBLEM, and there is one right answer off the step's thread: the tick driver's published tick offset (the first upcoming tick it hands the per-frame hook; the Chaos tick mapper's offset until og-session-runtime task 4), never the step's own clock. §9
 // ⚠ The two roles emit under DIFFERENT log tags and categories -- a line indistinguishable from the other role's by grep has already cost one mis-attributed analysis. §9
 // ---------------------------------------------------------------------------
 

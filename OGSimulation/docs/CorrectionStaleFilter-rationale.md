@@ -82,7 +82,7 @@ and decides through the same `staleTick::admit`, so the two can never drift apar
 
 Both classes are plain data, used from one thread: the thread that drains received messages. They hold
 no atomic, take no lock, and check no thread id. The draining thread may differ from one session phase
-to another (a frame-bound game thread, or a step or authority-loop thread); what the classes require is
+to another (before a session binds, while it steps, at its teardown); what the classes require is
 that no two calls overlap, which a single draining owner gives by construction. A caller that drains from
 two threads at once has a defect in the caller, not one this class could detect.
 

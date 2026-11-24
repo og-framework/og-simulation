@@ -43,7 +43,7 @@ sentence is the root of almost every asymmetry below.**
 ⚠ **A listen server is two managers, not one hybrid.** The composition root resolves a *different
 instance* per role, and a locally-hosted player's character is registered into both — once through
 each overload of `registerSimulatable`. (One adapter's binding for that root:
-`AOGBrawlerSimulationManager::instanceFor(bool isAuthority)`,
+`AOGBrawlerSimulationManager::instanceFor(const UWorld* world, bool isAuthority)`,
 `Source/OGBrawlerUnreal/OGBrawlerSimulationManager.h`.) Nothing in this document describes a manager
 that is both roles at once, because no such object exists.
 
@@ -93,8 +93,8 @@ identical is the point — the common mistake is to imagine a separate "proxy pa
 | 21 | `firstResimStepAll` | ⛔ | ✅ | ✅ | `<core>SimulationIntegrationExecutor.h` :: `firstResimStepAll` |
 | 22 | `applyResimAll` | ⛔ | ✅ | ✅ | `<core>SimulationReconciliation.h` :: `applyResimAll` |
 | 23 | `consumeResimAnchorsAll` | ⛔ | ✅ | ✅ | `<core>SimulationReconciliation.h` :: `consumeResimAnchorsAll` |
-| 24 | `onPostSimulationGameThread` | ✅ | ✅ | ✅ | `<core>SimulationManager.h` :: `onPostSimulationGameThread` |
-| 25 | `sendCorrectionAll` — **called** on both, **empty** on the client | ✅ | ∅ | ∅ | `<core>SimulationNetSync.h` :: `sendCorrectionAll`, `m_authorityWriters` |
+| 24 | `onPostSimulationGameThread` — the authority's post-batch send; no client calls it (a client sends at capture) | ✅ | ⛔ | ⛔ | `<core>SimulationManager.h` :: `onPostSimulationGameThread` |
+| 25 | `sendCorrectionAll` — **called** on the authority only (from row 24) | ✅ | ⛔ | ⛔ | `<core>SimulationNetSync.h` :: `sendCorrectionAll`, `m_authorityWriters` |
 | 26 | `sendLocalInputToAuthorityAll` — **called** on both, **empty** on the authority | ∅ | ✅ | ∅ | `<core>SimulationNetSync.h` :: `sendLocalInputToAuthorityAll`, `m_localInputSenders` |
 | 27 | `setAuthorityGuardContext` | ✅ | ⛔ | ⛔ | `<core>SimulationNetSync.h` :: `setAuthorityGuardContext` |
 | 28 | `createCacheFor` — a correction cache is allocated | ⛔ | ✅ | ✅ | `<core>SimulationReconciliation.h` :: `createCacheFor` |
@@ -371,13 +371,12 @@ last statement of that overload and made `registerLocalCharacter` create the del
 provider. Read the table row, not that paragraph, for the current order.
 
 ⛔ **The ordering IS still the only thing holding the invariant, and the alternative was measured and
-rejected.** `DeferredLifecycleQueue` exists in the core as a game→physics marshalling point — enqueue
-on the game thread, apply between physics steps. Since og-input-latency P5-17 and P5-19 og-sim-net's client and server
-sessions apply registrations through it on an **immediate client** and on the **authority loop**, where the sends that
-iterate these maps run on the queue's own thread (the step's thread, the runner). **A frame-locked client and an inline
-server do not use it**, and there adopting it
-inverts the crossing rather than closing it: it makes the physics thread the sole writer, and the
-readers that then sit on the far side include two per-tick game-thread ITERATIONS,
+rejected.** `DeferredLifecycleQueue` exists in the core as a marshalling point — enqueue on any thread,
+apply between steps on the step's thread. A host that registers through it and sends on the step's thread
+(og-sim-net's client and server sessions do both, since og-input-latency P5-17 and P5-19) has one thread for
+the writes and the sends that iterate these maps. For a host that sent from another thread, adopting it
+would invert the crossing rather than close it: it makes the step's thread the sole writer, and the
+readers on the far side would include two per-tick ITERATIONS on the sending thread,
 `sendCorrectionAll` over `m_authorityWriters` and `sendLocalInputToAuthorityAll` over
 `m_localInputSenders`. `ThreadingCrossings.md` row 11 carries the full reader list and the
 ruling. Treat the ordering as load-bearing.

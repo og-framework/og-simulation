@@ -88,11 +88,12 @@ vector or quaternion. If the overloads leave `namespace glm`, or a translation u
 header, or a new glm type has no overload, the build fails with a message that names this header. A runtime case
 (og-simulation-tests' `GlmFieldSimilarityTest.cpp`) also pins the verdict through the correction cache.
 
-**Calls that were never affected.** Non-dependent calls, such as og-brawler's projectile slot `operator==` and the Chaos
-backend's body-state comparison in the UE module, always found the global overloads by ordinary lookup. They now find
+**Calls that were never affected.** Non-dependent calls, such as og-brawler's projectile slot `operator==` and the former
+Chaos backend's body-state comparison in the UE module (removed with the Chaos configuration by og-session-runtime tasks
+3–6), always found the global overloads by ordinary lookup. They now find
 the same functions by ADL, so task 2e did not change their results. Task 2g's quaternion rule (§5) does reach a
-non-dependent call that compares a quaternion, such as the Chaos backend's comparison of `PhysicsBodyState::rotation`:
-it calls the same overload. The projectile slot's `operator==` compares two `glm::vec3` fields only.
+non-dependent call that compares a quaternion, such as the former Chaos backend's comparison of
+`PhysicsBodyState::rotation`: it called the same overload. The projectile slot's `operator==` compares two `glm::vec3` fields only.
 
 ## 4. What task 2e changed for corrections
 - Before, a 1-ULP difference in any glm field of a correction was a disagreement and a resim. Two builds that round one

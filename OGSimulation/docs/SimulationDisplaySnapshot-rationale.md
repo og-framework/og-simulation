@@ -80,22 +80,20 @@ observations, the correction caches and the prediction clock. When the host drai
 stepping thread too (at step start), the relay stores, the arrival ring, the tier and the floor are
 written there as well, and the fill crosses nothing.
 
-When the host drains on the drawing thread instead, those four are written there, and a fill on the stepping
-thread would read them across threads. Two of them reach the fill as values the host hands over: the tier reading,
-which the host builds where the tier arrives and passes in, and the relay fields (each entry's last relayed input
-and arrival ring), which the fill takes from a **relay source**:
-- `LiveDisplayRelaySource` answers from the input resolution itself. The six-argument fill uses it: right for a
-  host whose drain runs on the stepping thread, or whose fill runs on the draining thread.
-- `DisplayRelayStage` is a copy of the relay fields for every stored simulatable (up to `MaxSimulatables`), taken by
-  `stageDisplayRelay` on the draining thread, where those fields are written, and handed to the stepping thread
-  through a mailbox of the host's (the Unreal session uses a `TripleBuffer`). The fill then answers from the stage, so
-  it reads neither the relay stores nor the arrival rings across threads. A stage taken before a batch carries the
-  relay fields as of the drain before that batch; an id the stage does not hold answers as one with no relay store.
+The fill reads each entry's last relayed input (`getLastRelayedInput`) and arrival ring (the resolution's diagnostics) from
+the input resolution itself, so it is for a host whose drain runs on the stepping thread, or whose fill runs on the draining
+thread. The tier reading reaches the fill as a value the host hands over, built where the tier arrives.
 
-What a drawing-thread drain still writes under the fill is what the step's own sweeps already read across threads:
-the correction caches' landings, the relay stores the input collect reads, and the storage's membership at a
-registration. Those crossings are the netcode's, priced in `ThreadingCrossings.md` (rows 1, 2 and 11); the fill is
-one more reader on the stepping thread beside the step's own, and adds no crossing of its own.
+Until og-session-runtime task 13 the fill also took the relay fields from a relay source, for a host that drained on the
+drawing thread (the frame-locked client): a stage copied the relay fields of every stored simulatable on the draining thread
+and handed them to the stepping thread through a mailbox of the host's, so the fill read neither the relay stores nor the
+arrival rings across threads. Task 13 deleted the stage, its staging function and the fill overload that took a source,
+with the frame-locked client, its only user.
+
+A drawing-thread drain would write under the fill what the step's own sweeps already read across threads: the
+correction caches' landings, the relay stores the input collect reads, and the storage's membership at a registration.
+Those crossings are the netcode's, priced in `ThreadingCrossings.md` (rows 1, 2 and 11); the fill would be one more reader
+on the stepping thread beside the step's own, and adds no crossing of its own.
 
 The visualization state is copied from `getAllState()`, not from `getVizState()` (guard G-01). A host's
 visualization copy is refreshed on the drawing thread (`updateVisualizationAll`, `SimulationObjectStorage.h`)
@@ -201,6 +199,7 @@ copied.
 Added by og-input-latency task P2-18, with the inventory of drawing-thread readers it was sized from.
 The Unreal session's game-thread readers moved to it in og-input-latency task P5-16, which filled it on the game
 thread in the frame's post-physics pass, while the frame's own batch could still be stepping. og-input-latency task
-P5-36 moved the client's fill to the stepping thread after the batch (§3) and added the relay source, the relay stage
-and `stageDisplayRelay`, for a host that drains on the drawing thread. og-input-latency task P6-1 added
+P5-36 moved the client's fill to the stepping thread after the batch (§3) and added the relay source, the relay stage and
+its staging function, for a host that drains on the drawing thread; og-session-runtime task 13 deleted the three with the
+frame-locked client. og-input-latency task P6-1 added
 `refreshView_GameThread` (§5), the Unreal session's refresh moved into the publisher with its order fixed.

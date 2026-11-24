@@ -199,11 +199,12 @@ from taste.
 `Perspective-RemoteInputFlow.md` §8 both point here rather than re-deriving it; the header keeps the
 prohibitions.
 
-**The crossing.** The relayed-ring arrival callback fires on the GAME thread (og-sim-net's
-`SimNetClient::onRing` → `SimNetChannel::storeRing`, in the og-net driver's frame-locked drain, since
-og-input-latency task P5-7) and routes the ring into `populateRemoteInputCache`, which writes slots. `collectInputAll` and
-`collectResimInputAll` (`SimulationInputResolution.h`) read those slots on the PHYSICS thread, i.e.
-wherever the host ticks physics asynchronously. There is no seam between the two.
+**The crossing.** The relayed-ring arrival callback routes the ring into `populateRemoteInputCache`, which writes
+slots; `collectInputAll` and `collectResimInputAll` (`SimulationInputResolution.h`) read those slots in the step.
+There is no seam between the two, and og-simulation checks no thread: the store is single-threaded only while its
+host delivers the arrivals on the step's thread, between steps. Until og-session-runtime task 13 the drain could also
+run on the host's frame thread while a step read the store. The rest of this section is the analysis of record for
+a host that delivers arrivals on another thread than the step's.
 
 ⛔ **`LocalInputCache`'s "not thread-safe; single-threaded by construction" sentence is TRUE for the
 delay line and FALSE for this type**, and the header fences against copying it across along with the
@@ -214,8 +215,8 @@ inside one `collectInputAll` call. A false threading contract is worse than none
 
 1. **It is inherited, not introduced.** The correction-state arrival callback (og-sim-net's
    `SimNetClient::onCorrection` since og-input-latency task P5-7; one adapter's `OnRep_CorrectionState`
-   before, deleted by P5-8) is likewise game-thread and reaches `injectCorrectionState`
-   with no queue and no seam, while the same two physics-thread readers read the correction cache.
+   before, deleted by P5-8) arrives on the same thread as the ring and reaches `injectCorrectionState`
+   with no queue and no seam, while the same two step readers read the correction cache.
    The same inheritance was recorded for `m_lastUsedInputs` and, after that map was retired, for its
    surviving twin `m_lastUsedCaptureTicks`. This store widens nothing.
 2. **The failure mode is a TORN SLOT, not container UB.** Storage is a fixed-size slot array — as

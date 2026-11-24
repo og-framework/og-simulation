@@ -33,13 +33,12 @@ wins. §15 lists the three places task 14 knew that to be the case.
 ⚠ **One adapter binding the quoted text names.** `og-simulation` is engine-free — it names no
 game-engine type and is reached from a host engine only through `concept`s. One quoted block names a
 host-engine type, `USimmableUpdateComponent`, together with a **tier-arrival replication callback**.
-The role is what matters and it is engine-neutral: *the game-thread writer of the
-effective-input-delay atomic, whose physics-thread reader is `collectInputAll` — one adapter reaches
+The role is what matters and it is engine-neutral: *the writer of the effective-input-delay atomic, on
+the tier's arrival, whose reader is `collectInputAll` — one adapter reached
 `setClientEffectiveInputDelayTicks` from a replication notification, and another substitutes its own
-arrival signal.* The crossing is the fact; the type is one adapter's binding for the writing side. (Since og-input-latency
-task P5-7 the Unreal adapter's arrival signal is og-sim-net's tier and floor arrival, which reaches
-`UESimulationSession::applyReplicatedConnectionTier` and `applyReplicatedRelayDelayFloor` on the client session's drain
-thread: the game thread frame-locked, the step's thread on an immediate client. A quoted OnRep below is that arrival.)
+arrival signal.* The atomic is the fact; the type is one adapter's binding for the writing side. (Since og-input-latency
+task P5-7 the arrival signal is the tier and floor arrival of the host's transport, delivered in its drain on the
+step's thread before `collectInputAll` reads the atomic. A quoted OnRep below is that arrival.)
 
 ⛔ **F-28-1 — that quotation's QUALIFICATION is false, and it is preserved false.** In the tree as
 read on 2026-08-22 the tier callback `OnRep_ConnectionTier` is declared on

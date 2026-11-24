@@ -22,33 +22,28 @@ OGSIM_OPTIMIZE_OFF
 // ============================================================
 // THREAD-SAFETY CONTRACT
 // ============================================================
-// This class is accessed from two threads without a mutex:
+// This class is written on one thread and read on two, without a mutex:
 //
-//   Game thread (GT)  — writes via: updateRTT(), recordAuthorityTick(), and
+//   Writer (the step's thread) — updateRTT(), recordAuthorityTick(), and
 //                       since og-input-latency P3-10 noteEngineRttSample(),
 //                       noteSimClockSample() and noteRttSourceChanged(), which
-//                       must run on that same writer thread.
-//                       Called from the adapter's clock arrival callback, on
-//                       the game thread. One adapter binds that to
-//                       `UESimulationSession::onTimingInfoReceived`, fed since
-//                       og-input-latency task P5-7 by og-sim-net's
-//                       `SimNetClient::drain` in the frame-locked drain the
-//                       og-net driver runs at the end of its `PostTickDispatch`
-//                       (by `ASimulationTimingRelay::OnRep_Buffer` before;
-//                       deleted by P5-9). Since og-input-latency task 27 that
-//                       drain hands over at most one clock sample, the newest.
-//                       That is og-sim-net's FRAME-LOCKED mode
-//                       (`SimNetConfig::immediate` false, `SimNetConfig`'s
-//                       default; Jolt clients ship immediate).
-//                       In its IMMEDIATE mode (og-input-latency P2-15) the
-//                       host calls `SimNetClient::drain` at the start of each
-//                       step, on the step's thread, so the one writer is the
-//                       PT below and the GT/PT crossing becomes same-thread.
-//                       The atomics stay: the frame-locked mode keeps the GT
-//                       writer, and a game-thread display read is then the
-//                       crossing they synchronize.
+//                       must run on that same writer thread. Called from the
+//                       clock arrival callback, fed through the port at the
+//                       start of each step; since og-input-latency task 27 at
+//                       most one clock sample per feed, the newest. Until
+//                       og-session-runtime task 13 a frame-locked client fed
+//                       it on its frame thread (the GT of
+//                       docs/ThreadingCrossings.md rows 9 and 10).
 //
-//   Physics thread (PT) — reads via: hasFirstRTTSample(), then
+//   Frame-thread reader — the clock-dilation stage before the pump
+//                       (`clockDilation::beforeClientPump`) reads
+//                       getSmoothedRTT(), getSmoothedJitter(),
+//                       activeJitterMultiplier(), getLastAuthorityTick(),
+//                       getPredictionOffsetTicks() and the server-tick sensor
+//                       while the step's thread writes them: the crossing the
+//                       atomics synchronize.
+//
+//   Step-thread reader (PT) — reads via: hasFirstRTTSample(), then
 //                          getPredictionOffsetTicks() and getLastAuthorityTick(),
 //                          which the clock sums into its target (since P3-10
 //                          rework 1, in place of getTargetPredictionTick());
@@ -56,16 +51,16 @@ OGSIM_OPTIMIZE_OFF
 //                          getPredictionOffsetTicks() directly for the clock's re-centre.
 //                          Called inside ClientPredictionClock::advancePrediction().
 //                          The other accessors read the same members and are
-//                          safe from either thread.
+//                          safe from any thread.
 //
 // m_authorityTick, m_smoothedRTT, m_smoothedJitter, m_hasFirstSample,
 // m_measuredRTTSamples and (since P3-13, for the offset's per-source jitter
-// multiplier) m_activeRttSource are all std::atomic, with ONE writer (GT) and
-// memory_order_relaxed on every access. Every crossing read is therefore correctly synchronized on every
+// multiplier) m_activeRttSource are all std::atomic, with ONE writer (the step's thread) and
+// memory_order_relaxed on every access. Every cross-thread read is therefore correctly synchronized on every
 // platform — no data race, no torn value — not only on x86-64, where a relaxed
 // atomic compiles to the same plain load and store the old fields used.
 //
-// Each member is coherent on its own; the four are NOT a snapshot. A PT read
+// Each member is coherent on its own; the four are NOT a snapshot. A read
 // may combine values written by different writer calls (e.g. the first-sample
 // flag already true while the seed is not yet visible). The worst outcome is
 // one frame's offset computed from that mix (the floor, in the flag example),
@@ -78,7 +73,7 @@ OGSIM_OPTIMIZE_OFF
 // The static_assert on std::atomic<double> below replaces the old caveat
 // "if this class is ever ported to ARM ... wrap these fields in
 // std::atomic<double>": a platform without lock-free 8-byte atomics now
-// fails to compile instead of silently taking a lock on the PT.
+// fails to compile instead of silently taking a lock on the step.
 // ============================================================
 
 // One SimClock ping/pong, in seconds: the RTT with the server's turnaround removed,
@@ -126,8 +121,7 @@ using LoggerFn = std::function<void(const char*)>;
     OGSIMULATION_API explicit NetworkTimeEstimator(const TimeConfig& config, LoggerFn logger);
 
     // -----------------------------------------------------------------------
-    // Mutators — called from the game thread in the frame-locked mode, from the step in the
-    // immediate mode (see the THREAD-SAFETY CONTRACT above)
+    // Mutators — called on the step's thread (see the THREAD-SAFETY CONTRACT above)
     // -----------------------------------------------------------------------
 
     // Feed a new raw RTT sample (seconds).  Updates smoothed RTT and jitter.
@@ -221,7 +215,7 @@ using LoggerFn = std::function<void(const char*)>;
     // counts samples the ENGINE said do not exist: these are well-formed
     // readings the ESTIMATOR judged to be frame-hitch artifacts. Keeping the two
     // separate is what lets a PIE trace tell "the ping source is broken" from
-    // "the game thread is hitching".
+    // "the host's frame is hitching".
     OGSIMULATION_API unsigned int  getOutlierRejectedSampleCount() const;
 
     // How many times the outlier gate's escape hatch fired — i.e. how many times

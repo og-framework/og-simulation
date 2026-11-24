@@ -442,7 +442,7 @@ public:
 	{
 		Snapshot* const snapshot = m_snapshots.beginWrite();
 		OG_CHECK(snapshot != nullptr,
-			"TickDriverPresenter::publish_Step: the render snapshot channel (J5) has no free slot. The game thread holds at most "
+			"TickDriverPresenter::publish_Step: the render snapshot channel (J5) has no free slot. The frame thread holds at most "
 			"two snapshots, the pair that brackets the render time, and a 4-slot channel keeps a slot free while two are held. "
 			"Was the engine-hosted render publish's free-slot check");
 		if (snapshot == nullptr)

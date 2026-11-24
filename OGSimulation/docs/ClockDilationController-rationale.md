@@ -331,12 +331,12 @@ They check defaults only. A host that sets the guard edges at runtime must keep 
 the bound into the lead coordinate. So c is right only when its `A + O` is the one the clock's next advance reads, and the
 first-read derivation of §5.1 (`drift₁ = φ − e + δc`) holds only for that c.
 
-**Why the stage's own A is wrong.** An immediate Unreal client drains its authority ticks (and SimClock samples) at each
-step's start, after the stage (og-tickdriver's `receiveForStep`). The stage's A is then the A of the clock's previous read,
+**Why the stage's own A is wrong.** A client drains its authority ticks (and SimClock samples) at each
+step's start, after the stage (the tick driver's `receiveForStep`). The stage's A is then the A of the clock's previous read,
 and every authority tick that arrived since is missing: c reads low by the arrivals of one frame, F ticks when every frame
 steps and the mean time since the last stepping frame below that. Measured in the closed loop (§19): −2.000 tick at 30 fps,
-−1.000 at 60, −0.847 at 100, −0.725 at 144. A non-immediate client drains at the game thread's net dispatch, before the
-stage, where the stage's A was right. Both orders ship, so the centre must not depend on the order.
+−1.000 at 60, −0.847 at 100, −0.725 at 144. Until og-session-runtime task 13 a client could also drain before the stage,
+where the stage's A was right; the centre was built not to depend on the order, and that stays.
 
 **The sample.** The clock publishes the target of its last advance with the advance count (`publishedTargetRead()`,
 `TimeConfig-rationale.md` §18.1); the stage copies it into `ClockDilationInputs::clockRead`. A call whose count differs from

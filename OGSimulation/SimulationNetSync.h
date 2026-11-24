@@ -16,9 +16,8 @@
 #include "OGSimulation/Network/CorrectionRotation.h"
 #include "OGSimulation/Network/CorrectionVerdictProbe.h"
 // The correction-landing half of the resim-gate telemetry, fed from the same
-// correction-arrival callback (onCorrectionReceived) as the verdict probe: on the
-// GAME thread in og-sim-net's frame-locked mode, on the step's thread on an
-// immediate client.
+// correction-arrival callback (onCorrectionReceived) as the verdict probe, on the
+// step's thread.
 #include "OGSimulation/ResimGateProbe.h"
 #include "OGSimulation/Network/RelayReadProbe.h"
 #include "OGSimulation/Network/RemoteInputCache.h"
@@ -193,7 +192,7 @@ concept AuthoritySyncedBufferOwnerConcept =
 //                                       sendLocalInputToAuthorityAll (input out),
 //                                       and the two inbound callbacks
 //       the RECEIVE-SIDE GUARD context  m_currentAuthorityTick + the window
-//       its GAME-THREAD telemetry       m_telemetry (NetSyncTelemetry)
+//       its arrival-side telemetry      m_telemetry (NetSyncTelemetry)
 //
 //   * WHERE EVERYTHING ELSE WENT. Reached through a by-id door on the
 //     resolution peer; NONE of it is forwarded by this class any more, so a
@@ -217,50 +216,32 @@ concept AuthoritySyncedBufferOwnerConcept =
 //       ingestRelayRing          queueRemoteMove          findPendingInputQueue
 //       getLastUsedCaptureTick   isLocallyControlled
 //
-//   * THREADS. Almost everything here is GAME thread, and the exception is the
-//     one that matters:
+//   * THREADS. Everything here runs on the step's thread, the one thread that
+//     steps the role, serialized:
 //
-//       GAME, arrival     onRelayedInputReceived, onCorrectionReceived and the
-//                         remote-move lambda — from og-sim-net's frame-locked
-//                         drains (client `SimNetClient::onRing` / `onCorrection`;
-//                         server `receiveInputBundle` and the delayed release);
-//                         OnRep- or RPC-dispatched until og-input-latency task P5-7
-//       GAME, per frame   sendCorrectionAll, sendLocalInputToAuthorityAll, from
-//                         SimulationManager::onPostSimulationGameThread (once
-//                         per frame, not per tick)
-//       GAME, lifecycle   registerPredictionOwner, registerAuthorityOwner,
-//                         unregisterSimulatable, from the facades below, on
-//                         the thread that registers
-//       PHYSICS           setAuthorityGuardContext ALONE, from
-//                         SimulationManager::onGameSimulationAuthority
+//       arrival     onRelayedInputReceived, onCorrectionReceived (client) and the
+//                   remote-move lambda (authority), fed through the port between
+//                   steps; OnRep- or RPC-dispatched until og-input-latency task P5-7
+//       send        sendLocalInputToAuthorityAll (client: once per tick, after the
+//                   capture); sendCorrectionAll, through
+//                   SimulationManager::onPostSimulationGameThread (authority: once
+//                   per batch, on the step's thread despite the name)
+//       lifecycle   registerPredictionOwner, registerAuthorityOwner,
+//                   unregisterSimulatable, from the facades below, at the
+//                   lifecycle queue's apply point (DeferredLifecycleQueue.h)
+//       per step    setAuthorityGuardContext, from
+//                   SimulationManager::onGameSimulationAuthority
 //
-//     ⚠ THAT LAST ROW IS A REAL CROSSING AND THE ONLY WRITE-SIDE ONE ON THIS
-//     CLASS: setAuthorityGuardContext writes m_currentAuthorityTick and
-//     m_rollbackWindowTicks on the PHYSICS thread, and the remote-move lambda
-//     (og-sim-net's server input arrival) reads them on the GAME thread. Both
-//     members are PLAIN, deliberately —
-//     fenced at their own declaration, and inventoried in
-//     docs/ThreadingCrossings.md under m_currentAuthorityTick.
-//
-//     The file's OTHER admitted race is a READ: the post-insert frontier read
-//     in decideCorrectionArrival, ±1 per sample and non-accumulating, fenced
-//     there, and inventoried in the same doc under decideCorrectionArrival.
-//
-//     ⚠ THE TABLE IS og-sim-net's FRAME-LOCKED MODE (`SimNetConfig::immediate`
-//     false, `SimNetConfig`'s default; Jolt clients ship immediate). On a client in the IMMEDIATE mode
-//     (og-input-latency P2-15) the host calls `SimNetClient::drain` at the start
-//     of each step, before `collectInputAll`, on the step's thread: the two
-//     client arrival callbacks then run on the PHYSICS (step) thread, between
-//     steps, and the frontier read above is exact. The client's input send
-//     then runs at capture, once per tick, on the step's thread
-//     (`SimNetClient::afterCaptureTick_Step`, P2-16). A host that registers
-//     through the session's lifecycle queue (`SimNetClient::registerCharacter`
-//     and `unregisterCharacter`, P2-17) has the lifecycle row applied at the
-//     top of that drain, on the same thread; the Unreal host's wiring is P5-17.
-//     The server's arrival rows, its sends and the guard-context crossing stay
-//     as written when frame-locked. On the authority loop (P5-19) the server's
-//     drain (its arrival rows), its sends and setAuthorityGuardContext all run
-//     on the loop's runner, so the crossing is one thread there.
+//     ⚠ TWO RACES ARE PRICED HERE, AND BOTH OCCUR ONLY IF A FEED RUNS ON ANOTHER
+//     THREAD THAN THE STEP, as a frame-locked client's and the in-frame server's
+//     did until og-session-runtime tasks 13 and 14. (1) setAuthorityGuardContext
+//     writes m_currentAuthorityTick and m_rollbackWindowTicks and the remote-move
+//     lambda reads them: both members are PLAIN, deliberately — fenced at their
+//     own declaration, and inventoried in docs/ThreadingCrossings.md under
+//     m_currentAuthorityTick. (2) The post-insert frontier read in
+//     decideCorrectionArrival, ±1 per sample and non-accumulating, fenced there,
+//     and inventoried in the same doc under decideCorrectionArrival. On the owner
+//     thread the first is one thread and the second is exact.
 //
 //   * ROLES — which half of this class is even reachable where:
 //
@@ -268,8 +249,7 @@ concept AuthoritySyncedBufferOwnerConcept =
 //                        neutral-injection guard, setAuthorityGuardContext
 //       CLIENT ONLY      onCorrectionReceived and onRelayedInputReceived —
 //                        reached only from SimNetClient's ring and correction
-//                        stores, in either mode, so neither can fire on a
-//                        server at all
+//                        stores, so neither can fire on a server at all
 //       BOTH             registration, unregistration, and the guard members
 //
 //   * CALLBACK LIFECYCLE — what can fire outside a fully-registered window.
@@ -345,8 +325,8 @@ public:
     // ⛔ relayReadProbe() IS NOT HERE and must not be re-added: it is reached at
     // inputResolution.getDiagnostics().relayReadProbe(). §4
     //
-    // ⛔ CONST-ONLY, DELIBERATELY — a mutable handle here invites a physics-thread
-    // counter to be incremented from the game thread. §4
+    // ⛔ CONST-ONLY, DELIBERATELY — a mutable handle here invites a counter the step
+    // owns to be incremented from another thread. §4
     // ⛔ THERE IS NO editDiagnostics() / MutableDiagnostics ON THIS CLASS, unlike
     // StateCorrectionCache's pair. The absence is a ruling, not an omission. §4
     //
@@ -413,8 +393,8 @@ public:
             // container reference. §5
             inputResolution.template registerRemoteCharacter<SimulatableT>(id);
 
-            // ⛔ CALL SITE 1 — arrival, on the GAME thread; the store is read on the
-            // physics thread. Rule in Network/RemoteInputCache.h. §6
+            // ⛔ CALL SITE 1 — arrival, on the step's thread; the store is read in the
+            // step's collect. Rule in Network/RemoteInputCache.h. §6
             predictionOwner.setOnRelayedInputReceivedCallback(
                 [this, id](const typename PredictionOwnerFor<SimulatableT>::RelayedInputRingType& ring) {
                     onRelayedInputReceived<SimulatableT>(id, ring);
@@ -512,19 +492,19 @@ public:
     //
     // ⛔ SPLIT IN TWO BY THE REGISTRATION-RACE FIX, AND THE SPLIT IS ALONG A THREAD
     // BOUNDARY, NOT A TASTE ONE. Step 1 is the only half that touches the OWNER, and an
-    // owner is a game-thread object that is leaving — it must be unbound while the game
-    // thread still holds it. Steps 2-4 touch no owner at all, which is what makes them
+    // owner is its caller's object that is leaving — it must be unbound while that thread
+    // still holds it. Steps 2-4 touch no owner at all, which is what makes them
     // the half an adapter COULD defer to a between-steps apply point. ⚠ NO CALLER IN
     // THIS TREE DEFERS IT ALONE. og-sim-net's sessions route lifecycle through
     // `DeferredLifecycleQueue` (og-input-latency P2-17) but apply BOTH halves there, back
     // to back, through the composed facade below: their owner is the session's own
-    // channel, not a leaving game-thread object, so step 1 can wait for the apply point
-    // too. Every other caller runs both halves where it registers (the game thread in
-    // the Unreal host). ⛔ AND THE DEFERRED HALF IS NOT PHYSICS-ONLY EITHER: step 2
+    // channel, not a leaving caller's object, so step 1 can wait for the apply point
+    // too. Outside og-sim-net only tests call the facade, and they run both halves where
+    // they register. ⛔ AND THE DEFERRED HALF IS NOT STEP-ONLY EITHER: step 2
     // erases `m_authorityWriters`, `m_localInputSenders` and `m_redundancyCadences`,
-    // which `sendCorrectionAll` and `sendLocalInputToAuthorityAll` walk once per frame —
-    // so deferring it is sound only where those walks run on the applying thread (an
-    // immediate client sends at capture, on the step: og-input-latency P2-16).
+    // which `sendCorrectionAll` and `sendLocalInputToAuthorityAll` walk on every send —
+    // so deferring it is sound only where those walks run on the applying thread (the
+    // step's thread, for both sends: og-input-latency P2-16 and P5-19).
     // The ruling is in DeferredLifecycleQueue.h's banner and docs/ThreadingCrossings.md
     // row 11. The fixed order survives the split intact: step 1 still happens first,
     // EARLIER than before rather than later.
@@ -553,7 +533,7 @@ public:
     // through the composed facade below, on one thread, with the owner alive - so nothing
     // here is deferred and nothing would break if an owner pointer were passed. The
     // signature is id-only so that an adapter CAN defer this half: it is the half a
-    // `DeferredLifecycleQueue` job would carry, one or more frames after the game thread
+    // `DeferredLifecycleQueue` job would carry, one or more frames after its caller
     // queued it, by which time the owner it was queued for may be gone.
     // ⚠ NO CALLER IN THIS TREE DOES THAT YET: og-sim-net's sessions queue the composed
     // facade instead, with their own channel as the owner, alive at the apply point
@@ -596,9 +576,8 @@ public:
     }
 
     // Outbound — authority correction state, written into each character's channel and
-    // sent by SimNetServer's correction flush (frame-locked: written on the game thread
-    // once per frame, sent at flushFrame; on the authority loop, og-input-latency P5-19, written
-    // and sent after each batch on its runner)
+    // sent by the server session's correction flush, written and sent after each batch on
+    // the step's thread
     //
     // ⛔ THE SERVER->CLIENT CORRECTION-INPUT CHANNEL IS RETIRED AND MUST NOT BE
     // REBUILT — its seven core symbols and five adapter-side members are listed in the
@@ -686,9 +665,8 @@ public:
             correctionRotation::advanceRound(m_correctionRotationRound, correctionRotationK);
     }
 
-    // Outbound — local input bundle to authority: frame-locked, once per frame on the game
-    // thread (SimulationManager::onPostSimulationGameThread, sent at SimNetClient::flushFrame);
-    // immediate, once per tick at capture on the step's thread (SimNetClient::afterCaptureTick_Step)
+    // Outbound — local input bundle to authority: once per tick, after the capture, on the
+    // step's thread
 
     // The redundancy slot count for one send: `redundancyFrames` frames' worth of ticks, from the
     // sender's smoothed ticks per send.
@@ -718,7 +696,7 @@ public:
     {
         // ⛔ ONE redundancy bundle per send on og-net's unreliable SimInput lane, NOT one
         // reliable message per entry — a dropped datagram then self-heals on the next
-        // send's overlapping bundle (the next frame frame-locked, the next tick immediate).
+        // send's overlapping bundle (the next tick's).
         // The owner builds the wire bundle; only the queue and
         // scalars cross this line. §10
         //
@@ -890,9 +868,11 @@ private:
         // a placement already ruled against. nullptr on the authority is the right answer:
         // no caches are allocated there and this callback cannot fire there. §12
         //
-        // ⚠ READ AFTER THE INSERT — SAFE, AND ±1 RACY. Safe: tryInsertingCorrectState
-        // never touches the tick buffer. Racy: pushPredictionTick advances the frontier
-        // on the PHYSICS thread, misfiling one sample AtFrontier->Behind. §13
+        // ⚠ READ AFTER THE INSERT — SAFE, AND ±1 RACY OFF THE STEP'S THREAD. Safe:
+        // tryInsertingCorrectState never touches the tick buffer. Racy only if the landing
+        // runs on another thread than the step's pushPredictionTick, which advances the
+        // frontier (a frame-locked client's, until og-session-runtime task 13): one sample
+        // misfiled AtFrontier->Behind. On the step's thread the read is exact. §13
         // ⛔ NOT WORTH SYNCHRONIZING — ±1 on a 120-sample window, non-accumulating. §13
         const auto* landingCache =
             m_reconciliation.template findCorrectionCache<SimulatableT>(id);
@@ -926,9 +906,9 @@ private:
     std::tuple<AuthorityWriterMapFor<SimulatableTs>...>  m_authorityWriters;
     std::tuple<LocalInputSenderMapFor<SimulatableTs>...> m_localInputSenders;
 
-    // ⛔ THE GAME-THREAD HALF OF THE PROBE ROSTER — RelayArrivalProbe,
+    // ⛔ THE ARRIVAL-SIDE HALF OF THE PROBE ROSTER — RelayArrivalProbe,
     // CorrectionVerdictProbe, CorrectionLandingProbe and FOUR emit* helpers, all
-    // members of NetSyncTelemetry. The physics-thread half, RelayReadProbe plus
+    // members of NetSyncTelemetry. The step-side half, RelayReadProbe plus
     // TWELVE emit* helpers, belongs to InputResolutionTelemetry. §4
     NetSyncTelemetry m_telemetry;
 
@@ -948,22 +928,23 @@ private:
     // ⛔ PLAIN (non-atomic), AND THAT IS THE RULING — an at-most-one-tick-stale
     // authority tick is fine for a multi-tick rollback window, matching
     // RemoteMoveQueue's single-consumer assumption. setAuthorityGuardContext writes
-    // these on the PHYSICS thread; the remote-move lambda (og-sim-net's server input
-    // arrival) reads them on the GAME thread. Priced, not overlooked. §13
+    // these in the step; the remote-move lambda reads them at an input's arrival. Both
+    // run on the step's thread; the in-frame server read them on its frame thread until
+    // og-session-runtime task 14. Priced, not overlooked. §13
     // ⛔ -1 disables the future guard until SimulationManager injects the window. §13
     uint32 m_currentAuthorityTick = 0;
     int32  m_rollbackWindowTicks  = -1;
 
     // ⛔ THE STATE-ROTATION CURSOR — monotonic, advanced by K once per
     // sendCorrectionAll, wrapped per type map at the point of use. Plain (non-atomic)
-    // because sendCorrectionAll is GAME thread only. §13
+    // because sendCorrectionAll runs on the step's thread only. §13
     //
     // ⛔ NOT WIPED BY wipeAllForResync, INTENTIONALLY — a hard resync jumps the CLOCK,
     // and this is a round-robin position, not a tick-keyed quantity. Re-phasing would
     // skip or double-write a character for one round. §13
     std::size_t m_correctionRotationRound = 0u;
 
-    // ⛔ PER LOCAL SENDER, KEYED BY ID, GAME THREAD ONLY — inserted by the send, erased in
+    // ⛔ PER LOCAL SENDER, KEYED BY ID, STEP'S THREAD ONLY — inserted by the send, erased in
     // unregister step 2 beside the sender map. §17
     std::unordered_map<unsigned int, RedundancySendCadence> m_redundancyCadences;
 };
@@ -1103,8 +1084,8 @@ void registerSimulatable(
 // then the net-sync/resolver erases, then removeCacheFor. §14
 // ⛔ NO OWNER PARAMETER, AND NONE MAY BE ADDED — a constraint kept for the caller this
 // shape exists to allow, which does not exist yet. An adapter that marshalled lifecycle
-// through `DeferredLifecycleQueue` would call this from its physics-thread apply point,
-// frames after the game thread queued it, with the owner possibly gone and its callbacks
+// through `DeferredLifecycleQueue` and split the facade would call this from its apply point,
+// frames after its caller queued it, with the owner possibly gone and its callbacks
 // already cleared by the facade below. ⚠ NOTHING IN THIS TREE DOES THAT TODAY: every
 // caller goes through the facade, on one thread (og-sim-net's sessions call it at their
 // lifecycle queue's apply point, og-input-latency P2-17). The ruling on adopting the

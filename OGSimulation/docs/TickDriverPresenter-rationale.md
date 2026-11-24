@@ -23,7 +23,7 @@ rate on another. The presenter is the render half between them:
 - **on the step's thread**, after every step, it publishes the poses of every body into a snapshot channel
   (J5, a `SnapshotChannel` of four `RenderSnapshotT<N>`), and before every step it captures the correction a
   resimulation made to the poses the render already holds (J7, an `SpscRing` of sixteen `RenderCorrectionT`);
-- **on the game thread**, once per frame, it interpolates the poses at a render time a fixed number of steps
+- **on the frame thread**, once per frame, it interpolates the poses at a render time a fixed number of steps
   behind the host time, adds the correction smoothing, moves each render target's root through a render sink,
   writes the poses into a world host's shadow world, copies them into the visualization state, and checks and
   reports what it did.
@@ -54,9 +54,9 @@ The doors:
 - `publish_Step` (an outcome, a deadline) and `captureCorrection_Step` (a physics step), on the step's thread: the
   shape of `TickDriverPresenterSteps`, which the header's self-check asserts.
 - `present_GameThread` (clock, controls, sink, world host) and `updateVisualization_GameThread` (storage), on the
-  game thread, once per frame, in that order. A host that keeps its own copy of the state it draws calls
+  frame thread, once per frame, in that order. A host that keeps its own copy of the state it draws calls
   `overlayRenderPoses_GameThread<Simulatable>` (an id, a visualization state) in place of the second (§7).
-- `onRegistered` and `onUnregistered` (an id and a slot), on the game thread, for the target table (§11).
+- `onRegistered` and `onUnregistered` (an id and a slot), on the frame thread, for the target table (§11).
 - `renderPoses()`, `renderPosesValid()`, `renderFrame()` and `renderCorrectionFrame()` read the last frame's
   results.
 
@@ -76,7 +76,7 @@ non-conforming ones.
 **Publish (J5).** `publish_Step` takes a slot (`beginWrite`), fills it from the source's storage with
 `fillRenderSnapshot`, and commits it. On a peer that saves ticks it also hands the snapshot to the capture
 (`noteShownSnapshot`): the pose the render will draw for that tick. The `OG_CHECK` on the slot holds because
-the game thread holds at most two snapshots at once (the pair that brackets the render time, released before
+the frame thread holds at most two snapshots at once (the pair that brackets the render time, released before
 `interpolateRenderPoses` returns), and a four-slot channel keeps a slot free while two are held.
 
 Three `static_assert`s hold the step side's shape:
@@ -91,7 +91,7 @@ storage holds the corrected present tick. It calls `onStepAfterReplay` with `gra
 tick and the step, and counts the outcome: every outcome but `NoNewResim` is a resimulation, `TickMismatch`
 adds a tick mismatch, `NoError` a resimulation below the smoothing's thresholds, and `Captured` pushes the
 correction into J7, counted as captured when the ring took it. The counters are relaxed atomics: the step's
-thread writes them and the game thread's window line reads them. A peer that never resimulates never moves
+thread writes them and the frame thread's window line reads them. A peer that never resimulates never moves
 the granted count, so it captures nothing.
 
 ## §4 The game-thread side: order, render time and the bracket
@@ -309,9 +309,9 @@ construction.
 ## §12 Threads
 
 The step doors run on the step's thread, inside a step, under the tick driver's world lock and step scope;
-the game-thread doors and the target table on the game thread. What crosses: J5 (the channel), J7 (the ring)
+the frame-thread doors (the `_GameThread` names) and the target table on the frame thread. What crosses: J5 (the channel), J7 (the ring)
 and the four capture counters (relaxed atomics). The capture's state, the shown head, is the step's alone;
-everything else is the game thread's. The presenter asserts no thread: the step hooks that call its step doors
+everything else is the frame thread's. The presenter asserts no thread: the step hooks that call its step doors
 check that they run inside a step.
 
 ## §13 Provenance

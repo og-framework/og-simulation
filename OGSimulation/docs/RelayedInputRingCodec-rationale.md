@@ -301,9 +301,9 @@ The 2-generation hybrid of the flush-on-poll design (T30, §11.5) was its record
 loss. og-input-latency task 8's re-send (§15) is that escalation's shape: a flush carries the last `r`
 entries the previous flush published.
 
-**Threading: none.** Receipt (staging) and the flush are both on the game thread, in the same
-game-thread tick, receipt first (the tick's early dispatch broadcast) and the flush last (its
-end-of-tick flush broadcast). Plain members, no lock, no atomics (`ThreadingCrossings.md` lists the pair
+**Threading: none.** Receipt (staging) and the flush run on one thread, the caller's, receipt first
+and the flush after it (on the same receipt since og-session-runtime task 15; at the end of the
+host's frame before). Plain members, no lock, no atomics (`ThreadingCrossings.md` lists the pair
 as not a crossing).
 
 ## §13 `stageArrival` — the capacity rule

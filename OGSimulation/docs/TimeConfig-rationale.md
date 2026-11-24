@@ -511,8 +511,8 @@ only one of them is completely inert:
 | **read in production** | everything else in the header | — |
 
 `redundancyFrames` and `relayResendEntries` (§12) are in the last row, not the first. The client send reads
-`redundancyFrames` (`SimulationManager::onPostSimulationGameThread` passes it to
-`SimulationNetSync::sendLocalInputToAuthorityAll`). `relayResendEntries` has no reader in this repository, only its
+`redundancyFrames`, as the third argument of
+`SimulationNetSync::sendLocalInputToAuthorityAll`. `relayResendEntries` has no reader in this repository, only its
 setter: the host that owns the relay flush reads it and passes the count to `relayedInputRing::flushStagedInto`
 (og-input-latency task 8). `backDateM0P50ThresholdTicks` (§13) is in the last row too, since og-input-latency P3-6:
 `ServerReceptionCoordinator`'s constructor passes it to its `InputArrivalMargin`.
@@ -568,7 +568,7 @@ file deliberately does not paraphrase them.
 ## 12. The latency knobs: redundancy in frames, and the relay re-send
 
 Two fields added by og-input-latency task 4, 2026-11-11. **Both compile to today's behaviour.** `redundancyFrames`
-is read by the client send since og-input-latency task 7 (`SimulationManager::onPostSimulationGameThread` hands it to
+is read by the client send since og-input-latency task 7 (the third argument of
 `SimulationNetSync::sendLocalInputToAuthorityAll`; the arithmetic is in `SimulationNetSync-rationale.md` §17).
 `relayResendEntries` is read by the server's relay flush since og-input-latency task 8: the host that owns the
 flush reads it, so neither field is in §10's "no reader at all" row.
@@ -1067,8 +1067,8 @@ with ` cause=firstRtt offset=<landed>-><now>` appended. Either way the wait ends
 settled reading the clock never waits again, so every later hard resync is unchanged. `evaluateDrift` reports `HardResync` on
 that advance.
 
-**Across threads (rework 1).** Frame-locked, `updateRTT` runs on the game thread and the clock reads the estimator on the
-physics thread through relaxed atomics, which are not a snapshot (`ThreadingCrossings.md` row 10). Every other reader of the
+**Across threads (rework 1).** When `updateRTT` runs on another thread than the clock's advance (it could until
+og-session-runtime task 13), the clock reads the estimator through relaxed atomics, which are not a snapshot (`ThreadingCrossings.md` row 10). Every other reader of the
 estimate is re-read on the next advance, so a mixed read costs it one frame. This one acts once, so a mixed read on the advance
 that first sees the reading would end the wait for good. The review (R1) found two: the flag changing between two loads in one
 advance (the due check read it false, then the clear read it true), and the flag visible before its seed, which reads the floor
@@ -1142,7 +1142,7 @@ its offset stayed at 6 ticks: 2 × 9.2 ms took back the 18 ms the RTT gained, wh
 The gate measured (a)'s lead at 3.370 ticks (de-lagged) against Ph2's 2.453, with the late share at 2.6 pp against Ph2's 9.2.
 
 **Across threads.** The offset is read on the client's stepping thread, and the switch happens on the estimator's writer
-thread (the game thread frame-locked). So the active source is a relaxed atomic with the estimate's one writer, like the RTT
+thread, which may be another (it could until og-session-runtime task 13). So the active source is a relaxed atomic with the estimate's one writer, like the RTT
 and jitter EMAs: a read that combines a new source with an old EMA is one frame's offset, superseded by the next read. At
 the switch the first SimClock sample does not move the jitter EMA, or seeds it at 0 (§15), so the new multiplier first
 applies to the engine era's jitter, which is about 0.
@@ -1195,7 +1195,7 @@ each source, on an exact RTT and jitter (1/16 s and 1/32 s): 8, 7, 6, 5 and 4 ti
 Added by og-time-dilation task 5, 2026-11-21. Its writer is `ClientPredictionClock`; it has no field of its own. Its reader is
 the dilation controller (og-time-dilation task 6), which holds its rate scale at 1.0 while the clock's own corrections run:
 the re-centre armed or owing ticks (§14), an input-delay transition debt owed (Stalls or, since og-input-latency P6-2, Skips), the wait for the first RTT reading (§16), and a while after any
-hard resync. That reader runs once per frame on the scheduler's owning thread (the client's game thread), and the clock
+hard resync. That reader runs once per frame on the scheduler's owning thread (the client's frame thread), and the clock
 advances on the step's thread, so the clock publishes what the reader needs as one atomic word.
 
 **The word.** `ClientPredictionClock::publishedCorrectionPhase()` returns a `ClockCorrectionPhase`, decoded from one relaxed
@@ -1224,12 +1224,11 @@ the resync until the advance returns.
 
 **The contract: one writer, any reader, write-only for the clock.**
 - **One writer**, the clock's thread. Every write is a whole word, so a reader sees one store's value and never a mix of
-  two. ⚠ The stall request is called by the tier receipt (one adapter's binding: the Unreal host's connection-tier and
-  relay-floor handlers). In immediate mode that runs in the step's drain, on the clock's thread, and the contract holds as
-  stated. Frame-locked, it runs on the game thread while the clock advances on the physics thread, so the request is a second
-  writer, as it already is of the transition debt itself (a lock-free atomic since og-input-latency P6-2, consumed by compare-exchange: `ThreadingCrossings.md` row 12). Its store then encodes the re-centre's flags as the game thread reads
-  them, and may land after a newer advance's store; the clock's next advance stores the word again, so it is wrong for at
-  most one advance.
+  two. ⚠ The stall request is called by the tier receipt. A receipt in the step's drain, on the clock's thread, keeps the
+  contract as stated. A receipt on another thread while the clock advances would be a second writer, as it would be of
+  the transition debt itself (a lock-free atomic since og-input-latency P6-2, consumed by compare-exchange: `ThreadingCrossings.md` row 12). Its store would encode the re-centre's flags as that thread reads
+  them, and might land after a newer advance's store; the clock's next advance stores the word again, so it would be wrong
+  for at most one advance.
 - **Any reader**, from any thread. The load is relaxed and the word is ordered with nothing else: a reader that also reads
   the estimator or the prediction tick may combine values one advance apart. The freeze is re-evaluated every frame, so that
   mix costs at most one frame's freeze decision, the same posture as the estimator's relaxed fields (`ThreadingCrossings.md`
@@ -1278,8 +1277,8 @@ payment) returns into it, as for the phase word. `requestInputDelayTransition()`
 it reads no target. The constructor does not either: `{0, 0}` already says "no read".
 
 **The contract** is the phase word's: one writer, any reader, write-only for the clock.
-- **One writer**: `advancePrediction()`'s caller, the step's thread. Unlike the phase word there is no second writer: the
-  frame-locked tier receipt calls the transition request, which does not store this word.
+- **One writer**: `advancePrediction()`'s caller, the step's thread. Unlike the phase word there is no second writer: a
+  tier receipt on another thread would call the transition request, which does not store this word.
 - **Any reader**, relaxed, ordered with nothing else. The stage reads it once per frame on the scheduler's owning thread. A
   read that lands inside a batch running on another thread sees the batch's latest advance so far; the controller pairs it
   with its previous call, a one-sample approximation `ClockDilationController-rationale.md` §5.4 accepts.

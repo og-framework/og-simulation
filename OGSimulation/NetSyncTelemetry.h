@@ -41,17 +41,15 @@ OGSIM_OPTIMIZE_OFF
 //     (`m_inputResolutionTelemetry`), not by NetSync and not by this class.
 //     Neither sibling holds a reference to the other.
 //
-//   * EVERY METHOD HERE IS GAME THREAD ONLY in og-sim-net's frame-locked mode.
-//     Three call sites, all methods of `SimulationNetSync`:
+//   * EVERY METHOD HERE RUNS ON ONE THREAD, the step's: the thread that
+//     delivers NetSync's arrivals. Three call sites, all methods of `SimulationNetSync`:
 //
 //       emitRelayArrival        onRelayedInputReceived    og-sim-net ring arrival
 //       emitCorrectionArrival   onCorrectionReceived      og-sim-net correction arrival
 //       forgetOwner             unregisterSimulatable     step 4, lifecycle
 //
-//     On an IMMEDIATE client (og-input-latency P2-15) the client drains at the
-//     start of each step, on the step's thread, so the two arrival rows run there,
-//     and so does forgetOwner for a host that unregisters through the session's
-//     lifecycle queue (P2-17).
+//     forgetOwner runs on that thread too for a host that unregisters through
+//     `DeferredLifecycleQueue`, which applies on the step's thread.
 //
 //     `emitCorrectionVerdictClassLine` / `emitCorrectionLandingClassLine` are
 //     reached only from `emitCorrectionArrival`, and
@@ -119,7 +117,7 @@ OGSIM_OPTIMIZE_OFF
 // ⛔ NO REFERENCE INTO A PRODUCTION CONTAINER IS EVER HANDED IN — `emitRelayArrival` takes a report, not the arriving `RemoteInputCache<InputT>&`. §2
 // ⛔ `shouldLogVersionMismatchOnce`'s latch therefore lives here, id-keyed, rather than on the store. §7
 //
-// ⛔ EVERY METHOD ON THIS CLASS RUNS ON ONE THREAD, the drain's (the game thread frame-locked, the step's thread on an immediate client), so no member here is atomic and none may be made concurrent. §3
+// ⛔ EVERY METHOD ON THIS CLASS RUNS ON ONE THREAD, the step's, which delivers the arrivals, so no member here is atomic and none may be made concurrent. §3
 // ⛔ `forgetOwner` is the one either-thread member and is never concurrent by construction — see `SimulationNetSync::unregisterSimulatable`'s ordering. §3
 // ⛔ `shouldLogVersionMismatchOnce` is public, but production reaches it only from `emitRelayArrival`; `emitCorrectionArrival` is the sole caller of the two class-line helpers.
 
@@ -249,7 +247,7 @@ public:
     // ⚠ `RemoteInputCache::shouldLogVersionMismatchOnce` no longer exists. §7
     void emitRelayArrival(unsigned int id, const RelayedInputIngestReport& report)
     {
-        // ⛔ PROBE 2 — the arrival-side cadence window (GAME thread frame-locked, the step's thread on an immediate client), measured in CAPTURE TICKS; a different object from the physics-side read probe, and they must not be merged. §5
+        // ⛔ PROBE 2 — the arrival-side cadence window (the step's thread, which delivers the arrivals), measured in CAPTURE TICKS; a different object from the physics-side read probe, and they must not be merged. §5
         // ⛔ `report.newestCaptureTick` is the newest tick THIS RING carried, not the newest the store holds.
         if (report.newestCaptureTickValid)
         {

@@ -193,7 +193,7 @@ void NetworkTimeEstimator::updateRTT(double rawRTTSeconds)
     // frame hitches, ack processing is delayed by up to the hitch duration and that
     // delay lands DIRECTLY in the measurement. On a loopback session with 5-10 ms of
     // emulated lag this produces readings near ONE SECOND: a hundredfold error
-    // caused by the local game thread, not by the network. Pre-T26b updateRTT
+    // caused by the local frame, not by the network. Pre-T26b updateRTT
     // believed them, jitterMultiplier = 2 doubled the excursion into the offset,
     // and jitterSmoothingAlpha = 0.15 dragged recovery out over seconds — the
     // ~8 s post-hitch offset transient this initiative kept measuring. This gate

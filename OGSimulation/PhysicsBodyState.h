@@ -64,7 +64,7 @@ struct SerializableFields<PhysicsBodyState>
 // (`bodyStateOf(state) = adapter.captureBodyState(id)`) and the rewind push
 // (`pushCorrectedBodyStatesAll`, reading `bodyStateOf(state)` as a
 // PhysicsBodyState) compile UNCHANGED — every
-// adapter, Chaos and Jolt alike, keeps its `captureBodyState(id) ->
+// adapter (Jolt; the former Chaos adapter too, until og-session-runtime task 4) keeps its `captureBodyState(id) ->
 // PhysicsBodyState` contract and needs no per-body-state-type code.
 struct LinearBodyState
 {

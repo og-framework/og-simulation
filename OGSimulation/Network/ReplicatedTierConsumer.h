@@ -75,9 +75,8 @@
 //
 // THREADING. Not thread-safe, and single-threaded by construction: the only
 // mutator (`onReplicatedTierReceived`) is called from that arrival callback,
-// on the GAME thread (og-sim-net's frame-locked drain, which the og-net driver
-// runs at the end of its `PostTickDispatch`). A reader on the physics thread
-// would be an unsynchronised cross-thread read — see the THREADING CONTRACT
+// and every reader runs on the same thread, the step's (which delivers the
+// arrival). A reader on another thread would be an unsynchronised cross-thread read — see the THREADING CONTRACT
 // block in ServerInputDelayQueue.h for why adding a lock is the wrong fix for
 // that shape of problem.
 //
@@ -98,7 +97,7 @@ public:
     }
 
     // Feed one authoritative tier value, as received from the server. Call from
-    // the tier's arrival callback (game thread).
+    // the tier's arrival callback, on the thread that reads this consumer.
     //
     // The incoming value came off the wire, so it is CLAMPED into the legal tier
     // range rather than trusted: a corrupt or version-mismatched byte must not

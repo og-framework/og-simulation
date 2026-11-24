@@ -166,13 +166,11 @@ public:
     // ⛔ UNREACHABLE IN PROGRAM ORDER, AND THAT IS WHY IT EXISTS. `registerLocalCharacter`
     // creates the line before the provider and `registerSimulatable` publishes to storage
     // last, so no completed registration in this tree can produce the state this reports.
-    // ⚠ THAT IS AN ORDERING ARGUMENT AND NOTHING MORE. A frame-locked client and an
-    // inline server do NOT marshal the registration path onto the step's thread —
-    // og-sim-net applies it through `DeferredLifecycleQueue` only on an immediate client
-    // and on the authority loop (og-input-latency P5-17, P5-19) — so on those two the
-    // concurrent game/physics mutation of these maps is UNCHANGED and
-    // remains the one route to this state (og-netcode-v2-field-defects task 4;
-    // docs/ThreadingCrossings.md row 11). It is the standing tripwire
+    // ⚠ THAT IS AN ORDERING ARGUMENT AND NOTHING MORE. og-simulation does not check
+    // which thread registers: a host that registers on another thread while a step
+    // runs (not through `DeferredLifecycleQueue` on the step's thread) mutates these
+    // maps under the step's sweep, and that remains the one route to this state
+    // (og-netcode-v2-field-defects task 4; docs/ThreadingCrossings.md row 11). It is the standing tripwire
     // that turns any FUTURE tear into one logged neutral tick instead of a dead process
     // — the shipped defect it replaces was a process-terminating `std::out_of_range` on a
     // client's physics thread (og-netcode-v2-field-defects task 3).

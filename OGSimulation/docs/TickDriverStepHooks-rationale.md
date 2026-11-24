@@ -209,9 +209,9 @@ The after-batch hook's cases run a whole `SimulationTickDriver` over the fake en
 (SimulationTickDriverDisplayFillTest.cpp, tag `[TickDriver]`), with a game of the test's own that records each fill
 and holds a step the driver does not wait for until the frame's post-physics pass has run, so a fill there overlaps
 it every time:
-- `SimulationTickDriver.DisplayFill.TheAfterBatchFillNeverRunsBesideAStep` (frame-locked and immediate: one fill per
-  batch, on the worker, after the batch's last step, never beside a step; an immediate one-step frame's post-physics
-  pass sees its own batch's fill);
+- `SimulationTickDriver.DisplayFill.TheAfterBatchFillNeverRunsBesideAStep` (under both frame waits, `EarlierFrames` and
+  `ThisFramesSingleStep`: one fill per batch, on the worker, after the batch's last step, never beside a step; under
+  `ThisFramesSingleStep` a one-step frame's post-physics pass sees its own batch's fill);
 - `SimulationTickDriver.DisplayFill.AFillAtPostPhysicsRunsBesideAStepTheDriverDoesNotWaitFor` (the harness's control:
   a game that fills in `onPostPhysics`, as the brawler's binding did before og-input-latency task P5-36, fills beside a
   step in every frame whose batch the driver does not wait for).

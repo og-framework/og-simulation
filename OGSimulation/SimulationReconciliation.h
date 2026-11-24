@@ -68,25 +68,18 @@ struct ResimSweepDiagnostics
 // Read this first. Every fence in this file states one invariant at the line
 // it guards; none of them restates this map, and this map states no invariant.
 //
-//   * TWO THREADS TOUCH THIS CLASS, AND ONLY ONE OF THEM TICKS — in og-sim-net's
-//     FRAME-LOCKED mode (`SimNetConfig::immediate` false, `SimNetConfig`'s default; Jolt clients ship immediate).
-//       GAME thread    corrections arrive — `injectCorrectionState`, from the
-//                      lambda NetSync binds on the owner's correction callback,
-//                      called from og-sim-net's frame-locked drain
-//                      (`SimNetClient::onCorrection`; replication-dispatched until
-//                      og-input-latency task P5-7) — and caches are created
-//                      and destroyed — `createCacheFor` / `removeCacheFor`,
-//                      from the registration facade.
-//       PHYSICS thread every per-tick sweep in this class, without exception,
-//                      all driven from the adapter's physics callbacks.
-//     That crossing is row 2 of `docs/ThreadingCrossings.md` — accepted debt,
-//     healed by the next correction; not re-argued here.
-//     IMMEDIATE (`immediate` true, og-input-latency P2-15): the host calls
-//     `SimNetClient::drain` at the start of each step, before `collectInputAll`,
-//     on the step's thread, so `injectCorrectionState` runs on the PHYSICS (step)
-//     thread between that step's sweeps and row 2 is same-thread. Cache creation
-//     and destruction stay wherever the registration facade is called
-//     (og-input-latency P2-17 applies them in the drain).
+//   * ONE THREAD TOUCHES THIS CLASS: the step's thread, which ticks it.
+//       corrections arrive — `injectCorrectionState`, from the lambda NetSync binds
+//                      on the owner's correction callback, fed through the port
+//                      between the step's sweeps;
+//       caches are created and destroyed — `createCacheFor` / `removeCacheFor`, from
+//                      the registration facade, applied through the lifecycle
+//                      queue (`DeferredLifecycleQueue.h`) on the same thread;
+//       every per-tick sweep in this class, without exception, driven from the
+//                      step's callbacks.
+//     Until og-session-runtime task 13 a frame-locked client injected corrections
+//     on its frame thread: row 2 of `docs/ThreadingCrossings.md`, then accepted
+//     debt healed by the next correction.
 //
 //   * ⭐ ONE ADAPTER'S BINDING FOR THE CALLBACK COLUMN OF BOTH TABLES BELOW.
 //     That column names the physics-callback ROLE a phase is driven from, never
@@ -105,7 +98,7 @@ struct ResimSweepDiagnostics
 //     cache at all, so `findCorrectionCache` answers nullptr for every id there and
 //     `SimulationManager` gates the tick calls behind `m_runsPrediction`.
 //
-//   * THE PREDICTION TICK — one PAIR, both halves on the PHYSICS thread:
+//   * THE PREDICTION TICK — one PAIR, both halves on the step's thread:
 //
 //       allocateFrontierSlotsAll   opens the frontier slot   pre-simulate step
 //       postPredictionAll          completes it with state   post-solve step
@@ -113,7 +106,7 @@ struct ResimSweepDiagnostics
 //     The contract binding the two is stated in full at
 //     `allocateFrontierSlotsAll`.
 //
-//   * THE RESIM CYCLE — six phases, ALL on the PHYSICS thread, in this order:
+//   * THE RESIM CYCLE — six phases, ALL on the step's thread, in this order:
 //
 //       phase   this class               SimulationManager.h            adapter callback
 //       ask     checkDivergenceAll       onCheckIsSimilar               rewind request
@@ -284,8 +277,8 @@ public:
         return diagnostics;
     }
 
-    // Correction injection — called from the correction lambda NetSync binds, in og-sim-net's
-    // drain (the GAME thread in the frame-locked mode; the class map above).
+    // Correction injection — called from the correction lambda NetSync binds, on the owner
+    // thread (the class map above).
 
     // ⛔ `appliedCaptureTick` rides the SAME slot as the state it corrects
     // (`kNoInputCaptureTick` = substituted); one scalar would answer only for the
@@ -313,7 +306,7 @@ public:
     //
     // `injectCorrectionState` above carries the applied-capture ref that replaced it.
 
-    // ⛔ R1 — the gate read, once per PHYSICS frame, folded with `min`: one physics
+    // ⛔ R1 — the gate read, once per step, folded with `min`: one physics
     // rewind serves everyone, so it must be the OLDEST tick anybody needs. §10.
     //
     // ⛔ `maxAnchorDepthTicks` IS THE DEPTH POLICY, 0 MEANS NO POLICY; the manager

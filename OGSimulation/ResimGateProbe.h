@@ -99,8 +99,8 @@ struct ResimGateWindowSummary
     std::uint32_t requestRatePerMille = 0u;
 
 // --- THE SURVIVING-ANCHOR COUNT. ------------------------------------------
-// Characters whose pending anchor SURVIVED the completion-edge CAS: a correction landed on the
-// game thread mid-replay and raised the anchor past the value `prepareResimAll` captured, so
+// Characters whose pending anchor SURVIVED the completion-edge CAS: a correction landed
+// between the prepare and the completion edge (mid-replay) and raised the anchor past the value `prepareResimAll` captured, so
 // the CAS failed, the gate stays OPEN and it re-requests next frame with a DIFFERENT anchor.
 // That is the mechanism working: `SimulationReconciliation::consumeResimAnchorsAll` argues it.
 // ⛔ FED FROM THE APPLY EDGE beside `noteFinish`, NOT from `noteCheck`'s call site like `checks`/`declined`/`requested`;
@@ -599,8 +599,8 @@ struct CorrectionLandingWindowSummary
 };
 
 // ---------------------------------------------------------------------------
-// CorrectionLandingProbe — ONE THREAD ONLY: the correction arrival's (the game thread
-// frame-locked, the step's thread on an immediate client, og-input-latency P2-15).
+// CorrectionLandingProbe — ONE THREAD ONLY: the correction arrival's (the step's thread,
+// which inserts the corrections).
 // ---------------------------------------------------------------------------
 class CorrectionLandingProbe
 {

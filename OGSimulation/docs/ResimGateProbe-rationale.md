@@ -56,17 +56,19 @@ to protect is intact. But the property is not preserved *verbatim*, and the head
 
 ## 2. Two objects because there are two threads
 
-`ResimGateProbe` is written only from the physics thread. `CorrectionLandingProbe` is written only
-from the game thread. They are separate objects with separate windows, never shared and never
-atomic, and that is a correctness property rather than a layout preference.
+`ResimGateProbe` is written only from the step. `CorrectionLandingProbe` is written only from the
+correction's arrival. They are separate objects with separate windows, never shared and never atomic.
+That is a correctness property for a host that delivers arrivals on another thread than the step's (as
+the host's frame thread did until og-session-runtime task 13); on a host that delivers them on the
+step's thread both run on one thread, and the split costs nothing.
 
 A single shared window would have one thread call `resetWindow` while the other is mid-increment.
 The loss is not one sample — it is **a whole window's totals**, because the reset zeroes every
 counter at once. Two objects make the race impossible rather than unlikely.
 
 **The cost, stated so nobody looks for a line that cannot exist.** The under-resimulation reading
-wants `landedBehind` (game thread) next to `requested` / `grants` / `finishes` (physics thread), and
-those cannot share one log line without sharing state across the two threads. So the reading is two
+wants `landedBehind` (the arrival) next to `requested` / `grants` / `finishes` (the step), and
+those cannot share one log line without sharing state across the two objects. So the reading is two
 adjacent Warning lines, each self-contained. `RelayReadProbe`, `RelayArrivalProbe` and
 `FrameHealthProbe` state the same one-object-per-thread rule for the same reason, so the shape is
 the family's, not this file's. `[ResimProbe.Landing]` alone already answers the
@@ -147,8 +149,8 @@ taken under the compiled default policy.
 
 ## 6. The surviving-anchor count
 
-A correction that lands on the game thread **mid-replay** raises the pending anchor past the value
-`prepareResimAll` captured. The completion edge then tries to consume the anchor with a
+A correction that lands after `prepareResimAll` captured the anchor and before the completion edge
+(**mid-replay**) raises the pending anchor past the value `prepareResimAll` captured. The completion edge then tries to consume the anchor with a
 compare-and-swap against the captured value, the compare fails, and the anchor **survives**. That is
 the mechanism working, not a defect: the gate stays open and re-requests next frame with a
 *different* anchor. `SimulationReconciliation::consumeResimAnchorsAll` carries the full argument.
@@ -307,10 +309,10 @@ or read `stuckResimFrames`, which has no boundary term at all.
 
 **`stuckResimFrames` is the boundary-noise-free reading of the same defect**, and its side effect is
 real rather than bookkeeping. While `ClientPredictionClock::isResimulating()` stays true through
-normal prediction frames, `SimulationManager::currentStep()` returns the stale resim step on the
-game thread, so `sendLocalInputToAuthorityAll` stamps a stale tick until the next
-`startResimulation` resets the cursor. Whether input dedup absorbs that is measurable rather than
-assumable; the counter is what makes it measurable.
+normal prediction frames, `SimulationManager::currentStep()` returns the stale resim step. Until
+og-session-runtime task 13 a client's send read that step after the batch and stamped a stale tick
+until the next `startResimulation` reset the cursor; a send at capture is handed the integrated tick
+instead. The counter measures the stuck cursor itself.
 
 ## 11. I6 — the replay span
 

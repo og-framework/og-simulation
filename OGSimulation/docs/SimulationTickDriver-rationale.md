@@ -195,7 +195,9 @@ functions in the same statement that cleared the flag).
 | `FreeRunning` | the runner (the owning thread), in `runAuthorityLoop`, at each wake | the runner, inline, then `afterInlineBatch` | runs `onPostPhysics` only, on the frame thread; never waits (§12) |
 
 `FreeRunning` is the authority's only: the constructor refuses a `FreeRunning` client, as the thread
-context's `configure` does. A client is `FrameBounded`, or `Inline` when it chose to step inline.
+context's `configure` does. A client is `FrameBounded`, or `Inline` when it chose to step inline. The driver keeps all
+three modes, and `Inline` is the engine-free tests' deterministic mode for both roles; a host that steps its client on a
+worker and its authority on a runner selects only `FrameBounded` and `FreeRunning`.
 
 Block mode 0 means the end of a frame waits only for steps dispatched in earlier frames; this frame's task
 may still be stepping while the post-physics pass runs. Block mode 1 (debugging) also waits for this frame's.
@@ -531,8 +533,8 @@ has seen it held and run, so whatever the pass does overlaps a step that is mid-
 * `SimulationTickDriver.DisplayFill.TheAfterBatchFillNeverRunsBesideAStep`: the game fills in `publishForDisplay`.
   There is one fill per batch, each on the worker, each after its batch's last step and none beside a step; under
   `ThisFramesSingleStep` a one-step frame's pass sees its own batch's fill. On the driver without the after-batch
-  call there is no fill; with the game filling in `onPostPhysics` instead, 52 of 60 frame-locked fills and 26
-  immediate ones ran beside a step (og-input-latency task P5-36's seen-failing runs).
+  call there is no fill; with the game filling in `onPostPhysics` instead, 52 of 60 fills under `EarlierFrames` and 26
+  under `ThisFramesSingleStep` ran beside a step (og-input-latency task P5-36's seen-failing runs).
 * `SimulationTickDriver.DisplayFill.AFillAtPostPhysicsRunsBesideAStepTheDriverDoesNotWaitFor`: the harness's
   control. A game that fills in `onPostPhysics` fills beside a step in exactly the frames whose batch the driver
   does not wait for, so the first case's zero is not the harness failing to see an overlap.

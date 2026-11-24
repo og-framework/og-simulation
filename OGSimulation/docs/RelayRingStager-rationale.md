@@ -129,12 +129,12 @@ to `LogOGNet` (`UESimulationLogRoutes.h:300`), and the game's engine config sets
 **Volume.** Nothing is logged per stage or per flush; only the windowed line and the final one. A per-flush line would
 be a line per character per frame.
 
-## §5 Frame-locked and immediate modes
+## §5 The flush cadence
 
-The stager does not know the session's send mode. A frame-locked caller stages every arrival of a frame and flushes
-once per frame, as the actor did once per replication update. An immediate caller flushes after each receipt, so each
-flush carries what arrived in one receipt. Both call the same two members. In immediate mode a window is 120 receipts,
-not 120 frames, so its time span depends on the arrival rate.
+The stager does not know its caller's cadence. Its caller flushes after each receipt, so each flush carries what
+arrived in one receipt, and a window is 120 receipts, not 120 frames: its time span depends on the arrival rate.
+Until og-session-runtime task 15 a caller could also stage every arrival of a frame and flush once per frame, as the
+actor did once per replication update, through the same two members.
 
 ## §6 Threads
 

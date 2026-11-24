@@ -42,11 +42,6 @@ nothing for a reader with no workspace. Task 35 moved that provenance out of the
 <!-- lint-external-ref: kMaxTrackedGap -- NEVER EXISTED, the subject of F-35-7: the real constant is kRelayArrivalMaxTrackedGap. Quoted so the defect is on the record; it must not resolve -->
 <!-- lint-external-ref: FReplicationWriter -- ENGINE TYPE, outside every scan root by construction: this core is engine-free. Named once as ONE adapter's binding -->
 <!-- lint-external-ref: FReplicationWriter::HandleDroppedRecord -- ENGINE MEMBER, same reason: the near-miss send-success signal that recovers the changemask and not the values -->
-<!-- lint-external-ref: UNetConnection::Tick -- ENGINE MEMBER, outside every scan root: the source of the per-tick allowance formula in SS12 -->
-<!-- lint-external-ref: UDataStreamChannel::Tick -- ENGINE MEMBER, outside every scan root: one adapter's writing channel -->
-<!-- lint-external-ref: UWorld::NotifyControlMessage -- ENGINE MEMBER, outside every scan root: one adapter's rate-negotiation path -->
-<!-- lint-external-ref: SendBuffer -- ENGINE FIELD, outside every scan root: half of one adapter's readiness test -->
-<!-- lint-external-ref: PktLoss -- ENGINE NETWORK-EMULATION KNOB, outside every scan root: the configured loss percentage SS12 contrasts against the ack-derived one -->
 <!-- lint-external-ref: dFrame -- A PROSE VARIABLE, not a symbol: the frame delta between two PROBE 4 invocations, named only in the log line and in these formulas -->
 <!-- lint-external-ref: serverFrameRate -- A PROSE VARIABLE in the relation `G ~ 60 / serverFrameRate`; the shipped setting is named by role, not by identifier -->
 <!-- lint-external-ref: previousNewest -- A PROSE VARIABLE naming the lower bound of the half-open interval the loss clamp argues about -->
@@ -66,10 +61,10 @@ nothing for a reader with no workspace. Task 35 moved that provenance out of the
 | 1 | scheduled-read outcome | `RelayReadProbe` | `RelayReadProbe.h` | PHYSICS | the prediction tick |
 | B | scheduled-read miss class | `RelayReadProbe` | `RelayReadProbe.h` | PHYSICS | the prediction tick |
 | 3 | D4 stale-hold run | `RelayReadProbe` | `RelayReadProbe.h` | PHYSICS | the prediction tick |
-| 2 | relay-ring arrival cadence | `RelayArrivalProbe` | `RelayReadProbe.h` | GAME | 120 gap samples |
-| 4 | frame health | `FrameHealthProbe` | `RelayReadProbe.h` | GAME, either role | 120 samples |
+| 2 | relay-ring arrival cadence | `RelayArrivalProbe` | `RelayReadProbe.h` | DRAIN (the arrivals' thread) | 120 gap samples |
+| 4 | frame health | `FrameHealthProbe` | `RelayReadProbe.h` | PUMP (the thread that pumps the tick driver), either role | 120 samples |
 | 5 | relay writes per server frame | `RelayWriteProbe` | `RelayWritePathProbe.h` | GAME, server | 120 completed runs |
-| 6 | per-connection send budget | `ConnectionBudgetProbe` | `RelayWritePathProbe.h` | GAME, server | 120 samples |
+| 6 | per-connection send budget | ConnectionBudgetProbe (deleted by og-session-runtime task 14, §12) | `RelayWritePathProbe.h` until then | GAME, server | 120 samples |
 
 The two files are split along a **disposability** line that no longer holds and is worth stating
 plainly, because the header used to argue it at length. `RelayWritePathProbe.h` was created as a
@@ -88,7 +83,7 @@ every write goes through a telemetry sibling:
 | `RelayArrivalProbe::noteArrival` | `NetSyncTelemetry::emitRelayArrival` | the relay-ring arrival callback that `SimulationNetSync::registerPredictionOwner` binds |
 | `FrameHealthProbe::noteFrame` | the adapter's per-frame game-thread hook | — |
 | `RelayWriteProbe::noteWrite` | the adapter's relay-write tap | — |
-| `ConnectionBudgetProbe::noteSample` | the adapter's per-frame per-connection sample | — |
+| ConnectionBudgetProbe's sample (deleted, §12) | the adapter's per-frame per-connection sample, the Unreal session's in-frame server's until og-session-runtime task 14 | — |
 
 ⚠ **That table is the correction, not the original.** Both headers named `SimulationNetSync` as the
 owner of the two collect paths; it has not owned them since the input-resolution extraction. §14,
@@ -429,8 +424,8 @@ the wire. Crediting its delivered ticks while not charging its gap would let an 
 
 **Origin, server-only.** This probe was built to measure the CAUSE of the quantity PROBE 2 measures
 the EFFECT of. PROBE 2 reports `gapCaptureTicks` — how many capture ticks a client's relay ring
-skipped between two arrivals. This probe reports how many sim ticks a game thread advanced between
-two frames. On the server the two are predicted to be the same number, and that prediction was the
+skipped between two arrivals. This probe reports how many sim ticks its pumping thread advanced between
+two frames (two wakes, on a FreeRunning authority). On the server the two are predicted to be the same number, and that prediction was the
 whole experiment:
 
 - Property replication runs once per server GAME-THREAD FRAME, and **the server frame-rate setting
@@ -453,15 +448,15 @@ sampled wall-clock time on that thread. The type was renamed from `ServerFramePr
 nothing role-specific survives in its math, so nothing role-specific should survive in its name.
 
 **Two routes to a ratio above 1, and they are not the same defect.** The physics engine may run
-several fixed sub-steps inside one game frame (`numSteps > 1`), or the game thread may simply be
+several fixed sub-steps inside one frame (`numSteps > 1`), or the pumping thread may simply be
 slow. Both show up as ticks-per-frame > 1 and they need different fixes, so this probe reports the
 sub-step count ALONGSIDE the ratio and never collapses them. **On a resimming client that
 separation is the whole point:** a resim burst folds extra sim ticks into `numSteps` at the SAME
-hook, so a ratio above 1 with `numStepsAboveOne > 0` reads as "resim ran", not "the game thread
+hook, so a ratio above 1 with `numStepsAboveOne > 0` reads as "resim ran", not "the pumping thread
 hitched" — the two client-cost questions the role extension exists to keep apart.
 
 **Hook-independent by construction.** The caller supplies a GLOBAL frame counter, not an invocation
-count, so the ratio is correct no matter which game-thread hook feeds it and no matter how often
+count, so the ratio is correct no matter which per-frame hook feeds it and no matter how often
 that hook fires — the same property that let this probe move to a second role without a second
 implementation. The probe additionally reports how its own invocations distributed over frames:
 `dFrame == 1` (once per frame, the assumed case), `dFrame == 0` (fired more than once in a frame,
@@ -470,15 +465,17 @@ hook's cadence is measured, never assumed — on either role, from its own count
 which hook the caller chose. The whole-window aggregate is likewise cadence-independent, because
 the totals are differences of the caller's own counters.
 
-**Game thread only, on whichever role the owning object runs on.** Like the other two objects it
+**One thread only (the pumping thread), on whichever role the owning object runs on.** Like the other two objects it
 holds no lock and needs none — it is touched from exactly one thread. Each role gets its OWN
 instance: the adapter's frame-health probe is a plain member, constructed once per actor, and both
 a server-role and a client-role actor exist as separate objects whenever ONE PROCESS HOSTS BOTH
 ROLES. Never shared, so there is no cross-role synchronization question either.
 
-**Tick source is the caller's problem**, and there is only one right answer on the game thread: the
-tick↔physics-frame mapper's atomic offset. The underlying clock — the server tick, or the client's
-prediction tick — is written on the physics thread and must not be read here on either role. This
+**Tick source is the caller's problem**, and there is only one right answer off the step's thread: the
+tick driver's published tick offset (the first upcoming tick it hands the per-frame hook; the Chaos
+tick↔physics-frame mapper's atomic offset until og-session-runtime task 4). The underlying clock — the
+server tick, or the client's prediction tick — is written on the step's thread and must not be read
+here on either role. This
 probe takes a plain number and therefore cannot make that mistake on the caller's behalf; the call
 site carries the argument for why the same atomic read already proven safe for the server call site
 is equally safe for the client one.
@@ -650,6 +647,12 @@ reason: the observable numerator needs the per-probe stage capacity.
 
 ## 12. PROBE 6 — the per-connection send budget
 
+> **Retired.** og-session-runtime task 14 deleted PROBE 6 (`RelayWritePathProbe.h`'s ConnectionBudgetProbe and its window
+> summary, and its four test cases in `RelayWritePathProbeTest.cpp`) with its one call site: the Unreal session fed it from its
+> frame function only while the server stepped in-frame, on the game thread, and that server is retired (a dedicated server's
+> authority runner never fed it, since og-input-latency P5-19). The section below records it as it stood.
+
+<!-- lint-anchor-ignore-begin: og-session-runtime task 14 deleted PROBE 6 (ConnectionBudgetProbe) with its one call site, the Unreal session in-frame server; this block records it as it stood -->
 **What it settles, and why the arithmetic alone was not enough.** The budget model is: the server's
 per-tick send allowance is the NEGOTIATED RATE divided by the desired tick rate, in bytes, and a
 connection may bank at most two ticks of unused allowance. Both halves are read from engine source
@@ -699,6 +702,7 @@ them across our window would drop whatever it zeroed mid-window. `tickRateHz` is
 than assumed so that a run on a differently-configured server still reports a correct allowance. A
 counter that went backwards means the connection was replaced under the same id (reconnect), so the
 probe re-anchors rather than reporting a negative delta as a gigantic unsigned one.
+<!-- lint-anchor-ignore-end -->
 
 ---
 
@@ -833,11 +837,13 @@ survives compression perfectly well — it is the *seal* comparison against the 
 
 ### F-35-8 — a field described under its log spelling, not its own name
 
+<!-- lint-anchor-ignore-begin: og-session-runtime task 14 deleted PROBE 6 (ConnectionBudgetProbe) with its one call site, the Unreal session in-frame server; this block records it as it stood (section 12) -->
 The send-budget block wrote *"`queuedBits` min/max and `notReadyFrames`"* while describing the
 struct. The field is `notReadySamples`; `notReadyFrames=` is the token the emitted log line uses.
 Both are live and both resolve, so this is a precision defect rather than a falsehood — but a reader
 grepping `notReadyFrames` in the engine-free core finds no field, and one grepping `notReadySamples`
 in a log finds no line. **Both names are now stated, in §12.**
+<!-- lint-anchor-ignore-end -->
 
 ### A ninth, smaller: a heading that counted three where the block declares four
 
@@ -2411,6 +2417,7 @@ number.** A line-number label in an archive is a join to a file that has since m
 // [T34] How many of one frame's staged writes the publish step can carry.
 ```
 
+<!-- lint-anchor-ignore-begin: og-session-runtime task 14 deleted PROBE 6 (ConnectionBudgetProbe) with its one call site, the Unreal session in-frame server; this block records it as it stood (the archive of its header block) -->
 **attached to** `// One summary per this many samples, per connection. At the intended once-per-`
 
 ```
@@ -2528,6 +2535,7 @@ number.** A line-number label in an archive is a join to a file that has since m
 // same id (reconnect). Re-anchor rather than reporting a negative delta as
 // a gigantic unsigned one.
 ```
+<!-- lint-anchor-ignore-end -->
 
 
 ---

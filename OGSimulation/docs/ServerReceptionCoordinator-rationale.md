@@ -268,10 +268,10 @@ therefore records it. No adapter signature changed to arm this gate.
 `noteRttSample` also receives a `serverTick` and could plausibly feed the same reference. It is
 deliberately **not** wired in, for two reasons:
 
-1. **Source quality.** `reapConnections` is called by the host on the game thread, once per physics
-   frame, and is passed that frame's `firstUpcomingSimTick` from the host's game-thread-safe tick
-   source (a tick↔physics-step mapper, or an offset the step publishes). `noteRttSample`'s tick is `getServerReceptionTick()`, an acknowledged wart: an
-   unsynchronized read of the physics-thread-written server clock. A gate that *discards* player
+1. **Source quality.** `reapConnections` is called by the host once per step batch, after it, and is
+   passed the batch's `firstUpcomingSimTick` from the offset the steps publish (a tick↔physics-step
+   mapper's before). `noteRttSample`'s tick is `getServerReceptionTick()`, an acknowledged wart: a read
+   of the step-written server clock, unsynchronized for a host that samples RTT off the step's thread. A gate that *discards* player
    input should judge against the safe source, not the racy one.
 2. **A monotonic-enough reference.** Two feeds a tick apart could hand the gate a reference that
    jitters backwards between consecutive receipts, making an input sitting exactly on a boundary
@@ -324,7 +324,7 @@ one-tick schedule shift several thousand ticks later.
 `captureTick > serverAuthorityTick + rollbackWindowTicks` — a **tighter** bound — at the
 physics-thread *delivery* layer, with its context published per authority tick through
 `setAuthorityGuardContext`. The two do not conflict and neither subsumes the other: this one guards
-**receipt** on the game thread, and therefore guards the relay tap; that one guards **delivery** into
+**receipt**, and therefore guards the relay tap; that one guards **delivery** into
 the simulation.
 
 On the parked path the queue guard is effectively dead — drained entries are due-or-overdue, never

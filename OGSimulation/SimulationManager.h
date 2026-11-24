@@ -151,10 +151,11 @@ concept SimulationSystemsExecutorConcept = requires(
 //     already had to be fixed for exactly this.
 //
 //   * THREADS. Everything in the dispatch group, and everything it calls, runs
-//     on the PHYSICS thread from the adapter's physics callbacks. The three
-//     config setters and `onPostSimulationGameThread` run on the GAME thread.
-//     `m_resimGateProbe` is physics-thread-only, which is why it holds no
-//     atomics.
+//     on the step's thread. The config setters
+//     run before the first step or between steps, never during one.
+//     `onPostSimulationGameThread` runs on the step's thread after each authority
+//     batch, despite its name (the rename waits for og-session-runtime task 22).
+//     `m_resimGateProbe` is step-thread-only, which is why it holds no atomics.
 //     ⭐ ONE ADAPTER'S BINDING FOR THE CALLBACK COLUMN BELOW: it names the
 //     physics-callback ROLE, never an engine type. On the tick driver the step
 //     driver (`SimulationStepDriver.h`) drives those roles in its tick. The former
@@ -694,7 +695,7 @@ private:
     // ⛔ THREE LINES, NOT ONE, split by PIPELINE STAGE: `.Gate` = did we ask, the middle
     // one = did the physics engine accept, `.Apply` = did it land. That middle tag spells
     // one adapter's engine — `[ResimProbe.Chaos]` — and is a FROZEN spelling archived greps
-    // key on, not a claim about this layer. With the game thread's two
+    // key on, not a claim about this layer. With the correction arrival's two
     // `[ResimProbe.Landing]` lines that is 5 Warning lines per window, inside a budget of
     // 6. §6
     void noteDivergenceCheck(bool requestedResim)

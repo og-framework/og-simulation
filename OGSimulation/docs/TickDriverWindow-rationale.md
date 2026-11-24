@@ -213,7 +213,7 @@ one format call: they must all be alive and distinct when the line is formatted.
 
 ## §6 Threads
 
-All window state belongs to the thread that owns the driver's frame (the game thread in an engine):
+All window state belongs to the thread that owns the driver's frame (the host's frame thread):
 the note doors, `restart`, `isDue` and the three formatters run there, and a step running on another
 thread reaches the window only through the owner's rings, never directly. In `FreeRunning` that owner
 is the runner, the dedicated thread that runs the authority loop and its steps; the frame thread does

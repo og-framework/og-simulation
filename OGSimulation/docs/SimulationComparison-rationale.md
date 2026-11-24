@@ -349,7 +349,7 @@ and no verdict test:
 
 The verdict condition the diff has (`!predictionWasCorrect`) is absent on purpose: agreeing verdicts
 are what this measures. The predicate follows `correctionFieldDiff`'s rules (§2): unset is off, it is
-re-read on every correction, game thread only, not atomic. It is a SECOND predicate rather than the
+re-read on every correction, on the thread that receives the corrections only, not atomic. It is a SECOND predicate rather than the
 first one reused, because one host answers the two at different levels. The UE host answers the margin
 gate from `LogOGDivergenceProbe` at `Log` and the diff gate at `Verbose`. So a session at `Log` gets the
 per-window margin line without the per-correction lines. `correctionVerdictMargin::walkCount` counts

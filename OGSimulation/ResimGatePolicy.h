@@ -63,7 +63,7 @@ namespace resimGate
     // -----------------------------------------------------------------------
     // W1 — DOES THIS LANDED CORRECTION SET THE PENDING ANCHOR? `landedAtFrontier`
     // is `tick == cache.getPredictionTick()` evaluated at INSERT TIME, on the
-    // game thread, inside the hit branch.
+    // thread that inserts the correction, inside the hit branch.
     //
     // ⭐ `FrontierExact` REPRODUCES THE LEGACY GATE'S OBSERVABLE BEHAVIOUR AND
     // IS THE COMPILED DEFAULT (`TimeConfig.h`) — but NOT the shipped
@@ -180,8 +180,8 @@ namespace resimGate
     // IT" — and the fresh/stale classifier that measures how often it bites.
     //
     // ⛔ THE DEFECT THIS REPAIRS (the HOLLOW ANCHOR). A replay could overwrite
-    // a slot a correction had just landed in (the game thread writes, an
-    // in-flight physics-thread replay clobbers) while leaving
+    // a slot a correction had just landed in (a correction written on one
+    // thread, an in-flight replay on another clobbering it) while leaving
     // `m_containsCorrectTick` SET, so the slot claimed authority provenance
     // over a re-derivation it did not have.
     //

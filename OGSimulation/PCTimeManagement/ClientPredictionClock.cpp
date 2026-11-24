@@ -347,7 +347,8 @@ int32_t ClientPredictionClock::getPendingInputDelayTransitionTicks() const
 }
 
 // One tick toward 0 by compare-exchange, so a request landing between the load
-// and the store (a frame-locked client requests on the game thread) is never lost.
+/// and the store (from another thread, as a frame-locked client's request was until
+// og-session-runtime task 13) is never lost.
 int32_t ClientPredictionClock::consumeOneInputDelayTransitionTick()
 {
     int32_t pending = m_pendingInputDelayTransitionTicks.load(std::memory_order_relaxed);

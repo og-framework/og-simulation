@@ -45,7 +45,7 @@ through it.
 | `FInputRedundancyBundle` | was one adapter's **wire type for the local-input RPC**, carrying the most-recent `redundancyDepth` ticks in one unreliable send (deleted by og-input-latency task P5-9; since P5-7 og-sim-net's `InputBundleBuffer` on the SimInput lane) | the core handles only its decoded contents |
 | `USimmableUpdateComponent` | one adapter's **per-character component**: it registers the character with the core and is the owner the core's callbacks are bound to | since og-ue-simulationcomponentandmanagersplit task 20a the replicated correction-state buffer behind those callbacks is held by a sibling component, `USimulatableNetSyncComponent` (deleted by og-input-latency task P5-8), which this one forwarded to; since task 20b the relayed-ring link behind the relayed-input callbacks is held there too; since task 29 its registration loop is the generic skeleton of its binding base, `UESimulatableOwnerBinding` |
 | `Iris` | that engine's **replication system** (the sim traffic's until og-input-latency task P5-7; og-net's sim lanes since) — the party that batches, drops and rolls back property writes | role words: *the replication system* / *the replication poll* |
-| `OnRep` / `OnRep_*`, `RPC` | that engine's **property notification** and **remote call**: the arrival of a replicated value on a client, and a client-to-server call | the sim traffic's until og-input-latency task P5-7. Since then a correction, a relay ring and an input bundle arrive through og-sim-net's sessions, in their drain (`SimNetClient::onCorrection`, `SimNetClient::onRing`, `SimNetServer::receiveBundle`): on the game thread frame-locked, on the step's thread on an immediate client. A quoted OnRep or RPC below is that arrival |
+| `OnRep` / `OnRep_*`, `RPC` | that engine's **property notification** and **remote call**: the arrival of a replicated value on a client, and a client-to-server call | the sim traffic's until og-input-latency task P5-7. Since then a correction, a relay ring and an input bundle arrive through og-sim-net's sessions, in their drain (`SimNetClient::onCorrection`, `SimNetClient::onRing`, `SimNetServer::receiveBundle`), on the step's thread (until og-session-runtime task 13 a frame-locked client drained on the game thread). A quoted OnRep or RPC below is that arrival |
 | `Config/DefaultEngine.ini` | one adapter's **host-application configuration surface**, where shipped policy and log values are set | another adapter supplies the same values under its own keys |
 
 ⛔ **None of these is a dependency of this core**, and none of them appears in `SimulationNetSync.h`
@@ -1663,7 +1663,7 @@ This section is not archived prose. It was written with the code it describes, a
 here.
 
 **What it changes.** `sendLocalInputToAuthorityAll` takes a third argument, `redundancyFrames`
-(`TimeConfig::redundancyFrames`, read live by `SimulationManager::onPostSimulationGameThread`). Each local sender's
+(`TimeConfig::redundancyFrames`, read live at each send). Each local sender's
 bundle now carries `slots` entries instead of `redundancyDepth`, and `releaseAllButRecent` keeps the same `slots`. The
 owner concept is unchanged: the owner still receives one scalar and still builds the bundle from the queue, so no wire
 type enters this layer. The header includes the engine-free codec header only for `inputRedundancyBundle::kMaxSlots`.
@@ -1701,14 +1701,12 @@ quarter of a second at 30 fps).
   forward jump samples at most `kMaxSlots`, so one resync cannot hold the window at the cap for longer than the EMA's
   memory.
 
-**Lifetime.** `m_redundancyCadences` is touched only by the send (on the game thread frame-locked; on an immediate client
-on the step's thread, `SimNetClient::afterCaptureTick_Step`), and by
-`unregisterSimulatableContainers` step 2, which erases the entry beside the sender maps. A re-registration therefore
-starts a fresh cadence. ⚠ It is a third game-thread container in step 2. The deferral fence on `clearOwnerCallbacks`
-names the two sender maps; the cadence map adds to the same blocker, because the send looks it up with
-`operator[]` every frame and inserts on a sender's first send. Adopting `DeferredLifecycleQueue` would have to marshal it with them.
-og-sim-net's immediate client does (og-input-latency P5-17): its lifecycle queue applies the unregistration on the step's
-thread, the send's thread there. A frame-locked client still sends and unregisters on the game thread.
+**Lifetime.** `m_redundancyCadences` is touched only by the send and by `unregisterSimulatableContainers` step 2,
+which erases the entry beside the sender maps. A re-registration therefore starts a fresh cadence. ⚠ It is the third
+container in step 2 that the send reads. The deferral fence on `clearOwnerCallbacks` names the two sender maps; the
+cadence map adds to the same requirement, because the send looks it up with `operator[]` on every send and inserts on
+a sender's first send. A host that adopts `DeferredLifecycleQueue` must send on the step's thread, where the queue
+applies the unregistration, so the send and step 2 share one thread (og-input-latency P5-17).
 
 **The log line.** `[SendLocalInputToServer] id=… tick=… depth=… slots=…`: `slots=` is appended, so existing greps on
 `depth=` still match. At the default, every line reads `depth=3 slots=3` on a 60 Hz tick.

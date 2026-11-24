@@ -77,6 +77,7 @@ None of the four is a dependency of this core.
 <!-- lint-external-ref: ResimGatePolicyTest -- TEST TRANSLATION UNIT in og-simulation-tests, outside every scan root of this repository; it must not resolve here -->
 <!-- lint-external-ref: impl/research_correction_discards.md -- ARCHIVE PATH in the og-netcode-v2-input-relay workspace, outside this repository; it must not resolve -->
 <!-- lint-external-ref: findInputCache -- RENAMED (item 39, 2026-08-25) to findCorrectionCache; the old spelling survives only inside verbatim pre-compression archive blocks and must not resolve -->
+<!-- lint-external-ref: editReconciliation -- the Unreal session's reconciliation door, deleted by og-input-latency task P5-16; it survives only inside a verbatim pre-compression archive block and must not resolve -->
 
 ---
 

@@ -287,7 +287,7 @@ struct TimeConfig
 	// ⛔ 0 IS "TODAY", NOT "OFF": the bundle keeps exactly `redundancyDepthTicks`. §12
 	// ⛔ CLAMPED to [0, kMaxRedundancyFrames] by `latencyKnobs::clampRedundancyFrames`
 	// at the intake and at the setter. §12
-	// Read by `SimulationManager::onPostSimulationGameThread`, which hands it to
+	// Read live at each send of the local inputs, as the third argument of
 	// `SimulationNetSync::sendLocalInputToAuthorityAll` (og-input-latency task 7). §12
 	int32_t redundancyFrames = 0;
 

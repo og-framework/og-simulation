@@ -275,8 +275,8 @@ public:
 		PublishF&& publish, unsigned int id, SimulatableT& simulatable, const StaticDataT& staticData)
 	{
 		OG_CHECK(!freeRunning() || m_worldHost.threadContext().isOwnerThreadForRole(),
-			"SimulationTickBackend::acquireAndBind: a free-running authority binds on its runner; the game thread reaches it "
-			"through queues only");
+			"SimulationTickBackend::acquireAndBind: a free-running authority binds on its runner; every other thread reaches "
+			"it through queues only");
 		const std::optional<uint32_t> slot = m_worldHost.acquire(key, name, isAuthority, replicatedSlot, publish);
 		if (!slot.has_value())
 			return false;
@@ -311,8 +311,8 @@ public:
 	void releaseSlot(uint64_t key, unsigned int id)
 	{
 		OG_CHECK(!freeRunning() || m_worldHost.threadContext().isOwnerThreadForRole(),
-			"SimulationTickBackend::releaseSlot: a free-running authority releases on its runner; the game thread reaches it "
-			"through queues only");
+			"SimulationTickBackend::releaseSlot: a free-running authority releases on its runner; every other thread reaches "
+			"it through queues only");
 		m_worldHost.release(key, id, [this](uint32_t slot, bool occupied) { driver().pushBodySlotOccupancy(slot, occupied); });
 	}
 

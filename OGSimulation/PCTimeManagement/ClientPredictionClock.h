@@ -394,10 +394,11 @@ private:
 
     // [T11, signed since og-input-latency P6-2] The unpaid input-delay transition:
     // > 0 Stalls owed, < 0 Skips owed. Paid one tick per advancePrediction() call
-    // toward 0 by compare-exchange, cleared by a hard resync. Atomic because the
-    // request runs where the floor and the tier arrive: the game thread on a
-    // frame-locked client, the step thread on an immediate one
-    // (docs/ThreadingCrossings.md row 12).
+    // toward 0 by compare-exchange, cleared by a hard resync. The request runs where
+    // the floor and the tier arrive, on the step's thread with the payment
+    // (docs/ThreadingCrossings.md row 12). Atomic because until og-session-runtime
+    // task 13 a frame-locked client requested on its frame thread; the atomic and its
+    // static_assert are code and stay.
     static_assert(std::atomic<int32_t>::is_always_lock_free,
         "ClientPredictionClock: the input-delay transition debt is requested off the clock's thread on a frame-locked "
         "client, so it must be a lock-free atomic (og-input-latency P6-2; it was a plain unsigned before)");
