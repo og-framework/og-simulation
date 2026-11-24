@@ -327,7 +327,7 @@ scheduler's time base, it is the seam a time-dilation controller plugs into.
 
 **The rate door.** `pumpAndRunSteps` builds a new `TickRateDoor` for each pump, with the scheduler, the
 published tick offset J3 (loaded relaxed, §5), the role (`m_config.isAuthority`) as the door's refusal
-flag, and `m_refusedRateChanges` as its counter (`TickDriverConcepts-rationale.md` §7). So the game's
+flag, and `m_refusedRateChanges` as its counter (`TickDriverGameTypes-rationale.md` §2). So the game's
 `beforePump` reads the scheduler's `nextDeadline()` and `currentInterval()` and the offset the steps last
 published from the door it is handed, with no further hook.
 * **An authority's door refuses.** On an authority `setRateScale` changes nothing and counts one refusal

@@ -61,7 +61,10 @@ with `std::snprintf`, and checks that only the 5,000-character line allocates.
 Written on 2026-10-16 for the og-tickdriver migration, to replace the engine string formatting the
 brawler's Unreal frame host and Jolt backend host use for their host lines, in `TickDriverLog.h`.
 
-Moved unchanged to this header on 2026-11-24 (og-session-runtime task 18), with guard G-01 and its tag. The
+Moved unchanged to this header on 2026-11-24 (og-session-runtime task 18), with guard G-01 and its tag. G-01 was
+`TickDriverLog-guards.md` G-01 until then, and kept its id. The entry's text before that move said that deleting the
+`va_copy` alone does not compile; it does (`HostLog-guards.md` G-01, "What breaks if it moves"), and the entry was
+corrected in the move. The
 types are og-simulation vocabulary rather than tick-driver machinery: og-simulation headers outside the tick
 driver use them too (`ClockDilationController.h` formats its window line with `formatHostLine`;
 `SimulationLogRoutes.h` gives each route a `HostLogLevel`), and they now include this header rather than one

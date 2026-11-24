@@ -11,7 +11,6 @@
 #include "glm/gtc/quaternion.hpp"
 #include "glm/vec3.hpp"
 #include "OGSimulation/PhysicsWorldAdapter.h"
-#include "OGSimulation/SimulationScheduler.h"
 #include "OGSimulation/StepHooks.h"
 #include "OGSimulation/TickDriverGameTypes.h"
 #include "OGSimulation/TickDriverLog.h"

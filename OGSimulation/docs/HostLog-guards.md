@@ -40,8 +40,3 @@ hidden on every short line.
 pass then reads it uninitialized. clang (`-std=c++20`) compiles that with no error and reports it only under
 `-Wall`, as a `-Wuninitialized` warning (measured 2026-11-24). Deleting the declaration too does not compile,
 because `retry` is then undeclared.
-
-**History.** This guard was `TickDriverLog-guards.md` G-01 until 2026-11-24, when og-session-runtime task 18
-moved `formatHostLine` and its tag site from `TickDriverLog.h` to this header with its id unchanged. The text
-before that move said that deleting the `va_copy` alone does not compile; it does (above), and that sentence was
-corrected here.
