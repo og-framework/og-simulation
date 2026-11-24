@@ -10,7 +10,7 @@ the header's rules are `static_assert`s).
 Fix this file; do not soften the header to match it.
 
 ⚠ **This header is `og-simulation` core and ships standalone under MPL-2.0**, engine-free by
-construction: plain `char` prefixes, `HostLogLevel` from `TickDriverLog.h`, no engine type. Everything
+construction: plain `char` prefixes, `HostLogLevel` from `HostLog.h`, no engine type. Everything
 below is true to a reader with no game engine and no other repository.
 
 ---

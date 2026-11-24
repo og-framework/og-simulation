@@ -9,11 +9,11 @@
 #include <cstdint>
 #include <optional>
 
+#include "OGSimulation/HostLog.h"
 #include "OGSimulation/OGAssert.h"
 #include "OGSimulation/PCTimeManagement/ClientPredictionClock.h"
 #include "OGSimulation/PCTimeManagement/TimeConfig.h"
-#include "OGSimulation/TickDriverConcepts.h"
-#include "OGSimulation/TickDriverLog.h"
+#include "OGSimulation/TickDriverGameTypes.h"
 
 enum class ClockDilationMode : uint8_t { Off, Shadow, On };
 

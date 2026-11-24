@@ -13,7 +13,7 @@ nine guard tags and three derivation tags (§5.1, §3.1, §5.4); everything that
 file; do not soften the header to match it.
 
 ⚠ **This header is `og-simulation` core and ships standalone under MPL-2.0**, engine-free (the STL, `TimeConfig.h`,
-`ClientPredictionClock.h` for `ClockCorrectionPhase`, `TickDriverConcepts.h` for `TickRateDoor`, `TickDriverLog.h` for the
+`ClientPredictionClock.h` for `ClockCorrectionPhase`, `TickDriverGameTypes.h` for `TickRateDoor`, `HostLog.h` for the
 window's line buffer and `OGAssert.h`). The law and the stage never allocate; the window allocates its line buffer once, at
 construction (§14). Where a host appears below it is "the host": whatever program owns the scheduler, the clock and the log.
 

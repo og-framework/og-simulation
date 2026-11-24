@@ -1,11 +1,12 @@
 <!-- SPDX-License-Identifier: MPL-2.0 -->
 # `TickDriverConcepts.h` — rationale
 
-The narrative behind `TickRateDoor`, `IdleWake` and the ten tick-driver concepts:
+The narrative behind the ten tick-driver concepts:
 `TickDriverEngine`, `TickDriverGame`, `TickDriverSampleGame`, `TickDriverReceiveGame`, `TickDriverDisplayGame`, `TickDriverIdleGame`, `TickDriverPresenterSteps`,
 `TickDriverWorldHost`, `TickDriverRenderSink` and `TickDriverRunnerHost`, and the helper concept `OptionalVec3Result` (§5). The header keeps its licence,
 its docs pointer, its code and its self-check `static_assert`s; everything that explains it lives here. It has no guards (`TickDriverConcepts-guards.md`
-says why): every rule it carries is a `static_assert`.
+says why): every rule it carries is a `static_assert`. `TickRateDoor` and `IdleWake`, the types the game hooks receive and
+return, are declared in `TickDriverGameTypes.h`, which this header includes (§7, §8).
 
 **If this file and `TickDriverConcepts.h` disagree, the header is authoritative and this file is stale.**
 Fix this file; do not soften the header to match it.
@@ -54,7 +55,7 @@ for; the driver's own documentation states when it calls each one.
 - `nowSeconds()` and `frameNumber()`: the host clock and the engine's frame counter, both callable on a
   const engine;
 - `logEnabled(level)` and `log(level, line)`: the host log sink for the driver's lines, with the levels
-  of `HostLogLevel` (`TickDriverLog.h`). `logEnabled` lets a caller skip formatting a line whose level
+  of `HostLogLevel` (`HostLog.h`, through `TickDriverLog.h`). `logEnabled` lets a caller skip formatting a line whose level
   is disabled;
 - `kHostDiagnostics`: a `bool` **constant expression**. The driver and the world host branch on it with
   `if constexpr`, so a build without diagnostics compiles none of their diagnostic code;
@@ -163,30 +164,10 @@ except the one property it names, so each assertion stays tied to that property.
 
 `BasicLockable` is in `TickDriverThreadContext.h`, with its own self-check.
 
-## §7 `TickRateDoor` and `StepThreading`
+## §7 `StepThreading`, and where `TickRateDoor` is
 
-`TickRateDoor` is the only part of the scheduler a game reaches. `setRateScale`, `rateScale`,
-`lostTime`, `physicsStepCount` and `nextDeadline` forward to the same-named `SimulationScheduler`
-members, and `currentInterval` to `SimulationScheduler::currentStepInterval`, the interval of the
-scheduler's newest deadline segment: the spacing from `nextDeadline()` to the deadline after it, and
-exactly `dtSeconds / rateScale()` (a rate change applies from the next deadline on,
-`SimulationScheduler-rationale.md` §5). It holds a pointer to the scheduler, which must outlive it. The
-scheduler has no synchronization, so the door is used only on the scheduler's owning thread, which is
-where `beforePump` runs.
-
-The constructor takes three more arguments, and the door's owner passes all of them; none has a
-default:
-- `tickOffset`, returned by `tickOffset()`: the offset from a physics step to the sim tick that step
-  integrates, as the owner last saw it. The door copies the value when it is built, so it stays the
-  same for the door's lifetime. A tick driver passes its published offset (`SimulationTickDriver-rationale.md` §5, J3);
-- `refusesRateChange`: when true, `setRateScale` changes nothing. The scheduler's rate, interval and
-  deadlines stay as they were, and the call only adds one to the refusal counter. Every call counts:
-  a value equal to the current scale, or a NaN, is refused and counted too. A tick driver passes its
-  role, so an authority's door refuses and a client's applies (`SimulationTickDriver-guards.md` G-11);
-- `refusedRateChanges`, a counter the door holds by pointer and reads back in `refusedRateChanges()`.
-  It belongs to the owner and must outlive the door. A driver builds a new door for each pump, and the
-  count carries over from one door to the next, so it covers the whole session. A door that applies
-  its calls never writes the counter.
+`TickRateDoor` is declared in `TickDriverGameTypes.h`, which this header includes; what it forwards to and
+what its constructor takes are in `TickDriverGameTypes-rationale.md` §2.
 
 `StepThreading` names the three ways a driver can run its steps: `Inline` (on the thread that pumps),
 `FrameBounded` (on an engine task, waited for within the frame) and `FreeRunning` (on a thread of its
@@ -198,7 +179,7 @@ header still sees it: the thread context is configured with the mode (`TickDrive
 
 In `FreeRunning` (§7) a runner thread of its own pumps the scheduler and runs the steps. Between steps it
 has nothing to do until the next step's deadline or until input arrives. `TickDriverIdleGame` gives the
-game that wait: `IdleWake idleUntil(double deadlineSeconds)`. It refines `TickDriverGame`, so a game that
+game that wait: `IdleWake idleUntil(double deadlineSeconds)` (`IdleWake` is in `TickDriverGameTypes.h`). It refines `TickDriverGame`, so a game that
 never runs free does not declare it and is still a `TickDriverGame` (the self-check pins both).
 
 **The hook contract.**
@@ -337,6 +318,7 @@ than following the collect in `onStepStarted`, where what it received reached on
 `TickDriverDisplayGame` and §11 were added on 2026-11-20, so that a client's display copy is taken after its batch on the
 step's thread, rather than on the frame's thread while the frame's own batch could still be stepping. Also on
 2026-11-20 `TickRateDoor` gained `nextDeadline`, `currentInterval`, `tickOffset` and `refusedRateChanges`, and the
-constructor's offset, refusal flag and counter (§7), so that a rate controller reads the scheduler's timing through the
-door it already receives and an authority's door refuses its rate changes. Nothing in this file depends on any document
+constructor's offset, refusal flag and counter (`TickDriverGameTypes-rationale.md` §2), so that a rate controller reads the scheduler's timing through the
+door it already receives and an authority's door refuses its rate changes. On 2026-11-24 og-session-runtime task 18 moved
+`TickRateDoor` and `IdleWake`, unchanged, to `TickDriverGameTypes.h`, which this header includes, and pointed §7 there. Nothing in this file depends on any document
 outside this submodule.

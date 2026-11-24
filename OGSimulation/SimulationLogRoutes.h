@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MPL-2.0
 // docs/SimulationLogRoutes-rationale.md · docs/SimulationLogRoutes-guards.md
 
-#include "OGSimulation/TickDriverLog.h"
+#include "OGSimulation/HostLog.h"
 
 #include <cstddef>
 #include <cstdint>

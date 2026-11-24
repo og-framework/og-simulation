@@ -17,23 +17,15 @@ true and actionable to a reader with no game engine and no other repository.
 
 ---
 
-## G-01 — The second `vsnprintf` reads `retry`, the copy. Never pass it `args`.
+**There are no live guards.** The header includes `HostLog.h` and declares nothing of its own.
 
-**Tag site:** `TickDriverLog.h`, in `formatHostLine`, immediately above the second `std::vsnprintf`
-call, the one that formats into the grown line.
+## §R Retired ids
 
-**The prohibition.** Do not pass `args` to the second pass, and do not replace the `va_copy` with a
-second `va_start` over the same list or a plain assignment of one `va_list` to another.
+⛔ **These ids are spent.** They may be named, but must never again appear as a `⛔G-nn` tag that
+names this file.
 
-**The consequence.** The first `std::vsnprintf` consumes `args`. The C standard leaves a `va_list`
-indeterminate after a `v…printf` call has read from it, so a second pass over `args` may format garbage
-or read past the arguments. On an ABI whose `va_list` is an array type (x86-64 System V: Linux, and
-macOS on Intel) the callee advances the caller's list, and the second pass then reads the arguments
-after the last one. With MSVC on Windows x64 the reuse happens to format the same line, so a Windows
-test does not catch it: with the second pass reading `args`,
-`TickDriverLog.FormatHostLine.EqualsSnprintfWithoutTruncationOrAllocation` passed (measured
-2026-10-16). Only lines longer than the reservation take the second pass, so the defect also stays
-hidden on every short line.
+### G-01 — RETIRED, moved with its site to `HostLog-guards.md` G-01
 
-**What breaks if it moves.** The `va_copy` must be taken before the first pass reads `args`. Deleting it
-alone does not compile, because `retry` is then undeclared.
+The second `vsnprintf` in `formatHostLine` reads `retry`, the copy, never `args`. On 2026-11-24
+og-session-runtime task 18 moved `formatHostLine` unchanged from this header to `HostLog.h`, and the
+guard went with it: its entry and its tag are now `HostLog-guards.md` G-01, under the same id.
