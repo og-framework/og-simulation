@@ -1556,7 +1556,8 @@ Not archived prose; the header's `§16` pointers at `setClockRttSource` land her
 `TimeConfig`, and no clamp (the enum has two values, both valid).
 
 **The configuration key** (P3-10 part B). The Unreal host's `[OGNetcode] ClockRttSource=Engine|SimClock` (case-insensitive,
-read on both roles beside `RecentreSettleSamples`) calls the setter from its session's `applyClockRttSource`; an
+read on both roles beside `RecentreSettleSamples`) calls the setter through og-sim-session's `applyClockRttSource` (the
+Unreal session's member until og-session-runtime task 23); an
 unrecognised value is reported and the compiled default kept. The start-up line is `[ClockSource.Config] clockRttSource=<Engine|SimClock>
 (<ini|compiled>)`.
 

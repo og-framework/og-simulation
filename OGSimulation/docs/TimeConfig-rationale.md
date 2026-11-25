@@ -608,8 +608,9 @@ orientation rule that both roles carry the same struct: `redundancyFrames` is re
 `relayResendEntries` only by the authority's flush, and each simply has no reader on the other role. Its start-up
 proof line is `[LatencyKnobs] redundancyFrames=… relayResendEntries=… (ini|compiled)`, at `Warning`, with the values
 read back from the session's `TimeConfig`. The trailing token is `ini` when either key was present in the ini and
-`compiled` when neither was. (One adapter's binding: `UESimulationSession`'s `readSessionKnobs` and
-`applyLatencyKnobs`, and the commented-out keys in the brawler's `Config/DefaultEngine.ini`.)
+`compiled` when neither was. (One adapter's binding: og-sim-session's `readSessionKnobs` and `applyLatencyKnobs`
+(`SessionKnobs.h`, since og-session-runtime task 23; `UESimulationSession`'s members before), which the Unreal session calls,
+and the keys in the brawler's `Config/DefaultEngine.ini`.)
 
 ## 13. Back-dating detection: the m0 p50 threshold
 
@@ -657,8 +658,8 @@ Since og-input-latency P3-11 it counts the clock's own advances on which the est
 `NetworkTimeEstimator::getMeasuredRTTSampleCount`, the running total of samples that passed `updateRTT`'s validity gate
 (plausible or not) **and read above 0**, which the decision's line still reports. See "The window is time" below. The
 composition root may override it with the `RecentreSettleSamples`
-key under `[OGNetcode]`, read on both roles (one adapter's binding: `UESimulationSession`'s `readSessionKnobs` and
-`applyLatencyKnobs`, with the start-up line `[ClockRecentre.Config] recentreSettleSamples=… (ini|compiled)`). The key
+key under `[OGNetcode]`, read on both roles (one adapter's binding: og-sim-session's `readSessionKnobs` and
+`applyLatencyKnobs`, `UESimulationSession`'s members until og-session-runtime task 23, with the start-up line `[ClockRecentre.Config] recentreSettleSamples=… (ini|compiled)`). The key
 exists so the A arm (0) runs on the same binary as the B arm.
 
 **The problem it fixes: the dead band keeps a join's landing error for the session.** The clock corrects only a drift
