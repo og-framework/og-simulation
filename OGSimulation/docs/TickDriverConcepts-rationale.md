@@ -278,8 +278,8 @@ your display shows." A client whose steps run on another thread than its frame c
 the frame: under `FrameBounded` the frame's end of physics waits only for earlier frames' steps (or for this frame's
 single step, `FrameWait::ThisFramesSingleStep`), so the frame's own batch may be stepping while the frame reads. This
 hook runs where nothing steps: on the step's thread, after the batch's last step and before the next batch, which the
-engine runs only after this one. The game publishes a copy there (og-simulation's `SimulationDisplaySnapshot.h` is
-such a copy) and the frame reads only the copy.
+engine runs only after this one. The game publishes a copy there (og-sim-session's `SimulationDisplaySnapshot.h` in this
+tree, og-simulation's until og-session-runtime task 25, is such a copy) and the frame reads only the copy.
 
 **The hook contract.**
 - It is called once per client batch (the steps one frame dispatched), after the batch's last step, on the thread
