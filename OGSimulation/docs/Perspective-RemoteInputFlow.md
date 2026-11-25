@@ -115,7 +115,7 @@ input the authority is still holding. That held copy travels its own short path.
 
 | # | hop | machine · thread | file | symbol |
 |---:|---|---|---|---|
-| A1 | Before each authority step, the drain runs for the tick about to be simulated (once per physics frame, for the frame's ticks, in the former Chaos configuration) | S · GT | `Plugins/OGSimulation/Source/OGSimulationUnreal/UESimulationSession.h` | `releaseDelayedInputsForStep` |
+| A1 | Before each authority step, the drain runs for the tick about to be simulated (once per physics frame, for the frame's ticks, in the former Chaos configuration) | S · GT | `Plugins/OGSimulation/Source/OGSimulationSession/og-sim-session/OGSimSession/SessionNetHooks.h` | `releaseForTick` (the Unreal session's `releaseDelayedInputsForStep` until og-session-runtime task 26) |
 | A2 | Every claimed slot releases what is due, or overdue | S · GT | `<core>Network/ServerReceptionCoordinator.h` | `releaseDelayedInputs` |
 | A3 | …surfacing the entry's **stored** capture tick, not a reconstructed one | S · GT | `<core>Network/ServerInputDelayQueue.h` | `tryDequeueForTick` |
 | A4 | Delivery routes id → the character's channel → core (og-sim-net's server since og-input-latency task P5-7; id → component before) | S · GT | `Plugins/OGSimulation/Source/OGSimulationNet/og-sim-net/OGSimNet/SimNetServer.h` | `deliverRemoteInput` |

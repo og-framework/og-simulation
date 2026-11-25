@@ -200,7 +200,8 @@ in task 13.
   thread, before the pump; the game publishes the frame's sample there through a `TripleBuffer` (`Mailbox.h`: one
   producer, one consumer, the reader always takes the newest whole sample), and its provider reads only that. The
   Unreal brawler adopts it in P5-15: `UOGBrawlerInputCollectionComponent` stages a `BrawlerInputSample` in the
-  character's tick and publishes it from `BrawlerTickDriverGameUImpl::sampleInput()`; `buildPlayerInput` reads only the
+  character's tick and publishes it from `BrawlerSessionHooksUImpl::sampleInput` (which og-sim-session's `SessionTickGame`
+  calls through the Unreal session's tick host since og-session-runtime task 26); `buildPlayerInput` reads only the
   published sample. Before P5-15 the provider read the component's fields directly while the game thread could write
   them, accepted as benign (each field a trivially copyable value, re-sampled every frame); that crossing was in the
   outer game repository, outside this doc's scope, and was never a row here. Like the Chaos tick mapper above, the adopting

@@ -90,8 +90,9 @@ this warning produced **28,192 lines / 6.4 MB in 94 s** of a single session.
 
 ### The drain, and the capture tick it delivers
 
-`releaseDelayedInputs` runs from the adapter's pre-physics-step hook — `releaseDelayedInputsForStep`
-in the one adapter that exists today. The adapter supplies `firstUpcomingSimTick` and `numSteps`
+`releaseDelayedInputs` runs from the adapter's pre-physics-step hook — og-sim-session's
+`SessionNetHooks::releaseForTick` since og-session-runtime task 26 (the Unreal session's `releaseDelayedInputsForStep` until
+then), through og-sim-net's server. The adapter supplies `firstUpcomingSimTick` and `numSteps`
 because it owns the game-thread-safe tick source; the core never reads a physics-thread clock.
 
 **The delivered capture tick is the entry's STORED `captureTick`, never a reconstructed

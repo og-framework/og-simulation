@@ -1594,9 +1594,11 @@ Not archived prose; the header's `§18` pointer at `noteAuthorityStepSeconds` la
 and clears it, so each value is written on exactly one step's line. A step with no value set logs the line as it was
 before the field existed, byte for byte: the tests, a host that never calls the setter, and the second and later steps
 of a host that releases several steps at once and notes one time for them. The manager reads no clock and does not
-interpret the number; the host chooses the clock (one adapter's binding: the Unreal session's
-`releaseDelayedInputsForStep` notes `FPlatformTime::Seconds()` at the release that precedes the step, the same value it
-passes to the coordinator's `[Release]` lines, `ServerReceptionCoordinator-rationale.md` §8).
+interpret the number; the host chooses the clock (one adapter's binding: og-sim-session's `SessionClock::noteAuthorityStepStart`
+notes the Unreal engine's `FPlatformTime::Seconds()` before the release that precedes the step, and the release
+(`SessionNetHooks::releaseForTick`, og-session-runtime task 26) passes the same value to the coordinator's `[Release]` lines,
+`ServerReceptionCoordinator-rationale.md` §8; the Unreal session's `releaseDelayedInputsForStep` did both until
+og-session-runtime task 24).
 
 **Why.** A host may stamp a log line later than it was written. The Unreal dedicated server has no log thread, so a line
 the authority runner logs is stamped when the server's frame next flushes the log queue, up to one server frame late. The
