@@ -35,8 +35,8 @@
 #include "OGSimulation/SimulationObjectStorage.h"
 #include "OGSimulation/SimulationTimeContext.h"
 #include "OGSimulation/StepHooks.h"
-#include "OGSimulation/TickDriverConcepts.h"
-#include "OGSimulation/TickDriverLog.h"
+#include "OGTickDriver/TickDriverConcepts.h"
+#include "OGTickDriver/TickDriverLog.h"
 
 struct PresentControls
 {

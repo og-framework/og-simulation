@@ -14,7 +14,7 @@
 #include "OGSimulation/BodySlotAssignment.h"
 #include "OGSimulation/BodySlotOccupancy.h"
 #include "OGSimulation/OGAssert.h"
-#include "OGSimulation/TickDriverLog.h"
+#include "OGTickDriver/TickDriverLog.h"
 
 template <typename E>
 concept TickSlotLogTarget = requires(E& e, const E& ce, HostLogLevel level, const char* line)

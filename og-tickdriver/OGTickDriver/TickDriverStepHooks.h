@@ -9,7 +9,7 @@
 #include "OGSimulation/OGAssert.h"
 #include "OGSimulation/PhysicsWorldAdapter.h"
 #include "OGSimulation/StepHooks.h"
-#include "OGSimulation/TickDriverConcepts.h"
+#include "OGTickDriver/TickDriverConcepts.h"
 
 struct StepCostSample
 {

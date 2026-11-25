@@ -4,8 +4,8 @@
 
 #include "OGSimulation/OGExport.h"
 #include "OGSimulation/SimulationScheduler.h"
-#include "OGSimulation/TickDriverLog.h"
-#include "OGSimulation/TickDriverThreadContext.h"
+#include "OGTickDriver/TickDriverLog.h"
+#include "OGTickDriver/TickDriverThreadContext.h"
 
 #include <algorithm>
 #include <array>

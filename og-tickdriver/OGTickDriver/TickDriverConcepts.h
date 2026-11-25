@@ -13,8 +13,8 @@
 #include "OGSimulation/PhysicsWorldAdapter.h"
 #include "OGSimulation/StepHooks.h"
 #include "OGSimulation/TickDriverGameTypes.h"
-#include "OGSimulation/TickDriverLog.h"
-#include "OGSimulation/TickDriverThreadContext.h"
+#include "OGTickDriver/TickDriverLog.h"
+#include "OGTickDriver/TickDriverThreadContext.h"
 
 namespace tickDriverConceptProbe
 {

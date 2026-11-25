@@ -13,8 +13,8 @@
 #include <utility>
 
 #include "OGSimulation/OGAssert.h"
-#include "OGSimulation/TickDriverConcepts.h"
-#include "OGSimulation/TickDriverLog.h"
+#include "OGTickDriver/TickDriverConcepts.h"
+#include "OGTickDriver/TickDriverLog.h"
 
 template <typename H>
 concept ExecutorThreadHost = requires(H& h, const char* name, int priority, void (*fn)(void*), void* arg)

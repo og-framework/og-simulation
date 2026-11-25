@@ -3,6 +3,8 @@
 file(GLOB_RECURSE OGSIM_SOURCES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/*.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../og-tickdriver/OGTickDriver/*.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../og-tickdriver/OGTickDriver/*.h"
 )
 
 # UE-only files that cannot compile in the standalone CMake build:
@@ -15,6 +17,7 @@ add_library(og_simulation STATIC ${OGSIM_SOURCES})
 
 target_include_directories(og_simulation PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../og-tickdriver
 )
 
 target_link_libraries(og_simulation PUBLIC glm::glm-header-only)

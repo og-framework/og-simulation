@@ -14,10 +14,10 @@
 #include "OGSimulation/Mailbox.h"
 #include "OGSimulation/OGAssert.h"
 #include "OGSimulation/QueryGeometry.h"
-#include "OGSimulation/SimulationTickDriver.h"
+#include "OGTickDriver/SimulationTickDriver.h"
 #include "OGSimulation/StaticGeometry.h"
-#include "OGSimulation/TickDriverConcepts.h"
-#include "OGSimulation/TickDriverPresenter.h"
+#include "OGTickDriver/TickDriverConcepts.h"
+#include "OGTickDriver/TickDriverPresenter.h"
 
 namespace tickBackendWorldHost
 {
