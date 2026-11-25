@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: MPL-2.0
 // docs/TickDriverWindow-rationale.md · docs/TickDriverWindow-guards.md
 
-#include "OGSimulation/OGExport.h"
 #include "OGSimulation/SimulationScheduler.h"
+#include "OGTickDriver/OGTickDriverExport.h"
 #include "OGTickDriver/TickDriverLog.h"
 #include "OGTickDriver/TickDriverThreadContext.h"
 
@@ -69,7 +69,7 @@ struct TickDriverPercentiles
 	double   max = 0.0;
 };
 
-OGSIMULATION_API TickDriverPercentiles tickDriverPercentilesOf(float* values, uint32_t count);
+OGTICKDRIVER_API TickDriverPercentiles tickDriverPercentilesOf(float* values, uint32_t count);
 
 struct TickDriverWindowTotals
 {

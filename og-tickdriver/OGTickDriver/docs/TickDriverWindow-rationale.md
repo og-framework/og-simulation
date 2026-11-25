@@ -228,7 +228,8 @@ sure it is formatted once (the old frame host kept a "first step logged" flag be
 
 ## §7 What the `.cpp` holds
 
-Only `tickDriverPercentilesOf`, exported with `OGSIMULATION_API`: the one non-template algorithm, so
+Only `tickDriverPercentilesOf`, exported with `OGTICKDRIVER_API` (the OGTickDriver module's, `OGTickDriver-rationale.md`
+§4; `OGSIMULATION_API` until og-session-runtime task 27b): the one non-template algorithm, so
 every engine module that instantiates the window shares one sort-and-rank routine. Everything else is
 a template over the allocator and lives in the header.
 
