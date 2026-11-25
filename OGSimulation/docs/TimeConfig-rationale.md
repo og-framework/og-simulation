@@ -895,7 +895,7 @@ in the clock. The re-centre corrects the landing either way.
 
 **Why a 0 reading does not count** (found by this task's headless smoke, 2026-11-18). One adapter's client RTT is
 an averaged RoundTrip ping (one adapter's binding: `FNetPing` with `RoundTrip=PlayerStateAvg`, read in
-`UESimNetClientHost::serverRttSeconds`), which reads exactly 0 until its first one-second bucket fills. The estimator
+`UESimNetLinkServices::serverRttSeconds`), which reads exactly 0 until its first one-second bucket fills. The estimator
 takes the 0 as a real first reading and seeds from it. In the smoke every client's window filled on 0 readings
 (`rttMs=0.000 samples=30`, about 0.5 s after the join) while the first real reading arrived 0.9 s after it. On that
 loopback the offset stayed at its floor, so nothing moved; on a 100 ms link the target rises by two ticks after the
@@ -951,7 +951,7 @@ measured the client's RTT about 4 ms higher in Ph3 than in Ph2 on every shape. P
 engine lane, so the client's engine packets are mostly acknowledgement replies sent in step with the server's frames, and the
 engine's round trip (from the send to the start of the client frame that processes the acknowledgement) now includes about one
 server frame minus the client's turnaround, against about half a client frame before: 11.4 to 15.4 ms on loopback (one
-adapter's binding: UE's `FNetPing` RoundTrip, read by `UESimNetClientHost::serverRttSeconds`). og-sim-net's SimClock ping/pong
+adapter's binding: UE's `FNetPing` RoundTrip, read by `UESimNetLinkServices::serverRttSeconds`). og-sim-net's SimClock ping/pong
 (`SimNetClock.h`) takes the server's turnaround out: `RTT = (t3 − t0) − (t2 − t1)`. The target offset is
 `ceil((smoothedRTT + m × smoothedJitter) × tickFrequency)`, m the active source's multiplier (§17), so at 60 Hz 4 ms is 0.24 tick, and a whole tick
 on a link whose RTT sits near a tick boundary.
