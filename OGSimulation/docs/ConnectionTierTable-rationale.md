@@ -358,7 +358,8 @@ because a sweep for readers of `muteEchoOnDegradedTier` finds three and conclude
 ⛔ **RETIRED by og-input-latency P6-2 (2026-11-22).** `shouldStallForTierTransition` is deleted. The
 client no longer decides a tier transition's correction from the two tier indices: it pays the change
 of its own effective delay, **either sign, the first arrival included**: the value one adapter's
-recompute returns (`UESimulationSession::recomputeAndPublishEffectiveInputDelay`, the effective delay
+recompute returns (`SessionClock::recomputeAndPublishEffectiveInputDelay` in og-sim-session since og-session-runtime
+task 24, the Unreal session's before; the effective delay
 after the arrival minus the one before it), requested as `ClientPredictionClock::requestInputDelayTransition`,
 whose negative debt is paid as Skips. In the worked table below that is the **TRUE delay change**
 column, not the "correct stall" column. Two premises of this section were false and are why:
