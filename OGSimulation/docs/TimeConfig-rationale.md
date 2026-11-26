@@ -669,7 +669,10 @@ Since og-input-latency P3-11 it counts the clock's own advances on which the est
 composition root may override it with the `RecentreSettleSamples`
 key under `[OGNetcode]`, read on both roles (one adapter's binding: og-sim-session's `readSessionKnobs` and
 `applyLatencyKnobs`, `UESimulationSession`'s members until og-session-runtime task 23, with the start-up line `[ClockRecentre.Config] recentreSettleSamples=… (ini|compiled)`). The key
-exists so the A arm (0) runs on the same binary as the B arm.
+exists so the A arm (0) runs on the same binary as the B arm. Since og-session-runtime task 35 that intake is a knob row
+(`KnobTable-rationale.md`) whose clamp, `clockRecentre::clampSettleSamples`, sits after the struct: a negative value clamps
+to 0, which disables the re-centre; a `static_assert` keeps the compiled default inside the clamp and inside `int32_t`, the
+row's value type.
 
 **The problem it fixes: the dead band keeps a join's landing error for the session.** The clock corrects only a drift
 larger than `softDriftThresholdTicks` (3). Whatever lead a join leaves inside that band stays until the next hard resync.

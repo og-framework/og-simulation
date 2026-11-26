@@ -621,6 +621,23 @@ static_assert(clockJitter::clampJitterMultiplier(TimeConfig{}.jitterMultiplier) 
 	&& clockJitter::clampJitterMultiplier(TimeConfig{}.simClockJitterMultiplier) == TimeConfig{}.simClockJitterMultiplier,
 	"TimeConfig's two jitter multipliers' compiled defaults must lie inside the JitterMultiplier door's clamp, or the "
 	"setter would silently move a value nobody configured (og-input-latency P3-13).");
+// The `[OGNetcode] RecentreSettleSamples` door's clamp: a negative window clamps to 0,
+// which disables the re-centre. Its knob row is og-sim-session's (og-session-runtime
+// task 35); the intake's std::max(requested, 0) before it. §14
+namespace clockRecentre
+{
+	constexpr int32_t clampSettleSamples(int32_t requested)
+	{
+		return requested < 0 ? 0 : requested;
+	}
+} // namespace clockRecentre
+
+static_assert(TimeConfig{}.recentreSettleSamples <= 2147483647u
+	&& clockRecentre::clampSettleSamples(static_cast<int32_t>(TimeConfig{}.recentreSettleSamples))
+		== static_cast<int32_t>(TimeConfig{}.recentreSettleSamples),
+	"TimeConfig::recentreSettleSamples' compiled default must fit its knob row's int32 value and lie inside "
+	"clockRecentre::clampSettleSamples, or the row's read-back would misprint it and writing the compiled value into the "
+	"ini would move it (og-session-runtime task 35).");
 static_assert(TimeConfig{}.recentreSettleSamples >= TimeConfig{}.rttOutlierConsecutiveLimit,
 	"TimeConfig::recentreSettleSamples' compiled default must span a whole outlier run (rttOutlierConsecutiveLimit) at "
 	"the engine source's one reading per tick, so a join's inflated RTT is either rejected or re-seeded inside the settle "
