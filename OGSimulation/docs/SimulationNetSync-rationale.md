@@ -1671,7 +1671,11 @@ type enters this layer. The header includes the engine-free codec header only fo
 **Why frames, not ticks.** `redundancyDepthTicks` counts the window in ticks. A client that steps two ticks per frame
 sends one bundle per two ticks, so a depth of 3 overlaps the next bundle by one tick only. Losing one bundle then loses
 its middle tick, which is og-simulation-tests' `LinkModelPinsTodayTest.cpp` case (i). Counting the window in frames
-keeps the overlap at `redundancyFrames - 1` whole sends, whatever the step rate.
+keeps the overlap at `redundancyFrames - 1` whole sends, whatever the step rate. *Today it counts ticks (og-session-runtime
+task 33):* since the send moved to capture (og-input-latency Ph4; the frame-locked send retired by og-session-runtime task
+12) a client sends once per captured tick, so `ticksPerFrameEma` sits at 1, a "frame" here is one tick, and the slot count
+below is `redundancyDepthTicks` or `redundancyFrames`, whichever is larger (bounded as the bullets say). The knob keeps its name (`TimeConfig-rationale.md`
+§12).
 
 **`redundancySlots(ticksSinceLastSend, redundancyDepthTicks, redundancyFrames)`.** The first argument is the
 sender's smoothed ticks per send, `RedundancySendCadence::ticksPerFrameEma`, not one raw interval.

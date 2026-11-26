@@ -580,6 +580,15 @@ so a single lost send can lose more than one tick of input. The consumer sizes t
 depth is larger) and never more than the bundle's wire bound `inputRedundancyBundle::kMaxSlots`. **0 is "today", not "off":** at 0 the bundle keeps exactly
 `redundancyDepthTicks` slots, so the compiled default changes nothing.
 
+**Since the send moved to capture it counts ticks; the knob keeps its name.** "Frames" was right while a client sent once
+per frame. Since og-input-latency Ph4 a client sends once per captured tick, from the step (og-sim-net's
+`SimNetClient::afterCaptureTick_Step`, `SimNetClient-rationale.md` §17), and the frame-locked send was retired by
+og-session-runtime task 12. Each send is then one tick after the last, so the sender's ticks-per-send average
+(`RedundancySendCadence::ticksPerFrameEma`) sits at 1 and the slot count is `redundancyDepthTicks`, or `redundancyFrames`
+when that is larger (`SimulationNetSync-rationale.md` §17): `redundancyFrames` is a count of ticks. The field, the setter,
+the clamp and the `[OGNetcode] RedundancyFrames` key keep their names, so the `[LatencyKnobs]` proof line and every ini
+stay as they are.
+
 **`relayResendEntries`: already-flushed relay entries re-included in each flush.** This is the successor the relay
 ring's retirement block (in the header, above the field) names: "already-sent ticks re-included in a flush", a
 different quantity from "entries retained by a write path", under a different name. ⛔ **It is not a depth.** The
@@ -944,7 +953,9 @@ arm should still say so.
 One field added by og-input-latency P3-10 (part A), 2026-11-19: `clockRttSource`, `Engine` or `SimClock`, compiled
 default `SimClock` since part B's flip (`Engine` before it; see "The flip" below). Its reader is `NetworkTimeEstimator`. Its one door is `SimulationManager::setClockRttSource`
 (`SimulationManager-rationale.md` §16). P3-10's part B added the Unreal host's key, `[OGNetcode] ClockRttSource`, beside
-`RecentreSettleSamples`, and wired both feeds and the shadow line (in the Unreal host's `UESimulationSession`).
+`RecentreSettleSamples`, and wired both feeds and the shadow line (in the Unreal host's `UESimulationSession` then; since
+og-session-runtime task 24 both feeds are og-sim-session's `SessionClock::onAuthorityTick` (the engine reading) and
+`SessionClock::onClockSample` (the SimClock sample), and the key is read by og-sim-session's `SessionKnobs.h` since task 23).
 
 **Why a second source.** The engine ping includes the engine lane's acknowledgement turnaround. og-input-latency P5-27
 measured the client's RTT about 4 ms higher in Ph3 than in Ph2 on every shape. Ph3 took the inputs and corrections off the
@@ -1042,10 +1053,13 @@ apart; (a)/(b) lead and late share at or below Ph2's) is Ph4's gate's measuremen
 `serverTick` and `serverTickAgeSeconds` (appended after `t3Seconds`, so a positional copy of the first six is unchanged), and
 every valid sample, at either source and before and after the switch, ends `noteSimClockSample` in the estimator's
 `ServerTickEstimator`, after `updateRTT`, so its RTT gate reads the smoothed RTT that sample produced. A sample whose tick is
-`SimClockRttSample::kNoServerTick` (what a host that copies no tick delivers) is ignored there, and the estimator's other
+`SimClockRttSample::kNoServerTick` is ignored there, and the estimator's other
 outputs never read it (`PCTM.NetworkTimeEstimator.ServerTick.AValidSampleReachesTheServerTickEstimatorAndMovesNothingElse`).
 `activeJitterMultiplier()` exposes the multiplier the offset uses (§17). The sensor, its formula and its limits:
-`ServerTickEstimator-rationale.md`.
+`ServerTickEstimator-rationale.md`. *Who builds the sample (corrected by og-session-runtime task 33):* no host copies it in.
+og-sim-net builds the og-sim type itself from the pong, `simNetClock::sampleOf(pong, t3)` (`SimNetClock.h`), and a pong
+that carries no tick keeps `SimNetClockPong::serverTick`'s default, `SimClockRttSample::kNoServerTick`, so the sample
+reaches the estimator with it.
 
 ## 16. The join's second hard resync, on the first RTT reading
 

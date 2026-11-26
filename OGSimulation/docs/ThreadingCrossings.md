@@ -86,7 +86,7 @@ thread than the step, and each row prices that case. The one live crossing is a 
 og-session-runtime task 13 (the client) and task 14 (the server) a frame-locked client and the in-frame server ran their
 feeds on the host's game thread, and these rows were that mode's accepted debt (og-input-latency P2-15 added the client
 that drains at step start; P5-22 made it the default). Who calls what on which thread is the Unreal session's thread
-table, `UESimulationSession-rationale.md` §24 (OGSimulationUnreal's docs); the rows name og-simulation's members only,
+table, og-sim-session's `SessionThreads-rationale.md` §7 (the table of `SessionThreads.h`, which checks it); the rows name og-simulation's members only,
 and a host name in a row is history. The former Chaos adapter's two physics callbacks (removed by og-session-runtime
 task 3), which row 11's history names, were its pre-simulate and post-solve callbacks, with the solve between them.
 
@@ -158,7 +158,7 @@ second row, the tier reading, is a hand-over within the step's thread. Like the 
 | Crossing | Direction | Shape |
 |---|---|---|
 | the display snapshots, `SnapshotChannel<Snapshot, 4>` (`SimulationDisplayPublisher`) | step write (`publish_Step` in the after-batch fill) → drawing-thread read (release the one held, then acquire the newest: `refreshView_GameThread`, og-input-latency P6-1; between passes the reader holds one) | **Snapshot channel**, as J5: the reader holds at most two of four, so the writer always finds a slot and a held snapshot is never rewritten |
-| the display tier reading, a host's `TripleBuffer` beside the snapshot | the tier receipt's write, inside the client's drain at step start (the step's thread) → the fill's read on the step's thread | **Triple buffer**, one writer and one reader, both on the step's thread while the session steps: the reader takes the newest published reading. A host's other writes (before its first step, after its last) are in its thread table (`UESimulationSession-rationale.md` §24.3) |
+| the display tier reading, a host's `TripleBuffer` beside the snapshot | the tier receipt's write, inside the client's drain at step start (the step's thread) → the fill's read on the step's thread | **Triple buffer**, one writer and one reader, both on the step's thread while the session steps: the reader takes the newest published reading. A host's other writes (before its first step, after its last) are in its thread table (og-sim-session's `SessionThreads-rationale.md` §7.3) |
 
 The client's drain runs at step start, on the step's thread, so its writers (a correction landing, a relay store the collect
 also reads, a registration's storage insert: rows 1, 2 and 11) run on the thread the fill runs on, and the fill crosses
