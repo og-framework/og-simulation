@@ -206,6 +206,12 @@ in task 13.
   them, accepted as benign (each field a trivially copyable value, re-sampled every frame); that crossing was in the
   outer game repository, outside this doc's scope, and was never a row here. Like the Chaos tick mapper above, the adopting
   code is outside this submodule; the pattern it uses is og-simulation's.
+- **The authority's round trip** (og-session-runtime task 39). Until task 39 the Unreal session handed its authority runner
+  each og-net connection's engine ping through a game-thread → runner copy (one lock-free word per connection, published every
+  frame); that crossing was in the og-simulation-ue plugin, outside this doc's scope, and was never a row here. Since task 39
+  og-sim-net's server host core reads og-net's per-connection stats on the runner (`SimNetServerHost-rationale.md` §6), under
+  og-net's own stats lock (og-net's `EndpointCore-rationale.md` §10): the game-thread copy is gone, and what crosses is og-net's
+  servicing thread to the runner, which on a dedicated server are one thread.
 
 ## Item 82 (gated)
 
