@@ -58,8 +58,9 @@ members on the adapter's manager before. The queue borrows the tier table by ref
 Both borrow `const TimeConfig&`, so the coordinator must not outlive the config. Since og-input-latency
 task P5-7 its one owner is og-sim-net's server: `SimNetServer` holds it by value (`m_coordinator`,
 constructed from the `TimeConfig&` the server is given), and the Unreal session holds that server in a
-`std::optional` (`UESimulationSession::m_simNetServer`) destroyed before the manager whose `TimeConfig`
-it borrows; a `static_assert` on the member offsets in `UESimulationSession.h` keeps that order. Before
+`std::optional` (`SessionRuntime::m_simNetServer`, og-sim-session's runtime since og-session-runtime task 31)
+destroyed before the manager whose `TimeConfig` it borrows; a `static_assert` on the member offsets in
+`SessionRuntime.h` keeps that order (in `UESimulationSession.h` until task 31). Before
 P5-7 the session held the coordinator itself (`m_receptionCoordinator`, the same order rule), and before
 that the adapter's composition root did. A second engine binds its own owner and these names mean nothing
 there.
