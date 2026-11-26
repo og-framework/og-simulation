@@ -24,8 +24,8 @@ goes to or at what level a token-less line is printed: the host's sink does. A h
 first-match table of prefixes.
 
 `kSimulationLogRoutes` is the part of that table that belongs to the core: **one row per tag that
-og-simulation emits and no host emits.** Two rows break that rule: `[SimNet.` and `[Roster.` route the lines of og-sim-net, a
-library built on og-simulation, and of a host that runs it (§5). A row is:
+og-simulation emits and no host emits.** Until og-session-runtime task 36 two rows broke that rule, `[SimNet.` and
+`[Roster.`; they are og-sim-net's own rows now (§5). A row is:
 - `prefix`: the start of the tag. A host compares it with the line after the severity token,
   ignoring case;
 - `route`: the channel the line belongs to (§2);
@@ -44,6 +44,11 @@ emits. Which tags those are is the host's business; this header names only the c
 | `Sim` | rare simulation lifecycle lines: resim prepare and finish, time resyncs, divergence and restore events |
 | `Net` | replication lines: input and correction sends and receipts, the server's reception coordinator (park, release, gaps, drops, delay shifts, stats, arrival margins, back-dating episodes), the relay stager's flush report |
 | `DivergenceProbe` | the correction-verdict probe family: every `[DivergenceProbe.*]` line |
+| `Mgmt` | no core row: the manager and registration lines of og-sim-session's rows (`SimulationManager:`, `tryRegister:`) |
+| `SimHost` | no core row: the host-diagnostic lines of og-sim-session's `[SimHost.` row |
+
+`Mgmt` and `SimHost` were added by og-session-runtime task 36, so that og-sim-net's and og-sim-session's rows share this
+vocabulary and one row type (`SessionLogRoutes-rationale.md` in og-sim-session). A host maps every route it is given.
 
 A host may send two routes to one channel. Each probe family has its own route so a host can switch it on
 or off without touching any other line.
@@ -78,7 +83,11 @@ more specific row must come first:
 `allReachable(rows)` returns false if any row's prefix begins with an earlier row's prefix, compared
 ignoring case with `startsWithIgnoringCase`; such a later row could never be taken. `plainLevelsAreLogOrVerbose(rows)`
 returns false for a row at `Warning`. The header `static_assert`s both over `kSimulationLogRoutes`. Both are
-templates over a row array, so a test can show each one rejecting a bad table without breaking the build.
+templates over any row range (a row array or a `std::array` of rows), so a test can show each one rejecting a bad table
+without breaking the build, and the modules above this one assert their own blocks with them. Two more helpers serve those
+modules (og-session-runtime task 36): `blocksAreDisjoint(first, second)` returns false if a prefix in one range and a prefix
+in the other begin with one another, and `firstMatch(rows, line)` is the first row whose prefix begins the line, or
+`nullptr`.
 
 Seen failing (a copy of the header with the change, compiled in a standalone CMake build of og-simulation
 and the test; 2026-10-16):
@@ -95,7 +104,7 @@ would take every `[ResimCheck.` row's lines and fail `allReachable`.
 ## §5 The rows and their emitters
 
 Each row's tag is emitted by these core files and by no host (a search of every string literal in the
-core, with the severity token removed, 2026-10-16), except `[SimNet.` and `[Roster.` (below the table):
+core, with the severity token removed, 2026-10-16):
 
 | row | route | `plainLevel` | emitting file |
 |---|---|---|---|
@@ -126,8 +135,6 @@ core, with the severity token removed, 2026-10-16), except `[SimNet.` and `[Rost
 | `[InputDomain]` | `Net` | `Log` | `Network/ServerReceptionCoordinator.h` |
 | `[RelaySkip]` | `Net` | `Log` | `Network/ServerReceptionCoordinator.h` |
 | `[RelayFlush]` | `Net` | `Log` | `Network/RelayRingStager.h` |
-| `[SimNet.` | `Net` | `Log` | none in the core; og-sim-net's `SimNetServer.h` and `SimNetClient.h`, and the Unreal host (below) |
-| `[Roster.` | `Net` | `Log` | none in the core; og-sim-net's `SimNetServer.h`, `SimNetClient.h` and `SimNetRoster.h`, and the Unreal host (below) |
 | `[DivergenceProbe` | `DivergenceProbe` | `Log` | `NetSyncTelemetry.h` |
 
 **Not here, and why.** Three tag families are emitted by the core **and** by the brawler game's adapter:
@@ -150,6 +157,10 @@ window and teardown line, which always carries `[Warning]`, so its `plainLevel` 
 Unreal host's relay actor still prints a line with the same tag, through its own log category and not through a
 route table, until that host binds the stager and retires the actor; no host routes the tag. It sits after
 `[RelaySkip]`: neither begins with the other, and no earlier row's prefix (`[Release]` included) begins it.
+
+*The next four paragraphs are the record of the `[SimNet.` and `[Roster.` rows while they were in this block, from
+og-input-latency P5-4 to og-session-runtime task 36, which moved them to og-sim-net's own block (`SimNetLogRoutes.h`;
+og-sim-net's `SimNetLogRoutes-rationale.md`).*
 
 `[SimNet.` and `[Roster.` were added after `[RelayFlush]` (og-input-latency P5-4, 2026-11-18), and **they break the rule of
 §1** twice: no og-simulation file emits them, and a host emits lines of both. The exception is decided (og-input-latency P5-7,
@@ -175,7 +186,7 @@ not leave them at `Log`: its two og-sim-net hosts print every og-sim-net line, a
 line, through one function that puts `[Warning]` in front of a token-less `[Roster.` line before the router sees it. So the
 line shows at the `Warning` filter the brawler game ships for that channel.
 
-Neither prefix begins with an earlier row's prefix, and `[DivergenceProbe`, the one row after them, begins with neither.
+Neither prefix began with an earlier row's prefix, and `[DivergenceProbe`, the one row after them, began with neither.
 
 `[InputDelay]` has no row. The coordinator emits it (`Network/ServerReceptionCoordinator.h`, the one-shot
 warning for a derived player slot out of range), and no host emits it, so by the rule of §6 it should have
@@ -196,15 +207,17 @@ The search cannot see a tag assembled at run time (a `"%s"` that prints a tag); 
 ## §7 Tests
 
 `TickDriver/SimulationLogRoutesTest.cpp` (tag `[TickDriver]`):
-- `SimulationLogRoutes.Rows.PrefixRouteAndPlainLevelArePinnedInOrder` pins all 30 rows, in order;
+- `SimulationLogRoutes.Rows.PrefixRouteAndPlainLevelArePinnedInOrder` pins all 28 rows, in order;
 - `SimulationLogRoutes.Checks.HoldForTheTableAndRejectAShadowedRowOrAWarningLevel` checks both functions on
   the table and on four bad tables (a catch-all above its specific row, `DISCARD` below its catch-all, a
   lower-case duplicate, a `Warning` row) and one good one;
 - `SimulationLogRoutes.FirstMatch.TakesTheSpecificRowIgnoresCaseAndLeavesHostTagsUnrouted` resolves sample
   lines by first match: the specific rows win, case is ignored, an `[InputArrival.Window]` line and an
-  `[InputArrival.BackDate]` line each take their own `Net` row at `Log`, `[SimNet.Window]`, `[SimNet.Host]`,
-  `[Roster.Refused]` and `[Roster.InputRefused]` lines take their family's catch-all, and the host's tags (`[ResimProbe.Gate]`, `[ServerReceive]`, `[ReleaseBatch]`, …)
-  match no core row.
+  `[InputArrival.BackDate]` line each take their own `Net` row at `Log`, and og-sim-net's (`[SimNet.Window]`,
+  `[SimNet.Host]`, `[Roster.Refused]`, `[Roster.InputRefused]`) and the host's tags (`[ResimProbe.Gate]`, `[ServerReceive]`,
+  `[ReleaseBatch]`, …) match no core row. Since og-session-runtime task 36 og-sim-session's
+  `SessionLogRoutes.TheMovedSimNetAndRosterLinesRouteThroughOgSimNetsRows` routes those four og-sim-net lines through
+  the composed table.
 
 ## §8 Provenance
 
@@ -225,3 +238,8 @@ og-input-latency P2-5 (2026-11-14) added the `[RelayFlush]` row after `[RelaySki
 og-input-latency P5-4 (2026-11-18) added the `[SimNet.` and `[Roster.` rows after `[RelayFlush]`, for og-sim-net's lines (§5).
 28 rows became 30. og-input-latency P5-7 (2026-11-18) made the Unreal host emit lines of both families and kept the two
 rows here by decision (§5); no row changed.
+
+og-session-runtime task 36 (2026-11-26) moved the `[SimNet.` and `[Roster.` rows, unchanged, to og-sim-net's own block
+(`SimNetLogRoutes.h`), which og-sim-session's `SessionLogRoutes.h` composes after this one; 30 rows became 28. The same task
+added `Mgmt` and `SimHost` to `SimulationLogRoute` (§2), made `allReachable` and `plainLevelsAreLogOrVerbose` templates over
+any row range and added `blocksAreDisjoint` and `firstMatch` (§4). No other row changed.

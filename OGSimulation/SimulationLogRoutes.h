@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
 
 enum class SimulationLogRoute : uint8_t
 {
@@ -13,6 +14,8 @@ enum class SimulationLogRoute : uint8_t
 	Sim,
 	Net,
 	DivergenceProbe,
+	Mgmt,
+	SimHost,
 };
 
 struct SimulationLogRouteEntry
@@ -50,7 +53,6 @@ inline constexpr SimulationLogRouteEntry kSimulationLogRoutes[] = {
 	{ "[InputDomain]",                  SimulationLogRoute::Net,             HostLogLevel::Log },
 	{ "[RelaySkip]",                    SimulationLogRoute::Net,             HostLogLevel::Log },
 	{ "[RelayFlush]",                   SimulationLogRoute::Net,             HostLogLevel::Log },
-#include "OGSimNet/SimNetLogRoutes.h"
 	{ "[DivergenceProbe",               SimulationLogRoute::DivergenceProbe, HostLogLevel::Log }
 };
 
@@ -71,10 +73,10 @@ constexpr bool startsWithIgnoringCase(const char* text, const char* prefix)
 	return true;
 }
 
-template <std::size_t RowCount>
-constexpr bool allReachable(const SimulationLogRouteEntry (&rows)[RowCount])
+template <typename Rows>
+constexpr bool allReachable(const Rows& rows)
 {
-	for (std::size_t later = 0; later < RowCount; ++later)
+	for (std::size_t later = 0; later < std::size(rows); ++later)
 	{
 		for (std::size_t earlier = 0; earlier < later; ++earlier)
 		{
@@ -92,8 +94,8 @@ static_assert(allReachable(kSimulationLogRoutes),
 	"matched ahead of the [Resim. catch-all, and widening that catch-all to [Resim would "
 	"swallow every [ResimCheck. line.");
 
-template <std::size_t RowCount>
-constexpr bool plainLevelsAreLogOrVerbose(const SimulationLogRouteEntry (&rows)[RowCount])
+template <typename Rows>
+constexpr bool plainLevelsAreLogOrVerbose(const Rows& rows)
 {
 	for (const SimulationLogRouteEntry& entry : rows)
 	{
@@ -107,4 +109,29 @@ static_assert(plainLevelsAreLogOrVerbose(kSimulationLogRoutes),
 	"kSimulationLogRoutes: a row's plainLevel is the level of a line that carries no [Verbose] or "
 	"[Warning] token, and it may only be Log (rare events) or Verbose (per tick, per packet, "
 	"per relay). A line that must reach Warning says so with its own [Warning] token.");
+
+template <typename RowsA, typename RowsB>
+constexpr bool blocksAreDisjoint(const RowsA& first, const RowsB& second)
+{
+	for (const SimulationLogRouteEntry& a : first)
+	{
+		for (const SimulationLogRouteEntry& b : second)
+		{
+			if (startsWithIgnoringCase(a.prefix, b.prefix) || startsWithIgnoringCase(b.prefix, a.prefix))
+				return false;
+		}
+	}
+	return true;
+}
+
+template <typename Rows>
+constexpr const SimulationLogRouteEntry* firstMatch(const Rows& rows, const char* line)
+{
+	for (const SimulationLogRouteEntry& entry : rows)
+	{
+		if (startsWithIgnoringCase(line, entry.prefix))
+			return &entry;
+	}
+	return nullptr;
+}
 } // namespace simulationLogRoutes

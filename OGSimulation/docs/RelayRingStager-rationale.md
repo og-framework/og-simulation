@@ -121,10 +121,10 @@ that must reach `Warning` carries the token (`SimulationLogRoutes-rationale.md` 
 "Net, Warning"; the token and the row together give exactly that.
 
 The level is the actor's: it logged the line at `Warning`, until og-input-latency task P5-9 deleted it. In the Unreal host, `RouteOGMessage` maps the `Net` route
-to `LogOGNet` (`UESimulationLogRoutes.h:300`), and the game's engine config sets that category to `Warning`
+to `LogOGNet` (`UESimulationLogRoutes.h:358`), and the game's engine config sets that category to `Warning`
 (`LogOGNet=Warning`), so a line without the token would not be written. The line moved from `LogOGInputRelay` to
 `LogOGNet` when og-sim-net's server bound this class (og-input-latency task P5-7; its host's `log` routes through
-`RouteOGMessage`), and `RouteOGMessage` prints the whole string, token included (`UESimulationLogRoutes.h:281`).
+`RouteOGMessage`), and `RouteOGMessage` prints the whole string, token included (`UESimulationLogRoutes.h:334`).
 
 **Volume.** Nothing is logged per stage or per flush; only the windowed line and the final one. A per-flush line would
 be a line per character per frame.
