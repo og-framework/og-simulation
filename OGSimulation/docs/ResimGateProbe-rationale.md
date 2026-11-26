@@ -169,8 +169,11 @@ the mechanism working, not a defect: the gate stays open and re-requests next fr
    because the next request's anchor differs from this one's. A nonzero here *with* a matching
    `repeatRequests` is a different story and worth investigating.
 
-⚠ **Expect nonzero, possibly large, on a shipped run.** It was structurally near-zero only under the
-compiled default. See §20 for why the header used to say the opposite.
+**Measured: zero on this project's runs.** Every complete `[ResimProbe.Gate]` window in the 767 capture
+folders under the project's `Saved/Profiling` (2026-10-09 to 2026-11-26) reads `survivingAnchors=0`: 99,447
+windows in 2,172 logs, each of whose sessions printed `[ResimGate] session policy = OnDisagreement`
+(og-session-runtime task 33b). The header used to say *"expect nonzero, possibly large"*; §20 F-36-8 records
+why that line went. A nonzero reading is still possible by the mechanism above, so property 3 stands.
 
 ## 7. The depth-policy exclusion count
 
@@ -523,6 +526,7 @@ it replaced was compressed.
 | **F-36-5** | *"Fed from the OnRep-dispatched correction callback bound in `SimulationNetSync::registerPredictionOwner`"* | **True but no longer the useful handle.** The binding site is still that method, but the probe is now a member of `NetSyncTelemetry` and its immediate feeder is `NetSyncTelemetry::emitCorrectionArrival`, given a decision `SimulationNetSync::decideCorrectionArrival` computes. A reader following the old sentence lands two hops from the call. Both ends are named now. |
 | **F-36-6** | *"Measured healthy baseline: 15-31 % refused across all 18 archived client logs"* | **Over-narrow range attributed to a wider population.** 15–31 % is the span of the **four** runs the investigation tabulates; its own text gives **10–31 %** for the archived runs generally. §8 now states both with the population each belongs to. |
 | **F-36-7** | *"the engine-agnostic / no-simulatable / no-logger testability property that `RelayReadProbe.h` states is preserved **verbatim**"* | **The word *verbatim* is false.** That property's third clause is *no other OGSimulation header*, and this file includes one. Everything the clause protects survives, because the include is transitively `<cstdint>`-only — but not the clause. §1 states the distinction. |
+| **F-36-8** | The surviving-anchor count: *"EXPECT NONZERO, POSSIBLY LARGE, UNDER THE SHIPPED CONFIGURATION — near-0 only under the compiled default. Check the policy first"* | **Not borne out; the line was dropped (og-session-runtime task 33b).** All 99,447 complete `[ResimProbe.Gate]` windows of the 2,172 logs under `Saved/Profiling` (767 captures, 2026-10-09 to 2026-11-26, every session `OnDisagreement`) read `survivingAnchors=0`. §6 states the measurement. F-36-4's point, which policy ships, stands. |
 
 ⚠ **Two claims checked and confirmed, recorded because confirming them cost as much as refuting one.**
 `ResimGateProbe::fillSummary` really has no shipped caller — the only external callers anywhere are

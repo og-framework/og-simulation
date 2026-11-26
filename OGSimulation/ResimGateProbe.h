@@ -106,7 +106,6 @@ struct ResimGateWindowSummary
 // ⛔ FED FROM THE APPLY EDGE beside `noteFinish`, NOT from `noteCheck`'s call site like `checks`/`declined`/`requested`;
 //   it still lands in this window because `noteCheck` alone drives the window. §6
 // ⛔ ON THE GATE LINE BY EXPLICIT RULING, not on `[ResimProbe.Apply]`: a surviving anchor is a property of the GATE. §6
-// ⚠ EXPECT NONZERO, POSSIBLY LARGE, UNDER THE SHIPPED CONFIGURATION — near-0 only under the compiled default. Check the policy first. §6
 // ⚠ A NONZERO SHOULD SHOW IN `requests` WITHOUT a matching `repeatRequests`, because the next anchor differs from this one. §6
     std::uint32_t survivingAnchors = 0u;
 

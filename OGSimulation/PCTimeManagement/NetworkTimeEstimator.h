@@ -78,9 +78,10 @@ OGSIM_OPTIMIZE_OFF
 
 // One SimClock ping/pong, in seconds: the RTT with the server's turnaround removed,
 // the NTP offset theta, and the four stamps (t0/t3 on the client's clock, t1/t2 on
-// the server's). og-sim names no og-sim-net type: the host copies its sample in.
+// the server's). og-sim names no og-sim-net type: og-sim-net builds this one from
+// the pong (simNetClock::sampleOf, SimNetClock.h).
 // Since og-time-dilation task 3 also the pong's server tick and that tick's age at
-// the pong's send (server seconds); a host that copies no tick leaves kNoServerTick,
+// the pong's send (server seconds); a pong that carries no tick leaves kNoServerTick,
 // which the server-tick estimator ignores. The new fields stay last, so a positional
 // copy of the first six is unchanged.
 // Rationale: docs/TimeConfig-rationale.md §15.

@@ -19,17 +19,25 @@
 //   * The resim-completion edge CONSUMES the anchor with a CAS. A correction
 //     landing mid-replay makes that CAS fail and survives as the next
 //     trigger — TERMINATION IS STRUCTURAL, not policed by a cooldown.
-//   * Four predicates below, and where each is consulted:
-//       shouldSetPendingAnchor      GAME thread    — StateCorrectionCache::
+//   * Four predicates below, and where each is consulted (all on the
+//     client's STEP thread: a correction lands in the step-start drain,
+//     SessionOp::DrainInbox, and the check and the replay run in that
+//     step; GAME and PHYSICS were the frame-locked client's threads,
+//     retired by og-session-runtime tasks 12 and 13):
+//       shouldSetPendingAnchor      STEP thread    — StateCorrectionCache::
 //                                                     tryInsertingCorrectState,
-//                                                     hit branch (W1)
-//       policyEnforcesDepthCeiling  PHYSICS thread — SimulationReconciliation::
-//       isAnchorWithinDepthPolicy   PHYSICS thread   checkDivergenceAll,
+//                                                     hit branch (W1), in the
+//                                                     step-start drain
+//       policyEnforcesDepthCeiling  STEP thread    — SimulationManager::
+//                                                     onCheckIsSimilar, which
+//                                                     hands the ceiling down
+//       isAnchorWithinDepthPolicy   STEP thread    — SimulationReconciliation::
+//                                                     checkDivergenceAll,
 //                                                     per character (R1)
-//       classifyResimSlotWrite      PHYSICS thread — StateCorrectionCache::
+//       classifyResimSlotWrite      STEP thread    — StateCorrectionCache::
 //                                                     tryInsertingResimulatedState,
 //                                                     reading landing stamps the
-//                                                     GAME thread wrote (W1)
+//                                                     step-start drain wrote (W1)
 //   * Pure predicates here are swept exhaustively; wiring is then proven by
 //     one case per call site above. A green kernel with an unwired caller
 //     ships the legacy gate, so both halves are required.
