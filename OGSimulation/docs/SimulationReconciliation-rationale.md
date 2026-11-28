@@ -22,10 +22,11 @@ change is reading code, not documentation.
 
 ⚠ **One adapter binding the quoted text names.** `og-simulation` is engine-free — it names no
 game-engine type and is reached from a host engine only through `concept`s. Two quoted blocks below
-name **`Chaos`**, which is one adapter's **physics engine**: the party that owns the rewind loop, and
-whose rewind is global across every body, which is why `checkDivergenceAll` folds to a `min` across
-characters before asking for one. The globalness of the rewind is the fact; the engine's name is one
-adapter's binding, and another adapter substitutes its own. The quotations are byte-verbatim and are
+name **`Chaos`**, the physics engine of the former Chaos adapter (removed by og-session-runtime tasks 3–6):
+the party that owned the rewind loop, and whose rewind was global across every body, which is why
+`checkDivergenceAll` folds to a `min` across characters before asking for one. The globalness of the rewind
+is the fact (the step driver's restore is global too: one restore tick for every body); the engine's name
+is history. The quotations are byte-verbatim and are
 not edited to say so.
 
 <!-- lint-external-ref: pushPredictionInput -- RETIRED NAME (T16): the input-column writer wrapper; retired WITH the column, no successor, must not resolve -->

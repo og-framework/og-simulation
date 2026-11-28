@@ -3,10 +3,10 @@
 // docs/SimulationScheduler-rationale.md · docs/SimulationScheduler-guards.md
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
 #include <type_traits>
 
 #include "OGSimulation/OGAssert.h"
@@ -57,6 +57,12 @@ struct LostTime
 	double seconds = 0.0;
 };
 
+struct LostTimeByCause
+{
+	LostTime catchUp;
+	LostTime reanchor;
+};
+
 class SimulationScheduler
 {
 public:
@@ -74,7 +80,7 @@ public:
 			&& config.minRateScale > 0.0 && config.minRateScale <= 1.0 && config.maxRateScale >= 1.0,
 			"SimulationScheduler: rate-scale bounds must satisfy 0 < min <= 1 <= max");
 		OG_CHECK(std::isfinite(startSeconds), "SimulationScheduler: startSeconds must be finite");
-		segments_.push_back(DeadlineSegment{0u, startSeconds, config.dtSeconds});
+		segments_[0] = DeadlineSegment{0u, startSeconds, config.dtSeconds};
 	}
 
 	uint32_t pump(double nowSeconds)
@@ -92,7 +98,7 @@ public:
 			const double droppedFrom = deadlineAt(physicsSteps_);
 			const double droppedUntil = deadlineAt(physicsSteps_ + dropped);
 			// ⛔G-03  docs/SimulationScheduler-guards.md
-			recordLostTime(dropped, droppedUntil - droppedFrom);
+			recordLostTime(lost_.catchUp, dropped, droppedUntil - droppedFrom);
 			beginSegment(droppedUntil, currentInterval());
 		}
 		physicsSteps_ += run;
@@ -112,7 +118,7 @@ public:
 			return;
 		}
 		// ⛔G-04  docs/SimulationScheduler-guards.md
-		recordLostTime(stepsDueAt(nowSeconds) - 1u, nowSeconds - next);
+		recordLostTime(lost_.reanchor, stepsDueAt(nowSeconds) - 1u, nowSeconds - next);
 		beginSegment(nowSeconds, currentInterval());
 	}
 
@@ -135,11 +141,18 @@ public:
 
 	double nextDeadline() const { return deadlineAt(physicsSteps_); }
 
+	double currentStepInterval() const { return currentInterval(); }
+
 	double stepDeadline(uint64_t step) const { return deadlineAt(step); }
 
 	uint64_t physicsStepCount() const { return physicsSteps_; }
 
-	LostTime lostTime() const { return lost_; }
+	LostTime lostTime() const
+	{
+		return LostTime{lost_.catchUp.steps + lost_.reanchor.steps, lost_.catchUp.seconds + lost_.reanchor.seconds};
+	}
+
+	LostTimeByCause lostTimeByCause() const { return lost_; }
 
 	uint64_t ignoredTimeSamples() const { return ignoredTimeSamples_; }
 
@@ -164,24 +177,29 @@ private:
 		return true;
 	}
 
-	void recordLostTime(uint64_t steps, double seconds)
+	static void recordLostTime(LostTime& cause, uint64_t steps, double seconds)
 	{
-		lost_.steps += steps;
-		lost_.seconds += seconds;
+		cause.steps += steps;
+		cause.seconds += seconds;
 	}
 
-	double currentInterval() const { return segments_.back().interval; }
+	size_t segmentIndex(size_t fromOldest) const { return (oldestSegment_ + fromOldest) % kDeadlineHistorySegments; }
+
+	const DeadlineSegment& newestSegment() const { return segments_[segmentIndex(segmentCount_ - 1u)]; }
+
+	double currentInterval() const { return newestSegment().interval; }
 
 	const DeadlineSegment& segmentFor(uint64_t step) const
 	{
-		for (auto it = segments_.rbegin(); it != segments_.rend(); ++it)
+		for (size_t kept = segmentCount_; kept > 0u; --kept)
 		{
-			if (it->firstStep <= step)
+			const DeadlineSegment& segment = segments_[segmentIndex(kept - 1u)];
+			if (segment.firstStep <= step)
 			{
-				return *it;
+				return segment;
 			}
 		}
-		return segments_.front();
+		return segments_[oldestSegment_];
 	}
 
 	double deadlineAt(uint64_t step) const
@@ -215,24 +233,30 @@ private:
 
 	void beginSegment(double firstDeadline, double interval)
 	{
-		if (segments_.back().firstStep == physicsSteps_)
+		if (newestSegment().firstStep == physicsSteps_)
 		{
-			segments_.back() = DeadlineSegment{physicsSteps_, firstDeadline, interval};
+			segments_[segmentIndex(segmentCount_ - 1u)] = DeadlineSegment{physicsSteps_, firstDeadline, interval};
 			return;
 		}
-		segments_.push_back(DeadlineSegment{physicsSteps_, firstDeadline, interval});
-		if (segments_.size() > kDeadlineHistorySegments)
+		if (segmentCount_ == kDeadlineHistorySegments)
 		{
-			segments_.pop_front();
+			oldestSegment_ = segmentIndex(1u);
 		}
+		else
+		{
+			++segmentCount_;
+		}
+		segments_[segmentIndex(segmentCount_ - 1u)] = DeadlineSegment{physicsSteps_, firstDeadline, interval};
 	}
 
 	SchedulerConfig config_;
-	std::deque<DeadlineSegment> segments_;
+	std::array<DeadlineSegment, kDeadlineHistorySegments> segments_{};
+	size_t oldestSegment_ = 0u;
+	size_t segmentCount_ = 1u;
 	// ⛔G-01  docs/SimulationScheduler-guards.md
 	uint64_t physicsSteps_ = 0u;
 	double rateScale_ = 1.0;
 	double latestSeconds_;
-	LostTime lost_;
+	LostTimeByCause lost_;
 	uint64_t ignoredTimeSamples_ = 0u;
 };

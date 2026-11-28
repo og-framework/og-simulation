@@ -37,38 +37,46 @@
 //
 // POST-T10 PLACEMENT, and it is load-bearing for T11. Since the tier-channel
 // migration this class is instantiated ONCE PER WORLD, owned by the adapter's
-// composition root and fed by its per-connection tier relay (it used to be one
-// instance per CHARACTER on the update component). It is
+// session (`UESimulationSession::m_replicatedTierConsumer`) and fed by the tier
+// message og-sim-net delivers since og-input-latency task P5-7 (the per-connection
+// tier relay actor before, deleted by P5-9; it used to be one instance per CHARACTER
+// on the update component). It is
 // therefore THE client's tier cache, and `effectiveInputDelayTicks` below is the
 // tier half of T11's shared two-input recompute — the floor half is the
 // session-scoped `TimeConfig::relayDelayFloorTicks`, written into the SAME
-// borrowed config by the floor's own OnRep. Both OnReps then call one recompute,
+// borrowed config by the floor's own receipt. Both receipts then call one recompute,
 // rather than two parallel paths racing to write one atomic.
 //
-// PRE-ARRIVAL FALLBACK. Until the first OnRep actually lands, there is no
+// PRE-ARRIVAL FALLBACK. Until the first tier actually lands, there is no
 // authoritative tier and the no-tier fallback — `rttTierInputDelays[
 // kMaxConnectionTierIndex]` (the WORST tier; item 62 / RN-12 retired the
 // dedicated no-tier-baseline field this used to read — its old identifier is on
 // record in RN-12, ReviewNotes.md), floored by `relayDelayFloorTicks` since the
 // 2026-08-03 C2 amendment — is used
 // instead. This is deliberately keyed on ARRIVAL, not on the tier VALUE: the
-// replicated property defaults to 0, which is also a perfectly legal tier, so a
+// carried value defaults to 0, which is also a perfectly legal tier (until
+// og-input-latency P6-2 the server sent nothing while a connection stayed at tier 0;
+// since P6-2 `SimNetServer::publishTier` sends a connection's first tier, tier 0
+// included, so the client leaves this fallback once told), so a
 // value test could not tell "server says tier 0" from "server has not spoken
 // yet", and a client that had never heard from the server would silently adopt
 // tier-0 timing.
 //
 // ENGINE-AGNOSTIC. Sim core: STL plus `OGSimulation/` headers only. The
-// replicated value arrives as a plain integer; the transport that carries it —
-// a replicated byte narrowed to the owning client, plus the arrival callback
-// that hands it over — stays entirely on the adapter side. One adapter binds
-// that to `ASimulationConnectionRelay`'s `OnRep_ConnectionTier`, where the
-// narrowing is the relay actor's owner-only RELEVANCY rather than a per-property
-// replication condition.
+// value arrives as a plain integer; the transport that carries it — a byte sent
+// to the owning client only, plus the arrival callback that hands it over —
+// stays entirely outside this header. Since og-input-latency task P5-7 that is
+// og-sim-net: a `ConnectionTier` message on og-net's Control lane, sent to the
+// character's owning connection only (`SimNetServer::sendConnectionTierToOwningClient`)
+// and received by `SimNetClient::onTier`, which hands it to the Unreal session's
+// `onConnectionTierReceived`. Until then one adapter bound it to
+// `ASimulationConnectionRelay`'s `OnRep_ConnectionTier`, where the narrowing was
+// the relay actor's owner-only RELEVANCY (deleted by P5-9).
 //
 // THREADING. Not thread-safe, and single-threaded by construction: the only
 // mutator (`onReplicatedTierReceived`) is called from that arrival callback,
-// which is a GAME-THREAD replication callback. A reader on the physics thread
-// would be an unsynchronised cross-thread read — see the THREADING CONTRACT
+// and every reader runs on the same thread, the step's (which delivers the
+// arrival). A reader on another thread would be an unsynchronised cross-thread read — see the THREADING CONTRACT
 // block in ServerInputDelayQueue.h for why adding a lock is the wrong fix for
 // that shape of problem.
 //
@@ -89,7 +97,7 @@ public:
     }
 
     // Feed one authoritative tier value, as received from the server. Call from
-    // OnRep_ConnectionTier (game thread).
+    // the tier's arrival callback, on the thread that reads this consumer.
     //
     // The incoming value came off the wire, so it is CLAMPED into the legal tier
     // range rather than trusted: a corrupt or version-mismatched byte must not
@@ -130,9 +138,10 @@ public:
     //                               : rttTierInputDelays[kMaxConnectionTierIndex])
     //
     // THE NO-TIER ARM IS NOT OPTIONAL. This method IS the client's half of the
-    // shared recompute, and both channels feeding it (the per-connection tier
-    // relay and the session floor relay) are independent OnReps that can land in
-    // either order. If the floor arm silently assumed a tier, a floor OnRep
+    // shared recompute, and both channels feeding it (the connection tier and the
+    // session relay floor: two og-sim-net Control messages since og-input-latency
+    // task P5-7, two relay actors' OnReps before) are independent arrivals that can
+    // land in either order. If the floor arm silently assumed a tier, a floor
     // arriving first would compute tier 0's delay (1) while the server's
     // no-entry fallback still answers max(floor, 4) — the exact two-ends-diverge
     // bug the C2 ruling exists to prevent. Keying on ARRIVAL (below) is what

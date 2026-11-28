@@ -26,14 +26,14 @@
 // the delay line: store the capture at slot T, read the slot `effectiveDelay`
 // back. That is a silent desync, for two independent reasons:
 //
-//   1. THE SERVER WRITES THAT SAME BUFFER WITH A DIFFERENT MEANING.
-//      SimulationNetSync::sendCorrectionAll replicates the input the server
-//      APPLIED, stamped with the tick it applied it at; the client lands it via
+//   1. THE SERVER WROTE THAT SAME BUFFER WITH A DIFFERENT MEANING (until T8).
+//      SimulationNetSync::sendCorrectionAll replicated the input the server
+//      APPLIED, stamped with the tick it applied it at; the client landed it via
 //      receiveCorrectionInput -> StateCorrectionCache::insertCorrectionInput.
-//      So slot T means "the input APPLIED at tick T" — which, under the server's
+//      So slot T meant "the input APPLIED at tick T" — which, under the server's
 //      delay, is the client's capture from tick T-delay. Storing the capture at
-//      slot T instead would put two different values in one slot and make every
-//      correction comparison in the delay window wrong.
+//      slot T instead would have put two different values in one slot and made
+//      every correction comparison in the delay window wrong.
 //      [og-netcode-v2-input-relay T8] THAT SERVER WRITE IS GONE — sendCorrectionAll
 //      no longer replicates an applied input, and receiveCorrectionInput /
 //      insertCorrectionInput no longer exist. Recorded here rather than deleted
@@ -71,11 +71,13 @@
 // applied-capture-tick REF, and redeeming that ref means coming here.
 //
 // PendingInputQueue cannot serve as the delay line either: it retains only
-// `redundancyDepthTicks` (3) entries while the worst tier delay is 4, and
-// wipeAllForResync clears it outright.
+// the redundancy slot count — `redundancyDepthTicks` (3) at
+// `redundancyFrames = 0`, else SimulationNetSync::redundancySlots — while the
+// worst tier delay is 4, so its depth follows a network knob rather than the
+// delay, and wipeAllForResync clears it outright.
 //
 // ---------------------------------------------------------------------------
-// WHAT THE OUTBOUND RPC CARRIES — DO NOT "SIMPLIFY" THIS.
+// WHAT THE OUTBOUND INPUT BUNDLE CARRIES — DO NOT "SIMPLIFY" THIS.
 //
 // The capture pushed into PendingInputQueue (and therefore onto the wire) is the
 // ORIGINAL, UNDELAYED capture stamped at the CURRENT tick. The server applies

@@ -80,10 +80,11 @@ concept SimulationNetSyncTickConcept = requires(
 
 template <typename T>
 concept SimulationNetSyncPublishConcept = requires(
-    T& t, const SimulationTimeStep& step, uint32_t tick, int32_t correctionRotationK)
+    T& t, const SimulationTimeStep& step, uint32_t tick, int32_t correctionRotationK,
+    int32_t redundancyFrames)
 {
     { t.sendCorrectionAll(step, correctionRotationK) };
-    { t.sendLocalInputToAuthorityAll(tick, tick) };
+    { t.sendLocalInputToAuthorityAll(tick, tick, redundancyFrames) };
 };
 
 // ⛔ The resolution tick group, presence-only for the same reason; `wipeAllForResync` is in it. §2
@@ -150,14 +151,17 @@ concept SimulationSystemsExecutorConcept = requires(
 //     already had to be fixed for exactly this.
 //
 //   * THREADS. Everything in the dispatch group, and everything it calls, runs
-//     on the PHYSICS thread from the adapter's physics callbacks. The three
-//     config setters and `onPostSimulationGameThread` run on the GAME thread.
-//     `m_resimGateProbe` is physics-thread-only, which is why it holds no
-//     atomics.
+//     on the step's thread. The config setters
+//     run before the first step or between steps, never during one.
+//     `onPostSimulationGameThread` runs on the step's thread after each authority
+//     batch, despite its name (the rename waits for og-session-runtime task 22).
+//     `m_resimGateProbe` is step-thread-only, which is why it holds no atomics.
 //     ⭐ ONE ADAPTER'S BINDING FOR THE CALLBACK COLUMN BELOW: it names the
-//     physics-callback ROLE, never an engine type. One adapter binds those
-//     roles on the async callback of the Chaos-scheduled host (a game's
-//     engine adapter, outside this library), where that one adapter's names are
+//     physics-callback ROLE, never an engine type. On the tick driver the step
+//     driver (`SimulationStepDriver.h`) drives those roles in its tick. The former
+//     Chaos adapter (removed by og-session-runtime tasks 3-6) bound them on the
+//     async callback of its Chaos-scheduled host (a game's engine adapter,
+//     outside this library), where its names were
 //     `OnPreSimulate_Internal` (pre-simulate step), `OnPostSolve_Internal`
 //     (post-solve step),
 //     `TriggerRewindIfNeeded_Internal` (rewind request) and
@@ -173,11 +177,11 @@ concept SimulationSystemsExecutorConcept = requires(
 //     `prepareResimulation` also writes the restored bodies into the host's
 //     already-restored world (the integration executor's push).
 //
-//   * ⛔ THE `TimeConfig` RE-READ RULE, AND ITS SCOPE IS ALL THREE VALUES. This
+//   * ⛔ THE `TimeConfig` RE-READ RULE, AND ITS SCOPE IS ALL FOUR VALUES. This
 //     class is the sole reader-and-hander-down of `TimeConfig` into the peers,
 //     so the rule holds here or nowhere: the depth fold off `resimTriggerPolicy`,
-//     `correctionRotationK` and `redundancyDepthTicks` are ALL read live on every
-//     call and passed down as arguments. Caching any of them in a peer makes an
+//     `correctionRotationK`, `redundancyDepthTicks` and `redundancyFrames` are ALL
+//     read live on every call and passed down as arguments. Caching any of them in a peer makes an
 //     ini-driven setting silently ineffective. §4
 //
 //   * ⛔ THE RESIM TRIGGER POLICY IS **TWO SEPARATE FACTS**. They differ, and
@@ -323,6 +327,64 @@ public:
         m_timeConfig.correctionRotationK = correctionRotation::clampK(requestedK);
     }
 
+    // ⛔ THE one writable location for the redundancy window in frames — the
+    // `[OGNetcode] RedundancyFrames` ini door. §13
+    //
+    // ⛔ CLAMPED HERE TOO, `latencyKnobs::clampRedundancyFrames`. 0 keeps `redundancyDepthTicks`. §13
+    void setRedundancyFrames(int32_t requestedFrames)
+    {
+        m_timeConfig.redundancyFrames = latencyKnobs::clampRedundancyFrames(requestedFrames);
+    }
+
+    // ⛔ THE one writable location for the relay re-send count — the
+    // `[OGNetcode] RelayResendEntries` ini door. §13
+    //
+    // ⛔ CLAMPED HERE TOO, `latencyKnobs::clampRelayResendEntries`. 0 is today's flush. §13
+    void setRelayResendEntries(int32_t requestedEntries)
+    {
+        m_timeConfig.relayResendEntries = latencyKnobs::clampRelayResendEntries(requestedEntries);
+    }
+
+    // ⛔ THE one writable location for the client clock's re-centre window — the
+    // `[OGNetcode] RecentreSettleSamples` ini door. 0 disables the re-centre. §15
+    //
+    // ⛔ ONE-SHOT AT COMPOSITION — the client clock reads it on its stepping thread with no
+    // synchronization, safe only because nothing writes it once stepping has started. §15
+    void setRecentreSettleSamples(uint32_t samples)
+    {
+        m_timeConfig.recentreSettleSamples = samples;
+    }
+
+    // ⛔ THE one writable location for the client's clock RTT source — the
+    // `[OGNetcode] ClockRttSource` ini door. §16
+    //
+    // ⛔ ONE-SHOT AT COMPOSITION — the estimator reads it on its writer thread with no
+    // synchronization, safe only because nothing writes it once samples flow. §16
+    void setClockRttSource(TimeConfig::ClockRttSource source)
+    {
+        m_timeConfig.clockRttSource = source;
+    }
+
+    // ⛔ THE one writable location for both RTT sources' jitter multipliers — the
+    // `[OGNetcode] JitterMultiplier` ini door, which sets both to one value. §17
+    //
+    // ⛔ CLAMPED HERE TOO, `clockJitter::clampJitterMultiplier`. ONE-SHOT AT COMPOSITION —
+    // the estimator reads both on the stepping thread with no synchronization. §17
+    void setJitterMultiplier(double multiplier)
+    {
+        const double clamped = clockJitter::clampJitterMultiplier(multiplier);
+        m_timeConfig.jitterMultiplier         = clamped;
+        m_timeConfig.simClockJitterMultiplier = clamped;
+    }
+
+    // ⚠ The host's time for the NEXT authority step, appended to that step's
+    // [AuthoritySimulation] line as ` stepSeconds=` and then cleared; unset, the line is
+    // unchanged. Called on the stepping thread, before the step. §18
+    void noteAuthorityStepSeconds(double stepSeconds)
+    {
+        m_authorityStepSeconds = stepSeconds;
+    }
+
     // ⛔ THE one writable location for the session resim-gate trigger policy — the
     // `[OGNetcode] ResimTriggerPolicy` ini door. §4
     //
@@ -425,9 +487,9 @@ public:
 
                 // Apply-resim edge: the physics engine still resimulating, clock already caught up
                 // (`advanceResimulation`). ⛔ Unique to the last resim sub-step's `PostSolve`. §7
-                const bool chaosIsResim = updateInfo.isResimulation();
+                const bool engineIsResim = updateInfo.isResimulation();
                 const bool clockIsResim = m_clientClock->isResimulating();
-                if (chaosIsResim && !clockIsResim)
+                if (engineIsResim && !clockIsResim)
                 {
                     SIMLOG(m_logger, "[Resim.Finish] predictionTick=%u",
                         m_clientClock->getPredictionTick());
@@ -537,7 +599,7 @@ public:
     //
     // ⛔ NOT A GENERAL MUTABLE HANDLE — a counter sink read by no gate, clock, cache or
     // integrator; a game-thread call corrupts a window (`ResimGateProbe.h`'s two-object rule).
-    // The adapter uses two narrow passthroughs, as `requestInputDelayIncreaseStall` does. §5
+    // The adapter uses two narrow passthroughs, as `requestInputDelayTransition` does (`requestInputDelayIncreaseStall` until og-input-latency P6-2). §5
     //
     // ⛔ `editResimGateProbe()` STAYS EXACTLY HERE — a production WRITE handle is not a
     // diagnostic read seam (`docs/DiagnosticsConventions.md` §2). §5
@@ -592,12 +654,14 @@ public:
         requires SimulationNetSyncPublishConcept<NetSyncT>
     {
         const SimulationTimeStep step = currentStep();
-        // ⛔ BOTH VALUES ARE READ LIVE FROM `TimeConfig` AND HANDED DOWN — the rotation width
-        // `correctionRotationK`, and `redundancyDepthTicks` (3 at 60 Hz, 5 at 100 Hz). Caching
-        // either in a peer makes an ini-driven setting silently ineffective. §4
+        // ⛔ ALL THREE VALUES ARE READ LIVE FROM `TimeConfig` AND HANDED DOWN — the rotation width
+        // `correctionRotationK`, `redundancyDepthTicks` (3 at 60 Hz, 5 at 100 Hz) and
+        // `redundancyFrames` (0 = today's depth). Caching any in a peer makes an ini-driven
+        // setting silently ineffective. §4 §14
         m_netSync.sendCorrectionAll(step, m_timeConfig.correctionRotationK);
         m_netSync.sendLocalInputToAuthorityAll(
-            step.getTick(), static_cast<uint32>(m_timeConfig.redundancyDepthTicks));
+            step.getTick(), static_cast<uint32>(m_timeConfig.redundancyDepthTicks),
+            m_timeConfig.redundancyFrames);
     }
 
     // Character-lifecycle notifications — forwarded to the systems executor for its own
@@ -631,7 +695,7 @@ private:
     // ⛔ THREE LINES, NOT ONE, split by PIPELINE STAGE: `.Gate` = did we ask, the middle
     // one = did the physics engine accept, `.Apply` = did it land. That middle tag spells
     // one adapter's engine — `[ResimProbe.Chaos]` — and is a FROZEN spelling archived greps
-    // key on, not a claim about this layer. With the game thread's two
+    // key on, not a claim about this layer. With the correction arrival's two
     // `[ResimProbe.Landing]` lines that is 5 Warning lines per window, inside a budget of
     // 6. §6
     void noteDivergenceCheck(bool requestedResim)
@@ -754,7 +818,15 @@ private:
     {
         m_serverClock->advanceTick();
         const SimulationTimeStep step = m_serverClock->getSimulationStep();
-        SIMLOG(m_logger, "[AuthoritySimulation] tick=%u", step.getTick());
+        if (m_authorityStepSeconds.has_value())
+        {
+            SIMLOG(m_logger, "[AuthoritySimulation] tick=%u stepSeconds=%.6f", step.getTick(), *m_authorityStepSeconds);
+            m_authorityStepSeconds.reset();
+        }
+        else
+        {
+            SIMLOG(m_logger, "[AuthoritySimulation] tick=%u", step.getTick());
+        }
         // ⛔ Publishes the authority tick + `TimeConfig::rollbackWindowTicks` for the queueMove guard —
         // no literal. §4
         m_netSync.setAuthorityGuardContext(step.getTick(), m_timeConfig.rollbackWindowTicks);
@@ -840,6 +912,8 @@ private:
     // produced the captured state. §7
     std::optional<SimulationTimeStep>    m_lastStep;
 
+    std::optional<double>                m_authorityStepSeconds;
+
     // ⛔ CONSTRUCTED UNCONDITIONALLY, ON THE AUTHORITY TOO, where `onCheckIsSimilar` is never
     // reached (`!runsPrediction`) so it never flushes — which is why "zero new lines on the
     // authority" needs no role test, and guarding construction would buy nothing. §5
@@ -857,7 +931,8 @@ namespace simulationManagerConceptProof
     struct NetSyncShaped
     {
         void sendCorrectionAll(const SimulationTimeStep&, int32 /*correctionRotationK*/) {}
-        void sendLocalInputToAuthorityAll(uint32 /*tick*/, uint32 /*redundancyDepth*/) {}
+        void sendLocalInputToAuthorityAll(uint32 /*tick*/, uint32 /*redundancyDepth*/,
+                                          int32 /*redundancyFrames*/) {}
         void setAuthorityGuardContext(uint32 /*tick*/, int32 /*rollbackWindow*/) {}
     };
 

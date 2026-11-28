@@ -113,7 +113,8 @@ is visible: a rotation by `π + δ` about `a` comes back as `π − δ` about `-
 
 The angle uses `atan2` because it is well conditioned across the whole range: at small angles it reads the
 angle from the sine part `|xyz|`, where `acos(w)` would have to recover it from a `w` that rounds to almost
-exactly 1 (`SurfaceFrame-guards.md` G-02 has the measurement). Both `atan2` and `xyz / |xyz|` are unchanged
+exactly 1 (`SurfaceFrame-guards.md` G-02 has the measurement). The `atan2` is `simTrig::atan2`, which every platform
+computes to the same bits (`SimTrig-rationale.md`; og-input-latency task 22). Both `atan2` and `xyz / |xyz|` are unchanged
 by a positive scale of the quaternion, so the `glm::normalize` of the converted quaternion only removes a
 rounding-level scale; it is not what makes the result unit length.
 

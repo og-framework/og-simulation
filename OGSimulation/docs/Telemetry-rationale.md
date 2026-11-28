@@ -13,6 +13,10 @@ name-the-physical-quantity rule. The `§N` marks in either header resolve to the
 **If this file and a header disagree, the header is authoritative and this file is stale.**
 Fix this file; do not soften a header to match it.
 
+⚠ **The fenced blocks below are pre-compression text.** Where one says an arrival is "OnRep-bound" or "GAME THREAD
+ONLY": since og-input-latency task P5-7 the relay-ring and correction arrivals reach `NetSyncTelemetry` in its host's
+drain, on the step's thread. `NetSyncTelemetry.h`'s orientation block and fences give the current threads.
+
 ⛔ **Do not move a guard into this file.** Every section below is the *expansion* of a fence that
 still fires at its own line. If you find yourself deleting a one-liner because "it is in the
 rationale doc now", the guard has stopped working — the person about to make the change is
@@ -44,6 +48,7 @@ is byte-verbatim and is not edited to say so.
 <!-- lint-external-ref: SimulationNetSync::collectInputAll -- DEAD OWNER: collectInputAll moved to SimulationInputResolution at item 87; the qualified form must not resolve -->
 <!-- lint-external-ref: NetSyncTelemetryTest.cpp -- test translation unit in the og-simulation-tests submodule, not distributed with this submodule -->
 <!-- lint-external-ref: RemoteInputCacheTest.cpp -- test translation unit in the og-simulation-tests submodule, not distributed with this submodule -->
+<!-- lint-external-ref: VerdictMarginTest.cpp -- test translation unit in the og-simulation-tests submodule, not distributed with this submodule -->
 
 ---
 
@@ -1105,3 +1110,102 @@ token is the whole contract, and the host routes on it. So the tests pin the exa
 included, and run every case through a sink that drops `[Verbose]` lines when its gate is closed,
 as the host does. The `[CollectInput]` lines still reach that sink, which proves it was called.
 The cases are tagged RelayProbeTickLines in og-simulation-tests.
+
+---
+
+## 14. The per-sender prediction delta line — og-input-latency task 6
+
+*Not a pre-compression quotation: written by og-input-latency task 6.*
+
+`emitRelayReadWindowIfDue` no longer emits one `[RelayProbe.Delta]` line for the prediction call site. It emits one
+per remote sender, through the private `emitSenderDeltaLine`, from `RelayReadWindowSummary::predictionBySender`
+(`RelayProbes-rationale.md` §17), in sender-id order, each gated on that sender having formed at least one probe tick
+in the window. The fields every delta line had keep their order and their meaning over that sender's reads, and two
+are **appended**, so an archived pattern over the old fields still matches:
+
+```
+[Warning][RelayProbe.Delta] window=[500,620] src=Prediction n=4 p10=-3 p50=-3 p90=1 min=-3 max=1 satLow=0 satHigh=0 sender=9 lateShareX1000=250
+```
+
+- `sender` is the remote character's id;
+- `lateShareX1000` is the share of that sender's reads that formed a probe tick and did not hit, per mille.
+
+The resimulation call site's delta line is unchanged: one line, no `sender`, no late share.
+
+**Volume.** With one remote sender the line count is what it was. With `k` remote senders a window emits `k`
+prediction delta lines instead of one; the orientation block's volume roster says so.
+
+**Length.** The worst case, every field at its widest (`window` ticks and counts at 10 digits, percentiles at
+their saturated `-65`, min and max at `INT32_MIN`, `sender` at 10 digits, `lateShareX1000=1000`), is 217
+characters, inside `SIMLOG`'s 256-byte buffer. The line test in `InputResolutionTelemetryTest.cpp` pins the
+format of the three lines exactly.
+
+---
+
+## 15. The verdict margin line — og-input-latency task 2h
+
+`CorrectionArrivalDecision` carries a `verdictMargin` beside `fieldDivergence`, and `emitCorrectionArrival` keeps one
+`VerdictMarginClassWindow` per class. When the verdict window closes, it prints, after the two
+`[DivergenceProbe.Window]` lines:
+
+```
+[DivergenceProbe.Margin] class=LocallyPredicted verdicts=110 exactFail=5 b0=105 b1=1 b2=1 b3=1 b4=1 b5=1 discrete=0 maxRatio=2 maxField=verdictMarginMock::MotionState.bodyState.linearVelocity maxAgreeRatio=0.5 maxAgreeField=verdictMarginMock::MotionState.bodyState.linearVelocity
+```
+
+(the test file's line, for a mock state). One verdict's `r` is `VerdictMargin::maxRatio`, the largest normalised delta
+over its float-valued leaves (`docs/SimulationComparison-rationale.md` §8).
+
+| token | counts verdicts with |
+|---|---|
+| `verdicts` | a margin; equal to the Window line's `corrections` whenever the gate was on for the whole window |
+| `exactFail` | `r > 0`: what an exact compare of every float-valued leaf would flag |
+| `b0` … `b5` | `r = 0`, `r ≤ 1e-5`, `r ≤ 1e-3`, `r ≤ 1e-1`, `r < 1`, `r ≥ 1`. Each verdict is in exactly one, so they add up to `verdicts` |
+| `discrete` | a disagreement on a leaf outside `r`. Orthogonal to the buckets |
+| `maxRatio`, `maxField` | the window's largest `r` and the leaf that gave it; `maxField=-` while `maxRatio` is 0 |
+| `maxAgreeRatio`, `maxAgreeField` | the largest `r` among the window's AGREEING verdicts only, and the leaf that gave it; `maxAgreeField=-` while `maxAgreeRatio` is 0 (task 2i) |
+
+**Why a second max (og-input-latency task 2i).** `maxField` names the window's largest `r` over all its verdicts, so in
+a window that holds a float disagreement (`r ≥ 1`) it names a disagreeing field: every agreeing `r` is below 1. The
+near misses (b1 … b4) are the agreeing verdicts that came closest to the tolerance, and in a played session they come
+in the same windows as the disagreements: in og-input-latency's emulated baseline (B0, shape b), every one of the 91
+windows with `b4 > 0` also had `b5 > 0`, so no line named the field of a b4 verdict. `maxAgreeRatio` and `maxAgreeField` are the
+same max over the agreeing verdicts alone.
+
+**Agreement is the verdict, not `r < 1`.** `VerdictMarginClassWindow::note` takes the decision's `predictionWasCorrect`
+beside its margin, so a verdict with `r < 1` that disagrees on a discrete leaf stays out of the agreeing max.
+`VerdictMarginTest.cpp` pins that case: a disagreement at `r = 0.9` beside an agreement at `r = 0.5` names the 0.5. The
+walk is unchanged; the verdict was already on the decision. Every agreeing verdict has `r < 1`
+(`docs/SimulationComparison-rationale.md` §8: `r < 1` exactly when every float-valued leaf is similar), so on every
+line `maxAgreeRatio < 1` and `maxAgreeRatio ≤ maxRatio`, and `maxAgreeRatio` is 0 when b1 … b4 are all 0 (every agreeing
+verdict is then in b0). The converse does not hold: a b1 … b4 count can be made of discrete disagreements alone.
+
+**`exactFail` is not the pre-task-2e verdict.** Before task 2e only the glm fields compared exactly; scalar floats
+already had the epsilon. `exactFail` applies an exact compare to every float-valued leaf, so it is an upper bound on the
+float disagreements the pre-2e compare would have flagged.
+
+**The line checks itself against the Window line.** A verdict disagrees when `r ≥ 1` or a discrete leaf disagrees. So in
+a window where the gate was on throughout, `b5 ≤ disagreed ≤ b5 + discrete`, and with `discrete=0`, `b5` equals the
+Window line's `disagreed`.
+
+**Why the window is the verdict probe's.** The margin windows are noted BEFORE `noteCorrection`, which counts the
+window's closing correction in the window it closes, and they are reset when that window closes. They keep no count of
+their own, so a Margin line never covers a different set of corrections than the Window line printed with it. If the
+gate opens or closes mid-window, `verdicts` is smaller than `corrections`.
+
+**Severity: `Log`, written as no token.** The `[DivergenceProbe` route's plain level is `Log` (og-sim's
+`kSimulationLogRoutes`), so an untagged line goes to the route's category at `Log`. That is the point: the line does not
+exist at the shipped `Warning`, which is the exception the orientation block's severity bullet names. It cannot be
+written `[Log][DivergenceProbe.Margin]`: one adapter's router strips only a leading `[Verbose]` or `[Warning]`, and
+then matches the route prefix, so a `[Log]` token would fail the match and send the line to the catch-all category.
+
+**Silent on an empty class**, as the Window line is. A class whose margin window holds no verdict prints nothing.
+While the gate is off, every class is empty, so the line count is zero.
+
+**Length.** At maximum widths (nine counts at 10 digits, `maxRatio` as `1.23457e+300`, `maxAgreeRatio` as
+`1.23457e-300`, two 95-character paths) the line is 456 characters, more than `SIMLOG`'s 256-byte buffer. So it formats
+into its own 512-byte buffer (`kVerdictMarginLineCapacity`), with each path after its ratio and the agreeing path last.
+`VerdictMarginTest.cpp` checks that a maximal line holds the whole overall path and ends with the whole agreeing path,
+and that the widest format is exactly 456 characters. Task 2h's line, without the agreeing pair, was 319 characters in
+a 384-byte buffer.
+
+**Volume.** At most one line per class per closed verdict window (120 corrections), and none at the shipped verbosity.

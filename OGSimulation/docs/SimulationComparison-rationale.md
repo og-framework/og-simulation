@@ -20,6 +20,8 @@ is actually wired against in that consumer. None of them is a dependency of this
 <!-- lint-external-ref: BrawlerMovementSimulation.h -- ONE CONSUMER'S GAME CODE, in the og-brawler submodule; named as the measured blast radius of the rejected NTTP design, must not resolve here -->
 <!-- lint-external-ref: BrawlerRingoutSimulation.h -- ONE CONSUMER'S GAME CODE, in the og-brawler submodule, same reason as BrawlerMovementSimulation.h; must not resolve here -->
 <!-- lint-external-ref: CorrectionFieldDivergenceTest.cpp -- TEST TRANSLATION UNIT in og-simulation-tests, a separate submodule not distributed with this one; it must not resolve here -->
+<!-- lint-external-ref: GlmFieldSimilarityTest.cpp -- TEST TRANSLATION UNIT in og-simulation-tests, a separate submodule not distributed with this one; it must not resolve here -->
+<!-- lint-external-ref: VerdictMarginTest.cpp -- TEST TRANSLATION UNIT in og-simulation-tests, a separate submodule not distributed with this one; it must not resolve here -->
 <!-- lint-external-ref: BrawlerCorrectionFieldDivergenceTest.cpp -- TEST TRANSLATION UNIT in og-brawler-tests, outside this submodule; it must not resolve here -->
 <!-- lint-external-ref: Config/DefaultEngine.ini -- ONE ADAPTER'S HOST-APPLICATION CONFIGURATION SURFACE, outside this submodule; another adapter sets the same value under its own key -->
 
@@ -189,9 +191,11 @@ functions**, not by re-deriving the comparison:
 **Why that last one needs a shim at all.** `fieldwiseIsSimilarTo` calls `isSimilarToField`
 DEPENDENTLY. Under `/permissive-`, ordinary lookup for a dependent call is frozen at the
 TEMPLATE'S DEFINITION POINT and ADL contributes only the arguments' own associated namespaces. So
-the overload set the fold sees is decided by where the fold is written — and it excludes both the
-`Serializable<T>` and the `std::vector<T>` overloads declared below it, and the glm overloads in
-`SimulationComparisonGlm.h` (global namespace, not `glm`, so ADL never finds them).
+the overload set the fold sees is decided by where the fold is written — and it excludes the
+`Serializable<T>` and the `std::vector<T>` overloads declared below it. The glm overloads in
+`SimulationComparisonGlm.h` are reached by ADL, from the fold and the shim alike, because they are in
+`namespace glm` since og-input-latency task 2e. Before that they were in the global namespace, where ADL
+never looked, and a `glm::vec3` field compared exactly (`SimulationComparisonGlm-rationale.md` §3).
 
 A walk written in a different header would see a DIFFERENT overload set and would, for instance,
 forgive with an epsilon a `std::vector` field the fold compared with `operator==`. The shim is
@@ -208,11 +212,12 @@ sub-epsilon difference in an EARLIER descriptor and a real one in a LATER one �
 already differs, the walk descends, and the walk must name the SECOND field. A re-derived exact
 leaf names the first.
 
-⛔ **The sub-epsilon cases assert a RELATION, never a direction.** Under the lookup rule above a
-bare float compares with the epsilon while a `glm::vec3` compares exactly — a known property of
-this tree that is deliberately NOT fixed here and deliberately NOT pinned. A case asserting "a
-1e-5 vector difference IS a divergence" would turn the eventual fix into a false regression. What
-must hold either way is that one verdict comes out of this codebase.
+⛔ **The sub-epsilon cases assert a RELATION, never a direction.** When they were written a bare
+float compared with the epsilon while a `glm::vec3` compared exactly, a known property this task
+deliberately did not fix and did not pin. og-input-latency task 2e fixed it: a `glm::vec3` now
+compares with the epsilon too, and the direction is pinned in og-simulation-tests
+`GlmFieldSimilarityTest.cpp`. The relation held before and after. What must hold either way
+is that one verdict comes out of this codebase.
 
 ---
 
@@ -234,9 +239,10 @@ replace. A case asserts a maximal line lands strictly inside 255.
 compares badly across differently-shaped fields; the max component is the number an operator can
 put next to a tolerance. It is detected STRUCTURALLY — `if constexpr (requires { a.x; })` and so
 on for `y`, `z`, `w` — rather than through overloads for the glm types, and that is not a style
-choice: an overload declared in `SimulationComparisonGlm.h` would be invisible to a dependent
-call from this header for exactly the reason §4 gives, so it would COMPILE, be SILENTLY SKIPPED,
-and every weapon-spin delta would report 0. The structural form covers vec2, vec3 and quat
+choice: an overload declared in the global namespace would be invisible to a dependent call from
+this header for exactly the reason §4 gives, so it would COMPILE, be SILENTLY SKIPPED, and every
+weapon-spin delta would report 0. (One in `namespace glm` would be found; the structural form needs
+neither.) The structural form covers vec2, vec3 and quat
 without naming any of them.
 
 **First, in declaration order.** `walkFieldsImpl` is a short-circuiting `||` fold, which is the
@@ -279,3 +285,91 @@ declaration is itself a failure.
 
 ⛔ **A clean anchor-lint run is not evidence that anything here is TRUE.** That checker resolves
 names. Read the header.
+
+---
+
+## 8. The verdict margin — og-input-latency task 2h
+
+**What it answers.** The fold says yes or no and discards the distance, and the field-level walk
+(§1–§6) names only the first field of a DISAGREEING verdict. Neither says how close an AGREEING
+verdict came to the tolerance. Since og-input-latency task 2e, glm fields compare with
+`kDefaultSimilarityEpsilon` (1e-4) instead of exactly, and that initiative's exact-compare research
+kept the tolerance. It also asked, per run, how much of the tolerance is used: cross-build or
+cross-platform noise that stays far below 1e-4 is harmless, and noise near it is not.
+`measureVerdictMargin` measures that.
+
+**What it computes.** For one verdict, `VerdictMargin::maxRatio` is the largest
+`|Δ| / kDefaultSimilarityEpsilon` over the float-valued leaves the fold compares, and `maxField` is
+the path of the leaf that gave it, spelled as `FieldDivergence::path` is (the same
+`appendPathSegment`, so the same truncation rule). Per leaf type:
+
+| leaf | ratio | source |
+|---|---|---|
+| `float`, `double` | `|a − b| / ε` | the scalar arm, `similarityRatioField` in this header |
+| `glm::vec2`, `glm::vec3` | the largest component `|Δ|` over ε | the glm overloads, `SimulationComparisonGlm.h` |
+| `glm::quat` | the same, after the sign alignment of task 2g | the glm overload, with the alignment the verdict uses |
+| integer, `bool`, enum | none: a mismatch sets `discrete` | — |
+| any other leaf | none: a mismatch, as the fold decides it, sets `discrete` | — |
+| an element with a member `isSimilarTo` | none: that member decides; a disagreement sets `discrete` | — |
+
+A ratio below 1 means the leaf is similar, and the per-leaf check below makes sure of it. For a float
+leaf, `|Δ| < ε` in float holds exactly when `|Δ| / ε < 1` in double: two floats `d < e` satisfy
+`d ≤ e·(1 − 2⁻²⁴)`, and that quotient is a double below 1. `+0` against `−0` gives 0.
+
+**⛔ The verdict is the fold's, leaf for leaf; the ratio only measures it.** `walkLeaf` asks the leaf
+question through `leafIsSimilarToAsFieldwiseDoes` (§4's definition-point rule), and a float leaf that
+the fold calls dissimilar while its ratio is below 1 counts as infinite, so a NaN delta cannot land in b0 while the fold disagrees. An infinite delta
+lands in b5 (the test checks one). So `maxRatio ≥ 1 || discrete` holds on every
+disagreeing verdict. The test file checks that on a grid of offsets over six fields.
+
+**A `std::vector` field compares EXACTLY today, and the walk says so instead of hiding it.**
+`SimulationSerialization.h` declares the `std::vector` overload of `isSimilarToField` after
+`fieldwiseIsSimilarTo`, and `std::vector<float>` brings ADL only to namespace `std`. So the fold's
+dependent call never sees that overload: it reaches the generic template, whose `a == b` is
+`std::vector`'s exact `operator==`. This is the two-phase lookup trap of task 2e (§4), on a type the
+`static_assert` in `SimulationTypes.h` does not cover. Measured in `VerdictMarginTest.cpp`: a 5e-8
+offset on one element of a `std::vector<float>` field makes the verdict disagree. The first version
+of the walk compared vector elements one by one, and its agreement test failed on exactly that field.
+The walk therefore takes the vector leaf to the "any other leaf" row: `discrete` when the fold
+disagrees, nothing in the ratio. No production verdict reaches it today. The one `SIM_VECTOR` in the
+brawler is the projectile pool's `slots`, and that pool's `State` has a member `isSimilarTo` (the last
+row of the table).
+
+**Why `discrete` is a flag, not a bucket.** A verdict goes to exactly one ratio bucket, whatever its
+discrete leaves did, so the buckets of a window always add up to its verdicts. A verdict that
+disagreed only on a discrete leaf is in the bucket of its float leaves (often b0) with `discrete` set.
+
+**The gate.** One call site, `tryInsertingCorrectState`, beside the field diff's, with TWO conditions
+and no verdict test:
+
+| condition | what it excludes |
+|---|---|
+| `outDiagnosticVerdict != nullptr` | callers that cannot read the answer |
+| `correctionVerdictMargin::enabled()` | every host that has not opted in, and the opted-in host below its level |
+
+The verdict condition the diff has (`!predictionWasCorrect`) is absent on purpose: agreeing verdicts
+are what this measures. The predicate follows `correctionFieldDiff`'s rules (§2): unset is off, it is
+re-read on every correction, on the thread that receives the corrections only, not atomic. It is a SECOND predicate rather than the
+first one reused, because one host answers the two at different levels. The UE host answers the margin
+gate from `LogOGDivergenceProbe` at `Log` and the diff gate at `Verbose`. So a session at `Log` gets the
+per-window margin line without the per-correction lines. `correctionVerdictMargin::walkCount` counts
+entries to `measureVerdictMargin`, which is the one place that bumps it.
+
+Measured in `VerdictMarginTest.cpp`, over ten landed corrections (five agreeing, five disagreeing)
+and two discards:
+
+| arm | predicate | walks |
+|---|---|---|
+| unconfigured host | none | 0 |
+| opted out | returns false (consulted 10 times) | 0 |
+| opted in | returns true | 10 |
+| opted in, no observer | returns true | 0 |
+
+With the margin gate open and the diff's predicate unset, the diff still walks nothing.
+
+**The cost.** With the gate open, every landed verdict walks every leaf of the state. That is the fold's
+work again, plus a division per float leaf, once per landed correction. That is acceptable for a diagnostic that runs only at `Log`. At the shipped `Warning` not one leaf is read.
+
+**It reads only.** `measureVerdictMargin` takes both states by const reference and writes only its out
+argument. Verdicts, slot contents, the resim anchor and the landing stamp are identical with the gate
+on and off; the test file runs one ten-correction sequence both ways and compares all four.

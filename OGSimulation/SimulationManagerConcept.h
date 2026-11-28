@@ -6,30 +6,6 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "OGSimulation/PCTimeManagement/ServerTickClock.h"
-
-template <typename BufferT>
-concept SyncedTimingBufferConcept = requires(BufferT& b, const ServerTickClock& clock)
-{
-    { b.write(clock) };
-};
-
-// Owner-layer concept for the composition root that owns a SimulationManager.
-// One adapter's binding: `AOGBrawlerSimulationManager`, whose replicated timing-info
-// arrival callback is `OnRep_TimingInfo`.
-// Server side: getSyncedTimingBuffer() is writable; SimulationManager writes the server
-// clock into it each tick via write(). Client side: setOnTimingInfoReceivedCallback
-// registers the deserialized-tick+RTT handler; the adapter's timing-info arrival
-// callback fires it.
-template <typename OwnerT>
-concept SimulationManagerOwnerConcept =
-    requires(OwnerT& owner,
-             std::function<void(uint32_t authorityTick, double rtt)> timingFn)
-    {
-        { owner.getSyncedTimingBuffer() } -> SyncedTimingBufferConcept;
-        { owner.setOnTimingInfoReceivedCallback(timingFn) };
-    };
-
 // ---------------------------------------------------------------------------
 // NetConfig<C> — session-level compile-time netcode parameterization.
 // (Stage 3 / D3.2; proposal_ogbrawler_netcode.md §2.1. GGRS "Pattern B" adapted
@@ -39,10 +15,13 @@ concept SimulationManagerOwnerConcept =
 // opaque wire-identity handle type (`Address`) and the session tick rate. Every
 // engine-agnostic per-connection structure in this core — ConnectionTierTable,
 // ServerInputDelayQueue, and (Stage 4) ServerSubstitutionTracker — is templated
-// on `Address`, so the sim core never names a UE / Godot / engine type. Engine
-// adapters supply the concrete handle: `OGSimulationUnreal` provides
-// `FUEConnectionHandle` (wrapping `TWeakObjectPtr<UNetConnection>`), and the
-// engine-free Catch2 harness provides `FStandaloneTestHandle`.
+// on `Address`, so the sim core never names a UE / Godot / engine type. The
+// transport supplies the concrete handle: og-sim-net provides
+// `SimNetConnectionHandle` (an og-net connection id, an epoch and its liveness
+// table), which the Unreal game's NetConfig names since og-input-latency task P5-7
+// (`OGSimulationUnreal`'s `FUEConnectionHandle`, a `TWeakObjectPtr<UNetConnection>`
+// wrapper, until then; deleted by P5-9), and the engine-free Catch2 harness provides
+// `FStandaloneTestHandle`.
 //
 // WHY `NetConfig` DOES NOT CARRY `Input` / `State` TYPES (proposal §2.1
 // Correction 3): GGRS models a session over a single simulatable, so its config
@@ -58,8 +37,8 @@ concept SimulationManagerOwnerConcept =
 //
 // NAMESPACE NOTE: the design corpus (proposal §2.1) writes this concept as
 // `ogsim::NetConfig`, and this initiative's backlog quotes that spelling in its
-// acceptance criteria. The entire existing OGSim core — including the two
-// concepts above in this very file — lives in the GLOBAL namespace, and there
+// acceptance criteria. The entire existing OGSim core — including this very
+// file — lives in the GLOBAL namespace, and there
 // is no `namespace ogsim` anywhere in the tree. This declaration therefore
 // matches the established codebase convention, exactly as SimulatableList.h
 // already resolved the same design-corpus-vs-codebase mismatch. Downstream

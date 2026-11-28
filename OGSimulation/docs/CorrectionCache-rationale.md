@@ -1,4 +1,6 @@
 <!-- SPDX-License-Identifier: MPL-2.0 -->
+<!-- lint-external-ref: editStorage -- the Unreal session's accessor, deleted by og-session-runtime task 7b; kept in the verbatim pre-compression record -->
+<!-- lint-external-ref: FSimulationManagerAsyncCallback::OnPreSimulate_Internal -- deleted by og-session-runtime task 3 (the brawler's Chaos backend arm: the Chaos host, the Chaos binding and their four docs); kept in the history -->
 # `CorrectionCache.h` — rationale
 
 The header keeps a one-line guard at every site that has one, plus an orientation block
@@ -8,6 +10,10 @@ rejected alternatives, the measurement records and the migration history.
 
 **If this file and `CorrectionCache.h` disagree, the header is authoritative and this file
 is stale.** Fix this file; do not soften the header to match it.
+
+⚠ The fenced blocks below are the compressed text as it stood. Where one names "the OnRep-bound correction callback":
+since og-input-latency task P5-7 that callback fires from og-sim-net's client session (`SimNetClient::onCorrection`), in
+its drain.
 
 ⛔ **Do not move a guard into this file.** Every section below is the *expansion* of a fence
 that still fires at its own line. If you find yourself deleting a one-liner because "it is
@@ -24,12 +30,16 @@ sites** in the header; what is quoted below is the record, not the fence.
 is engine-free: it names no game-engine type and is reached from a host engine only through
 `concept`s. Three names in the quoted blocks belong to one adapter's host stack rather than to this
 core, and the quotations are byte-verbatim, so their ROLES are given here instead of edited in:
-**`Chaos`** is that adapter's **physics engine** — the party handed a tick to restore at, and the
-owner of the rewind loop; **`FSimulationManagerAsyncCallback::OnPreSimulate_Internal`** is one
-adapter's **pre-simulate physics callback**, where the core's step is entered before the solve; and
-**`FSimulationStateSyncBuffer`** is one adapter's **replicated state buffer** — the wire-side type
-whose `writeToBuffer<T>` / `readFromBuffer<T>` surface `ChecksumByteBuffer` deliberately mirrors so
-the same serializers can target both. A fourth, `Config/DefaultEngine.ini`, is one adapter's
+**`Chaos`** was that adapter's **physics engine** — the party handed a tick to restore at, and the
+owner of the rewind loop; **`FSimulationManagerAsyncCallback::OnPreSimulate_Internal`** was that
+adapter's **pre-simulate physics callback**, where the core's step is entered before the solve (both the
+former Chaos adapter's, removed by og-session-runtime tasks 3–6; on the tick driver the step driver
+takes both roles); and
+**`FSimulationStateSyncBuffer`** was one adapter's **replicated state buffer** (deleted by
+og-input-latency task P5-9) — the wire-side type whose `writeToBuffer<T>` / `readFromBuffer<T>` surface
+`ChecksumByteBuffer` deliberately mirrors so the same serializers can target both. Since task P5-7 the
+correction travels in og-simulation's own `CorrectionStateBuffer` (`Network/SimPayloadBuffers.h`),
+which exposes the same surface. A fourth, `Config/DefaultEngine.ini`, is one adapter's
 **host-application configuration surface**, named where a section records which compiled default the
 shipped session actually runs; another adapter sets the same value under its own key.
 None of the four is a dependency of this core.
@@ -67,6 +77,7 @@ None of the four is a dependency of this core.
 <!-- lint-external-ref: ResimGatePolicyTest -- TEST TRANSLATION UNIT in og-simulation-tests, outside every scan root of this repository; it must not resolve here -->
 <!-- lint-external-ref: impl/research_correction_discards.md -- ARCHIVE PATH in the og-netcode-v2-input-relay workspace, outside this repository; it must not resolve -->
 <!-- lint-external-ref: findInputCache -- RENAMED (item 39, 2026-08-25) to findCorrectionCache; the old spelling survives only inside verbatim pre-compression archive blocks and must not resolve -->
+<!-- lint-external-ref: editReconciliation -- the Unreal session's reconciliation door, deleted by og-input-latency task P5-16; it survives only inside a verbatim pre-compression archive block and must not resolve -->
 
 ---
 
@@ -2350,3 +2361,20 @@ says so.
 
 The design, the rejected alternatives, the cost-gate measurements and the field-naming mechanism
 live in `docs/SimulationComparison-rationale.md`; they are not re-derived here.
+
+## 14. The verdict margin — og-input-latency task 2h
+
+`CorrectionInsertVerdict` carries a fifth field, `verdictMargin`, and `tryInsertingCorrectState` has a second gated
+call, `measureVerdictMargin`, right below the field diff's. Both are additive: `isSimilarTo`, the slot overwrite, the
+provenance write, the landing stamp and the resim-anchor decision are unchanged.
+
+**Two conditions, not three.** The call runs when `outDiagnosticVerdict != nullptr && correctionVerdictMargin::enabled()`.
+It has no `!predictionWasCorrect` test, unlike §13's diff, because the margin of an AGREEING verdict is the quantity it
+exists to measure. The cost gate and its measurement are `docs/SimulationComparison-rationale.md` §8.
+
+**Ordering-bound, like `fieldDivergence`.** The walk reads the slot, the PREDICTION, and the arriving `state`, the
+AUTHORITY, so it runs before a disagreeing verdict's `std::move` replaces the slot. Its result goes out with the other
+fields on the hit path only. A discard returns before the call, so a discarded correction is never walked.
+
+⛔ **Reporting only**, under the same rule as §13: nothing in the cache, the gate policy or the resim path may branch on
+`verdictMargin`.

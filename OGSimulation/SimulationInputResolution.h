@@ -66,14 +66,16 @@ OGSIM_OPTIMIZE_OFF
 //   m_neutralInputs         per TYPE        the game's zero input
 //
 // ---------------------------------------------------------------------------
-// THE TWO-THREAD ROSTER. Assembled view; each crossing is fenced at its owner.
+// THE ROSTER BY SIDE. Assembled view; each crossing is fenced at its owner. Both
+// columns run on one thread, the step's (*): the feed side (the arrivals, the send,
+// the display fill) and the step side (the collects).
 //
-//   what                              GAME thread         PHYSICS thread
+//   what                              feed side           step side
 //   --------------------------------  ------------------  ------------------
-//   m_clientEffectiveInputDelayTicks  write OnRep_Conn-   read once per tick
-//     (atomic, relaxed)               ectionTier          (both collects)
-//   m_remoteInputCaches               write OnRep_Rel-    read (both collects)
-//                                     ayedInputRing
+//   m_clientEffectiveInputDelayTicks  write: the drain's  read once per tick
+//     (atomic, relaxed)               tier receipt (*)    (both collects)
+//   m_remoteInputCaches               write: the drain's  read (both collects)
+//                                     ring receipt (*)
 //   m_remoteInputCaches               read getLastRelay-  --
 //                                     edInput -- THE ONE
 //   m_lastUsedCaptureTicks            read sendCorrec-    write collectInputAll
@@ -85,14 +87,22 @@ OGSIM_OPTIMIZE_OFF
 //   m_inputResolutionTelemetry        --                  write (every emit*)
 //   registration / unregistration     all of it           --
 //
-// ⛔ getLastRelayedInput is THE ONE game-thread reader of a store the physics
-//   thread also reads -- and is same-thread with that store's WRITER, which is
-//   why it alone does not participate in the accepted tear. §14
-// ⛔ TWO crossings are ACCEPTED TEARS argued elsewhere, NOT re-derived here: the
-//   relay stores (Network/RemoteInputCache.h) and the join key (member below).
+// (*) The tier receipt and the ring receipt are fed through the port before the
+//   step's collect, and the display read below runs in the display snapshot's
+//   fill after the batch (og-input-latency P2-18, P5-36): every row is
+//   same-thread. Until og-session-runtime task 13 a frame-locked client fed both
+//   receipts on its frame thread (the OnRep_ConnectionTier / OnRep_RelayedInputRing
+//   callbacks until og-input-latency task P5-7), and each row was the crossing its
+//   fence prices.
+// ⛔ getLastRelayedInput is THE ONE display reader of a store the collects also
+//   read -- and runs on that store's WRITER thread, the step's, which is why it
+//   alone would not participate in a tear even with the feed on another thread. §14
+// ⛔ TWO crossings would be TEARS on two threads, argued elsewhere, NOT re-derived
+//   here: the relay stores (Network/RemoteInputCache.h) and the join key (member
+//   below).
 //
 // ---------------------------------------------------------------------------
-// WHERE THE TWO COLLECT PATHS ARE CALLED FROM. All three: physics thread.
+// WHERE THE TWO COLLECT PATHS ARE CALLED FROM. All three: the step's thread.
 //
 //   prediction  SimulationManager::onGameSimulationPrediction
 //                 -> preparePredictionSimulationStep (SimulationStepSequencing.h)
@@ -179,9 +189,11 @@ using LocalInputCacheMapFor = std::unordered_map<
 //
 // Every field is a plain integer, so a torn read is a wrong number on a display rather
 // than a crash -- the same accepted VALUE tear `Diagnostics::localInputCache` carries.
-// ⛔ WRITTEN ON THE PHYSICS THREAD, READ ON THE GAME THREAD, AND ACCEPTED. §14
+// ⛔ WRITTEN BY THE COLLECTS, READ BY THE DISPLAY FILL, both on the step's thread since
+//   og-input-latency P5-36. A reader on another thread (the game thread's, until then)
+//   tears, and that tear is ACCEPTED as a wrong number on a display. §14
 //
-// The map is touched at registration and unregistration only, both game-thread.
+// The map is touched at registration and unregistration only.
 // ⛔ NEITHER SIDE EVER REHASHES IT UNDER THE OTHER. §14
 // ---------------------------------------------------------------------------
 
@@ -211,12 +223,13 @@ struct RelayedReadObservation
     ScheduledRelayedReadMissClass missClass = ScheduledRelayedReadMissClass::NotAMiss;
 };
 
-// ⛔ A TORN READ MUST STAY A WRONG NUMBER -- a member owning memory would be a crash.
+// ⛔ THE RING STAYS A PLAIN VALUE -- the display snapshot copies it by value.
 static_assert(std::is_trivially_copyable_v<RelayedReadObservation>,
-    "RelayedReadObservation is written on the physics thread and read on the game "
-    "thread without a seam. That tear is accepted only because every field is a plain "
-    "value; a member owning memory would make the read a crash rather than a wrong "
-    "number on a display.");
+    "RelayedReadObservation is written and read on the step's thread, and its ring is "
+    "copied by value into each display snapshot: every field is a plain value, so that "
+    "copy is a byte copy that allocates nothing. Was: written on the physics thread and "
+    "read on the game thread without a seam, a tear accepted only because every field "
+    "was a plain value.");
 
 // One remote character's observations, addressed by sim tick.
 class RelayedReadObservationRing
@@ -280,8 +293,9 @@ struct RelayedReadObservationMapFor
 // answers for one display window instead.
 //
 // ⛔ THIS IS A DIAGNOSTIC READ AND MUST STAY ONE.
-// ⛔ WRITTEN AND READ ON THE GAME THREAD ALONE -- the arrival door and the display are
-//   both game-thread, so unlike the observation ring this crosses nothing. §14
+// ⛔ WRITTEN AND READ ON ONE THREAD -- the arrival door and the display's read run on
+//   the relay receipt's thread, the step's, so unlike the observation ring this
+//   crosses nothing even with the collects on another thread. §14
 // ---------------------------------------------------------------------------
 
 struct RelayedInputArrival
@@ -683,8 +697,9 @@ public:
     // ---------------------------------------------------------------------------
     // ⛔ ONE SCALAR, NOT A PER-ID MAP: a delay is a property of the local CONNECTION
     //   and a client has exactly one. §14
-    // ⛔ GAME->PHYSICS CROSSING: written by OnRep_ConnectionTier (GT), read ONCE per
-    //   tick (PT). An atomic suffices because it is a lone independent scalar -- the
+    // ⛔ FEED SIDE -> STEP SIDE: written by the tier receipt, read ONCE per tick by the
+    //   collect, both on the step's thread (the table's (*)); the atomic is for a feed on
+    //   another thread (a frame-locked client's until og-session-runtime task 13). An atomic suffices because it is a lone independent scalar -- the
     //   worst a stale read does is apply a tier change a tick late. EMPHATICALLY NOT
     //   `ServerInputDelayQueue`'s case, whose shared thing was an unordered_map with
     //   rehash UB, not a stale value. RELAXED is deliberate. §14
@@ -772,7 +787,7 @@ public:
     }
 
     // ---------------------------------------------------------------------------
-    // getLastRelayedInput -- LAST-KNOWN, for the GAME-THREAD viz readers. The
+    // getLastRelayedInput -- LAST-KNOWN, for the display's viz readers. The
     // newest relayed input for a REMOTE character, or nothing if none ever arrived.
     // ---------------------------------------------------------------------------
     // ⛔ THE ONLY SOURCE of a remote character's actual input on the client --
@@ -782,8 +797,8 @@ public:
     //   silently draw an aim indicator at the neutral pose. §7
     // ⛔ NULLABLE FOR TWO SEPARATE REASONS: no store exists for a LOCAL character or on
     //   the AUTHORITY at all, and a store that exists may still be cold. §7
-    // ⛔ THREADING -- THE ONE GAME-THREAD READER, and same-thread with the store's
-    //   WRITER, so it does NOT participate in the accepted tear. Returns a COPY. §14
+    // ⛔ THREADING -- THE ONE DISPLAY READER, called on the store's WRITER thread,
+    //   so it does NOT participate in the accepted tear. Returns a COPY. §14
     template <typename SimulatableT>
     std::optional<typename SimulatableT::InputType> getLastRelayedInput(unsigned int id) const
     {
@@ -803,7 +818,7 @@ public:
     // with `InputResolutionTelemetry`) plus a read seam onto `m_localInputCaches`.
     // ⛔ `SimulationNetSync::Diagnostics::relayReadProbe()` IS GONE, not delegating.
     //   Callers reach `inputResolution.getDiagnostics().relayReadProbe()`. §1
-    // ⛔ CONST-ONLY -- both members' data is written on the PHYSICS thread alone,
+    // ⛔ CONST-ONLY -- both members' data is written on the step's thread alone,
     //   by the telemetry sibling and by `collectInputAll`'s capture push. §14
     // ===========================================================================
     class Diagnostics
@@ -829,7 +844,7 @@ public:
         // ⛔ ABSENT IS NOT AN ERROR -- only remote-proxy ids have a ring, and a local
         //   character's client-side delay is answered by its delay line instead. §2
         //
-        // The accepted tear is argued at the ring's own declaration, not restated here.
+        // Why it stays a plain value is argued at the ring's own declaration, not restated here.
         // ⛔ A POINTER TO CONST: no reader may write back a tick the sim would run on. §14
         template <typename SimulatableT>
         const RelayedReadObservationRing* relayedReadObservations(unsigned int id) const
@@ -921,8 +936,8 @@ public:
             .try_emplace(id,
                 std::get<NeutralInputFor<SimulatableT>>(m_neutralInputs).value);
 
-        // Its physics-thread writer only ever LOOKS UP an id, so the map cannot rehash.
-        // ⛔ THE RING IS CREATED HERE, ON THE GAME THREAD, AND NOWHERE ELSE. §14
+        // Its writer, the collect, only ever LOOKS UP an id, so the map cannot rehash.
+        // ⛔ THE RING IS CREATED HERE, AT REGISTRATION, AND NOWHERE ELSE. §14
         std::get<RelayedReadObservationMapFor<SimulatableT>>(m_relayedReadObservations)
             .value.try_emplace(id);
 
@@ -984,10 +999,11 @@ public:
     //   only the unregistration ordering kept it out of UB. §7
     // ---------------------------------------------------------------------------
 
-    // Replaces the OnRep-bound relay-arrival callback's body AND the registration-time
-    // catch-up read, both by id.
+    // Replaces the relay-arrival callback's body (the callback NetSync binds on the
+    // owner, which og-sim-net's ring receipt calls; an OnRep's until og-input-latency
+    // task P5-7) AND the registration-time catch-up read, both by id.
     // ⛔ NetSync's catch-up call DISCARDS the returned report (the
-    //   not-fed-to-the-cadence-probe rule); only its OnRep thin-call emits. §7
+    //   not-fed-to-the-cadence-probe rule); only its arrival thin-call emits. §7
     template <typename SimulatableT, typename RingT>
     RelayedInputIngestReport ingestRelayRing(unsigned int id, const RingT& ring)
     {
@@ -1013,7 +1029,9 @@ public:
         return report;
     }
 
-    // Replaces the RPC-bound remote-move callback's queueing call, by id.
+    // Replaces the remote-move callback's queueing call, by id (the callback NetSync
+    // binds on the authority owner, which og-sim-net's delayed-input delivery calls;
+    // the input RPC's until og-input-latency task P5-7).
     // ⛔ GUARD CONTEXT CROSSES BY VALUE from NetSync's own members -- the guard stays
     //   NetSync's and this door only ever sees copies. The too-far-future warning and
     //   the `[ReceiveLocalInput]` SIMLOG stay at NetSync's lambda. §7
@@ -1073,7 +1091,7 @@ public:
     }
 
     // ---------------------------------------------------------------------------
-    // Per-tick input resolution (physics thread)
+    // Per-tick input resolution (the step's thread)
     // ---------------------------------------------------------------------------
 
     // ---------------------------------------------------------------------------
@@ -1109,7 +1127,7 @@ public:
         ResolvedInputs<SimulatableTs...> inputs;
 
         // ⛔ ONE LOAD PER TICK for every locally-controlled simulatable. Reading it
-        //   once rather than per id is what makes a concurrent OnRep_ConnectionTier write
+        //   once rather than per id is what makes a concurrent tier-receipt write
         //   unable to split a single tick across two different delays. §14
         const int32 effectiveDelay = getClientEffectiveInputDelayTicks();
 
@@ -1120,7 +1138,7 @@ public:
 
         // PROBES 1 + 3, per-window summary -- driven from here because this is the
         // only place with a monotonic tick AND a guarantee of running once per tick.
-        // ⛔ PHYSICS-THREAD WINDOW. The game-thread arrival probe has its OWN window
+        // ⛔ STEP-SIDE WINDOW. The arrival-side probe has its OWN window
         //   object; Network/RelayReadProbe.h states why they must not be merged. §14
         // ⛔ This reaches `InputResolutionTelemetry`, not `NetSyncTelemetry` --
         //   see that header for which of ITS methods this call site may reach. §14
@@ -1502,7 +1520,7 @@ private:
         {
             // ⛔ A NULLABLE LOOKUP for the reason collectInputAll's local-provider branch
             //   uses one: provider-present and line-present are the same condition, so a miss
-            //   is a broken invariant -- and answering it by throwing off the physics thread
+            //   is a broken invariant -- and answering it by throwing on the step's thread
             //   kills the process. The full argument is at that branch and is NOT re-derived
             //   here; this site only mirrors it. §2 §9
             auto& localInputCaches = std::get<LocalInputCacheMapFor<T>>(m_localInputCaches);
@@ -1605,7 +1623,7 @@ private:
     // observations are keyed by. A character whose first read has not run yet is stamped
     // against nothing and is therefore not recorded: no observation exists for an arrival
     // to have been late for.
-    // ⛔ GAME THREAD ON BOTH SIDES. The frontier read is the accepted value tear the
+    // ⛔ ONE THREAD ON BOTH SIDES, the relay receipt's. The frontier read is the accepted value tear the
     //   observation ring already carries; nothing here writes that ring. §14
     template <typename SimulatableT, typename RingT>
     void noteRelayedArrivals(unsigned int id, const RingT& ring,
@@ -1663,12 +1681,13 @@ private:
 
     // The capture tick behind each applied remote input, or kNoInputCaptureTick
     // on an underrun substitution.
-    // ⛔ WRITTEN IN collectInputAll (PHYSICS), READ IN sendCorrectionAll (GAME, on
-    //   SimulationNetSync). §14
+    // ⛔ WRITTEN IN collectInputAll, READ IN sendCorrectionAll (on SimulationNetSync),
+    //   both on the authority's step thread. §14
     // ⛔ AN INHERITED PATTERN, NOT A NEW ONE -- the strict parallel of the retired
-    //   `m_lastUsedInputs`. Tolerable because it is a plain scalar per id: a torn
-    //   schedule carries the previous tick's value for one tick, healed by the
-    //   every-frame correction that transports it. §14
+    //   `m_lastUsedInputs`. On two threads (the in-frame server's send, until
+    //   og-session-runtime task 14) it was tolerable because it is a plain scalar per
+    //   id: a torn schedule carries the previous tick's value for one tick, healed by
+    //   the next correction that transports it. §14
     std::tuple<LastUsedCaptureTickMapFor<SimulatableTs>...> m_lastUsedCaptureTicks;
 
     // Client Layer-1 input delay lines.
@@ -1689,40 +1708,42 @@ private:
     // ⛔ NOT "client" neutrals any more -- the AUTHORITY reads this too. The old name
     //   described one of several consumers and invited exactly the reasoning that left
     //   the authority path integrating `InputType{}`. §6
-    // ⛔ Written ONCE by the composition root (setNeutralInput, game thread), read on
-    //   the physics thread thereafter. §14
+    // ⛔ Written ONCE by the composition root (setNeutralInput), before the first step,
+    //   read by the steps thereafter. §14
     std::tuple<NeutralInputFor<SimulatableTs>...>            m_neutralInputs;
 
     // The client's relayed-input stores, one per REMOTE character
     // (provider-ABSENT ids -- the complement of m_localInputCaches).
-    // ⛔ WRITTEN ON THE GAME THREAD (OnRep_RelayedInputRing), READ ON THE PHYSICS
-    //   THREAD (both collects). The crossing is INHERITED from the correction path and
-    //   its full rationale is the THREADING section of Network/RemoteInputCache.h.
+    // ⛔ WRITTEN BY THE RING RECEIPT, READ BY BOTH COLLECTS, all on the step's thread.
+    //   Its threading rule and the crossing a feed on another thread would reopen are
+    //   the THREADING section of Network/RemoteInputCache.h.
     //   DO NOT RESTATE IT HERE; DO NOT WEAKEN IT THERE. §14
     std::tuple<RemoteInputCacheMapFor<SimulatableTs>...> m_remoteInputCaches;
 
     // What the scheduled read SERVED, per remote character, per sim tick. Display-side
     // diagnostic state only.
-    // Written on the PHYSICS thread (both collects), read on the GAME thread.
+    // Written by both collects, read by the display fill, both on the step's thread
+    // (og-input-latency P5-36; until og-session-runtime task 3 the Chaos host read it
+    // on its game thread).
     // ⛔ THE TEAR AND THE NO-REHASH PAIRING ARE ARGUED AT RelayedReadObservationRing. §14
     std::tuple<RelayedReadObservationMapFor<SimulatableTs>...> m_relayedReadObservations;
 
     // When each relayed capture first arrived, per remote character. Display-side
     // diagnostic state only, and the join key is the observation's own `probeTick`.
-    // ⛔ WRITTEN AND READ ON THE GAME THREAD ALONE -- argued at RelayedInputArrivalRing. §14
+    // ⛔ WRITTEN AND READ ON ONE THREAD, the relay receipt's -- argued at RelayedInputArrivalRing. §14
     std::tuple<RelayedInputArrivalMapFor<SimulatableTs>...> m_relayedInputArrivals;
 
-    // OWNED HERE, NOT ON NETSYNC. The PHYSICS-THREAD-ONLY telemetry
+    // OWNED HERE, NOT ON NETSYNC. The step-side telemetry
     // sibling: `RelayReadProbe` and its ten `emit*` helpers.
-    // ⛔ `NetSyncTelemetry` -- the other, GAME-THREAD-ONLY sibling -- stays on
+    // ⛔ `NetSyncTelemetry` -- the other, arrival-side sibling -- stays on
     //   `SimulationNetSync`. `InputResolutionTelemetry.h` holds the probe
     //   declaration, the fence on each method, and that class's two-thread rule. §14
     InputResolutionTelemetry m_inputResolutionTelemetry;
 
     // Client effective input delay.
-    // ⛔ Written on the GAME thread (OnRep_ConnectionTier, via the adapter calling this
-    //   class directly -- there is no `SimulationNetSync` forwarder), read once per
-    //   tick on the PHYSICS thread. ATOMIC -- AND ONLY ATOMIC -- for the reasons at
+    // ⛔ Written by the tier receipt (the host calling this class directly -- there is
+    //   no `SimulationNetSync` forwarder), read once per tick by the collect, both on the
+    //   step's thread. ATOMIC -- AND ONLY ATOMIC -- for the reasons at
     //   setClientEffectiveInputDelayTicks. 0 = no delay. §14
     std::atomic<int32> m_clientEffectiveInputDelayTicks{ 0 };
 

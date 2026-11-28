@@ -64,10 +64,10 @@
 // ---------------------------------------------------------------------------
 // ONE OBJECT, ONE THREAD. Unlike RelayReadProbe/RelayArrivalProbe (T19), which
 // had to split because their two call sites live on different threads, every
-// correction reaches this probe from the SAME place: the OnRep-dispatched
-// correction-state callback bound in `SimulationNetSync::registerPredictionOwner`,
-// which runs on the GAME thread. There is no physics-thread feeder, so there is
-// no window to tear and no split to make.
+// correction reaches this probe from the SAME place: the correction-state callback
+// bound in `SimulationNetSync::registerPredictionOwner`, which the host calls from
+// its correction store on one thread, the step's. One thread feeds it, so there
+// is no window to tear and no split to make.
 //
 // NO PER-ID STATE, hence no `forgetOwner`. The summary is a per-CLASS aggregate
 // across characters — that is what "corrections seen on remote proxies" means —

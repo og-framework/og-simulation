@@ -24,13 +24,15 @@
 // whether the render-side input echo is muted.
 //
 // OWNERSHIP -- Option A, locked 2026-07-19. THE SERVER OWNS THIS TABLE. The authority
-// derives each connection's tier from its own per-connection RTT and replicates the
-// resulting index to the owning client; clients do NOT run a second instance and do
+// derives each connection's tier from its own per-connection RTT and sends the
+// resulting index to the owning client (og-sim-net's `SimNetServer::publishTier`;
+// a replicated property until og-input-latency P5-7); clients do NOT run a second instance and do
 // NOT derive their own tier. Nothing here enforces that placement -- it is stated so a
 // reader does not mistake the type for a symmetric client/server component.
 //
 // LIVE IN PRODUCTION, by this route:
-//   the per-character adapter component (GAME thread)
+//   og-sim-net's server, once per input bundle (`SimNetServer::receiveBundle`, on the
+//   server's drain thread; the per-character adapter component until P5-7)
 //     -> `ServerReceptionCoordinator::noteRttSample`
 //     -> `ConnectionTierTable::onRttSample`
 // `ServerReceptionCoordinator` owns the only production instance, by value, and reaps
@@ -39,9 +41,8 @@
 //
 // THIS FILE HOLDS TWO THINGS, and the split is the point:
 //   the SHARED free functions  `tierInputDelayTicks`, `tierRollbackCeiling`,
-//                              `tierShouldMuteEcho`, `tierDelayDeltaTicks`,
-//                              `shouldStallForTierTransition`, and the relay delay
-//                              floor helpers. Bare `(tierIndex, cfg)` -- no table and
+//                              `tierShouldMuteEcho`, `tierDelayDeltaTicks`, and the
+//                              relay delay floor helpers. Bare `(tierIndex, cfg)` -- no table and
 //                              no Address -- so the client can call them directly.
 //   the TABLE                  address-keyed state plus thin wrappers over those same
 //                              functions. It owns no copy of the rule.
@@ -66,7 +67,8 @@
 //
 // ENGINE-AGNOSTIC. Sim core: only other `OGSimulation/` headers and the STL. Wire
 // identity arrives as the opaque template parameter `Address`, bound in production to
-// `FUEConnectionHandle` (OGSimulationUnreal) and in the Catch2 suite to
+// og-sim-net's `SimNetConnectionHandle` (the Unreal `FUEConnectionHandle` until
+// og-input-latency task P5-7; deleted by P5-9) and in the Catch2 suite to
 // `FStandaloneTestHandle` (`Network/StandaloneTestHandle.h`).
 // GLOBAL NAMESPACE, matching the rest of the OGSim core (same note as `NetConfig` in
 // SimulationManagerConcept.h and SimulatableList.h). The design corpus writes
@@ -317,31 +319,11 @@ inline int32_t tierDelayDeltaTicks(int32_t fromTier, int32_t toTier, const TimeC
     return tierInputDelayTicks(toTier, cfg) - tierInputDelayTicks(fromTier, cfg);
 }
 
-// THE CLIENT PREDICTION-STALL DECISION for a wire tier transition.
-//
-// ⛔⛔ PASS `hadAnyTier`, NEVER INFER IT FROM `oldTier` -- 0 is both the replicated
-//   property's compiled default and a legal tier. On a fresh connection's FIRST real
-//   arrival the "before" value is that default, not a tier the client ever ran at: until
-//   then it runs the pre-arrival no-tier fallback (see `ReplicatedTierConsumer`). §8
-// ⛔ SO `tierDelayDeltaTicks(0, newTier, cfg)` STALLS BY THE WRONG QUANTITY IN THE WRONG
-//   DIRECTION for every newTier except 0 -- at the shipped table the fallback is 4 and
-//   tier 0 is 1, so a first arrival of tier 1 asks for a 1-tick stall where the true
-//   delta is -2: a stall for a transition that made the client's delay SHORTER. §8
-// ⛔ FIRST-EVER RESOLUTION -> ALWAYS ZERO, whatever newTier is. §8
-// ⛔ The `oldTier == newTier` early-out is preserved: a callback can fire unchanged. §8
-// ⛔ Only a POSITIVE delta is returned; the clock is also a no-op below zero. §8
-inline int32_t shouldStallForTierTransition(
-    int32_t oldTier, int32_t newTier, bool hadAnyTier, const TimeConfig& cfg)
-{
-    if (oldTier == newTier)
-        return 0;
-
-    if (!hadAnyTier)
-        return 0;
-
-    const int32_t deltaDelayTicks = tierDelayDeltaTicks(oldTier, newTier, cfg);
-    return deltaDelayTicks > 0 ? deltaDelayTicks : 0;
-}
+// ⛔ RETIRED (og-input-latency P6-2): `shouldStallForTierTransition`, the client's
+//   positive-only stall decision for a wire tier transition, is deliberately gone.
+//   A client pays the change of its effective delay, either sign, the first arrival
+//   included (the tier receipt's recompute delta, one adapter's
+//   `UESimulationSession::onConnectionTierReceived`). §8
 
 // Outcome of a single `ConnectionTierTable::onRttSample` call.
 //

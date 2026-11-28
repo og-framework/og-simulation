@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <functional>
 #include <iterator>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -14,7 +15,9 @@
 #include "OGSimulation/InputRedundancyBundleCodec.h"
 #include "OGSimulation/Network/ConnectionSlotKey.h"
 #include "OGSimulation/Network/ConnectionTierTable.h"
+#include "OGSimulation/Network/InputArrivalMargin.h"
 #include "OGSimulation/Network/ServerInputDelayQueue.h"
+#include "OGSimulation/OGAssert.h"
 #include "OGSimulation/PCTimeManagement/TimeConfig.h"
 #include "OGSimulation/SimulationLog.h"
 
@@ -40,7 +43,7 @@
 //
 //   * THE FOUR ENTRY POINTS, and the cadence each is driven at:
 //
-//       noteRttSample         per arriving BUNDLE   the RPC receive path
+//       noteRttSample         per arriving BUNDLE   SimNetServer's input receive path
 //       receiveInputBundle    per arriving BUNDLE   the same path, after it
 //       releaseDelayedInputs  per SIM TICK          the authority's pre-step hook
 //       reapConnections       per PHYSICS FRAME     the host, after the frame's steps
@@ -75,7 +78,7 @@
 //   * NAMESPACE. Global, like the rest of this core. The design corpus writes
 //     `ogsim::`; no such namespace exists in this tree.
 //
-//   * TEN LOG TAGS leave this file, all through `setLogger`. Their severities,
+//   * ELEVEN LOG TAGS leave this file, all through `setLogger`. Their severities,
 //     their windows and what each is for are tabulated in §8.
 // ===========================================================================
 
@@ -141,8 +144,8 @@ struct NullRemoteInputRelaySink
 //
 // ⛔ `parked == false` MEANS THE ADAPTER MUST DELIVER UNDELAYED, or input is lost. §2
 // ⛔ EXCEPT `rejectedOutOfDomain`, which must NOT be delivered - check it first. §5
-// ⛔ `acceptedNew` IS FIRST-SIGHT of (id, captureTick): false for a redundancy
-// re-send AND for a genuinely-new out-of-order-OLDER tick. §6
+// ⛔ `acceptedNew` IS THE OWNER'S NEWEST-SO-FAR WATERMARK, NOT FIRST SIGHT: false
+// for a redundancy re-send AND for a genuinely-new out-of-order-OLDER tick. §6
 // ⛔ IT GATES THE RELAY TAP TOGETHER WITH the park actually happening, and gates
 // nothing about parking or delivery itself. §6
 // ⚠ `parked == true` DOES NOT MEAN AN ENTRY IS IN THE DEQUE: a duplicate and a
@@ -163,23 +166,42 @@ public:
     using DelayQueue  = ServerInputDelayQueue<Address, SimulatableTs...>;
     using SlotKey     = ConnectionSlotKey<Address>;
 
+    using ArrivalMargin = InputArrivalMargin<Address>;
+
     template <typename SimT>
     using InputFor = SimulatableInputOf_t<SimT>;
 
+    static_assert(ArrivalMargin::kNoDrainYet == DelayQueue::kNoLateGate,
+        "InputArrivalMargin::kNoDrainYet must equal ServerInputDelayQueue::kNoLateGate: receiveRemoteInput passes the "
+        "late gate's own reference to noteArrival, so the late gate's fail-open sentinel is what takes no sample before "
+        "the first drain. Was the og-input-latency task 5 rule 'before the first drain, no sample is taken'.");
+
+    static_assert(TimeConfig{}.rollbackWindowHardCap + static_cast<int32_t>(TimeConfig{}.hardResyncThresholdTicks)
+                      < ArrivalMargin::kSeenMaskTicks,
+        "The receipt gate's span, rollbackWindowHardCap + hardResyncThresholdTicks, must stay below "
+        "InputArrivalMargin::kSeenMaskTicks: noteSighting's per-owner seen mask is exact only for capture ticks within "
+        "that span of the highest tick sighted. Was the og-input-latency P3-5 rule (design section 5) that a 64-bit "
+        "mask classifies the first sight of every in-domain capture exactly.");
+
     // ⛔ BORROWS `const TimeConfig&` - the caller must outlive this coordinator. §1
     // ⛔ TABLE BEFORE QUEUE - the queue binds the table by reference. §1
+    // ⛔ THE ARRIVAL WINDOW IS [InputStats]'s LENGTH, so both close on the same reap. §8
     explicit ServerReceptionCoordinator(const TimeConfig& cfg)
         : m_config(cfg)
         , m_tierTable(cfg)
         , m_inputDelayQueue(cfg, m_tierTable)
+        , m_arrivalMargin(inputStatsWindowTicks(cfg), cfg.tickFrequency, cfg.backDateM0P50ThresholdTicks)
     {
+        OG_CHECK(cfg.rollbackWindowHardCap + static_cast<int32_t>(cfg.hardResyncThresholdTicks)
+                     < ArrivalMargin::kSeenMaskTicks,
+            "ServerReceptionCoordinator: rollbackWindowHardCap + hardResyncThresholdTicks must stay below InputArrivalMargin::kSeenMaskTicks, or the per-owner seen mask misclassifies first sightings (og-input-latency P3-5)");
     }
 
     ServerReceptionCoordinator(const ServerReceptionCoordinator&)            = delete;
     ServerReceptionCoordinator& operator=(const ServerReceptionCoordinator&) = delete;
 
     // Optional structured-log sink, carrying EVERY line this file emits - all
-    // eleven `SIMLOG` sites across ten tags, not just the slot warning. §8
+    // thirteen `SIMLOG` sites across twelve tags, not just the slot warning. §8
     // ⚠ A leading `[Warning]` or `[Verbose]` picks the severity; see `SimulationLog.h`.
     void setLogger(std::function<void(const char*)> logger) { m_logger = std::move(logger); }
 
@@ -215,7 +237,8 @@ public:
     // and a per-Address key would starve the second sibling forever. §4
     // ⛔ COMPARE `result.newTierIndex`, NEVER "did THIS sample transition" - that
     // starves the sibling whose sample did not cross the dwell gate. §4
-    // ⚠ A missing entry means never told, baseline 0 - so tier 0 publishes nothing. §4
+    // ⛔ A MISSING ENTRY MEANS NEVER TOLD, SO THE FIRST SAMPLE PUBLISHES, TIER 0 TOO -
+    // the client runs the worst-tier fallback until told (og-input-latency P6-2). §4
     template <ConnectionTierSink Sink>
     void noteRttSample(const Address& addr, unsigned int ownerId, int32_t serverTick,
                        double rttMs, Sink&& sink)
@@ -228,8 +251,7 @@ public:
         const int32_t newTier = result.newTierIndex;
 
         const auto it = m_lastPublishedTier.find(ownerId);
-        const int32_t lastPublished = (it == m_lastPublishedTier.end()) ? 0 : it->second;
-        if (newTier == lastPublished)
+        if (it != m_lastPublishedTier.end() && newTier == it->second)
         {
             return;         // unchanged for this owner — do not dirty the wire
         }
@@ -337,11 +359,39 @@ public:
         const int32_t lateGate = m_drainTickKnown ? m_nextUndrainedSimTick
                                                   : DelayQueue::kNoLateGate;
 
+        // ⛔G-04  docs/InputArrivalMargin-guards.md
+        const bool firstSight = m_arrivalMargin.noteSighting(id, captureTick);
+
+        const std::size_t lateDroppedBefore = m_inputDelayQueue.lateDroppedCount();
+
         // TRUE when a NEW entry was parked; FALSE for a duplicate of a still-parked
         // tick AND for a LATE refusal - the discriminator the relay-tap gate turns on. §6
         // ⛔ A LATE DROP IS NOT A RELAY HOLE: nothing was applied for a peer to miss. §6
         const bool queuedNewEntry =
             m_inputDelayQueue.template enqueue<SimT>(key, captureTick, input, lateGate);
+
+        // ⛔G-02  docs/InputArrivalMargin-guards.md
+        if (m_inputDelayQueue.lateDroppedCount() != lateDroppedBefore)
+        {
+            m_arrivalMargin.noteLateRefused(key.address);
+            // ⛔G-05  docs/InputArrivalMargin-guards.md
+            if (firstSight)
+            {
+                m_arrivalMargin.noteLateFirstSight(key.address, captureTick, lateGate);
+            }
+            else
+            {
+                m_arrivalMargin.noteLateResent(key.address);
+            }
+        }
+
+        // ⛔G-03  docs/InputArrivalMargin-guards.md
+        if (queuedNewEntry)
+        {
+            // ⛔G-01  docs/InputArrivalMargin-guards.md
+            m_arrivalMargin.noteArrival(key.address, captureTick,
+                                        m_inputDelayQueue.effectiveDelay(key), lateGate, firstSight);
+        }
 
         // ⛔ [Park] IS GATED ON `acceptedNew`, so a re-send does not spam it. §8
         // ⛔ AND ON `queuedNewEntry`, or a LATE-DROPPED newest capture would log a
@@ -390,14 +440,25 @@ public:
               && RemoteInputRelaySink<RelaySink, InputFor<SimT>>
     void receiveInputBundle(unsigned int id, const Address& addr, uint8_t playerSlot,
                             const Buffer& wire, Sink&& deliver,
-                            RelaySink&& relay = RelaySink{})
+                            RelaySink&& relay = RelaySink{},
+                            std::optional<double> recvSeconds = std::nullopt)
     {
+        bool         bundleParked = false;
+        std::int32_t bundleNewest = 0;
         inputRedundancyBundle::forEachSlot<InputFor<SimT>>(
             wire,
             [&](std::uint32_t captureTick, const InputFor<SimT>& input)
             {
-                SIMLOG(m_logger, "[ServerReceive] id=%u tick=%u",
-                    id, static_cast<unsigned int>(captureTick));
+                if (recvSeconds.has_value())
+                {
+                    SIMLOG(m_logger, "[ServerReceive] id=%u tick=%u recvSeconds=%.6f",
+                        id, static_cast<unsigned int>(captureTick), *recvSeconds);
+                }
+                else
+                {
+                    SIMLOG(m_logger, "[ServerReceive] id=%u tick=%u",
+                        id, static_cast<unsigned int>(captureTick));
+                }
 
                 const ReceiveRemoteInputResult result = receiveRemoteInput<SimT>(
                     id, addr, playerSlot, static_cast<int32_t>(captureTick), input, relay);
@@ -409,7 +470,19 @@ public:
                 {
                     deliver.deliverRemoteInput(id, captureTick, input);
                 }
+
+                if (result.parked)
+                {
+                    const std::int32_t tick = static_cast<std::int32_t>(captureTick);
+                    bundleNewest = (!bundleParked || tick > bundleNewest) ? tick : bundleNewest;
+                    bundleParked = true;
+                }
             });
+
+        if (bundleParked)
+        {
+            m_arrivalMargin.noteBundleNewest(addr, id, bundleNewest);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -424,8 +497,11 @@ public:
     // `RemoteMoveQueue`'s capture-tick dedup. §2
     // ⚠ Release lateness is reported separately, as `[Release] late=N` TICKS. §8
     // ⚠ NOT the same quantity as `[InputStats] late=N`, which is a COUNT. §8
+    // ⚠ `stepSeconds`, when the host passes it, is appended to every [Release]
+    // line of this drain as ` stepSeconds=`; without it the line is unchanged. §8
     template <typename SimT, typename DeliverFn>
-    void releaseDelayedInputs(int32_t firstUpcomingSimTick, int32_t numSteps, DeliverFn&& deliver)
+    void releaseDelayedInputs(int32_t firstUpcomingSimTick, int32_t numSteps, DeliverFn&& deliver,
+                              std::optional<double> stepSeconds = std::nullopt)
     {
         // ⛔ RECORDED BEFORE THE EMPTY EARLY-OUT, so an idle server still advances it. §5
         // ⛔ `+ numSteps`, NOT `firstUpcomingSimTick`: this frame serves the whole
@@ -482,8 +558,16 @@ public:
 
                 // [Release] is the timeline companion to [Park]; this point sees
                 // every released tick per id, so [InputGap] lives here too. §8
-                SIMLOG(m_logger, "[Release] id=%u captureTick=%d releaseTick=%d late=%d",
-                    id, deliveredCaptureTick, simTick, late);
+                if (stepSeconds.has_value())
+                {
+                    SIMLOG(m_logger, "[Release] id=%u captureTick=%d releaseTick=%d late=%d stepSeconds=%.6f",
+                        id, deliveredCaptureTick, simTick, late, *stepSeconds);
+                }
+                else
+                {
+                    SIMLOG(m_logger, "[Release] id=%u captureTick=%d releaseTick=%d late=%d",
+                        id, deliveredCaptureTick, simTick, late);
+                }
                 noteDeliveredForGap(id, deliveredCaptureTick);
             }
 
@@ -532,6 +616,9 @@ public:
         // ⛔ ITS WINDOW IS SERVER-TICK TIME - no wall-clock is reachable here. §8
         maybeEmitInputStats(serverTick);
 
+        // ⛔ [InputArrival.Window] CLOSES ON THE SAME CALL, also before the dwell gate. §8
+        maybeEmitInputArrival(serverTick);
+
         const int32_t dwell = m_config.tierMinDwellTicks;
         if (dwell <= 0 || (serverTick % dwell) != 0)
         {
@@ -558,6 +645,10 @@ public:
             it = (!it->first.isAlive()) ? m_lastDrainDelay.erase(it) : std::next(it);
         }
 
+        // The arrival-margin windows are Address-keyed too, so a dead wire's are
+        // forgotten here, off the same liveness. §8
+        m_arrivalMargin.forgetDeadWires();
+
         // ⛔ `m_loggedOutOfRangeSlots` IS DELIBERATELY NOT PRUNED HERE. §8
         // ⛔ The reap cadence would re-fire the warning every dwell period. §8
     }
@@ -578,6 +669,7 @@ public:
         m_captureTickWatermark.erase(id);
         m_lastPublishedTier.erase(id);
         m_lastDeliveredCaptureTick.erase(id);   // [InputGap] watermark (T25)
+        m_arrivalMargin.forgetOwner(id);
     }
 
     // -----------------------------------------------------------------------
@@ -603,6 +695,12 @@ public:
     // ⛔ A DISJOINT POPULATION FROM `relayOooSkipCount()`: that one is applied and
     // not relayed, this one is neither applied nor relayed. §6
     std::size_t lateDroppedCount() const { return m_inputDelayQueue.lateDroppedCount(); }
+
+    // The per-wire arrival margin; `latest(addr)` is the last closed window. §8
+    const ArrivalMargin& arrivalMargin() const { return m_arrivalMargin; }
+
+    // ⛔G-06  docs/InputArrivalMargin-guards.md
+    ArrivalMargin& editArrivalMarginForFenceTest() { return m_arrivalMargin; }
 
     bool hasClaim(const SlotKey& key) const
     {
@@ -766,7 +864,7 @@ private:
     // ⚠ Same start tick, same reset point, same emit-only-if-carried rule. §8
     void maybeEmitInputStats(int32_t serverTick)
     {
-        const int32_t window = static_cast<int32_t>(2.0 * m_config.tickFrequency);
+        const int32_t window = inputStatsWindowTicks(m_config);
         if (window <= 0)
         {
             return;         // degenerate config — no meaningful window
@@ -836,6 +934,50 @@ private:
         m_windowRelayOooSkips       = 0;
         m_lateDroppedAtWindowStart  = lateTotal;
         m_statsWindowStartTick      = serverTick;
+    }
+
+    // The ~2 s window of SERVER-TICK time that [InputStats] and
+    // [InputArrival.Window] both use - one derivation for both. §8
+    static int32_t inputStatsWindowTicks(const TimeConfig& cfg)
+    {
+        return static_cast<int32_t>(2.0 * cfg.tickFrequency);
+    }
+
+    // [InputArrival.Window] - one line per wire per window that carried an
+    // arrival or a late refusal. `conn=` is the wire's hash, as in [DelayShift]. §8
+    // [InputArrival.BackDate] - one line when a wire's back-dating episode opens,
+    // after that window's [InputArrival.Window] line, with the same `conn=`. §8
+    void maybeEmitInputArrival(int32_t serverTick)
+    {
+        typename ArrivalMargin::WindowLines lines;
+        if (!m_arrivalMargin.closeWindowIfDue(serverTick, lines))
+        {
+            return;
+        }
+        for (const auto& [wire, summary, arrival, backDateOpening] : lines)
+        {
+            const std::size_t conn = static_cast<std::size_t>(std::hash<Address>{}(wire));
+            SIMLOG(m_logger,
+                "[Warning][InputArrival.Window] conn=%zu samples=%u marginP05=%d marginP50=%d "
+                "marginP95=%d min=%d lateRefused=%u lateFirstSight=%u lateResent=%u m0P05=%d "
+                "m0P50=%d stepsPerBundle=%d",
+                conn,
+                static_cast<unsigned int>(summary.samples), summary.marginP05Ticks,
+                summary.marginP50Ticks, summary.marginP95Ticks, summary.marginMinTicks,
+                static_cast<unsigned int>(summary.lateRefused),
+                static_cast<unsigned int>(arrival.lateFirstSight),
+                static_cast<unsigned int>(arrival.lateResent), arrival.m0P05Ticks, arrival.m0P50Ticks,
+                arrival.stepsPerBundleP50);
+            // ⛔G-07  docs/InputArrivalMargin-guards.md
+            if (backDateOpening.has_value())
+            {
+                SIMLOG(m_logger,
+                    "[Warning][InputArrival.BackDate] conn=%zu m0P50=%d windows=%u threshold=%d D=%d",
+                    conn, backDateOpening->m0P50Ticks,
+                    static_cast<unsigned int>(backDateOpening->sustainedWindows),
+                    backDateOpening->thresholdTicks, backDateOpening->effectiveDelayTicks);
+            }
+        }
     }
 
     // ⛔ ONE-SHOT PER (id, slot), keyed on a packed `(id<<8 | slot)`. §8
@@ -924,6 +1066,11 @@ private:
     // window opened. The count itself lives in the queue, which owns the
     // predicate; this is only the window baseline it is differenced against. §8
     std::size_t m_lateDroppedAtWindowStart = 0;
+
+    // --- Arrival margin -----------------------------------------------------
+    // Per-wire `captureTick + delay - nextUndrained` at park, plus late refusals,
+    // windowed with [InputStats]. Fed only from `receiveRemoteInput`. §8
+    ArrivalMargin m_arrivalMargin;
 
     std::function<void(const char*)> m_logger;
 };

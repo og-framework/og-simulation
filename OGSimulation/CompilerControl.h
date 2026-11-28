@@ -41,6 +41,10 @@
 // quantity under the right name — applied to build configuration. State the
 // setting the number was taken under, every time, in the record itself.
 
+#if defined(_M_FP_FAST) || defined(__FAST_MATH__)
+	#error "og-simulation code compiles with precise floating-point semantics only (MSVC /fp:precise; an Unreal module sets FPSemantics = FPSemanticsMode.Precise): docs/FloatingPointMode-rationale.md. Replaces the manual .obj.rsp check of that file's section 4 (og-input-latency task 20a)."
+#endif
+
 #if (defined(OGSIM_FORCE_OPTIMIZED) && OGSIM_FORCE_OPTIMIZED) \
 	|| (defined(UE_BUILD_SHIPPING) && UE_BUILD_SHIPPING)       \
 	|| (defined(UE_BUILD_TEST) && UE_BUILD_TEST)

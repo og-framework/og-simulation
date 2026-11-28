@@ -51,10 +51,10 @@ through this one branch; the early-return covers all three only while it stays f
 ## G-02 — The angle is `2 · atan2(|xyz|, w)`. Never `2 · acos(w)`.
 
 **Tag site:** `SurfaceFrame.h`, in `surfaceFrame::toAngleAxis`, immediately above
-`const float angle = 2.f * std::atan2(s, q.w);`.
+`const float angle = 2.f * simTrig::atan2(s, q.w);`.
 
-**The prohibition.** Do not replace the angle with `2.f * std::acos(q.w)`, even though it is shorter and
-needs no `s`.
+**The prohibition.** Do not replace the angle with `2.f * simTrig::acos(q.w)` (or any other `acos` of `w`), even
+though it is shorter and needs no `s`.
 
 **The consequence.** For a small rotation `w = cos(angle / 2)` is within a few float steps of 1, where
 `acos` is steepest: the rounding of `w` becomes a large error in the angle. Measured with `acos`

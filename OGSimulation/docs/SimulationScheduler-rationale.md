@@ -49,10 +49,12 @@ The public surface:
 | `SchedulerConfig` | `dtSeconds`, `maxCatchUpSteps` (no default, §4), `minRateScale`, `maxRateScale` |
 | `pump(now)` | steps due now, at most the cap; advances `physicsStepCount` by the returned count (§3) |
 | `nextDeadline()` | the wall time the next step falls due; a runner sleeps until it |
+| `currentStepInterval()` | the newest segment's interval: the spacing after `nextDeadline()`, exactly `dtSeconds / rateScale()` (§5, §11) |
 | `stepDeadline(step)` | the wall time a step was (or will be) scheduled for (§6) |
 | `setRateScale(s)` / `rateScale()` | the clock-dilation seam (§5) |
 | `reanchor(now)` | pause/resume: skip the gap, count it (§7) |
-| `lostTime()` | every dropped second and step, cumulative (§4, §7) |
+| `lostTime()` | every dropped second and step, cumulative: the sum of the two causes (§4, §7, §10) |
+| `lostTimeByCause()` | the same, split into `catchUp` (`pump`'s drops) and `reanchor` (skipped gaps) (§10) |
 | `ignoredTimeSamples()` | rejected `now` values (§8) |
 
 ## §2 The deadline grid
@@ -60,8 +62,8 @@ The public surface:
 The first deadline is `startSeconds` itself: a fresh scheduler issues one step on its first pump at
 the start time. Each later deadline is the previous one plus `interval = dtSeconds / rateScale`.
 
-That sum is never accumulated (guard G-02). The scheduler keeps a short list of **segments**, each
-`{firstStep, firstDeadline, interval}`, and computes a step's deadline as
+That sum is never accumulated (guard G-02). The scheduler keeps a short history of **segments**
+(a fixed ring, §11), each `{firstStep, firstDeadline, interval}`, and computes a step's deadline as
 `firstDeadline + (step − firstStep) × interval` from the segment that contains it. A segment
 begins wherever the grid stops being one straight line:
 
@@ -101,13 +103,14 @@ intervals, so the last step run is scheduled for the latest due deadline (at or 
 the next deadline is the first one after `now`. The grid keeps its phase.
 
 Worked example (60 Hz, cap 4): a pump 250 ms after the previous one finds 15 deadlines due. It runs
-4, drops 11, and adds `lostTime().steps += 11` and `lostTime().seconds += 11 × interval`
-(≈ 0.183 s). The next pump one step later runs 1, with no burst.
+4, drops 11, and adds 11 steps and `11 × interval` (≈ 0.183 s) to the catch-up cause,
+`lostTimeByCause().catchUp`, and so to `lostTime()` (§10). The next pump one step later runs 1, with
+no burst.
 
 **Every dropped step is counted (guard G-03).** A fixed-step loop that runs a cap and moves on is
 the textbook way to lose wall time silently: the simulation falls behind real time and nothing
-says why. `lostTime` is cumulative and never reset by the scheduler; a host that wants a rate
-differences two reads.
+says why. `lostTime` is cumulative and never reset by the scheduler (each cause is cumulative too);
+a host that wants a rate differences two reads.
 
 **The cap has no default.** The host chooses it per role (an authority and a predicting client
 want different caps), and a default would hide that choice. It is enforced by the
@@ -147,8 +150,8 @@ diagnostics. It is evaluated from the segment list (§2):
 
 - **issued steps inside the retained history** get the exact deadline they were issued against;
 - **steps before the oldest retained segment** are extrapolated backwards from that segment. The
-  list keeps the last `kDeadlineHistorySegments` segments, so this only happens after that many
-  grid changes, and only for steps older than all of them;
+  ring keeps the last `kDeadlineHistorySegments` segments (§11), so this only happens after that
+  many grid changes, and only for steps older than all of them;
 - **future steps** (`step >= physicsStepCount()`) are extrapolated from the current segment: the
   plan if nothing changes.
 
@@ -162,10 +165,11 @@ segment's own straight line, so it joins without a step backwards.
 
 `reanchor(now)` is for a host that knows the gap was not simulation time: a pause, a resume from
 background, a debug-mode switch. If `now` is later than `nextDeadline()`, it moves the next
-deadline to `now` and counts the gap (guard G-04):
+deadline to `now` and counts the gap (guard G-04) under the reanchor cause (§10):
 
-- `lostTime().seconds += now − nextDeadline()` (the gap, exactly),
-- `lostTime().steps += (deadlines due at now) − 1`, because one step still runs at `now`.
+- `lostTimeByCause().reanchor.seconds += now − nextDeadline()` (the gap, exactly),
+- `lostTimeByCause().reanchor.steps += (deadlines due at now) − 1`, because one step still runs at
+  `now`.
 
 The next `pump(now)` then returns 1. After a 10 s pause at 60 Hz that is ≈ 10 s and 599 steps.
 
@@ -193,9 +197,78 @@ The scheduler is a plain value with no synchronisation. It belongs to the one th
 Another thread that needs a deadline (a renderer interpolating between steps) reads it from data the
 owning thread publishes, never by calling into the scheduler.
 
-## §10 Provenance
+## §10 Lost time by cause
+
+Lost time has two causes, and a host that wants to tell a hitch from a pause needs them apart:
+
+| cause | recorded by | field |
+|---|---|---|
+| a catch-up drop (§4) | `pump`, at guard G-03 | `lostTimeByCause().catchUp` |
+| a skipped gap (§7) | `reanchor`, at guard G-04 | `lostTimeByCause().reanchor` |
+
+Each call site names its own field (`recordLostTime(lost_.catchUp, …)`,
+`recordLostTime(lost_.reanchor, …)`), so the cause is fixed where the amount is measured.
+
+`lostTime()` returns the field-wise sum, `catchUp + reanchor`, for steps and for seconds.
+
+- **It is bit-exact with the single total it replaced whenever only one cause has occurred.** That
+  cause accumulates the same amounts in the same order as the single total did, and the other
+  field is still exactly `0` and `+0.0`. Adding `+0.0` to a non-negative `double` returns it
+  unchanged, and every amount recorded is non-negative.
+- **Nothing in og-simulation calls `reanchor`.** `SimulationTickDriver` keeps its scheduler private
+  and never calls it, and the `TickRateDoor` it hands the game's `beforePump` has no `reanchor`.
+  So a host that drives the scheduler through the tick driver records catch-up drops only, and its
+  `lostTime()` is the old total, bit for bit. The tick driver's window totals read `lostTime()`, so
+  they print the sum.
+- **With both causes,** the step count is still exact. The seconds can differ from a single running
+  total by rounding, because the two sums are added once instead of interleaved.
+
+The test `SimulationScheduler.LostTime.ByCauseSplitsCatchUpDropsFromReanchorGaps` pins the split:
+a hitch beyond a cap of 3, then a reanchor gap. It fails if the gap is recorded as a catch-up drop.
+
+## §11 The segment ring: fixed capacity, no allocation
+
+The history is a `std::array<DeadlineSegment, kDeadlineHistorySegments>` used as a ring, with the
+index of the oldest kept segment and the number kept (1 to `kDeadlineHistorySegments`). The
+constructor seeds the first slot with the start segment, so there is always a newest segment.
+
+Its semantics are those of the `std::deque` it replaced:
+
+- `beginSegment` overwrites the newest segment when that one begins at the current step (§2: no
+  issued step lies in it).
+- Otherwise it appends. When the ring is full, the append overwrites the oldest slot and advances
+  the oldest index: the same as the deque's append followed by dropping its front once it held more
+  than `kDeadlineHistorySegments`.
+- `segmentFor` scans from the newest to the oldest and falls back to the oldest kept (§6).
+- `currentInterval()` is the newest segment's interval. The public `currentStepInterval()` returns it,
+  read-only. Every segment is begun with `dtSeconds` (the first) or `dtSeconds / rateScale_` (a rate
+  change), and a drop or a `reanchor` begins its segment with `currentInterval()`, so the value is always
+  exactly `dtSeconds / rateScale()`.
+
+**No allocation, at construction or after.** The ring lives inside the scheduler object, so
+`pump`, `reanchor` and `setRateScale` never reach the heap. A `std::deque` stores its elements in
+separately allocated blocks, so an append at a segment change (a rate change, a drop, a reanchor)
+could allocate on the thread that pumps.
+
+**The price is size.** The object carries all `kDeadlineHistorySegments` slots: measured with MSVC
+x64, `sizeof(SimulationScheduler)` went from 120 to 1,648 bytes. A copy of the scheduler copies the
+ring.
+
+The test `SimulationScheduler.Segments.TheRingKeepsTheDequesDeadlinesOverManySegments` pins the
+equivalence. It drives the scheduler beside a copy of the deque version through 1,000 pumps, more
+than 300 segments and two catch-up drops. Every `stepDeadline` from the oldest kept segment to ten
+steps ahead, and every `nextDeadline()`, must be exactly equal. Evicting one segment early fails it
+at the oldest kept deadline.
+
+## §12 Provenance
 
 Written on 2026-10-06 for the project-owned fixed step that replaces an engine physics scheduler.
 The catch-up rule answers a measured weakness of that engine scheduler, which discarded wall time on
 a hitch without reporting it. ⚠ That research and the design it fed live in private working
 material that is **not distributed with this submodule**; nothing above depends on it.
+
+2026-11-12: lost time split by cause (§10), and the segment history moved from a `std::deque` to a
+fixed ring (§11).
+
+2026-11-20: `currentStepInterval()`, a public read of the newest segment's interval (§11), for a rate
+controller that reads the step interval through the tick driver's rate door.

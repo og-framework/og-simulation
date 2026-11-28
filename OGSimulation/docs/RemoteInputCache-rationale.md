@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: MPL-2.0 -->
+<!-- lint-external-ref: ASimulationInputRelay -- deleted by og-input-latency task P5-9 (the relay actors, their listeners, the Iris sim buffers, serializers and proofs, and UEConnectionHandle); kept in the history -->
 # `RemoteInputCache.h` — rationale
 
 This is the narrative, the derivations and the deferral history for `RemoteInputCache` and its
@@ -34,8 +35,8 @@ architect rulings of 2026-08-04, and the `og-source-doc-extraction` extraction o
 <!-- lint-external-ref: RemoteInputCacheTest.cpp -- test translation unit in the og-simulation-tests submodule, not distributed with this submodule -->
 <!-- lint-external-ref: NetSyncTelemetryTest.cpp -- test translation unit in the og-simulation-tests submodule, not distributed with this submodule -->
 <!-- lint-external-ref: SimulationInputResolutionTest.cpp -- test translation unit in the og-brawler-tests submodule, not distributed with this submodule -->
-<!-- lint-external-ref: ASimulationInputRelay::OnRep_RelayedInputRing -- one adapter's replication callback, in the OGSimulationUnreal subtree, not in this engine-free library -->
-<!-- lint-external-ref: OnRep_CorrectionState -- one adapter's replication callback, in the adapter subtree, not in this engine-free library -->
+<!-- lint-external-ref: ASimulationInputRelay::OnRep_RelayedInputRing -- deleted by og-input-latency task P5-9 (the relay actors, their listeners, the Iris sim buffers, serializers and proofs, and UEConnectionHandle); kept in the history -->
+<!-- lint-external-ref: OnRep_CorrectionState -- deleted by og-input-latency task P5-8 (the net-sync component, the pawn's subobject, the bundle builder and the owner binding's net half); kept in the history -->
 <!-- lint-external-ref: RelayedInputStore -- RETIRED NAME: this type's name before the 2026-08-16 rename to RemoteInputCache; it must not resolve -->
 <!-- lint-external-ref: relayStaleInputHoldTicks -- A NAME THAT HAS NEVER EXISTED: the deferred stale-hold window (§5). The absence is the fence; if this ever resolves, the deferral has landed and §5 is stale -->
 <!-- lint-external-ref: prepareSimulationStep -- RETIRED NAME: collectInputAll carried it between items 90 and 94 only; §10 records the correction and it must not resolve -->
@@ -198,10 +199,12 @@ from taste.
 `Perspective-RemoteInputFlow.md` §8 both point here rather than re-deriving it; the header keeps the
 prohibitions.
 
-**The crossing.** The adapter's relayed-ring arrival callback fires on the GAME thread and routes
-the ring into `populateRemoteInputCache`, which writes slots. `collectInputAll` and
-`collectResimInputAll` (`SimulationInputResolution.h`) read those slots on the PHYSICS thread, i.e.
-wherever the host ticks physics asynchronously. There is no seam between the two.
+**The crossing.** The relayed-ring arrival callback routes the ring into `populateRemoteInputCache`, which writes
+slots; `collectInputAll` and `collectResimInputAll` (`SimulationInputResolution.h`) read those slots in the step.
+There is no seam between the two, and og-simulation checks no thread: the store is single-threaded only while its
+host delivers the arrivals on the step's thread, between steps. Until og-session-runtime task 13 the drain could also
+run on the host's frame thread while a step read the store. The rest of this section is the analysis of record for
+a host that delivers arrivals on another thread than the step's.
 
 ⛔ **`LocalInputCache`'s "not thread-safe; single-threaded by construction" sentence is TRUE for the
 delay line and FALSE for this type**, and the header fences against copying it across along with the
@@ -210,9 +213,10 @@ inside one `collectInputAll` call. A false threading contract is worse than none
 
 **Why it is accepted rather than fixed here — four reasons, in order of weight.**
 
-1. **It is inherited, not introduced.** The correction-state arrival callback (one adapter's
-   binding: `OnRep_CorrectionState`) is likewise game-thread and reaches `injectCorrectionState`
-   with no queue and no seam, while the same two physics-thread readers read the correction cache.
+1. **It is inherited, not introduced.** The correction-state arrival callback (og-sim-net's
+   `SimNetClient::onCorrection` since og-input-latency task P5-7; one adapter's `OnRep_CorrectionState`
+   before, deleted by P5-8) arrives on the same thread as the ring and reaches `injectCorrectionState`
+   with no queue and no seam, while the same two step readers read the correction cache.
    The same inheritance was recorded for `m_lastUsedInputs` and, after that map was retired, for its
    surviving twin `m_lastUsedCaptureTicks`. This store widens nothing.
 2. **The failure mode is a TORN SLOT, not container UB.** Storage is a fixed-size slot array — as
@@ -416,7 +420,8 @@ file-name-for-class-name substitution reads perfectly and resolves to nothing.
 
 The first pass of this audit reported `ASimulationInputRelay::OnRep_RelayedInputRing` as
 **nonexistent**, because the scan root covered `Plugins/OGSimulation` and `Source/OGBrawlerUnreal`
-and the symbol lives in `Source/OGSimulationUnreal`. It exists and the header is right. ⇒ **A sweep
+and the symbol lived in `Source/OGSimulationUnreal`. It existed then and the header was right
+(og-input-latency task P5-9 deleted it later). ⇒ **A sweep
 whose root does not cover the claim returns a confident zero.** That is this project's signature
 defect appearing inside the auditor rather than in the prose, and it is the reason every negative
 result in §10 is quoted with its search root.

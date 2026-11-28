@@ -99,12 +99,9 @@ public:
     // declaration, because a `LinearBodyState` carries neither and its widening would write
     // identity and zero.
     //
-    // THE RESTORED BODY is read with `captureStartOfStepBodyState` when the adapter models
-    // `PhysicsBodyStartOfStepReader` (`if constexpr`), and with `captureBodyState` otherwise. It
-    // must be the state the first replayed step starts from. On Jolt that is `captureBodyState`
-    // after `restoreTick`. On Chaos `captureBodyState` reads the solved P/Q, which a rewind leaves
-    // stale while it restores X/R/V/W, so the Chaos adapter supplies the start-of-step read. Both
-    // reads below (the skip and a linear declaration's rotation) use this one value.
+    // THE RESTORED BODY is read with `captureBodyState`. It must be the state the first replayed
+    // step starts from; on Jolt that is `captureBodyState` after `restoreTick`. Both reads below
+    // (the skip and a linear declaration's rotation) use this one value.
     //
     // RESTORE SKIP. A declaration whose state equals the adapter's capture of the restored body
     // (exact `operator==`: all four fields for `PhysicsBodyState`, position and linear velocity for
@@ -194,14 +191,7 @@ private:
     // pushCorrectedBodyStatesAll).
     PhysicsBodyState captureRestoredBodyState(BodyId bodyId) const
     {
-        if constexpr (PhysicsBodyStartOfStepReader<PhysAdapterT>)
-        {
-            return m_physicsAdapter.captureStartOfStepBodyState(bodyId);
-        }
-        else
-        {
-            return m_physicsAdapter.captureBodyState(bodyId);
-        }
+        return m_physicsAdapter.captureBodyState(bodyId);
     }
 
     // The restore skip's comparison (see pushCorrectedBodyStatesAll). Exact float equality on the

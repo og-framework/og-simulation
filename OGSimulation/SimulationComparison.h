@@ -10,7 +10,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <concepts>
 #include <functional>
+#include <limits>
 #include <tuple>
 #include <type_traits>
 #include <utility>
@@ -66,6 +68,11 @@ OGSIM_OPTIMIZE_OFF
 //     `CorrectionArrivalDecision` -> `NetSyncTelemetry::emitCorrectionArrival`.
 //     Nothing in this file logs; the vocabulary rule is
 //     `docs/DiagnosticsConventions.md` §2/§3 and is not re-derived here.
+//
+//   * A SECOND WALK, SINCE og-input-latency task 2h: `measureVerdictMargin`
+//     (the bottom of this file) measures how close EVERY landed verdict came to
+//     the tolerance, under its own gate and counter (`correctionVerdictMargin`),
+//     from the same call site. §8
 //
 //   * THE TWO GLOBALS. `correctionFieldDiff::g_enabledPredicate` and
 //     `g_walkCount` are process-global for the same reason `simlog::g_sink` is:
@@ -198,24 +205,35 @@ namespace fieldDivergenceDetail
 //
 // ⛔ TRUNCATES, NEVER OVERFLOWS, AND NEVER DROPS THE SEGMENT IT CANNOT FIT — a
 //    shortened path is still a name an operator can grep; a missing one is not.
-inline void appendSegment(FieldDivergence& out, const char* segment)
+//    One rule for both walks: the margin walk's path goes through here too. §8
+inline void appendPathSegment(char (&path)[kFieldPathCapacity], const char* segment)
 {
-    std::size_t len = std::strlen(out.path);
+    std::size_t len = std::strlen(path);
     if (segment == nullptr)
         segment = "?";
     if (len != 0u && len + 1u < kFieldPathCapacity)
-        out.path[len++] = '.';
+        path[len++] = '.';
     for (const char* s = segment; *s != '\0' && len + 1u < kFieldPathCapacity; ++s)
-        out.path[len++] = *s;
-    out.path[len] = '\0';
+        path[len++] = *s;
+    path[len] = '\0';
+}
+
+inline void appendSegment(FieldDivergence& out, const char* segment)
+{
+    appendPathSegment(out.path, segment);
 }
 
 // `#<index>` — the fallback name for a descriptor written as a bare type. §3
-inline void appendIndex(FieldDivergence& out, std::size_t index)
+inline void appendPathIndex(char (&path)[kFieldPathCapacity], std::size_t index)
 {
     char buf[16];
     std::snprintf(buf, sizeof(buf), "#%u", static_cast<unsigned int>(index));
-    appendSegment(out, buf);
+    appendPathSegment(path, buf);
+}
+
+inline void appendIndex(FieldDivergence& out, std::size_t index)
+{
+    appendPathIndex(out.path, index);
 }
 
 // THE COMPILER'S OWN SPELLING OF A TYPE. §6
@@ -296,11 +314,11 @@ const char* typeName()
 
 // THE MAGNITUDE. §5
 //
-// ⛔ SHAPE-DETECTED, NOT GLM-OVERLOADED, AND THE REASON IS THE SAME LOOKUP TRAP
-//    THAT MAKES `isSimilarToField` EXACT FOR VECTORS: an overload declared in
-//    `SimulationComparisonGlm.h`, in the GLOBAL namespace, is invisible to a
-//    dependent call from here under /permissive- (ordinary lookup is frozen at
-//    this definition point; ADL searches `glm`, where the overload is not). A
+// ⛔ SHAPE-DETECTED, NOT GLM-OVERLOADED, AND THE REASON IS THE LOOKUP TRAP THAT
+//    MADE `isSimilarToField` EXACT FOR VECTORS UNTIL og-input-latency task 2e: an
+//    overload declared in the GLOBAL namespace is invisible to a dependent call
+//    from here under /permissive- (ordinary lookup is frozen at this definition
+//    point; ADL searches only `glm`). A
 //    `fieldDeltaMagnitude(glm::vec3)` overload would therefore COMPILE, be
 //    SILENTLY SKIPPED, and every weapon-spin delta would report 0. Detecting the
 //    components structurally cannot be defeated that way. §5
@@ -574,6 +592,226 @@ inline void formatFieldDivergence(const FieldDivergence& divergence, char* buffe
     default:
         std::snprintf(buffer, capacity, " field=%s", divergence.path);
         break;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// THE VERDICT MARGIN — og-input-latency task 2h. §8
+//
+// How close a verdict came to the tolerance: `maxRatio` = the largest
+// |Δ| / kDefaultSimilarityEpsilon over the float-valued leaves the fold compares,
+// asked on EVERY landed verdict, agreeing and disagreeing, while its own gate is
+// on. The per-window `[DivergenceProbe.Margin]` line is `NetSyncTelemetry`'s.
+//
+// ⛔ A REPORTER, LIKE EVERYTHING ABOVE. Nothing may branch on `VerdictMargin`
+//    outside a log line. §8
+// ---------------------------------------------------------------------------
+
+namespace correctionVerdictMargin
+{
+
+// ⛔ THE SAME THREE RULES AS `correctionFieldDiff::g_enabledPredicate`: UNSET IS
+//    OFF, RE-READ PER CORRECTION, GAME THREAD ONLY. A SECOND predicate rather than
+//    the first one reused, because the host answers it at its own verbosity: the
+//    margin line runs without the per-correction Verbose lines. §8
+inline std::function<bool()> g_enabledPredicate;
+
+inline void setEnabledPredicate(std::function<bool()> predicate)
+{
+    g_enabledPredicate = std::move(predicate);
+}
+
+inline void clearEnabledPredicate()
+{
+    g_enabledPredicate = nullptr;
+}
+
+inline bool enabled()
+{
+    return static_cast<bool>(g_enabledPredicate) && g_enabledPredicate();
+}
+
+// ⛔ COUNTS WALKS, NOT LINES — bumped in `measureVerdictMargin` and nowhere else. §8
+inline std::uint64_t g_walkCount = 0u;
+
+inline std::uint64_t walkCount() { return g_walkCount; }
+inline void resetWalkCount() { g_walkCount = 0u; }
+
+} // namespace correctionVerdictMargin
+
+struct VerdictMargin
+{
+    // ⛔ false = the walk did not run. Never read it as `maxRatio == 0`. §8
+    bool evaluated = false;
+
+    double maxRatio = 0.0;
+
+    // A leaf OUTSIDE `maxRatio` disagreed: an integer, bool or enum, any other
+    // type the fold compares exactly (a `std::vector` field, today), or an element
+    // its own member `isSimilarTo` decides. §8
+    bool discrete = false;
+
+    // The leaf that gave `maxRatio`, as `FieldDivergence::path` spells it; empty
+    // while `maxRatio` is 0. §8
+    char maxField[kFieldPathCapacity] = {};
+};
+
+// THE SCALAR ARM of the per-type normalised delta. The glm arms are overloads in
+// namespace glm beside their `isSimilarToField`, found by ADL from the walk's
+// dependent call (`SimulationComparisonGlm.h`). §8
+template <typename T>
+double similarityRatioField(const T& a, const T& b)
+{
+    static_assert(!simulationTypesDetail::GlmFloatType<T>,
+        "similarityRatioField: a glm float vector, quaternion or matrix reached the scalar arm. Its overload is in "
+        "namespace glm in OGSimulation/SimulationComparisonGlm.h, beside the type's isSimilarToField, found by ADL: "
+        "include that header, or add both overloads there for a new glm type. The twin of isSimilarToField's pin "
+        "(og-input-latency task 2h)");
+    static_assert(std::floating_point<T>,
+        "similarityRatioField: only a float-valued leaf has a ratio; integers, bools and enums count as discrete "
+        "(og-input-latency task 2h)");
+    return static_cast<double>(std::abs(a - b)) / static_cast<double>(kDefaultSimilarityEpsilon);
+}
+
+namespace verdictMarginDetail
+{
+
+struct Cursor
+{
+    VerdictMargin& out;
+    char path[kFieldPathCapacity] = {};
+};
+
+template <typename E>
+concept DecidedByMemberIsSimilarTo = requires(const E& a, const E& b) {
+    { a.isSimilarTo(b) } -> std::convertible_to<bool>;
+};
+
+inline void noteRatio(Cursor& c, double ratio)
+{
+    if (ratio > c.out.maxRatio)
+    {
+        c.out.maxRatio = ratio;
+        std::memcpy(c.out.maxField, c.path, sizeof(c.path));
+    }
+}
+
+template <typename T>
+void walkFields(const T& a, const T& b, Cursor& c);
+
+// ⛔ THE VERDICT IS THE FOLD'S, BRANCH FOR BRANCH; THE RATIO ONLY MEASURES IT. Each
+//    arm mirrors the overload `fieldwiseIsSimilarTo` reaches for that leaf type. A
+//    float leaf the fold calls dissimilar is at least 1 even when its ratio is not
+//    (a NaN), so b5 can never hide a disagreement. §8
+template <typename V>
+void walkLeaf(const V& a, const V& b, Cursor& c)
+{
+    if constexpr (std::floating_point<V> || simulationTypesDetail::GlmFloatType<V>)
+    {
+        const double ratio = similarityRatioField(a, b);
+        const bool similar = leafIsSimilarToAsFieldwiseDoes<V>(a, b);
+        noteRatio(c, similar || ratio >= 1.0 ? ratio : std::numeric_limits<double>::infinity());
+    }
+    else if constexpr (Serializable<V>)
+    {
+        walkFields<V>(a, b, c);
+    }
+    else
+    {
+        if (!leafIsSimilarToAsFieldwiseDoes<V>(a, b))
+            c.out.discrete = true;
+    }
+}
+
+template <typename T, typename Fields, std::size_t I>
+void walkOneField(const T& a, const T& b, const Fields& fields, Cursor& c)
+{
+    using FD = std::tuple_element_t<I, Fields>;
+    using V = typename FD::Value;
+
+    const std::size_t mark = std::strlen(c.path);
+    const char* name = std::get<I>(fields).name;
+    if (name != nullptr)
+        fieldDivergenceDetail::appendPathSegment(c.path, name);
+    else
+        fieldDivergenceDetail::appendPathIndex(c.path, I);
+
+    if constexpr (Serializable<V>)
+        walkFields<V>(FD::read(a), FD::read(b), c);
+    else
+        walkLeaf<V>(FD::read(a), FD::read(b), c);
+
+    c.path[mark] = '\0';
+}
+
+// ⛔ EVERY FIELD, NO SHORT-CIRCUIT: the margin is a maximum, not a first hit. §8
+template <typename T, typename Fields, std::size_t... Is>
+void walkFieldsImpl(const T& a, const T& b, const Fields& fields, Cursor& c, std::index_sequence<Is...>)
+{
+    (walkOneField<T, Fields, Is>(a, b, fields, c), ...);
+}
+
+template <typename T>
+void walkFields(const T& a, const T& b, Cursor& c)
+{
+    const auto fields = SerializableFields<T>::get();
+    using Fields = decltype(SerializableFields<T>::get());
+    walkFieldsImpl<T>(a, b, fields, c, std::make_index_sequence<std::tuple_size_v<Fields>>{});
+}
+
+// ⛔ MIRRORS `compositeDetail::compareElement`: an element with a member
+//    `isSimilarTo` is decided by it, so its fields are not in the ratio and its
+//    disagreement counts as discrete. §8
+template <typename E>
+void walkElement(const E& a, const E& b, Cursor& c)
+{
+    const std::size_t mark = std::strlen(c.path);
+    fieldDivergenceDetail::appendPathSegment(c.path, fieldDivergenceDetail::typeName<E>());
+
+    if constexpr (DecidedByMemberIsSimilarTo<E>)
+    {
+        if (!a.isSimilarTo(b))
+            c.out.discrete = true;
+    }
+    else
+    {
+        walkFields<E>(a, b, c);
+    }
+
+    c.path[mark] = '\0';
+}
+
+template <typename... Ts>
+void walkComposite(const SimulationComposite<Ts...>& a, const SimulationComposite<Ts...>& b, Cursor& c)
+{
+    (walkElement<Ts>(a.template get<Ts>(), b.template get<Ts>(), c), ...);
+}
+
+} // namespace verdictMarginDetail
+
+// ⛔ LIKE `describeFirstDivergingField`, IT DOES NOT CHECK ITS GATE: the call site
+//    does, before the arguments are formed. The counter is bumped here only. §8
+template <typename S>
+void measureVerdictMargin(const S& predicted, const S& authority, VerdictMargin& out)
+{
+    out = VerdictMargin{};
+    out.evaluated = true;
+    ++correctionVerdictMargin::g_walkCount;
+
+    verdictMarginDetail::Cursor cursor{ out };
+    if constexpr (Serializable<S>)
+    {
+        fieldDivergenceDetail::appendPathSegment(cursor.path, fieldDivergenceDetail::typeName<S>());
+        verdictMarginDetail::walkFields<S>(predicted, authority, cursor);
+    }
+    else if constexpr (IsSimulationComposite<S>::value)
+    {
+        verdictMarginDetail::walkComposite(predicted, authority, cursor);
+    }
+    else if constexpr (verdictMarginDetail::DecidedByMemberIsSimilarTo<S>)
+    {
+        if (!predicted.isSimilarTo(authority))
+            out.discrete = true;
     }
 }
 

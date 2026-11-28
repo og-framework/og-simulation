@@ -50,6 +50,35 @@ guard.
 
 ---
 
+## G-02 — A helper template is defined above every member function that calls it
+
+**Tag site:** `SimulationFrame.h`, the end of `simFrame`: after `forwardColumn`, immediately above the closing `};`. It is
+an **absence tag**: the line under it is blank, and that is where the forbidden helper would go.
+
+**The prohibition.** Do not define a member function template of `simFrame` below a member function whose body calls it.
+That covers moving `signedPick`, `signedPlace` or `place` back to the end of the struct, where they stood under a second
+`private:` until 2026-11-12, and appending a new helper template there. Each helper template is defined in the first
+`private:` section, above the first `public:`, so it sits above every member that calls it.
+
+**The consequence.** Clang refuses the header; MSVC accepts both orders. The namespace-scope `static_assert` on
+`simFrameDetail::picksKeepTheSignOfZero<simFrame>` constant-evaluates the public picks, and clang cannot evaluate a call
+to a member template defined below its caller:
+
+```
+error: static assertion expression is not an integral constant expression
+note: undefined function 'signedPick<1, false>' cannot be used in a constant expression
+```
+
+Every translation unit that includes the header fails to compile under clang. This was measured with clang-cl 19 (with and
+without MSVC-style delayed template parsing) and with the Android NDK's clang 18 for arm64 and x86-64. Moving any one of
+the three helpers alone is enough to fail; the note then names that helper.
+
+**What breaks if it moves.** Nothing on MSVC: MSVC 2022 accepts the wrong order, so a Win64 MSVC build passes
+either way. Only a clang compile of a translation unit that includes this header catches it. If the tag leaves the end of
+`simFrame`, a helper appended there is typed with no tag in view.
+
+---
+
 ## §R Retired ids
 
 **None.**
@@ -65,5 +94,6 @@ the wrappers (rationale §7).
 ## Provenance
 
 G-01 was written with the header on 2026-10-25 and re-worded on 2026-10-26, when the knobs, the
-template and the wrappers were deleted; the prohibition did not change. Nothing in
+template and the wrappers were deleted; the prohibition did not change. G-02 was written on 2026-11-12, after the
+three helpers were moved above their callers so that the header compiles under clang. Nothing in
 this file depends on any document outside this submodule.

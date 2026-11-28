@@ -7,7 +7,7 @@
 #include <unordered_map>
 
 // ---------------------------------------------------------------------------
-// RelayWriteProbe / ConnectionBudgetProbe -- the SERVER-side relay telemetry.
+// RelayWriteProbe -- the SERVER-side relay telemetry.
 // Companion: Network/RelayReadProbe.h (the CLIENT-side read and arrival probes,
 // plus FrameHealthProbe). Tests: Network/RelayWritePathProbeTest.cpp.
 // Every `§N` mark below resolves in docs/RelayProbes-rationale.md.
@@ -18,24 +18,26 @@
 //   object                 thread        window closes on
 //   ---------------------  ------------  -----------------------------
 //   RelayWriteProbe        GAME, SERVER  120 COMPLETED RUNS, per owner
-//   ConnectionBudgetProbe  GAME, SERVER  120 SAMPLES, per connection
 //
 //   PROBE 5 (RelayWriteProbe) asks how many relay writes for ONE owner share
 //   one server game-thread frame, and so how many of them a once-per-poll
-//   publish could ever carry. PROBE 6 (ConnectionBudgetProbe) asks what a
-//   connection's rate, payload and saturation state ACTUALLY are. One adapter
-//   call site feeds each. §10 §12
+//   publish could ever carry. §10
+//   PROBE 6 (ConnectionBudgetProbe, a connection's rate, payload and saturation
+//   state) was removed by og-session-runtime task 14 with its one adapter call
+//   site, the Unreal session's in-frame server. §12
 //
 // ⛔ INSTRUMENTATION ONLY, GAME THREAD ONLY, server role -- no lock, no logging, no feedback into any simulated value. §13
-// ⛔ STL ONLY, no engine types: reading a transport connection's fields is the CALLER's job, in the adapter. §13
-// ⚠ Neither object logs; each hands back a summary struct and the caller owns the logger. Global namespace, like the rest of the core. §13
+// ⛔ STL ONLY, no engine types. §13
+// ⚠ It does not log; it hands back a summary struct and the caller owns the logger. Global namespace, like the rest of the core. §13
 //
 // ---------------------------------------------------------------------------
 // ONE ADAPTER'S BINDING FOR THE REPLICATION NAMES. This header names ROLES --
 // replication system, replication poll, replication writer, game-thread frame
-// identity. For one adapter (Unreal) those are Iris, its once-per-frame property
-// poll, `FReplicationWriter` and `GFrameCounter`. Another adapter substitutes its
-// own; nothing here depends on them. Transport roles: their own block at PROBE 6.
+// identity. For one adapter (Unreal) those were Iris, its once-per-frame property
+// poll, `FReplicationWriter` and `GFrameCounter`, until og-input-latency P5-7 moved
+// the sim traffic to og-sim-net; since then no adapter feeds `RelayWriteProbe` (the
+// Unreal session's PROBE 5 is gone, and only og-simulation-tests drive it). Another
+// adapter substitutes its own; nothing here depends on them.
 //
 // ⭐ WHY IT EXISTS AND WHAT IT FOUND: an elimination chain blamed the replication send path without testing whether two relay writes can share one server frame. They can: the answer was COALESCING, ~11.6 % of relayed inputs. §10
 // ⛔ THAT WRITE PATH IS GONE: flush-on-poll staging replaced replace-latest, so the probe now measures the STAGE-OVERFLOW ceiling and `observableX1000` is that ceiling's acceptance gate. §11
@@ -376,206 +378,4 @@ private:
     // How many of one frame's staged writes the publish step can carry. §11
     std::uint32_t m_stageCapacity;
     std::unordered_map<unsigned int, OwnerState> m_owners;
-};
-
-// ---------------------------------------------------------------------------
-// PROBE 6 -- PER-CONNECTION SEND BUDGET AND THROUGHPUT.
-//
-// ONE ADAPTER'S BINDING FOR THE TRANSPORT NAMES BELOW: the TRANSPORT CONNECTION,
-// its NEGOTIATED RATE, its SEND-DEBT counter, its READINESS test and the CHANNEL
-// that writes are, for one adapter (Unreal), `UNetConnection`, `CurrentNetSpeed`,
-// `QueuedBits`/`SendBuffer`, `UNetConnection::IsNetReady()` and
-// `UDataStreamChannel::Tick`; in that one adapter the rate is negotiated inside
-// `UWorld::NotifyControlMessage`. The probe never sees any of them.
-//
-// ⛔ EVERY TERM OF THE BUDGET MODEL IS DERIVED, NOT OBSERVED -- 4,166.67 B/tick, 8,333 B bankable at 250,000 BYTES/s and 60 Hz, ~34 % of a modelled 1,413.75 B/round. This probe measures each instead. §12
-// ⛔ IF `netSpeedBps` IS NOT 250,000 the 34 % reading is wrong and Protocol B's prediction inverts. §12
-// ⛔ A NON-ZERO `notReadySamples` IS THE SEND-PATH-DEFERRAL CANDIDATE'S SMOKING GUN; a zero one with `queuedBits` near its floor REFUTES it, measured rather than argued. §12
-// ⛔ `outPacketsLost` IS ACK-DERIVED -- the REAL outgoing loss rate, not the configured percentage, so candidate 1 is evidenced without changing a config value. §12
-// ⚠ TAKES PLAIN NUMBERS, exactly like FrameHealthProbe: reading the connection's fields is the CALLER's job, in the adapter. §13
-// ---------------------------------------------------------------------------
-
-// One summary per this many samples, per connection -- ~2 s at the intended
-// once-per-server-frame cadence, the same feel as every other window here. §12
-inline constexpr std::uint32_t kConnectionBudgetWindowSamples = 120u;
-
-struct ConnectionBudgetWindowSummary
-{
-    std::uint32_t connectionId = 0u;
-
-    // --- the window itself --------------------------------------------------
-    std::uint32_t samples      = 0u;
-    std::uint32_t elapsedMs    = 0u;
-
-    // --- the allowance, as the server actually negotiated it -----------------
-    std::int32_t  netSpeedBps         = 0;
-    std::uint32_t allowanceBytesPerTick = 0u;   // netSpeedBps / tickRate
-
-    // --- what was actually sent ---------------------------------------------
-    std::uint32_t outBytes          = 0u;   // delta over the window
-    std::uint32_t outPackets        = 0u;
-    std::uint32_t outPacketsLost    = 0u;
-    std::uint32_t bytesPerSample    = 0u;   // outBytes / samples
-    std::uint32_t bytesPerPacket    = 0u;
-    // Occupancy of the per-tick allowance, in tenths of a percent. 340 = 34.0 %.
-    std::uint32_t occupancyPctX10   = 0u;
-
-    // --- the saturation state ------------------------------------------------
-    // ⛔ THE SEND-DEBT COUNTER IS NEGATIVE WHEN THERE IS HEADROOM, so `min` is the MOST headroom seen and `max` the CLOSEST to saturation -- not the other way round. §12
-    // ⛔ `notReadySamples` COUNTS SAMPLES AT OR ABOVE ZERO -- the state in which the replication system writes nothing at all this frame. §12
-    std::int32_t  queuedBitsMin  = 0;
-    std::int32_t  queuedBitsMax  = 0;
-    std::int32_t  queuedBitsMean = 0;
-    std::uint32_t notReadySamples = 0u;
-};
-
-class ConnectionBudgetProbe
-{
-public:
-    explicit ConnectionBudgetProbe(
-        std::uint32_t windowSamples = kConnectionBudgetWindowSamples)
-        : m_windowSamples(windowSamples == 0u ? kConnectionBudgetWindowSamples
-                                              : windowSamples)
-    {
-    }
-
-    // One sample, once per server game-thread frame, per client connection.
-    // `tickRateHz` is the rate the per-tick allowance is computed against, passed
-    // in rather than assumed so a differently-configured server still reports a
-    // correct allowance. §12
-    // ⛔ THE `outTotal*` ARGUMENTS ARE SESSION-CUMULATIVE, NEVER THE PERIODIC STAT ACCUMULATORS -- the engine zeroes those on its own schedule, and differencing them would drop what it zeroed. §12
-    bool noteSample(std::uint32_t connectionId,
-                    std::int32_t netSpeedBps,
-                    std::int32_t queuedBits,
-                    std::uint64_t outTotalBytes,
-                    std::uint64_t outTotalPackets,
-                    std::uint64_t outTotalPacketsLost,
-                    std::uint32_t tickRateHz,
-                    std::uint64_t nowMicros,
-                    ConnectionBudgetWindowSummary& out)
-    {
-        ConnState& s = m_conns[connectionId];
-
-        if (!s.seeded)
-        {
-            s.seeded = true;
-            reseed(s, outTotalBytes, outTotalPackets, outTotalPacketsLost, nowMicros);
-            return false;
-        }
-
-        // ⛔ A COUNTER THAT WENT BACKWARDS means the connection was replaced under the same id -- re-anchor, rather than report a negative delta as a gigantic unsigned one. §12
-        if (outTotalBytes < s.startBytes || outTotalPackets < s.startPackets
-            || outTotalPacketsLost < s.startPacketsLost || nowMicros < s.startMicros)
-        {
-            reseed(s, outTotalBytes, outTotalPackets, outTotalPacketsLost, nowMicros);
-            return false;
-        }
-
-        if (s.samples == 0u)
-        {
-            s.queuedBitsMin = queuedBits;
-            s.queuedBitsMax = queuedBits;
-        }
-        else
-        {
-            if (queuedBits < s.queuedBitsMin) { s.queuedBitsMin = queuedBits; }
-            if (queuedBits > s.queuedBitsMax) { s.queuedBitsMax = queuedBits; }
-        }
-        s.queuedBitsSum += static_cast<std::int64_t>(queuedBits);
-        if (queuedBits >= 0) { ++s.notReadySamples; }
-        s.netSpeedBps = netSpeedBps;
-        s.tickRateHz  = tickRateHz;
-        ++s.samples;
-
-        if (s.samples < m_windowSamples)
-        {
-            return false;
-        }
-
-        fillSummary(out, connectionId, s,
-                    outTotalBytes, outTotalPackets, outTotalPacketsLost, nowMicros);
-        reseed(s, outTotalBytes, outTotalPackets, outTotalPacketsLost, nowMicros);
-        return true;
-    }
-
-    void forgetConnection(std::uint32_t connectionId) { m_conns.erase(connectionId); }
-
-    std::size_t trackedConnectionCount() const { return m_conns.size(); }
-
-private:
-    struct ConnState
-    {
-        bool          seeded           = false;
-        std::uint64_t startBytes       = 0u;
-        std::uint64_t startPackets     = 0u;
-        std::uint64_t startPacketsLost = 0u;
-        std::uint64_t startMicros      = 0u;
-
-        std::uint32_t samples         = 0u;
-        std::int32_t  queuedBitsMin   = 0;
-        std::int32_t  queuedBitsMax   = 0;
-        std::int64_t  queuedBitsSum   = 0;
-        std::uint32_t notReadySamples = 0u;
-        std::int32_t  netSpeedBps     = 0;
-        std::uint32_t tickRateHz      = 0u;
-    };
-
-    static void reseed(ConnState& s,
-                       std::uint64_t outTotalBytes,
-                       std::uint64_t outTotalPackets,
-                       std::uint64_t outTotalPacketsLost,
-                       std::uint64_t nowMicros)
-    {
-        s.startBytes       = outTotalBytes;
-        s.startPackets     = outTotalPackets;
-        s.startPacketsLost = outTotalPacketsLost;
-        s.startMicros      = nowMicros;
-        s.samples          = 0u;
-        s.queuedBitsMin    = 0;
-        s.queuedBitsMax    = 0;
-        s.queuedBitsSum    = 0;
-        s.notReadySamples  = 0u;
-    }
-
-    static void fillSummary(ConnectionBudgetWindowSummary& out,
-                            std::uint32_t connectionId,
-                            const ConnState& s,
-                            std::uint64_t outTotalBytes,
-                            std::uint64_t outTotalPackets,
-                            std::uint64_t outTotalPacketsLost,
-                            std::uint64_t nowMicros)
-    {
-        out.connectionId = connectionId;
-        out.samples      = s.samples;
-        out.elapsedMs    = static_cast<std::uint32_t>((nowMicros - s.startMicros) / 1000u);
-
-        out.netSpeedBps = s.netSpeedBps;
-        out.allowanceBytesPerTick = (s.tickRateHz == 0u || s.netSpeedBps <= 0)
-            ? 0u
-            : static_cast<std::uint32_t>(
-                  static_cast<std::uint32_t>(s.netSpeedBps) / s.tickRateHz);
-
-        out.outBytes       = static_cast<std::uint32_t>(outTotalBytes - s.startBytes);
-        out.outPackets     = static_cast<std::uint32_t>(outTotalPackets - s.startPackets);
-        out.outPacketsLost =
-            static_cast<std::uint32_t>(outTotalPacketsLost - s.startPacketsLost);
-
-        out.bytesPerSample = (s.samples == 0u) ? 0u : (out.outBytes / s.samples);
-        out.bytesPerPacket = (out.outPackets == 0u) ? 0u : (out.outBytes / out.outPackets);
-        out.occupancyPctX10 = (out.allowanceBytesPerTick == 0u)
-            ? 0u
-            : static_cast<std::uint32_t>(
-                  (static_cast<std::uint64_t>(out.bytesPerSample) * 1000u)
-                  / out.allowanceBytesPerTick);
-
-        out.queuedBitsMin  = s.queuedBitsMin;
-        out.queuedBitsMax  = s.queuedBitsMax;
-        out.queuedBitsMean = (s.samples == 0u)
-            ? 0
-            : static_cast<std::int32_t>(s.queuedBitsSum / static_cast<std::int64_t>(s.samples));
-        out.notReadySamples = s.notReadySamples;
-    }
-
-    std::uint32_t m_windowSamples;
-    std::unordered_map<std::uint32_t, ConnState> m_conns;
 };

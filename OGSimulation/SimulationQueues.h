@@ -29,8 +29,9 @@ enum class QueueMoveResult
     IdNotRegistered,
 };
 
-// Generic circular move queue — physics thread writes on RPC arrival (game thread),
-// integration reads on physics thread. Mirrors the concrete RemoteMoveQueue pattern
+// Generic circular move queue — written on remote-input arrival, read by the integration
+// on the step's thread: one producer thread, one consumer thread (the input RPC wrote it
+// until og-input-latency task P5-7). Mirrors the concrete RemoteMoveQueue pattern
 // but is templated on InputType so SimulationNetSync can instantiate one per type.
 template <typename InputType>
 class RemoteMoveQueue
@@ -112,7 +113,9 @@ private:
 };
 
 // SPSC queue for buffering locally-produced inputs between the physics thread
-// (producer: collectInputAll) and the game thread (consumer: sendLocalInputToAuthorityAll).
+// (producer: collectInputAll) and its consumer, sendLocalInputToAuthorityAll: one
+// producer thread, one consumer thread, which may be the same thread (a host that sends
+// at capture runs both ends on the step's thread).
 // Lamport ring: head/tail are atomic, no count. Full = next(tail)==head (wastes
 // one slot, hence RingSize = Capacity + 1 to preserve 60 usable entries).
 template <typename InputType>
@@ -149,10 +152,12 @@ public:
 
     // Const peek of up to `maxSlots` most-recent still-pending entries whose tick
     // is <= upToTick, invoking cb(uint32 tick, const InputType& input) oldest-first.
-    // Does NOT advance head/tail — used by the Stage 1 redundancy-bundle producer
-    // (buildRedundancyBundle) to re-send the last N ticks every frame so a
+    // Does NOT advance head/tail — used by the redundancy-bundle producer
+    // (og-sim-net's SimNetChannel::sendLocalInputToAuthority; the Unreal
+    // buildRedundancyBundle until og-input-latency task P5-8 deleted it) to re-send
+    // the last N ticks on every send so a
     // dropped unreliable datagram self-heals on the next send. Consumer-thread only
-    // (the game thread that also calls dequeue / releaseAllButRecent).
+    // (the thread that also calls dequeue / releaseAllButRecent).
     template <typename Callback>
     void forEachRecent(uint32 upToTick, size_t maxSlots, Callback&& cb) const
     {
@@ -194,10 +199,9 @@ public:
 
     // Drops all pending entries. Safe only when neither producer nor consumer
     // is concurrently accessing the queue — i.e. from the clock-resync wipe
-    // path, which runs on the physics thread inside advancePrediction while the
-    // game thread's end-of-physics tick group is still blocked, so the consumer
-    // cannot touch the queue. (One adapter's binding for that barrier:
-    // `TG_EndPhysics`.)
+    // path inside advancePrediction, on the step's thread, which the host keeps
+    // exclusive of the consumer (the consumer runs on the same thread, or waits
+    // for the step).
     void clear()
     {
         m_head.store(0, std::memory_order_relaxed);

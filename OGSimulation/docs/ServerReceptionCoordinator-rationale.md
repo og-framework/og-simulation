@@ -1,4 +1,5 @@
 <!-- SPDX-License-Identifier: MPL-2.0 -->
+<!-- lint-external-ref: USimulatableNetSyncComponent -- deleted by og-input-latency task P5-8 (the net-sync component, the pawn's subobject, the bundle builder and the owner binding's net half); kept in the history -->
 # `ServerReceptionCoordinator.h` — rationale
 
 The derivations, the rejected alternatives, the wire contracts and the correction record behind
@@ -14,15 +15,15 @@ claims that stood in this header were checked against the tree and found wrong, 
 over-stated. §9 quotes each one so the correction is legible; nowhere else in this document restates
 a quoted sentence as fact.
 
-<!-- lint-external-ref: ASimulationConnectionRelay -- ENGINE-SIDE ADAPTER ACTOR of ONE adapter (Unreal), named in Sec 4 and Sec 9 as that adapter's transport for the connection tier; another adapter substitutes its own and this token means nothing there -->
+<!-- lint-external-ref: ASimulationConnectionRelay -- deleted by og-input-latency task P5-9 (the relay actors, their listeners, the Iris sim buffers, serializers and proofs, and UEConnectionHandle); kept in the history: named in Sec 4 and Sec 9 as that adapter's transport for the connection tier until task P5-7 -->
 <!-- lint-external-ref: bOnlyRelevantToOwner -- ENGINE REPLICATION FLAG of ONE adapter, named in Sec 4 because it is what narrows the tier to the owning client after the property moved off the component -->
 <!-- lint-external-ref: m_replicatedConnectionTier -- RETIRED SYMBOL: the component property the tier used to ride, removed when the tier moved to the connection relay. Quoted in Sec 9 precisely because it must NOT resolve -->
 <!-- lint-external-ref: COND_OwnerOnly -- ENGINE REPLICATION CONDITION of ONE adapter, named in Sec 9 as the mechanism that was removed; it has no counterpart in this repository -->
 <!-- lint-external-ref: GetPlayerSlotForActor -- ENGINE-SIDE ADAPTER HELPER of ONE adapter, named in Sec 2 as the source of the playerSlot primitive the core cannot derive -->
-<!-- lint-external-ref: FInputRedundancyBundle -- ENGINE-SIDE WIRE TYPE of ONE adapter, named in Sec 4 as the production Buffer binding beside the suite's; the core never names it -->
+<!-- lint-external-ref: FInputRedundancyBundle -- deleted by og-input-latency task P5-9 (the relay actors, their listeners, the Iris sim buffers, serializers and proofs, and UEConnectionHandle); kept in the history: named in Sec 4 as the production Buffer binding until task P5-7 -->
 <!-- lint-external-ref: ASimulationManagerUImpl -- ENGINE-SIDE COMPOSITION ROOT of ONE adapter, named in Sec 9's quoted finding F-37-2 (history); RENAMED by og-ue-simulationcomponentandmanagersplit task 30 to AOGBrawlerSimulationManager, the name Sec 1 uses for that adapter's owner of this type -->
 <!-- lint-external-ref: USimmableUpdateComponent -- ENGINE-SIDE PER-CHARACTER COMPONENT of ONE adapter, named in Sec 9 (F-37-1, F-37-2) as that adapter's ConnectionTierSink binding before og-ue-simulationcomponentandmanagersplit task 20b -->
-<!-- lint-external-ref: FUEConnectionHandle -- ENGINE-SIDE Address BINDING of ONE adapter, named in Sec 7 beside the suite's FStandaloneTestHandle -->
+<!-- lint-external-ref: FUEConnectionHandle -- deleted by og-input-latency task P5-9 (the relay actors, their listeners, the Iris sim buffers, serializers and proofs, and UEConnectionHandle); kept in the history: named in Sec 7 as the production Address binding until task P5-7 -->
 <!-- lint-external-ref: Unreal -- ENGINE VENDOR NAME, quoted in Sec 9 as one of the three literal grep TOKENS the falsified sentence promised would return nothing; it names no symbol in this repository -->
 <!-- lint-external-ref: getServerReceptionTick -- ENGINE-SIDE ADAPTER ACCESSOR of ONE adapter, named in Sec 5 as the tick source the gate deliberately does NOT use -->
 
@@ -54,11 +55,14 @@ members on the adapter's manager before. The queue borrows the tier table by ref
 * **member-declaration order is the only thing enforcing either.** There is no assertion. That is
   why the rule is fenced twice in the header — once at the constructor, once at the members.
 
-Both borrow `const TimeConfig&`, so the coordinator must not outlive the config. In the one adapter
-that exists today — `AOGBrawlerSimulationManager`, that engine's composition root — the whole coordinator
-is a `std::optional` emplaced inside `BeginPlay`'s authority branch, after the core manager whose
-`TimeConfig` it borrows, and reset in `EndPlay` **before** that manager. The adapter's own comments
-state the borrow rule at both ends. A second engine binds its own root and this name means nothing
+Both borrow `const TimeConfig&`, so the coordinator must not outlive the config. Since og-input-latency
+task P5-7 its one owner is og-sim-net's server: `SimNetServer` holds it by value (`m_coordinator`,
+constructed from the `TimeConfig&` the server is given), and the Unreal session holds that server in a
+`std::optional` (`SessionRuntime::m_simNetServer`, og-sim-session's runtime since og-session-runtime task 31)
+destroyed before the manager whose `TimeConfig` it borrows; a `static_assert` on the member offsets in
+`SessionRuntime.h` keeps that order (in `UESimulationSession.h` until task 31). Before
+P5-7 the session held the coordinator itself (`m_receptionCoordinator`, the same order rule), and before
+that the adapter's composition root did. A second engine binds its own owner and these names mean nothing
 there.
 
 ---
@@ -87,8 +91,9 @@ this warning produced **28,192 lines / 6.4 MB in 94 s** of a single session.
 
 ### The drain, and the capture tick it delivers
 
-`releaseDelayedInputs` runs from the adapter's pre-physics-step hook — `releaseDelayedInputsForStep`
-in the one adapter that exists today. The adapter supplies `firstUpcomingSimTick` and `numSteps`
+`releaseDelayedInputs` runs from the adapter's pre-physics-step hook — og-sim-session's
+`SessionNetHooks::releaseForTick` since og-session-runtime task 26 (the Unreal session's `releaseDelayedInputsForStep` until
+then), through og-sim-net's server. The adapter supplies `firstUpcomingSimTick` and `numSteps`
 because it owns the game-thread-safe tick source; the core never reads a physics-thread clock.
 
 **The delivered capture tick is the entry's STORED `captureTick`, never a reconstructed
@@ -167,8 +172,14 @@ whichever owner's sample happened to cross the dwell gate. A sibling that did no
 transition still sees `newTierIndex` equal to the new tier and, having last been told 0, must be
 published to. Gating the publish on "did *this* sample transition" starves that sibling.
 
-A missing map entry means "never told", whose baseline is the far side's default of 0 — so a first
-sample that derives tier 0 correctly publishes nothing.
+A missing map entry means "never told", and the first sample publishes whatever tier it derives, tier 0
+included (og-input-latency P6-2). Until then this paragraph said the far side's baseline was 0, "so a first
+sample that derives tier 0 correctly publishes nothing". That premise was false: a client that has never
+been told a tier does not run tier 0, it runs the no-tier fallback, the worst tier's delay
+(`ReplicatedTierConsumer::effectiveInputDelayTicks`), while this table answers tier 0 for the wire from its
+first sample. At a relay delay floor of 4 or more both ends collapse to the floor and the gap was invisible;
+below it the owning client applied its own inputs at the fallback while the server applied them at the
+tier's delay, and the client never learned of the server's switch, so it could not pay for it.
 
 ### The sink is a concept, and what one adapter binds it to
 
@@ -178,32 +189,36 @@ target entity, so a sink that is a central manager rather than the entity itself
 A sink missing the method is a compile error at the `noteRttSample` call site, the same way the
 buffer-owner concepts in `SimulationNetSync.h` fail at theirs.
 
-The one adapter that exists today binds it to `USimulatableNetSyncComponent`, its per-character wire
+Since og-input-latency task P5-7 og-sim-net's server is the sink: `SimNetServer::sendConnectionTierToOwningClient`
+resolves the id to the character's owning connection through its roster and sends a `ConnectionTier`
+message on og-net's Control lane to that connection only (`publishTier`, which skips a value that connection
+already has). Before P5-7 the one adapter bound it to `USimulatableNetSyncComponent`, its per-character wire
 component (since og-ue-simulationcomponentandmanagersplit task 20b; before that, the adapter's game
-component), which does **not** hold the tier itself. It forwards to `ASimulationConnectionRelay`, a
-per-connection actor whose tier property
-replicates unconditionally and is narrowed to the owning client by `bOnlyRelevantToOwner`
-**relevancy** rather than by a replication condition. §9 records the correction; the operational
-point is that split-screen siblings resolve to the same root connection and therefore to the same
-relay, so the sibling-starvation class the core's per-owner dedup guards against is also structurally
-impossible on the transport side.
+component), which did **not** hold the tier itself. It forwarded to `ASimulationConnectionRelay`, a
+per-connection actor whose tier property replicated unconditionally and was narrowed to the owning client by
+`bOnlyRelevantToOwner` **relevancy** rather than by a replication condition; tasks P5-8 and P5-9 deleted both.
+§9 records the correction of that time. The operational point holds on the new transport: split-screen
+siblings share their client's one og-net connection and therefore its one per-connection tier record, so
+the sibling-starvation class the core's per-owner dedup guards against is also structurally impossible on
+the transport side.
 
 ### `receiveInputBundle` — the loop, and what deliberately stays outside it
 
 `receiveInputBundle` is the whole per-slot loop: decode the bundle with the redundancy codec, park
 each slot through `receiveRemoteInput`, and on the one non-parked path deliver immediately. `wire` is
 any type satisfying the codec's Buffer concept (`bundleByteNum`, `readFromBuffer` and the rest) — in
-production `FInputRedundancyBundle`, in the Catch2 suite a `std::vector`-backed test buffer, and the
-core names neither.
+production og-sim-net's `InputBundleBuffer` (`SimNetServer.h`, `m_bundle`; the Unreal `FInputRedundancyBundle`
+until og-input-latency task P5-7, deleted by P5-9), in the Catch2 suite a `std::vector`-backed test buffer,
+and the core names neither.
 
-Two things stay outside on purpose. The **no-wire early-out** is the adapter's: it only reaches this
-method when it has a live wire and a coordinator, so the core handles only `hasValidSlot`. The
-**once-per-bundle RTT sample** is also the adapter's, immediately before this call, because this
-method is purely the slot loop.
+Two things stay outside on purpose. The **no-wire early-out** is the caller's: og-sim-net's server
+(`SimNetServer::receiveBundle`) reaches this method only with a bundle it decoded (`assignFromWire`) and with
+its own coordinator, so the core handles only `hasValidSlot`. The **once-per-bundle RTT sample** is also the
+caller's (`noteRttSample`), immediately before this call, because this method is purely the slot loop.
 
 `relay` is threaded straight through to `receiveRemoteInput`'s tap and this method adds no relay
-policy of its own. Production passes the *same object* for both sinks — the adapter's manager binds
-delivery and relay — but they stay separate parameters because they are separate boundaries: one
+policy of its own. Production passes the *same object* for both sinks — og-sim-net's server passes itself
+for delivery and relay — but they stay separate parameters because they are separate boundaries: one
 routes an input into this simulation, the other forwards it out to everyone else.
 
 ---
@@ -255,10 +270,10 @@ therefore records it. No adapter signature changed to arm this gate.
 `noteRttSample` also receives a `serverTick` and could plausibly feed the same reference. It is
 deliberately **not** wired in, for two reasons:
 
-1. **Source quality.** `reapConnections` is called by the host on the game thread, once per physics
-   frame, and is passed that frame's `firstUpcomingSimTick` from the host's game-thread-safe tick
-   source (a tick↔physics-step mapper, or an offset the step publishes). `noteRttSample`'s tick is `getServerReceptionTick()`, an acknowledged wart: an
-   unsynchronized read of the physics-thread-written server clock. A gate that *discards* player
+1. **Source quality.** `reapConnections` is called by the host once per step batch, after it, and is
+   passed the batch's `firstUpcomingSimTick` from the offset the steps publish (a tick↔physics-step
+   mapper's before). `noteRttSample`'s tick is `getServerReceptionTick()`, an acknowledged wart: a read
+   of the step-written server clock, unsynchronized for a host that samples RTT off the step's thread. A gate that *discards* player
    input should judge against the safe source, not the racy one.
 2. **A monotonic-enough reference.** Two feeds a tick apart could hand the gate a reference that
    jitters backwards between consecutive receipts, making an input sitting exactly on a boundary
@@ -311,7 +326,7 @@ one-tick schedule shift several thousand ticks later.
 `captureTick > serverAuthorityTick + rollbackWindowTicks` — a **tighter** bound — at the
 physics-thread *delivery* layer, with its context published per authority tick through
 `setAuthorityGuardContext`. The two do not conflict and neither subsumes the other: this one guards
-**receipt** on the game thread, and therefore guards the relay tap; that one guards **delivery** into
+**receipt**, and therefore guards the relay tap; that one guards **delivery** into
 the simulation.
 
 On the parked path the queue guard is effectively dead — drained entries are due-or-overdue, never
@@ -423,7 +438,8 @@ figures live in the integrating project's own initiative notes and are not distr
 submodule; everything needed to judge the fix is restated here.
 
 `ServerInputDelayQueue::enqueue` de-duplicated against one memory only: what is parked *right now*.
-Each client packet re-sends the previous `redundancyDepthTicks` captures. When a packet landed after
+Each client packet re-sends the previous `redundancyDepthTicks` captures (that count holds at the default
+`redundancyFrames = 0`; otherwise it is `SimulationNetSync::redundancySlots`). When a packet landed after
 the server tick on which its **oldest** re-send had been released, that re-send was no longer in the
 deque, passed the duplicate scan as new, was parked a second time, and — being the oldest due entry
 — was released again on the next tick. Release and the downstream FIFO's consumption are both
@@ -471,7 +487,8 @@ double-apply the gate removes.
 
 This is a sim-core header. Its includes are other `OGSimulation/` headers and the STL, and **no
 declaration in it names an engine type**: the `Address` half stays opaque and is bound in production
-to `FUEConnectionHandle` and in the Catch2 suite to `FStandaloneTestHandle`; every boundary that
+to og-sim-net's `SimNetConnectionHandle` (the Unreal `FUEConnectionHandle` until og-input-latency task
+P5-7, deleted by P5-9) and in the Catch2 suite to `FStandaloneTestHandle`; every boundary that
 would otherwise need an engine type is a concept instead.
 
 The **comments** do name one adapter's bindings, in several places, and that is deliberate. Naming
@@ -484,17 +501,17 @@ The design corpus writes `ogsim::`; no such namespace exists in this tree.
 
 ---
 
-## §8 — The diagnostics: ten tags, one sink, one window
+## §8 — The diagnostics: twelve tags, one sink, one window
 
-Every line this file emits goes through the optional `setLogger` sink — eleven `SIMLOG` call sites
-across ten tags. A leading `[Warning]` or `[Verbose]` token selects the severity; an unprefixed line
+Every line this file emits goes through the optional `setLogger` sink — fifteen `SIMLOG` call sites
+across twelve tags (`[Release]` has two: with and without its step time; `[ServerReceive]` has two: with and without its receive time). A leading `[Warning]` or `[Verbose]` token selects the severity; an unprefixed line
 stays at Log, which is hidden under the shipped `LogOGNet=Warning`.
 
 | tag | severity | fires | notes |
 |---|---|---|---|
-| `[ServerReceive]` | Log | per decoded slot | the generic replacement for a former game-specific trace |
+| `[ServerReceive]` | Log | per decoded slot | the generic replacement for a former game-specific trace; ends with ` recvSeconds=%.6f` only when the host passes the bundle's receive time (below) |
 | `[Park]` | Log | per genuinely-new park | gated on `acceptedNew`, so a redundancy bundle does not spam it |
-| `[Release]` | Log | per released input | the timeline companion to `[Park]` |
+| `[Release]` | Log | per released input | the timeline companion to `[Park]`; ends with ` stepSeconds=%.6f` only when the host passes the drain's time (below) |
 | `[InputGap]` | Warning | per hole in an id's delivered ticks | the primary, cause-agnostic drop signal |
 | `[InputDrop]` | Warning | per purged, never-released entry | the precise attributable record |
 | `[DelayShift]` | Warning | per wire, per change | keyed on the wire, so at most once per wire per drain |
@@ -502,6 +519,8 @@ stays at Log, which is hidden under the shipped `LogOGNet=Warning`.
 | `[InputDomain]` | Warning | per ~2 s window | one line per rejection burst, naming the last offender |
 | `[RelaySkip]` | Verbose / Warning | per event / per window | Verbose per skipped tick, Warning for the window totals of the OOO-older and the late classes |
 | `[InputDelay]` | Warning | once per `(id, slot)` ever | the malformed-slot fence |
+| `[InputArrival.Window]` | Warning | per ~2 s window, per connection | the arrival margin of each wire, from `InputArrivalMargin`, then the late split, the D-free m0 and the steps per bundle (og-input-latency P3-5, appended); silent for a wire that carried nothing |
+| `[InputArrival.BackDate]` | Warning | once per back-dating episode, per connection | a wire's m0 p50 stayed below `TimeConfig::backDateM0P50ThresholdTicks` for five qualifying windows (og-input-latency P3-6); detect only, silent on an honest session |
 
 ### The window, and why there is only one
 
@@ -528,6 +547,30 @@ window, not on the OOO-older count alone. The whole point of the field is to mak
 visible at shipped verbosity, and a late-only window is the common shape — it is what the
 2026-09-13 session would have produced.
 
+### The step time on `[Release]` (og-input-latency P5-37)
+
+`releaseDelayedInputs` takes an optional `stepSeconds`, and when it is present every `[Release]` line
+of that drain ends with ` stepSeconds=<s>` (six decimals). The value is the host's, from the clock the
+host uses for its own timing: this header reads no clock (§7), and it formats the number without
+interpreting it. One drain gets one value, so a drain that releases several ticks writes the same
+time on each of their lines: the time of the release, not of each tick's step.
+
+The field exists because a host's log may stamp a line later than it was written. A host that logs
+from a thread other than the one that writes its log file can queue the line and stamp it when the
+queue is flushed, and then the stamp of `[Release]` is not the time of the release. The field is that
+time, written with the line. Without it (every caller that passes nothing, the tests among them) the
+line is byte-identical to what it was before the field existed.
+
+### The receive time on `[ServerReceive]` (og-input-latency P5-38)
+
+`receiveInputBundle` takes an optional `recvSeconds` after its relay sink, and when it is present every
+`[ServerReceive]` line of that bundle ends with ` recvSeconds=<s>` (six decimals). As with the step time
+above, the value is the host's and this header formats it without interpreting it; every slot of one
+bundle carries the same value, the time the host received the message that held it. The reason is the
+same as for `[Release]`: a line written on a thread that does not write the log file can be stamped
+when the log is next flushed, and the field is the time written with the line. Without it the line is
+byte-identical to what it was before the field existed.
+
 ### Where the late count actually lives
 
 The window figure on both lines is **differenced from the delay queue's lifetime total**
@@ -548,6 +591,53 @@ it. `[InputDrop]` carries the per-line attributable record instead.
 `m_relayOooSkipTotal` is not reset in `forgetOwner`, unlike the per-owner watermarks beside it: it is
 a session-scoped diagnostic, not per-owner state.
 
+### The arrival margin, and the line it writes
+
+The coordinator owns one `InputArrivalMargin` (`InputArrivalMargin-rationale.md`) and is its only
+feed. `receiveRemoteInput` feeds it three times:
+
+- For every capture that passed the receipt gate and has a valid slot, before `enqueue`,
+  `noteSighting(id, captureTick)` answers whether this owner's capture tick is seen for the first time:
+  the per-owner seen mask of `InputArrivalMargin-rationale.md` §8, keyed by owner id (guard G-04).
+- Whenever `enqueue` parked a new entry (`queuedNewEntry`), before the split into the `[Park]` arm
+  and the out-of-order arm, `noteArrival` records `captureTick + delay - lateGate` for the wire, and
+  on a first sighting the D-free `captureTick - lateGate` (`InputArrivalMargin-rationale.md` §9): the
+  queue's effective delay, the same value `[Park]` reports, and the late gate's own reference
+  (guards G-03 and G-01 of `InputArrivalMargin-guards.md`). Both arms are sampled, so a capture that
+  arrives after a newer one is not left out (`InputArrivalMargin-rationale.md` §3).
+- When the queue's late count moved across the `enqueue` call, `noteLateRefused` counts a late
+  refusal for the wire (guard G-02 there). The late count belongs to the queue, as above; this only
+  attributes each refusal to a wire. On the sighting's answer it is then filed as a late first sight
+  (`noteLateFirstSight`, with its m0) or a late re-send (`noteLateResent`) (guard G-05), so
+  `lateRefused == lateFirstSight + lateResent`.
+
+`receiveInputBundle` feeds it once per bundle: the newest capture tick among the slots the core
+handled, for the owner's steps per bundle (`InputArrivalMargin-rationale.md` §10). `forgetOwner` drops
+the owner's mask and step mark with the owner's other id-keyed state.
+
+The constructor passes the tick frequency for the m0 EWMA and `TimeConfig::backDateM0P50ThresholdTicks`
+for the back-dating detector, and checks the receipt gate's span against the mask's width: a `static_assert` on `TimeConfig{}` and an `OG_CHECK` on the configuration it
+borrows (`rollbackWindowHardCap + hardResyncThresholdTicks < kSeenMaskTicks`).
+
+`reapConnections` closes its window right after `maybeEmitInputStats`, before the dwell gate, and
+writes one `[InputArrival.Window]` line per wire that carried a sample or a late refusal. The window
+length comes from the same helper as `[InputStats]`'s, so the two close on the same frames, and the
+`lateRefused` fields of one window sum to that window's `late=`. `conn=` is the wire's hash, the same
+number `[DelayShift]` prints as `addr=`. The fields after `lateRefused=` (`lateFirstSight`,
+`lateResent`, `m0P05`, `m0P50`, `stepsPerBundle`) are appended; the ones before keep their meaning
+and position. Dead wires are forgotten on the dwell-gated reap, next to the `[DelayShift]` memo.
+Read-only access for other consumers is `arrivalMargin()`. `editArrivalMarginForFenceTest()` is the
+one mutable door, for `ArrivalMarginFenceTest.cpp` only (guard G-06): it proves that no decision here
+reads the margin (`InputArrivalMargin-rationale.md` §13).
+
+The same close can open a wire's back-dating episode (`InputArrivalMargin-rationale.md` §14). The
+`WindowLine` then carries an `ArrivalBackDateOpening`, and right after that wire's
+`[InputArrival.Window]` line the coordinator writes one
+`[Warning][InputArrival.BackDate] conn=%zu m0P50=%d windows=%u threshold=%d D=%d`, with the same `conn=`.
+That line is the detector's only effect here: nothing is refused, delayed or flagged to the client, and
+no decision reads the episode state (guard G-07 of `InputArrivalMargin-guards.md`). The fence scribbles
+the episode state too.
+
 ---
 
 ## §9 — What was found FALSE, stale or over-stated here, and the evidence
@@ -556,7 +646,9 @@ Eight claims that stood in this header were checked against the tree before anyt
 Compressing a false statement makes it shorter, denser and more authoritative, and every existence
 check in the toolchain passes it — so the check has to be a reading of the code, not of the comment.
 **The quoted "before" text in this table is reproduced so the correction is legible. It is not a
-statement of fact.**
+statement of fact.** The "what the tree says" column is the tree of that audit: og-input-latency tasks
+P5-7 to P5-9 have since moved the tier and the input bundle onto og-sim-net and deleted the Unreal
+classes it names.
 
 | # | the claim as it stood | what the tree says |
 |---|---|---|
@@ -566,7 +658,7 @@ statement of fact.**
 | **F-37-4** | `noteServerTick`: *"It is PUBLIC so an adapter (or the Catch2 suite) can arm it explicitly."* | **OVER-STATED.** No adapter and no test calls it; both arm through `reapConnections`. The sentence is true as a statement about the seam and false as an implication about use, and combined with F-37-3 it is what made the two-feeds claim read as plausible. Restated as *"public, but no external caller today"*. |
 | **F-37-5** | `reapConnections`: *"The Catch2 suite cannot model that in-place transition … so that path is proven in the PIE smoke test, not by unit tests."* | **OVER-STATED.** The `!isAlive()` **branch** *is* unit-tested: a case reaps a dead wire from all three containers using a handle constructed dead, and its own comment says it *"drives the !isAlive branch"*. What cannot be staged is the **in-place** transition, because `FStandaloneTestHandle`'s `aliveBit` is part of its identity — flipping it produces a *different key* rather than a stale one. The header now claims only that. (The half of the original sentence that asserts smoke-test coverage is unverifiable from this tree and was dropped rather than repeated.) |
 | **F-37-6** | `reapConnections`: *"the adapter calls it once per tick"*, and `maybeEmitInputStats`: *"Called once per tick from reapConnections"* | **IMPRECISE, with a behavioural consequence the file never stated.** Both are once per physics **frame**; the adapter's own call site says so. A frame simulates `numSteps` ticks, so the `serverTick % tierMinDwellTicks` gate is sampled at frame granularity and a dwell boundary can be **stepped straight over** on a substepping frame. Nothing breaks — the reap deadline is eight dwell periods — but "once per tick" actively conceals it. |
-| **F-37-7** | `setLogger`: *"routes the one-shot malformed-slot warning."* | **STALE.** It routes every line this file emits: eleven `SIMLOG` sites across ten tags. It was true when there was one. |
+| **F-37-7** | `setLogger`: *"routes the one-shot malformed-slot warning."* | **STALE.** It routes every line this file emits: eleven `SIMLOG` sites across ten tags at the time of this finding, twelve across eleven since `[InputArrival.Window]`, thirteen across twelve since `[InputArrival.BackDate]` (og-input-latency P3-6). It was true when there was one. |
 | **F-37-8** | the stamp: *"floored at most to the LocalInputCache's residency ceiling"* / *"capped at 44 by the client ring's residency limit"* | **HALF-RIGHT, in two places.** The cap is `relayDelayFloorHardCapTicks`, which takes the **smaller of the local and remote input-cache capacities** minus `rollbackWindowHardCap`. Both capacities are 64 today and the hard cap is 20, so the number 44 is correct and the attribution to the local cache alone is not. The header now names the function rather than restating a derivation that can drift. |
 
 ### Two things checked and found TRUE, recorded because they look like the ones above
@@ -574,6 +666,11 @@ statement of fact.**
 * **The `LogOGNet` claims are correct.** Every tag this file emits is routed to `LogOGNet` by the
   adapter's tag router, and the shipped configuration does set `LogOGNet=Warning` — so an unprefixed
   `[Park]` line really is invisible by default. Verified at the key, not at a line number.
+  ⚠ **Amended 2026-11-11 (og-input-latency task 5b): "every tag" is not true.** `[InputDelay]` has a
+  row in neither `kSimulationLogRoutes` (`SimulationLogRoutes.h`) nor the host's own table, so a host
+  prints it on its fallback channel, not on its `Net` channel. `[InputArrival.Window]` had no row
+  either from task 5, which added it, until task 5b added its row. Every other tag here has a row: the
+  core table's `Net` rows, and the host's own row for `[ServerReceive]`.
 * **`hardResyncThresholdTicks > rollbackWindowHardCap` is genuinely asserted**, by
   `TimeConfigOrderingTest.cpp`, and the numbers behind the header's bound arithmetic hold at the
   compiled defaults.

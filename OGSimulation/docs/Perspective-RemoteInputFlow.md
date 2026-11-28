@@ -1,4 +1,6 @@
 <!-- SPDX-License-Identifier: MPL-2.0 -->
+<!-- lint-external-ref: ASimulationInputRelay -- deleted by og-input-latency task P5-9 (the relay actors, their listeners, the Iris sim buffers, serializers and proofs, and UEConnectionHandle); kept in the history -->
+<!-- lint-external-ref: PreReplication -- Unreal Engine replication hook name, outside every scan root -->
 # Perspective: how a remote input reaches a proxy
 
 **One input, followed end to end.** A player presses a key on machine A. This document follows that
@@ -55,20 +57,24 @@ the number that lets a peer be early.**
 
 ## 2. The trace table
 
-Every row is one hop. `thread` is **GT** (game thread) or **PT** (physics thread); the physics thread
-is whichever thread the host engine runs its asynchronous physics callback on — one adapter's binding
-is Chaos's async-callback thread under `bTickPhysicsAsync`. `machine` is A (the sender), S (the
+Every row is one hop. `thread` is **GT** (the host's frame thread) or **PT** (the step's thread) as the
+hops were split before og-session-runtime tasks 13–15. Since then every hop of one machine runs on one
+thread, the step's (a worker client's task, or a FreeRunning authority's runner), so read both letters as
+that thread; §8 groups them. The former Chaos adapter's binding (removed by
+og-session-runtime tasks 3–6) was Chaos's async-callback thread under `bTickPhysicsAsync`. `machine` is A (the sender), S (the
 authority) or B (an observing peer). Paths are relative to the repository root; `<core>` abbreviates
 `Plugins/OGSimulation/Source/OGSimulation/og-simulation/OGSimulation/`.
 
-⚠ **Rows whose `file` column starts with `Source/` are outside `og-simulation`, and are one
-adapter's binding rather than the binding.** The engine-free core owns only the `<core>` rows; the
-`Source/` rows are how *this project's* adapter happens to reach them, and an adapter on another
-engine substitutes its own. Two carry a whole hop rather than illustrating it, so their roles are
-named here. `AOGBrawlerSimulationManager` — one adapter's **composition root**: the object that owns
-the per-role manager and routes an arriving input to the component owning that character.
-`ASimulationInputRelay` — one adapter's **per-connection transport actor**: it publishes a
-connection's staged inputs once per replication poll.
+⚠ **Rows whose `file` column does not start with `<core>` are outside `og-simulation`, and are one
+host's binding rather than the binding.** The engine-free core owns only the `<core>` rows. The
+`Source/` and `Plugins/OGSimulation/Source/OGSimulationUnreal/` rows are how *this project's* Unreal
+adapter happens to reach them, and the `Plugins/OGSimulation/Source/OGSimulationNet/` rows are
+og-sim-net, the engine-free transport host that adapter uses; another engine or transport
+substitutes its own. Until og-input-latency tasks P5-7 to P5-9 two adapter classes carried whole hops:
+`AOGBrawlerSimulationManager`, the composition root that routed an arriving input to the component
+owning that character, and `ASimulationInputRelay`, a per-connection transport actor that published a
+connection's staged inputs once per replication poll (deleted by P5-9). og-sim-net's sessions do both
+hops now (hops 8 to 20).
 
 | # | hop | machine · thread | file | symbol |
 |---:|---|---|---|---|
@@ -77,22 +83,22 @@ connection's staged inputs once per replication poll.
 | 3 | The **raw** capture is recorded, keyed by the tick it was captured at | A · PT | `<core>Network/LocalInputCache.h` | `LocalInputCache::push` |
 | 4 | A's own integrator reads the capture from `tick - effectiveDelay` | A · PT | `<core>Network/LocalInputCache.h` | `resolveDelayedInput` |
 | 5 | The **undelayed** capture is queued for the wire | A · PT (producer) | `<core>SimulationQueues.h` | `PendingInputQueue::enqueue` |
-| 6 | Once per game frame, the send sweep drains the queue's recent window | A · GT | `<core>SimulationNetSync.h` | `sendLocalInputToAuthorityAll` |
-| 7 | The redundancy bundle is built from the last `redundancyDepthTicks` entries | A · GT | `Plugins/OGSimulation/Source/OGSimulationUnreal/InputRedundancyBundleBuilder.h` | `buildRedundancyBundle` |
-| 8 | One **unreliable** RPC carries the bundle to the authority | A→S · GT | `Plugins/OGSimulation/Source/OGSimulationUnreal/SimulatableNetSyncComponent.h` | `ServerReceiveRemoteMove` |
+| 6 | After each tick's capture, the send sweep drains the queue's recent window | A · GT | `<core>SimulationNetSync.h` | `sendLocalInputToAuthorityAll` |
+| 7 | The redundancy bundle is built from the last `redundancySlots` entries the send hands it (`redundancyDepthTicks` at `redundancyFrames = 0`), clamped to `kMaxSlots` (the character's og-sim-net channel since og-input-latency task P5-7; the Unreal bundle builder before, deleted by P5-8) | A · GT | `Plugins/OGSimulation/Source/OGSimulationNet/og-sim-net/OGSimNet/SimNetChannel.h` | `sendLocalInputToAuthority` |
+| 8 | The bundle joins the frame's input set, which og-net's SimInput lane carries to the authority (since og-input-latency task P5-7; one unreliable RPC of the Unreal net-sync component before, deleted by P5-8) | A→S · GT | `Plugins/OGSimulation/Source/OGSimulationNet/og-sim-net/OGSimNet/SimNetTransport.h` | `appendInputBundle` |
 | 9 | The bundle is decoded and each slot is offered to the coordinator | S · GT | `<core>Network/ServerReceptionCoordinator.h` | `receiveInputBundle` |
 | 10 | Per slot: domain gate, dedup watermark, park | S · GT | `<core>Network/ServerReceptionCoordinator.h` | `receiveRemoteInput` |
 | 11 | The input is parked for `effectiveDelay` ticks | S · GT | `<core>Network/ServerInputDelayQueue.h` | `ServerInputDelayQueue::enqueue` |
 | 12 | **The relay tap** — the same delay becomes the schedule stamp `dA` | S · GT | `<core>Network/ServerReceptionCoordinator.h` | `stampFromDelay` |
-| 13 | The tap resolves `id` → owning component and stages the entry | S · GT | `Plugins/OGSimulation/Source/OGSimulationUnreal/UESimulationSession.h` | `UESimulationSession::relayRemoteInput` |
-| 14 | The entry lands in the **staging** ring, not the replicated one | S · GT | `Plugins/OGSimulation/Source/OGSimulationUnreal/UESimulatableOwnerBinding.h` | `stageRelayedInput` |
-| 15 | …via the ring type's staging entry point | S · GT | `Plugins/OGSimulation/Source/OGSimulationUnreal/RelayedInputRing.h` | `stageArrival` |
-| 16 | The whole staged burst is published once per replication poll | S · GT | `Plugins/OGSimulation/Source/OGSimulationUnreal/SimulationInputRelay.cpp` | `ASimulationInputRelay::PreReplication` |
+| 13 | The tap resolves `id` → the character and stages the entry (og-sim-net's server since og-input-latency task P5-7; the Unreal session's own relay sink before) | S · GT | `Plugins/OGSimulation/Source/OGSimulationNet/og-sim-net/OGSimNet/SimNetServer.h` | `relayRemoteInput` |
+| 14 | The entry lands in the **staging** ring, not the published one (the server's per-character stager since og-input-latency task P5-7; the Unreal owner binding's staging write before, deleted by P5-8) | S · GT | `<core>Network/RelayRingStager.h` | `stageArrival` |
+| 15 | …via the stager's staging entry point (since og-input-latency task P5-7; the Unreal ring type's before, deleted by P5-9) | S · GT | `<core>Network/RelayRingStager.h` | `stageArrival` |
+| 16 | The staged entries are published on receipt (og-sim-net's server, at once since og-session-runtime task 15 and once per frame from og-input-latency task P5-7; the input relay actor's replication poll before, deleted by P5-9) | S · GT | `Plugins/OGSimulation/Source/OGSimulationNet/og-sim-net/OGSimNet/SimNetServer.h` | `flushRelays` |
 | 17 | …by flushing staging into the replicated ring | S · GT | `<core>RelayedInputRingCodec.h` | `flushStagedInto` |
-| 18 | The replicated property lands on the peer | S→B | `Plugins/OGSimulation/Source/OGSimulationUnreal/SimulationInputRelay.h` | `m_relayedInputRing` |
-| 19 | The peer is notified | B · GT | `Plugins/OGSimulation/Source/OGSimulationUnreal/SimulationInputRelay.cpp` | `OnRep_RelayedInputRing` |
-| 20 | The host actor routes the ring to the character's component | B · GT | `Plugins/OGSimulation/Source/OGSimulationUnreal/SimulatableNetSyncComponent.cpp` | `onRelayedInputRingArrived` |
-| 21 | The component's bound callback enters the engine-free core | B · GT | `<core>SimulationNetSync.h` | `onRelayedInputReceived` |
+| 18 | The ring lands on the peer, an og-net `RelayRing` message (since og-input-latency task P5-7; the relay actor's replicated property before, deleted by P5-9) | S→B | `Plugins/OGSimulation/Source/OGSimulationNet/og-sim-net/OGSimNet/SimNetClient.h` | `onRing` |
+| 19 | The peer stores it on the character's channel (since og-input-latency task P5-7; the relay actor's OnRep before, deleted by P5-9) | B · GT | `Plugins/OGSimulation/Source/OGSimulationNet/og-sim-net/OGSimNet/SimNetChannel.h` | `storeRing` |
+| 20 | The client session routes the ring to the character's channel (since og-input-latency task P5-7; the relay host actor to the character's net-sync component before, deleted by P5-8) | B · GT | `Plugins/OGSimulation/Source/OGSimulationNet/og-sim-net/OGSimNet/SimNetClient.h` | `onRing` |
+| 21 | The channel's bound callback (the one `registerPredictionOwner` installed) enters the engine-free core | B · GT | `<core>SimulationNetSync.h` | `onRelayedInputReceived` |
 | 22 | …through the resolution peer's by-id door | B · GT | `<core>SimulationInputResolution.h` | `ingestRelayRing` |
 | 23 | Every entry in the ring is re-consumed, idempotently | B · GT | `<core>Network/RemoteInputCache.h` | `populateRemoteInputCache` |
 | 24 | Each `(captureTick, dA, input)` triple is stored, sender-keyed | B · GT | `<core>Network/RemoteInputCache.h` | `RemoteInputCache::push` |
@@ -109,10 +115,10 @@ input the authority is still holding. That held copy travels its own short path.
 
 | # | hop | machine · thread | file | symbol |
 |---:|---|---|---|---|
-| A1 | Once per physics frame, the drain runs for the tick(s) about to be simulated | S · GT | `Plugins/OGSimulation/Source/OGSimulationUnreal/UESimulationSession.h` | `releaseDelayedInputsForStep` |
+| A1 | Before each authority step, the drain runs for the tick about to be simulated (once per physics frame, for the frame's ticks, in the former Chaos configuration) | S · GT | `Plugins/OGSimulation/Source/OGSimulationSession/og-sim-session/OGSimSession/SessionNetHooks.h` | `releaseForTick` (the Unreal session's `releaseDelayedInputsForStep` until og-session-runtime task 26) |
 | A2 | Every claimed slot releases what is due, or overdue | S · GT | `<core>Network/ServerReceptionCoordinator.h` | `releaseDelayedInputs` |
 | A3 | …surfacing the entry's **stored** capture tick, not a reconstructed one | S · GT | `<core>Network/ServerInputDelayQueue.h` | `tryDequeueForTick` |
-| A4 | Delivery routes id → component → core | S · GT | `Plugins/OGSimulation/Source/OGSimulationUnreal/UESimulationSession.h` | `deliverRemoteInput` |
+| A4 | Delivery routes id → the character's channel → core (og-sim-net's server since og-input-latency task P5-7; id → component before) | S · GT | `Plugins/OGSimulation/Source/OGSimulationNet/og-sim-net/OGSimNet/SimNetServer.h` | `deliverRemoteInput` |
 | A5 | …into the SPSC ring the physics thread drains | S · GT (producer) | `<core>SimulationInputResolution.h` | `queueRemoteMove` |
 | A6 | The authority's collect dequeues it on the remote branch | S · PT | `<core>SimulationQueues.h` | `dequeueMove` |
 | A7 | The tick is integrated | S · PT | `<core>SimulationManager.h` | `onGameSimulationAuthority` |
@@ -172,7 +178,7 @@ keeping them apart is the whole content of the hop:
 ⛔ **Sending `applied` would double the delay.** The authority applies its own delay to whatever it
 receives; handing it an already-delayed input makes the two ends diverge by exactly `effectiveDelay`
 ticks. The fence for this lives at the branch itself in `SimulationInputResolution.h` and in
-`Network/LocalInputCache.h`'s "WHAT THE OUTBOUND RPC CARRIES" block — the fence is at the site, this
+`Network/LocalInputCache.h`'s "WHAT THE OUTBOUND INPUT BUNDLE CARRIES" block — the fence is at the site, this
 paragraph is only the narrative around it.
 
 Three details worth carrying:
@@ -191,9 +197,11 @@ Three details worth carrying:
    `NeutralInputFor` (`<core>SimulationInputResolution.h`) carries the flag that turns a missed
    injection into a warning at registration rather than a silent poison.
 
-The RPC is **unreliable**, and that is deliberate: instead of one reliable message per tick, one
-bundle per frame carries the last `redundancyDepthTicks` captures, so a dropped datagram self-heals
-on the next frame's overlapping bundle. `releaseAllButRecent` keeps the queue bounded to exactly that
+The bundle's lane, og-net's SimInput, is **unreliable** (as the input RPC was until og-input-latency task P5-7), and
+that is deliberate: instead of one reliable message per tick, one
+unreliable bundle per send (one send per captured tick) carries the last few captures (`redundancyDepthTicks` at `redundancyFrames = 0`, else
+the count `SimulationNetSync::redundancySlots` returns), so a dropped datagram self-heals
+on the next overlapping bundle. `releaseAllButRecent` keeps the queue bounded to exactly that
 overlap window.
 
 ---
@@ -227,19 +235,24 @@ through the same sink the drain uses — so no player input is ever silently dro
 out-of-domain rejection above is the one case that is dropped, deliberately: delivering it undelayed
 would defeat the gate that rejected it.
 
-**Staging, and why it exists.** The tap does not write the replicated ring. `stageRelayedInput` puts
-the entry in a *staging* ring, and a pre-replication hook flushes the whole staged burst into the
-replicated property once per replication poll (one adapter's binding: `PreReplication`). Without that, two arrivals inside one server frame would collapse
-to one on the wire — the second overwriting the first in server memory before the poll ever compared
-it. The ring's capacity is the codec constant `kMaxDepth` (`<core>RelayedInputRingCodec.h`); no depth
+**Staging, and why it exists.** The tap does not write the published ring. `RelayRingStager::stageArrival`
+puts the entry in a *staging* ring, and og-sim-net's server publishes it at once, on the bundle's receipt
+(`SimNetServer::flushRelays`; once per frame until og-session-runtime task 15). Until
+og-input-latency task P5-7 the Unreal owner binding's `stageRelayedInput` staged it and the relay actor's
+pre-replication hook (`PreReplication`) flushed it once per replication poll; P5-8 and P5-9 deleted both.
+Without staging, two arrivals before one flush would collapse to one on the wire — the second
+overwriting the first in server memory before the flush ever sent it. The ring's capacity is the codec constant `kMaxDepth` (`<core>RelayedInputRingCodec.h`); no depth
 parameter reaches `stageArrival`, deliberately, so no caller can silently reduce the flush back to
 replace-latest.
 
-**The ring is a per-connection object, not a per-character property.** The transport actor named in
-§2 owns the replicated ring; the character component keeps the accessor pair and the callback pair
-that the engine-free core sees, and never learns that the ring lives on a different object
-altogether. That is why hop 20 exists at all — it is a pure forwarder. (One adapter's binding:
-`ASimulationInputRelay` in `Plugins/OGSimulation/Source/OGSimulationUnreal/` owns the replicated `FRelayedInputRing`.)
+**The ring is per character.** Since og-input-latency task P5-7 og-sim-net's server keeps one
+stager, with its published ring, per relayed character (`SimNetServer.h`, `Character::stager`), and
+the client stores the arriving ring on that character's channel (`SimNetChannel::storeRing`), which
+keeps the accessor pair and the callback pair the engine-free core sees. Before P5-7 the ring was a
+per-connection object: the transport actor `ASimulationInputRelay` in
+`Plugins/OGSimulation/Source/OGSimulationUnreal/` owned the replicated `FRelayedInputRing`, and hop 20
+was a pure forwarder to the character component that never learned the ring lived on a different
+object (P5-9 deleted both).
 
 ---
 
@@ -322,42 +335,46 @@ ticks that no longer mean what they meant. Going cold is the honest answer.
 
 ## 8. Which thread each hop runs on
 
-Grouped, because the pattern matters more than the per-row answer:
+Grouped, because the pattern matters more than the per-row answer. Each machine runs all of its hops on
+one thread, the step's (A and B: a worker client's task; S: a FreeRunning authority's runner); the
+GT/PT letters record the split that og-session-runtime tasks 13–15 retired.
 
 - **A, PT:** hops 1–5. Provider call, capture push, delayed read, send-queue enqueue. The
   `LocalInputCache` push and read are two statements inside one `collectInputAll` call, which is why
   that container's own contract says *not thread-safe, single-threaded by construction*. ⛔ That
   sentence is TRUE of `LocalInputCache` and FALSE of `RemoteInputCache`; the fence forbidding the copy
   lives in `Network/RemoteInputCache.h`.
-- **A, GT:** hops 6–8. The send sweep runs from `onPostSimulationGameThread`, reached from the
-  adapter session's `onPostPhysicsStep` — a game-thread hook, which is what makes the RPC legal to fire.
-- **A, PT→GT crossing:** hop 5 → hop 6. `PendingInputQueue` is a Lamport SPSC ring — physics-thread
-  producer, game-thread consumer. This is the shape `ThreadingCrossings.md`'s standing rule points
-  every *new* crossing at.
-- **S, GT:** hops 9–17 and A1–A5. The RPC handler, the coordinator, the tap, the staging ring and the
-  drain are all game-thread. `releaseDelayedInputsForStep` runs from the host engine's game-thread
-  hook immediately preceding the physics step — one adapter binds that to Chaos's
-  `InjectInputs_External`.
-- **S, GT→PT crossing:** hop A5 → A6. `RemoteMoveQueue` is the second staged ring — game-thread
-  enqueue, physics-thread dequeue. ⚠ Unlike `PendingInputQueue` it carries **plain** `size_t`
+- **A, GT:** hops 6–8. The send runs at capture, after each tick's capture, on the step's thread
+  (`SimNetClient::afterCaptureTick_Step`, og-input-latency P2-16), and a send from another thread is refused.
+- **A, hop 5 → hop 6.** `PendingInputQueue` is a Lamport SPSC ring, one producer and one consumer; with the
+  send at capture both ends run on the step's thread. It is the shape `ThreadingCrossings.md`'s standing rule
+  points every *new* crossing at.
+- **S, GT:** hops 9–17 and A1–A5. og-sim-net's server drain (`SimNetServer::receiveBundle`; the RPC handler until
+  og-input-latency task P5-7), the coordinator, the tap, the staging ring and the publish run on the step's thread,
+  between batches. The release runs immediately before each authority step — the tick driver's
+  `releaseInputsForAuthorityTick`, in each authority step's `beforeTick`; the former Chaos adapter (removed by
+  og-session-runtime task 3) bound it to Chaos's InjectInputs_External.
+- **S, hop A5 → hop A6.** `RemoteMoveQueue` is the second staged ring, one producer and one consumer, both on
+  the step's thread. ⚠ Unlike `PendingInputQueue` it carries **plain** `size_t`
   head/tail/count, not atomics (`<core>SimulationQueues.h`); read the declarations before treating
   the two rings as the same shape.
-- **B, GT:** hops 19–24. The OnRep, the forwarders, the core ingest and the `RemoteInputCache` write.
-- **B, PT:** hops 25–29. Resolution and integration, entered from the adapter's pre-simulate
-  physics callback (one adapter's binding: `OnPreSimulate_Internal`).
-- **B, GT→PT, and it is *not* a queue:** hop 24 → hop 26. `RemoteInputCache` is written on the game
-  thread and read on the physics thread with **no seam**. This is **row 1** of
-  `ThreadingCrossings.md`, priced there as accepted, correction-healed debt; the analysis of record is
-  that header's own `THREADING — GAME-THREAD WRITE / PHYSICS-THREAD READ. ACCEPTED DEBT.` block. It is
-  not re-derived here.
-- **B, GT→PT, correctly synchronized:** the effective delay itself.
-  `setClientEffectiveInputDelayTicks` writes one `std::atomic<int32>` from the tier OnRep;
+- **B, GT:** hops 19–24. og-sim-net's ring arrival (`SimNetClient::onRing`; the relay actor's OnRep until
+  og-input-latency task P5-7), the forwarders, the core ingest and the `RemoteInputCache` write, in the drain at
+  step start, on the step's thread.
+- **B, PT:** hops 25–29. Resolution and integration, later in the same step (the former Chaos adapter entered them
+  from its pre-simulate physics callback, `OnPreSimulate_Internal`).
+- **B, hop 24 → hop 26, and it is *not* a queue:** `RemoteInputCache` is written in the drain and read by the
+  resolution with **no seam**, both on the step's thread. This is **row 1** of `ThreadingCrossings.md`; the analysis
+  of record is that header's own THREADING block. It is not re-derived here.
+- **B, the effective delay, correctly synchronized:**
+  `setClientEffectiveInputDelayTicks` writes one `std::atomic<int32>` from the tier's arrival (og-sim-net's drain; the
+  tier OnRep until og-input-latency task P5-7);
   `collectInputAll` loads it **once per tick**, so a concurrent tier change cannot split a single tick
   across two different delays. This is row 7 of `ThreadingCrossings.md`.
 
 ⚠ The core's step functions are named `onGameSimulation*` for historical reasons and run on the
-**physics** thread. The adapter hook that genuinely runs on the game thread is
-`onPostSimulationGameThread`.
+step's thread. So does `onPostSimulationGameThread`, after each authority batch, despite its name (the
+rename waits for og-session-runtime task 22).
 
 ---
 

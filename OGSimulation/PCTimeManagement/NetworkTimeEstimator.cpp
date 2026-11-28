@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <limits>
 #include <string>
 
 #include "OGSimulation/CompilerControl.h"
@@ -10,11 +11,23 @@
 // pragma optimize off — debugger-friendliness; rationale in SimulationManager.h.
 OGSIM_OPTIMIZE_OFF
 
+namespace
+{
+    // The server-tick estimator's defaults, on this estimator's tick rate (og-time-dilation task 3).
+    ServerTickEstimatorConfig serverTickEstimatorConfigFor(const TimeConfig& config)
+    {
+        ServerTickEstimatorConfig serverTickConfig;
+        serverTickConfig.tickFrequency = config.tickFrequency;
+        return serverTickConfig;
+    }
+}
+
 NetworkTimeEstimator::NetworkTimeEstimator(const TimeConfig& config, LoggerFn logger)
     : m_config(config)
     , m_smoothedRTT(0.0)
     , m_smoothedJitter(0.0)
     , m_hasFirstSample(false)
+    , m_serverTickEstimator(serverTickEstimatorConfigFor(config))
     , m_logger(std::move(logger))
 {
 }
@@ -29,7 +42,8 @@ void NetworkTimeEstimator::updateRTT(double rawRTTSeconds)
     // which that engine documents as **-1.0 when the ping type is disabled or has
     // zero samples** (NetPing.h: "The current/latest ping value, or -1.0 if not
     // set"). That value reached here UNGUARDED, and because the branch below
-    // latches the FIRST sample verbatim, a single pre-warm-up OnRep would set
+    // latches the FIRST sample verbatim, a single pre-warm-up clock arrival (the
+    // timing relay's OnRep until og-input-latency P5-7) would set
     // m_smoothedRTT = -1.0 and m_hasFirstSample = true.
     //
     // TWO CONSEQUENCES, THE SECOND MUCH WORSE THAN THE FIRST.
@@ -83,8 +97,10 @@ void NetworkTimeEstimator::updateRTT(double rawRTTSeconds)
     {
         ++m_rejectedRTTSamples;
 
-        // ONE-SHOT. OnRep_Buffer fires at the timing relay's replication rate
-        // (100 Hz), so an unpopulated accumulator would otherwise emit hundreds
+        // ONE-SHOT. The engine reading arrives with every clock tick the server
+        // sends (og-sim-net's `flushClock`, once per server frame or stepping
+        // batch; the timing relay's OnRep_Buffer at 100 Hz until og-input-latency
+        // P5-7), so an unpopulated accumulator would otherwise emit dozens
         // of lines a second. The running total stays available through
         // getRejectedRTTSampleCount() for anyone who needs the magnitude.
         if (!m_rejectedRTTLogged && m_logger)
@@ -100,7 +116,7 @@ void NetworkTimeEstimator::updateRTT(double rawRTTSeconds)
                     "only signal that the offset is unmeasured; do not read the offset value as evidence. "
                     "One-shot; running total via getRejectedRTTSampleCount().",
                     rawRTTSeconds,
-                    m_hasFirstSample ? 1 : 0,
+                    m_hasFirstSample.load(std::memory_order_relaxed) ? 1 : 0,
                     static_cast<unsigned int>(m_config.predOffsetFloorTicks));
             };
             const int length = format(nullptr, 0);
@@ -112,6 +128,57 @@ void NetworkTimeEstimator::updateRTT(double rawRTTSeconds)
             }
         }
         return;
+    }
+
+    if (rawRTTSeconds > 0.0)
+        m_measuredRTTSamples.fetch_add(1u, std::memory_order_relaxed);
+
+    // -----------------------------------------------------------------------
+    // A 0 READING DOES NOT SEED (og-input-latency P5-28).
+    //
+    // One adapter's ping source reads exactly 0 before it has measured
+    // anything: UE's `FNetPing` with `RoundTrip=PlayerStateAvg` averages its
+    // one-second buckets on the first ack, while every bucket is still empty,
+    // so `RecalculateAvgPing` posts `0.0`, and `Current` holds that 0 until the
+    // next bucket closes about a second later. Seeded from it, the estimate
+    // sat at 0 and the plausibility bound below collapsed to
+    // `rttOutlierMarginSeconds` (30 ms): on a link above 30 ms every real
+    // reading after it was rejected until the escape hatch re-seeded on the
+    // `rttOutlierConsecutiveLimit`-th, so every such client spent its first 29
+    // real readings on the floor target (og-input-latency's Ph3 captures: 29
+    // rejects and 1 re-seed at every join on a 75-89 ms link).
+    //
+    // So a 0 is not a seed: before the first sample above 0 it is a VALID
+    // reading (not counted or warned about by the gate above) that latches
+    // nothing and moves nothing, exactly as getMeasuredRTTSampleCount already
+    // counts it out. It still counts in the outlier window, so the window's
+    // cadence is unchanged. After a seed a 0 is an ordinary low reading: the
+    // gate is one-sided, and a sub-millisecond loopback averages to 0.
+    // -----------------------------------------------------------------------
+    if (!(rawRTTSeconds > 0.0) && !m_hasFirstSample.load(std::memory_order_relaxed))
+    {
+        noteOutlierWindowSample();
+        return;
+    }
+
+    // THE NEW SOURCE'S FIRST SAMPLE (og-input-latency P3-10, after
+    // noteRttSourceChanged; rationale in docs/TimeConfig-rationale.md §15). Its
+    // distance from the estimate is the step between the two sources' biases, not
+    // jitter, so it skips the jitter update. If it reads above the estimate the
+    // gate is re-based on it, or a step up beyond the bound would be rejected
+    // rttOutlierConsecutiveLimit times and then re-seeded: the reset the switch
+    // must not be. A reading above the cold-start ceiling earns no re-base, as it
+    // would earn no seed.
+    if (m_rttSourceChangePending)
+    {
+        m_rttSourceChangePending = false;
+        m_skipNextJitterUpdate   = true;
+        if (rawRTTSeconds > m_smoothedRTT.load(std::memory_order_relaxed)
+            && rawRTTSeconds <= m_config.rttOutlierColdStartCeilingSeconds)
+        {
+            m_gateRebaseRTTSeconds  = rawRTTSeconds;
+            m_gateRebaseSamplesLeft = m_config.rttOutlierConsecutiveLimit > 1u ? m_config.rttOutlierConsecutiveLimit : 1u;
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -126,7 +193,7 @@ void NetworkTimeEstimator::updateRTT(double rawRTTSeconds)
     // frame hitches, ack processing is delayed by up to the hitch duration and that
     // delay lands DIRECTLY in the measurement. On a loopback session with 5-10 ms of
     // emulated lag this produces readings near ONE SECOND: a hundredfold error
-    // caused by the local game thread, not by the network. Pre-T26b updateRTT
+    // caused by the local frame, not by the network. Pre-T26b updateRTT
     // believed them, jitterMultiplier = 2 doubled the excursion into the offset,
     // and jitterSmoothingAlpha = 0.15 dragged recovery out over seconds — the
     // ~8 s post-hitch offset transient this initiative kept measuring. This gate
@@ -189,10 +256,13 @@ void NetworkTimeEstimator::updateRTT(double rawRTTSeconds)
 
         if (m_consecutiveOutliers >= escapeAfter)
         {
-            m_smoothedRTT         = rawRTTSeconds;
-            m_smoothedJitter      = 0.0;
-            m_hasFirstSample      = true;
-            m_consecutiveOutliers = 0;
+            m_smoothedRTT.store(rawRTTSeconds, std::memory_order_relaxed);
+            m_smoothedJitter.store(0.0, std::memory_order_relaxed);
+            m_hasFirstSample.store(true, std::memory_order_relaxed);
+            m_consecutiveOutliers   = 0;
+            m_skipNextJitterUpdate  = false;
+            m_gateRebaseRTTSeconds  = 0.0;
+            m_gateRebaseSamplesLeft = 0;
             ++m_outlierEscapes;
             ++m_outlierWindowEscapes;
         }
@@ -208,30 +278,156 @@ void NetworkTimeEstimator::updateRTT(double rawRTTSeconds)
 
     m_consecutiveOutliers = 0;
 
-    if (!m_hasFirstSample)
+    if (!m_hasFirstSample.load(std::memory_order_relaxed))
     {
-        m_smoothedRTT    = rawRTTSeconds;
-        m_smoothedJitter = 0.0;
-        m_hasFirstSample = true;
+        m_smoothedRTT.store(rawRTTSeconds, std::memory_order_relaxed);
+        m_smoothedJitter.store(0.0, std::memory_order_relaxed);
+        m_hasFirstSample.store(true, std::memory_order_relaxed);
     }
     else
     {
         const double alpha  = m_config.rttSmoothingAlpha;
         const double alphaJ = m_config.jitterSmoothingAlpha;
 
-        const double delta  = rawRTTSeconds >= m_smoothedRTT
-                                ? rawRTTSeconds - m_smoothedRTT
-                                : m_smoothedRTT - rawRTTSeconds;
+        const double smoothedRTT    = m_smoothedRTT.load(std::memory_order_relaxed);
+        const double smoothedJitter = m_smoothedJitter.load(std::memory_order_relaxed);
 
-        m_smoothedRTT    = alpha  * rawRTTSeconds + (1.0 - alpha)  * m_smoothedRTT;
-        m_smoothedJitter = alphaJ * delta          + (1.0 - alphaJ) * m_smoothedJitter;
+        const double delta  = rawRTTSeconds >= smoothedRTT
+                                ? rawRTTSeconds - smoothedRTT
+                                : smoothedRTT - rawRTTSeconds;
+
+        m_smoothedRTT.store(alpha  * rawRTTSeconds + (1.0 - alpha)  * smoothedRTT, std::memory_order_relaxed);
+        if (m_skipNextJitterUpdate)
+            m_skipNextJitterUpdate = false;
+        else
+            m_smoothedJitter.store(alphaJ * delta          + (1.0 - alphaJ) * smoothedJitter, std::memory_order_relaxed);
+    }
+
+    // The re-base ends once the plain bound admits the reading it was re-based on,
+    // or after rttOutlierConsecutiveLimit samples, the horizon of the re-seed it
+    // stands in for (P3-10, §15).
+    if (m_gateRebaseRTTSeconds > 0.0)
+    {
+        --m_gateRebaseSamplesLeft;
+        const double plainBound = m_config.rttOutlierMultiplier * m_smoothedRTT.load(std::memory_order_relaxed)
+                                  + m_config.rttOutlierMarginSeconds;
+        if (m_gateRebaseRTTSeconds <= plainBound || m_gateRebaseSamplesLeft == 0u)
+        {
+            m_gateRebaseRTTSeconds  = 0.0;
+            m_gateRebaseSamplesLeft = 0;
+        }
     }
 
     noteOutlierWindowSample();
 }
 
+void NetworkTimeEstimator::noteEngineRttSample(double rawRTTSeconds)
+{
+    if (m_activeRttSource.load(std::memory_order_relaxed) == TimeConfig::ClockRttSource::Engine)
+        updateRTT(rawRTTSeconds);
+}
+
+void NetworkTimeEstimator::noteSimClockSample(const SimClockRttSample& sample)
+{
+    const bool valid = std::isfinite(sample.rttSeconds) && sample.rttSeconds > 0.0 && std::isfinite(sample.thetaSeconds)
+                       && std::isfinite(sample.t0Seconds) && std::isfinite(sample.t1Seconds)
+                       && std::isfinite(sample.t2Seconds) && std::isfinite(sample.t3Seconds);
+    if (!valid)
+    {
+        ++m_shadow.invalidSamples;
+        return;
+    }
+
+    // The shadow (§15): an ungated EMA of the RTT, the offset of the minimum-RTT
+    // sample of the last kClockOffsetSamples, and RFC 3550's interarrival jitter
+    // (J += (|D| - J) / 16) of each direction's transit time. A transit carries the
+    // clock offset with its sign, which the difference D of two transits cancels.
+    const double upTransit   = sample.t1Seconds - sample.t0Seconds;
+    const double downTransit = sample.t3Seconds - sample.t2Seconds;
+    if (m_shadow.samples == 0u)
+    {
+        m_shadow.simClockRttSeconds = sample.rttSeconds;
+    }
+    else
+    {
+        const double alpha = m_config.rttSmoothingAlpha;
+        m_shadow.simClockRttSeconds = alpha * sample.rttSeconds + (1.0 - alpha) * m_shadow.simClockRttSeconds;
+        m_shadow.owdVarUpSeconds   += (std::abs(upTransit - m_shadowLastUpTransit) - m_shadow.owdVarUpSeconds) / 16.0;
+        m_shadow.owdVarDownSeconds += (std::abs(downTransit - m_shadowLastDownTransit) - m_shadow.owdVarDownSeconds) / 16.0;
+    }
+    m_shadowLastUpTransit   = upTransit;
+    m_shadowLastDownTransit = downTransit;
+
+    m_shadowOffsetRing[m_shadowOffsetNext] = ShadowOffsetSample{sample.rttSeconds, sample.thetaSeconds};
+    m_shadowOffsetNext = (m_shadowOffsetNext + 1u) % kClockOffsetSamples;
+    ++m_shadow.samples;
+
+    // Oldest to newest, so a tie goes to the newest sample.
+    const unsigned int filled = m_shadow.samples < kClockOffsetSamples ? m_shadow.samples : kClockOffsetSamples;
+    const unsigned int oldest = filled < kClockOffsetSamples ? 0u : m_shadowOffsetNext;
+    double minRtt = std::numeric_limits<double>::infinity();
+    for (unsigned int i = 0; i < filled; ++i)
+    {
+        const ShadowOffsetSample& entry = m_shadowOffsetRing[(oldest + i) % kClockOffsetSamples];
+        if (entry.rttSeconds <= minRtt)
+        {
+            minRtt                = entry.rttSeconds;
+            m_shadow.offsetSeconds = entry.thetaSeconds;
+        }
+    }
+
+    if (m_config.clockRttSource == TimeConfig::ClockRttSource::SimClock)
+    {
+        if (m_activeRttSource.load(std::memory_order_relaxed) != TimeConfig::ClockRttSource::SimClock)
+        {
+            m_activeRttSource.store(TimeConfig::ClockRttSource::SimClock, std::memory_order_relaxed);
+            noteRttSourceChanged();
+            if (m_logger)
+            {
+                char buf[256];
+                std::snprintf(buf, sizeof(buf),
+                    "[Warning][ClockSource.Switch] NetworkTimeEstimator RTT source Engine -> SimClock "
+                    "hasFirstRTTSample=%d smoothedRTT=%.3fms firstSimClockRtt=%.3fms",
+                    m_hasFirstSample.load(std::memory_order_relaxed) ? 1 : 0,
+                    m_smoothedRTT.load(std::memory_order_relaxed) * 1000.0,
+                    sample.rttSeconds * 1000.0);
+                m_logger(buf);
+            }
+        }
+        updateRTT(sample.rttSeconds);
+    }
+
+    // og-time-dilation task 3: every valid sample, at either source, before and after
+    // the switch; after updateRTT, so the estimator's RTT gate reads the smoothed RTT
+    // this sample produced. A sample with no server tick is ignored there. §15
+    m_serverTickEstimator.noteSample(sample.serverTick, sample.serverTickAgeSeconds, sample.rttSeconds,
+                                     sample.t3Seconds, m_smoothedRTT.load(std::memory_order_relaxed));
+}
+
+void NetworkTimeEstimator::noteRttSourceChanged()
+{
+    // Before the first seed there is no estimate to keep: the first sample seeds as always.
+    if (!m_hasFirstSample.load(std::memory_order_relaxed))
+        return;
+
+    // The outlier run belongs to the old source; the new source's samples start their own.
+    m_rttSourceChangePending = true;
+    m_consecutiveOutliers    = 0;
+}
+
+TimeConfig::ClockRttSource NetworkTimeEstimator::getActiveRttSource() const
+{
+    return m_activeRttSource.load(std::memory_order_relaxed);
+}
+
+ClockSourceShadow NetworkTimeEstimator::getClockSourceShadow() const
+{
+    return m_shadow;
+}
+
 // COLD START IS THE SUBTLE CASE and the rule is recorded here rather than left
-// implicit. The first sample is latched VERBATIM into m_smoothedRTT, so a
+// implicit. The first sample above 0 (a 0 never seeds: P5-28, in updateRTT) is
+// latched VERBATIM into m_smoothedRTT, so a
 // relative bound has nothing to measure it against. The choice made — and the
 // alternative rejected — is:
 //
@@ -253,11 +449,13 @@ void NetworkTimeEstimator::updateRTT(double rawRTTSeconds)
 // the baseline.
 bool NetworkTimeEstimator::isPlausibleRTTSample(double rawRTTSeconds) const
 {
-    if (!m_hasFirstSample)
+    if (!m_hasFirstSample.load(std::memory_order_relaxed))
         return rawRTTSeconds <= m_config.rttOutlierColdStartCeilingSeconds;
 
-    return rawRTTSeconds <= m_config.rttOutlierMultiplier * m_smoothedRTT
-                            + m_config.rttOutlierMarginSeconds;
+    // A re-based gate (P3-10, a source switch that stepped up) measures against the
+    // new source's first reading until the estimate has caught up with it.
+    const double reference = std::max(m_smoothedRTT.load(std::memory_order_relaxed), m_gateRebaseRTTSeconds);
+    return rawRTTSeconds <= m_config.rttOutlierMultiplier * reference + m_config.rttOutlierMarginSeconds;
 }
 
 // PER-WINDOW REPORTING. Rejections must not be silent: a silent reject hides a
@@ -269,7 +467,8 @@ bool NetworkTimeEstimator::isPlausibleRTTSample(double rawRTTSeconds) const
 //
 // So: one summary line per WINDOW, emitted only when the window actually
 // contained something, carrying rejects, escapes and the surviving estimate.
-// That bounds volume at ~1 line / 6 s at the 100 Hz timing relay even under a
+// That bounds volume at ~1 line per 600-sample window (6 s at the retired 100 Hz
+// timing relay; the wall length follows the RTT source's sample rate) even under a
 // continuously misbehaving ping source, while keeping the per-window resolution
 // the analysis needs. The two totals are separate on purpose: rejects WITHOUT
 // escapes means transients were filtered; escapes mean the network genuinely
@@ -295,8 +494,8 @@ void NetworkTimeEstimator::noteOutlierWindowSample()
             m_outlierWindowRejects,
             m_outlierWindowEscapes,
             m_outlierWindowSamples,
-            m_smoothedRTT    * 1000.0,
-            m_smoothedJitter * 1000.0);
+            m_smoothedRTT.load(std::memory_order_relaxed)    * 1000.0,
+            m_smoothedJitter.load(std::memory_order_relaxed) * 1000.0);
         m_logger(buf);
     }
 
@@ -315,8 +514,8 @@ void NetworkTimeEstimator::recordAuthorityTick(unsigned int serverTick)
         std::snprintf(buf, sizeof(buf),
             "[Verbose] PCTM NTE: authorityTick=%u smoothedRTT=%.3fms smoothedJitter=%.3fms targetPredTick=%u",
             m_authorityTick.load(std::memory_order_relaxed),
-            m_smoothedRTT    * 1000.0,
-            m_smoothedJitter * 1000.0,
+            m_smoothedRTT.load(std::memory_order_relaxed)    * 1000.0,
+            m_smoothedJitter.load(std::memory_order_relaxed) * 1000.0,
             getTargetPredictionTick());
         m_logger(buf);
     }
@@ -342,8 +541,9 @@ unsigned int NetworkTimeEstimator::getPredictionOffsetTicks() const
     //     RTT estimate exists yet.
     //
     // (2) RETURNING 0 RE-CREATES THAT PATHOLOGY IN EXACTLY THE CASE THE T21 GATE
-    //     DETECTS. The timing relay's OnRep delivers authorityTick AND reads the
-    //     ping in the SAME handler, so a client can legitimately have a live,
+    //     DETECTS. The clock arrival (`UESimNetClientHost::onTimingInfo`; the
+    //     timing relay's OnRep until og-input-latency P5-7) delivers authorityTick
+    //     AND the ping reading in the SAME call, so a client can legitimately have a live,
     //     advancing authorityTick while its ping source is still unpopulated.
     //     Then target = authorityTick + 0, pastGuard goes true, and the clock
     //     steers the client to run AT the server tick — perpetually behind,
@@ -361,16 +561,20 @@ unsigned int NetworkTimeEstimator::getPredictionOffsetTicks() const
     //     0, and the floor below substituted. Returning the floor preserves
     //     shipped behaviour while keeping the new diagnostic.
     //
-    // (5) TRUE COLD START IS UNAFFECTED EITHER WAY. Before the first OnRep,
+    // (5) TRUE COLD START IS UNAFFECTED EITHER WAY. Before the first clock arrival,
     //     authorityTick is 0, so targetTick is below minTicksBeforeDriftCheck,
     //     pastGuard is false, and nothing is steering. The floor only starts
     //     mattering once authority ticks arrive — which is precisely the
     //     harmful case.
     // -----------------------------------------------------------------------
-    if (!m_hasFirstSample)
+    if (!m_hasFirstSample.load(std::memory_order_relaxed))
         return static_cast<unsigned int>(m_config.predOffsetFloorTicks);
 
-    const double rawOffset = (m_smoothedRTT + m_config.jitterMultiplier * m_smoothedJitter)
+    // Each RTT source has its own jitter multiplier (og-input-latency P3-13;
+    // docs/TimeConfig-rationale.md §17).
+    const double jitterMultiplier = activeJitterMultiplier();
+    const double rawOffset = (m_smoothedRTT.load(std::memory_order_relaxed)
+                              + jitterMultiplier * m_smoothedJitter.load(std::memory_order_relaxed))
                              * m_config.tickFrequency;
 
     // ceil rounds up so predictions arrive slightly early rather than late.
@@ -400,17 +604,20 @@ unsigned int NetworkTimeEstimator::getLastAuthorityTick() const
 
 double NetworkTimeEstimator::getSmoothedRTT() const
 {
-    return m_smoothedRTT;
+    return m_smoothedRTT.load(std::memory_order_relaxed);
 }
 
 double NetworkTimeEstimator::getSmoothedJitter() const
 {
-    return m_smoothedJitter;
+    return m_smoothedJitter.load(std::memory_order_relaxed);
 }
 
 bool NetworkTimeEstimator::hasFirstRTTSample() const
 {
-    return m_hasFirstSample;
+    const bool hasFirstSample = m_hasFirstSample.load(std::memory_order_relaxed);
+    if (m_afterFirstSampleLoad)
+        m_afterFirstSampleLoad();   // tests only: see the member
+    return hasFirstSample;
 }
 
 unsigned int NetworkTimeEstimator::getRejectedRTTSampleCount() const
@@ -426,6 +633,23 @@ unsigned int NetworkTimeEstimator::getOutlierRejectedSampleCount() const
 unsigned int NetworkTimeEstimator::getOutlierEscapeCount() const
 {
     return m_outlierEscapes;
+}
+
+unsigned int NetworkTimeEstimator::getMeasuredRTTSampleCount() const
+{
+    return m_measuredRTTSamples.load(std::memory_order_relaxed);
+}
+
+double NetworkTimeEstimator::activeJitterMultiplier() const
+{
+    return m_activeRttSource.load(std::memory_order_relaxed) == TimeConfig::ClockRttSource::SimClock
+               ? m_config.simClockJitterMultiplier
+               : m_config.jitterMultiplier;
+}
+
+const ServerTickEstimator& NetworkTimeEstimator::serverTickEstimator() const
+{
+    return m_serverTickEstimator;
 }
 
 OGSIM_OPTIMIZE_ON

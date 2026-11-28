@@ -106,7 +106,7 @@ OGSIM_OPTIMIZE_OFF
 // already stored in `m_predictionWasCorrect`. Only its ability to leave the function is new. §10
 //
 // ⛔ AN OUT-POINTER, NOT A RETURN VALUE — the cache is DELIBERATELY ID-AGNOSTIC and cannot
-// attribute a verdict; the OnRep-bound callback in `SimulationNetSync::registerPredictionOwner`
+// attribute a verdict; the correction callback `SimulationNetSync::registerPredictionOwner` binds
 // can. DEFAULTED, so every existing caller stays byte-identical by construction — the same
 // trick that widened `resolveScheduledRelayedInput`. §10
 //
@@ -138,6 +138,13 @@ struct CorrectionInsertVerdict
     // may ever branch on it, or the shipped build's behaviour starts depending on
     // the log verbosity. §13
     FieldDivergence fieldDivergence;
+
+    // HOW CLOSE THE VERDICT CAME TO THE TOLERANCE (og-input-latency task 2h). §14
+    //
+    // ⛔ A SECOND WALK WITH ITS OWN GATE, on agreeing verdicts too. `evaluated` is
+    // false unless an observer asked and `correctionVerdictMargin::enabled()` held.
+    // REPORTING ONLY, like `fieldDivergence`. §14
+    VerdictMargin verdictMargin;
 };
 
 // ---------------------------------------------------------------------------
@@ -161,18 +168,22 @@ struct CorrectionInsertVerdict
 //     ⛔ There is no input value and no resim bit in a slot. Both are retired, and what
 //     replaced each read is listed at the two gravestones. §1
 //
-//   * TWO THREADS TOUCH THIS CLASS.
-//       GAME thread     corrections land — `tryInsertingCorrectState`, reached from the
-//                       OnRep_-dispatched lambdas via `SimulationReconciliation::injectCorrectionState`.
-//       PHYSICS thread  everything else: the ring push pair, the replay write, both
-//                       prepare-time captures, `wipeCache`, and every read.
+//   * ONE THREAD TOUCHES THIS CLASS: the step's thread. Corrections land there —
+//     `tryInsertingCorrectState`, reached via `SimulationReconciliation::injectCorrectionState`,
+//     fed through the port before the step's collect — and so does everything else: the ring
+//     push pair, the replay write, both prepare-time captures, `wipeCache`, and every read.
+//     One serialized context, so no race in the table below occurs. In this file "GT" and the
+//     "GAME thread" name the landing side and "PT" and the "PHYSICS thread" the step side, as
+//     in `docs/ThreadingCrossings.md`; both run on the step's thread. Until og-session-runtime
+//     task 13 a frame-locked client landed corrections on its frame thread, and the table is
+//     that history's price list, and the price of any future feed on another thread.
 //
 //     ⭐ EXACTLY ONE WORD IS SYNCHRONIZED — `m_pendingResimAnchorTick` — because it is
 //     CONTROL state with two legitimate writers and exactly one correct value. Every other
-//     crossing below is unsynchronized and rides the pre-existing `m_stateBuffer` GT/PT race:
-//     row 2 of `docs/ThreadingCrossings.md`, accepted debt, not re-argued here.
+//     word below is unsynchronized: on two threads each would ride the `m_stateBuffer`
+//     GT/PT race, row 2 of `docs/ThreadingCrossings.md`, not re-argued here.
 //
-//       word / column                crossing              what a race COSTS
+//       word / column                if on two threads     what a race would COST
 //       m_pendingResimAnchorTick     GT set / PT consume   nothing — atomic CAS. §2
 //       m_containsCorrectTick        GT set / PT clear     ⛔ a LOST UPDATE of a whole
 //                                                          DECISION BIT — not a torn value. §5
@@ -515,6 +526,8 @@ public:
 	//
 	// ⛔ GAME-THREAD-ONLY IN EFFECT — written at composition, read at W1 — which is why it is not
 	// atomic; a runtime cvar would break that. Shipped policy: `SimulationManager.h`. §2
+	// (In og-sim-net's IMMEDIATE mode W1 runs on the step's thread; composition still precedes
+	// the first step, so the read is still ordered after the only write.)
 	//
 	// The read-back moved to `getDiagnostics()`; this setter is production-called and stays. §8
 	void setResimTriggerPolicy(TimeConfig::ResimTriggerPolicy policy)
@@ -607,7 +620,9 @@ public:
 	// ⚠ THE INVARIANT'S HONEST BOUND — it holds UP TO AN ACKNOWLEDGED WORD RACE.
 	// ⛔ `m_containsCorrectTick` IS A TWO-WRITER WORD — the GT `set()` here and the PT clear in
 	// `pushPredictionTick` — so the exposure is a LOST UPDATE OF A DECISION BIT, NOT a torn read,
-	// and the milder description must not be re-adopted. The deliberately-redundant provenance
+	// and the milder description must not be re-adopted. (On the step's thread the `set()` and the
+	// clear are serialized and the word race does not occur; it occurs only if the landing runs on
+	// another thread, as a frame-locked client's did until og-session-runtime task 13.) The deliberately-redundant provenance
 	// check (`ReplayedOverCorrection`, WRITE SITE 3 below) catches it ONLY on the
 	// `[ResimProbe.SlotMap]` Verbose surface, never on this decision path. §5
 	//
@@ -763,6 +778,18 @@ public:
 				describeFirstDivergingField(m_stateBuffer[cacheIndex], state, fieldDivergence);
 			}
 
+			// THE MARGIN WALK'S GATE (og-input-latency task 2h). §14
+			//
+			// ⛔ NO VERDICT TEST: the margin is asked on EVERY landed verdict, agreeing
+			// ones above all. Ahead of the call and before the `std::move`, for the
+			// diff's reasons; `Network/VerdictMarginTest.cpp` counts it. §14
+			VerdictMargin verdictMargin;
+			if (outDiagnosticVerdict != nullptr
+				&& correctionVerdictMargin::enabled())
+			{
+				measureVerdictMargin(m_stateBuffer[cacheIndex], state, verdictMargin);
+			}
+
 			m_containsCorrectTick.set(cacheIndex);
 			m_predictionWasCorrect[cacheIndex] = predictionWasCorrect;
 
@@ -808,6 +835,7 @@ public:
 			{
 				*outDiagnosticVerdict = CorrectionInsertVerdict{ true, predictionWasCorrect, tick };
 				outDiagnosticVerdict->fieldDivergence = fieldDivergence;
+				outDiagnosticVerdict->verdictMargin = verdictMargin;
 			}
 
 			if (!predictionWasCorrect)
@@ -1204,7 +1232,10 @@ private:
 	// not travel into `Diagnostics::slotLandingSeqNr`. §8
 	//
 	// ⚠ THREADING — THE ONE NEW CROSS-THREAD SURFACE THE LANDING STAMPS ADD. GT-written (W1), PT-read (the
-	// classifier), PLAIN `uint32`s deliberately:
+	// classifier), PLAIN `uint32`s deliberately. W1 runs on the step's thread, so the
+	// stamps, `m_stateBuffer` and `m_containsCorrectTick` are written and read by one serialized
+	// context, and neither race below occurs. The bullets price a landing on another thread (a
+	// frame-locked client's, until og-session-runtime task 13):
 	//   * THEY RIDE THE PRE-EXISTING `m_stateBuffer` RACE they exist to protect — the same race,
 	//     not a new class of one. §5
 	//   * THEY ARE OBSERVATIONAL: `classifyResimSlotWrite` returns `Written` iff

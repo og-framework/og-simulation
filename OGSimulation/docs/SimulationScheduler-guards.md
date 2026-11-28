@@ -66,7 +66,7 @@ change all read this one expression. They agree with each other only because the
 ## G-03 — A step that `pump` does not run is COUNTED. Never drop due time silently.
 
 **Tag site:** `SimulationScheduler.h`, in `pump`, immediately above
-`recordLostTime(dropped, droppedUntil - droppedFrom);`.
+`recordLostTime(lost_.catchUp, dropped, droppedUntil - droppedFrom);`.
 
 **The prohibition.** Do not delete this call, and do not make it conditional.
 
@@ -84,7 +84,7 @@ else, it has to be re-derived from deadlines that `beginSegment` has already mov
 ## G-04 — `reanchor` COUNTS the gap it skips. Never move the deadline forward without it.
 
 **Tag site:** `SimulationScheduler.h`, in `reanchor`, immediately above
-`recordLostTime(stepsDueAt(nowSeconds) - 1u, nowSeconds - next);`.
+`recordLostTime(lost_.reanchor, stepsDueAt(nowSeconds) - 1u, nowSeconds - next);`.
 
 **The prohibition.** Do not delete this call, and do not make it conditional.
 

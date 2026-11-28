@@ -30,8 +30,10 @@
 //   LocalInputCache<InputT>   this machine's OWN captures, read at `T - d`.
 //                             Sender-side delay mechanism. CLOCK-KEYED.
 //   the relayed input ring    the WIRE payload, server -> peers. Bytes, plus its
-//                             codec in core. One adapter's binding:
-//                             `FRelayedInputRing`.
+//                             codec in core. Its buffer: `RelayRingBuffer`
+//                             (SimPayloadBuffers.h); one adapter's
+//                             `FRelayedInputRing` until og-input-latency task
+//                             P5-9 deleted it.
 //   RemoteInputCache<InputT>  THIS: the client's typed read-side cache. SENDER-KEYED.
 //
 // THE CONTRACTS, one line each. Every one is fenced at its own declaration:
@@ -44,8 +46,9 @@
 //   capacity             64 slots -- and the number is load-bearing for the relay
 //                        delay floor's hard cap.
 //
-// THREADING: GAME-thread write, PHYSICS-thread read, NO SEAM. Accepted, priced,
-// correction-healed debt -- `docs/ThreadingCrossings.md` row 1, analysis of record in
+// THREADING: ONE THREAD, NO SEAM. The ingest and both collects run on the step's thread,
+// serialized (the block below). NOT thread-safe: a writer on another thread reopens
+// `docs/ThreadingCrossings.md` row 1, whose history and analysis of record are
 // `docs/RemoteInputCache-rationale.md` §6. The PROHIBITIONS stay here.
 //
 // WHAT PINS WHAT, so a reader knows which test breaks on a change:
@@ -120,23 +123,22 @@
 // ⛔ `!findLatest().valid` MEANS NO SCHEDULED PROBE AT ALL, never a probe at `dA` 0. §4
 //
 // ---------------------------------------------------------------------------
-// THREADING -- GAME-THREAD WRITE / PHYSICS-THREAD READ. ACCEPTED DEBT.
-// (Ruling 2026-08-04, option (a); source-verified at the time, stated as fact.)
+// THREADING -- ONE THREAD, BY THE HOST'S CONTRACT, NOT BY CONSTRUCTION.
 //
-// WRITER: the adapter's relayed-ring arrival callback, on the GAME thread, routed into
-// `populateRemoteInputCache`. READER: `SimulationInputResolution::collectInputAll` and
-// `SimulationInputResolution::collectResimInputAll`, on the PHYSICS thread, i.e. only
-// where the host ticks physics asynchronously. ONE ADAPTER'S BINDING FOR BOTH ENDS:
-// the async-physics switch is `bTickPhysicsAsync`; the arrival callback is
-// `ASimulationInputRelay::OnRep_RelayedInputRing`, which hands the ring to the owning
-// per-character component and thence to the core callback `registerPredictionOwner`
-// installed. `docs/ThreadingCrossings.md` row 1 cites this block as authoritative.
+// WRITER: the relayed-ring arrival callback `registerPredictionOwner` installs, routed into
+// `populateRemoteInputCache`. READERS: `SimulationInputResolution::collectInputAll` and
+// `SimulationInputResolution::collectResimInputAll`. All three run on the step's thread: the
+// ring is fed through the port before the step's collect, so the writer and both readers are
+// one serialized context, with no crossing and no torn slot. Until og-session-runtime task 13
+// a frame-locked client wrote it on another thread than its reads: the accepted debt
+// `docs/ThreadingCrossings.md` row 1 priced (ruling 2026-08-04, option (a)).
 //
 // ⛔⛔ DO NOT COPY LocalInputCache's "not thread-safe; single-threaded by construction"
 //   claim with the ring mechanics: TRUE of the delay line (its push and read are two
-//   statements in one `collectInputAll` call), FALSE here. Reject a copied one. §6
-// ⛔ ACCEPTED, NOT OVERLOOKED -- inherited, torn-slot-bounded, correction-healed. §6
-// ⛔ THE DEFERRED FIX IS AN SPSC RING at `collectInputAll`, as `RemoteMoveQueue` does. §6
+//   statements in one `collectInputAll` call), NOT here: this store is single-threaded only
+//   because its feed runs on the step's thread. Reject a copied one. §6
+// ⛔ A FEED ON ANOTHER THREAD REOPENS ROW 1 (torn-slot-bounded, correction-healed). §6
+// ⛔ ITS FIX WOULD BE AN SPSC RING at `collectInputAll`, as `RemoteMoveQueue` does. §6
 // ---------------------------------------------------------------------------
 
 // Slot count of a default-constructed RemoteInputCache.
@@ -402,13 +404,16 @@ private:
 // populateRemoteInputCache -- THE ingest, in one place, carrying the wire fence.
 //
 // It lives in core beside the store (the RelayedInputRingCodec precedent) so the
-// engine-free Low-Level-Tests exercise the REAL path: the adapter side does nothing
-// but call this with the freshly-replicated ring.
+// engine-free Low-Level-Tests exercise the REAL path: the transport side does nothing
+// but call this with the freshly-received ring.
 //
-// ONE ADAPTER'S BINDING FOR THE WIRE NAMES IN THIS BLOCK: the replicated wrapper is
-// `FRelayedInputRing`, its property serializer is `NetSerialize`, and the archive's
-// failure switch is `SetError`. Another adapter substitutes its own; every claim here
-// is about those ROLES, not about one engine.
+// ONE ADAPTER'S BINDING FOR THE WIRE NAMES IN THIS BLOCK, until og-input-latency task
+// P5-7: the replicated wrapper was `FRelayedInputRing` (deleted by P5-9), its property
+// serializer `NetSerialize`, and the archive's failure switch `SetError`; the archive
+// and bunch wording below is that adapter's. Since P5-7 og-sim-net carries the ring as
+// a sim-envelope message whose decoder checks only this build's layout and passes
+// another version through (SimEnvelope.h, `decodeRelayRing`), so the version is still
+// decided here, at consume. Every claim here is about those ROLES, not about one engine.
 //
 // ⛔⛔ THE VERSION IS CHECKED BEFORE ANY STRUCTURAL READ. The serializer only
 //   LENGTH-checks, so a layout change makes an old peer read arbitrary bytes as

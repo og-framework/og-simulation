@@ -68,21 +68,26 @@ struct ResimSweepDiagnostics
 // Read this first. Every fence in this file states one invariant at the line
 // it guards; none of them restates this map, and this map states no invariant.
 //
-//   * TWO THREADS TOUCH THIS CLASS, AND ONLY ONE OF THEM TICKS.
-//       GAME thread    corrections arrive — `injectCorrectionState`, from the
-//                      replication-dispatched lambdas — and caches are created
-//                      and destroyed — `createCacheFor` / `removeCacheFor`,
-//                      from the registration facade.
-//       PHYSICS thread every per-tick sweep in this class, without exception,
-//                      all driven from the adapter's physics callbacks.
-//     That crossing is row 2 of `docs/ThreadingCrossings.md` — accepted debt,
-//     healed by the next correction; not re-argued here.
+//   * ONE THREAD TOUCHES THIS CLASS: the step's thread, which ticks it.
+//       corrections arrive — `injectCorrectionState`, from the lambda NetSync binds
+//                      on the owner's correction callback, fed through the port
+//                      between the step's sweeps;
+//       caches are created and destroyed — `createCacheFor` / `removeCacheFor`, from
+//                      the registration facade, applied through the lifecycle
+//                      queue (`DeferredLifecycleQueue.h`) on the same thread;
+//       every per-tick sweep in this class, without exception, driven from the
+//                      step's callbacks.
+//     Until og-session-runtime task 13 a frame-locked client injected corrections
+//     on its frame thread: row 2 of `docs/ThreadingCrossings.md`, then accepted
+//     debt healed by the next correction.
 //
 //   * ⭐ ONE ADAPTER'S BINDING FOR THE CALLBACK COLUMN OF BOTH TABLES BELOW.
 //     That column names the physics-callback ROLE a phase is driven from, never
-//     an engine type. One adapter binds those roles on
-//     the async callback of the Chaos-scheduled host (a game's engine
-//     adapter, outside this library), where that one adapter's names are
+//     an engine type. On the tick driver the step driver
+//     (`SimulationStepDriver.h`) drives those roles in its tick. The former
+//     Chaos adapter (removed by og-session-runtime tasks 3-6) bound them on
+//     the async callback of its Chaos-scheduled host (a game's engine
+//     adapter, outside this library), where its names were
 //     `OnPreSimulate_Internal` (pre-simulate step), `OnPostSolve_Internal`
 //     (post-solve step), `TriggerRewindIfNeeded_Internal` (rewind request) and
 //     `FirstPreResimStep_Internal` (first resim step). Another adapter
@@ -93,7 +98,7 @@ struct ResimSweepDiagnostics
 //     cache at all, so `findCorrectionCache` answers nullptr for every id there and
 //     `SimulationManager` gates the tick calls behind `m_runsPrediction`.
 //
-//   * THE PREDICTION TICK — one PAIR, both halves on the PHYSICS thread:
+//   * THE PREDICTION TICK — one PAIR, both halves on the step's thread:
 //
 //       allocateFrontierSlotsAll   opens the frontier slot   pre-simulate step
 //       postPredictionAll          completes it with state   post-solve step
@@ -101,7 +106,7 @@ struct ResimSweepDiagnostics
 //     The contract binding the two is stated in full at
 //     `allocateFrontierSlotsAll`.
 //
-//   * THE RESIM CYCLE — six phases, ALL on the PHYSICS thread, in this order:
+//   * THE RESIM CYCLE — six phases, ALL on the step's thread, in this order:
 //
 //       phase   this class               SimulationManager.h            adapter callback
 //       ask     checkDivergenceAll       onCheckIsSimilar               rewind request
@@ -272,7 +277,8 @@ public:
         return diagnostics;
     }
 
-    // Correction injection — called from replication-dispatched lambdas (GAME thread).
+    // Correction injection — called from the correction lambda NetSync binds, on the owner
+    // thread (the class map above).
 
     // ⛔ `appliedCaptureTick` rides the SAME slot as the state it corrects
     // (`kNoInputCaptureTick` = substituted); one scalar would answer only for the
@@ -300,7 +306,7 @@ public:
     //
     // `injectCorrectionState` above carries the applied-capture ref that replaced it.
 
-    // ⛔ R1 — the gate read, once per PHYSICS frame, folded with `min`: one physics
+    // ⛔ R1 — the gate read, once per step, folded with `min`: one physics
     // rewind serves everyone, so it must be the OLDEST tick anybody needs. §10.
     //
     // ⛔ `maxAnchorDepthTicks` IS THE DEPTH POLICY, 0 MEANS NO POLICY; the manager

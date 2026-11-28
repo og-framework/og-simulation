@@ -82,9 +82,15 @@ struct TimeConfig
 	// EMA smoothing factor for jitter (absolute RTT deviation), same range.
 	double jitterSmoothingAlpha = 0.15;
 
-	// Safety margin: the offset grows by `jitterMultiplier * smoothedJitter`.
+	// Safety margin: the offset grows by `jitterMultiplier * smoothedJitter` while the
+	// ENGINE ping is the estimator's active RTT source (see `clockRttSource`). §17
 	// ⚠ Larger hides more late arrivals and costs exactly that much input lag.
 	double jitterMultiplier = 2.0;
+
+	// The same margin once the SIMCLOCK ping is the active source: it reads real per-sample
+	// jitter where the engine ping read ~0, so the two sources need their own multipliers. §17
+	// ⚠ Measured (og-input-latency P3-13), not derived: retune only with that sweep re-run. §17
+	double simClockJitterMultiplier = 0.5;
 
 	// Floor, in ticks, for `NetworkTimeEstimator::getPredictionOffsetTicks()`.
 	// ⛔ A STRUCTURAL INVARIANT, NOT AN ESTIMATE — "the client predicts forward".
@@ -127,6 +133,15 @@ struct TimeConfig
 	// ⛔ 0 disables the summary; the running totals stay on the estimator's accessors.
 	uint32_t rttOutlierLogWindowSamples = 600;
 
+	// Which ping feeds the estimate: the host's engine ping, or og-sim-net's SimClock ping/pong.
+	enum class ClockRttSource : uint8_t { Engine, SimClock };
+
+	// The CLIENT's RTT source. With `SimClock` the engine ping feeds the estimate only until the
+	// first valid SimClock sample, which switches it once, without resetting the estimator. A host
+	// that delivers no SimClock sample stays on the engine ping. `SimClock` since P3-10's flip. §15
+	// ⛔ ONE-SHOT AT COMPOSITION: read on the estimator's writer thread with no synchronization.
+	ClockRttSource clockRttSource = ClockRttSource::SimClock;
+
 	// -------------------------------------------------------------------------
 	// Drift correction (ClientPredictionClock)
 	// -------------------------------------------------------------------------
@@ -147,6 +162,20 @@ struct TimeConfig
 	// Prediction ticks that must elapse before drift correction is evaluated.
 	// ⛔ Prevents spurious corrections during startup.
 	uint32_t minTicksBeforeDriftCheck = 60;
+
+	// ONE-SHOT RE-CENTRE: clock advances with an RTT reading (the estimator has its
+	// first sample) after a join or a HardResync before the CLIENT CLOCK decides once,
+	// on the median lead of its last 15 advances, how many ticks it is off the target,
+	// and pays exactly that many corrections through the graduated Skip/Stall path.
+	// ⚠ A TIME WINDOW, in ticks, since P3-11 (it counted samples before): 30 is 0.5 s at
+	// 60 Hz whatever the RTT source's rate. The name and the ini key are kept. §14
+	// ⚠ It also waits for ClientPredictionClock::kRecentreMinSamples (8) measured samples
+	// since the arm (P3-12): a catch-up batch's advances are not time. §14
+	// ⛔ 0 DISABLES IT: the clock then behaves exactly as it did before the re-centre. §14
+	// ⚠ Not a controller: it fires once per arm, then the dead band applies again; a
+	// move of 2+ ticks in the RTT-only offset, max(predOffsetFloorTicks,
+	// ceil(smoothed RTT * tickFrequency)), held for 15 advances re-arms it. §14
+	uint32_t recentreSettleSamples = 30;
 
 	// -------------------------------------------------------------------------
 	// Tick frequency
@@ -253,9 +282,18 @@ struct TimeConfig
 	// ⛔ That tick rate is the host's physics timestep, set OUTSIDE this library. §9
 	int32_t redundancyDepthTicks = 3;
 
+	// The redundancy window counted in client FRAMES (sends) rather than ticks, so a
+	// client that steps several ticks per frame still re-sends its last few frames.
+	// ⛔ 0 IS "TODAY", NOT "OFF": the bundle keeps exactly `redundancyDepthTicks`. §12
+	// ⛔ CLAMPED to [0, kMaxRedundancyFrames] by `latencyKnobs::clampRedundancyFrames`
+	// at the intake and at the setter. §12
+	// Read live at each send of the local inputs, as the third argument of
+	// `SimulationNetSync::sendLocalInputToAuthorityAll` (og-input-latency task 7). §12
+	int32_t redundancyFrames = 0;
+
 	// -------------------------------------------------------------------------
 	// Outbound input relay — the per-character ring of recently captured inputs
-	// the authority replicates on to the other peers
+	// the authority relays on to the other peers (over og-sim-net since og-input-latency P5-7)
 	// -------------------------------------------------------------------------
 
 	// ⛔ RETIRED (2026-08-16): there is deliberately no session-configurable
@@ -294,6 +332,15 @@ struct TimeConfig
 	// If a depth knob is ever reintroduced here, argue against this block, not
 	// merely against its absence.
 
+	// How many already-flushed relay entries the authority re-includes in each flush
+	// that has new entries — the differently-named successor the block above names.
+	// ⛔ IT IS NOT A DEPTH AND NEVER SIZES THE FLUSH STAGE: that capacity stays
+	// `relayedInputRing::kMaxDepth` (the trap in the block above). §12
+	// ⛔ CLAMPED to [0, kMaxRelayResendEntries] by `latencyKnobs::clampRelayResendEntries`
+	// at the intake and at the setter. 0 is today's flush. §12
+	// ⚠ NO PRODUCTION READER YET: the flush that re-sends is not built. §12
+	int32_t relayResendEntries = 0;
+
 	// THE FLOOR LEVER — the session-scoped minimum effective Layer-1 input delay,
 	// in ticks. §7
 	// ⛔ IT IS A MAX, NEVER A SUM: `max(relayDelayFloorTicks, tier-or-fallback)`, via
@@ -304,8 +351,9 @@ struct TimeConfig
 	// ⛔ CLAMPED at a DERIVED ceiling, `relayDelayFloorHardCapTicks` — beyond it a
 	// capture is evicted before its scheduled tick and the regime degenerates silently.
 	// ⛔ That clamp runs at BOTH intakes and once more on every read. §7
-	// ⛔ THE SERVER OWNS THE VALUE and replicates it as a session-scoped uint8; a
-	// client's copy is written from that property's callback, never derived. §7
+	// ⛔ THE SERVER OWNS THE VALUE and sends it as a session-scoped uint8 (og-sim-net's
+	// `SimNetServer::publishFloor`; a replicated property until og-input-latency P5-7); a
+	// client's copy is written from its arrival, never derived. §7
 	// ⚠ UNIFORM-D FAIRNESS MODE is a config VALUE, not a feature: once the floor reaches
 	// `max(rttTierInputDelays)` every derivation path collapses to it. §7
 	// ⚠ The shipped configuration reaches it; `classifyRelayDelayFloor` logs that. §7
@@ -345,7 +393,7 @@ struct TimeConfig
 	// Tiered input delay (Layer-1 latency hiding)
 	//
 	// ⛔ THE RTT TIER IS SERVER-AUTHORITATIVE: the server derives it from its own RTT
-	// sample and replicates the index; the client CONSUMES it, never computes it. §9
+	// sample and sends the index (`SimNetServer::publishTier`); the client CONSUMES it, never computes it. §9
 	// ⛔ ALL FOUR TIER ARRAYS SHARE THE 0..3 INDEX — entry N is the same bucket. §9
 	// ⛔ EVERY EFFECTIVE DELAY BELOW IS FLOORED by `relayDelayFloorTicks` through
 	// `applyRelayDelayFloor`. A floor of 0 is the identity — and 0 is the COMPILED one.
@@ -357,7 +405,7 @@ struct TimeConfig
 	// needs it), and its absence is a ruling, not an omission. It used to hold the
 	// baseline Layer-1 input-delay applied when NO per-connection tier is
 	// available (before the first
-	// authoritative tier replicates to a client, and for any Address the server
+	// authoritative tier reaches a client, and for any Address the server
 	// has never sampled). The window it served is bounded to a handful of
 	// frames — `ConnectionTierTable::onRttSample` seeds a brand-new connection at
 	// tier 0 on its FIRST RTT sample (it does not sit tierless accumulating
@@ -427,6 +475,17 @@ struct TimeConfig
 	// branch, so `max(floor, 0) == floor` wins. Correct precedence, not a conflict. §7
 	// ⛔ The ordering is implemented in `tierInputDelayTicks` (ConnectionTierTable.h).
 	bool lanZeroDelayOverride = false;
+
+	// -------------------------------------------------------------------------
+	// Back-dating detection (og-input-latency P3)
+	// -------------------------------------------------------------------------
+
+	// The `ArrivalMarginSignal::m0P50Ticks` below which a wire's window counts
+	// toward a back-dating episode: m0 is the arrival margin without the delay. §13
+	// ⛔ DETECT ONLY: crossing it must never refuse, delay or flag an input. §13
+	// Read by `ServerReceptionCoordinator`'s constructor, which passes it to its
+	// `InputArrivalMargin`, the detector (og-input-latency P3-6). §10 §13
+	int32_t backDateM0P50ThresholdTicks = -5;
 
 	// -------------------------------------------------------------------------
 	// OBSERVABILITY — FIELDS ONLY, NO RUNTIME CONSUMER IN THIS LIBRARY YET
@@ -513,3 +572,78 @@ struct TimeConfig
 	// ⛔ The field is here so the ring-log reads it instead of hardcoding a literal. §10
 	int32_t hashLogRingCapacity = 600;
 };
+
+// The shared, idempotent clamps of the two latency knobs: the ini intake and the
+// manager's setters call the same function, so the two can never disagree. §12
+namespace latencyKnobs
+{
+	inline constexpr int32_t kMinRedundancyFrames   = 0;
+	inline constexpr int32_t kMaxRedundancyFrames   = 8;
+	inline constexpr int32_t kMinRelayResendEntries = 0;
+	inline constexpr int32_t kMaxRelayResendEntries = 2;
+
+	constexpr int32_t clampRedundancyFrames(int32_t requestedFrames)
+	{
+		if (requestedFrames < kMinRedundancyFrames) return kMinRedundancyFrames;
+		if (requestedFrames > kMaxRedundancyFrames) return kMaxRedundancyFrames;
+		return requestedFrames;
+	}
+
+	constexpr int32_t clampRelayResendEntries(int32_t requestedEntries)
+	{
+		if (requestedEntries < kMinRelayResendEntries) return kMinRelayResendEntries;
+		if (requestedEntries > kMaxRelayResendEntries) return kMaxRelayResendEntries;
+		return requestedEntries;
+	}
+} // namespace latencyKnobs
+
+static_assert(latencyKnobs::clampRedundancyFrames(TimeConfig{}.redundancyFrames) == TimeConfig{}.redundancyFrames,
+	"TimeConfig::redundancyFrames' compiled default must lie inside its own clamp, or the setter would "
+	"silently move a value nobody configured (og-input-latency task 4).");
+static_assert(latencyKnobs::clampRelayResendEntries(TimeConfig{}.relayResendEntries) == TimeConfig{}.relayResendEntries,
+	"TimeConfig::relayResendEntries' compiled default must lie inside its own clamp, or the setter would "
+	"silently move a value nobody configured (og-input-latency task 4).");
+// The `[OGNetcode] JitterMultiplier` door's clamp (og-input-latency P3-13). §17
+namespace clockJitter
+{
+	constexpr double kMinJitterMultiplier = 0.0;
+	constexpr double kMaxJitterMultiplier = 4.0;
+
+	constexpr double clampJitterMultiplier(double requested)
+	{
+		if (!(requested >= kMinJitterMultiplier)) return kMinJitterMultiplier;
+		if (requested > kMaxJitterMultiplier) return kMaxJitterMultiplier;
+		return requested;
+	}
+} // namespace clockJitter
+
+static_assert(clockJitter::clampJitterMultiplier(TimeConfig{}.jitterMultiplier) == TimeConfig{}.jitterMultiplier
+	&& clockJitter::clampJitterMultiplier(TimeConfig{}.simClockJitterMultiplier) == TimeConfig{}.simClockJitterMultiplier,
+	"TimeConfig's two jitter multipliers' compiled defaults must lie inside the JitterMultiplier door's clamp, or the "
+	"setter would silently move a value nobody configured (og-input-latency P3-13).");
+// The `[OGNetcode] RecentreSettleSamples` door's clamp: a negative window clamps to 0,
+// which disables the re-centre. Its knob row is og-sim-session's (og-session-runtime
+// task 35); the intake's std::max(requested, 0) before it. §14
+namespace clockRecentre
+{
+	constexpr int32_t clampSettleSamples(int32_t requested)
+	{
+		return requested < 0 ? 0 : requested;
+	}
+} // namespace clockRecentre
+
+static_assert(TimeConfig{}.recentreSettleSamples <= 2147483647u
+	&& clockRecentre::clampSettleSamples(static_cast<int32_t>(TimeConfig{}.recentreSettleSamples))
+		== static_cast<int32_t>(TimeConfig{}.recentreSettleSamples),
+	"TimeConfig::recentreSettleSamples' compiled default must fit its knob row's int32 value and lie inside "
+	"clockRecentre::clampSettleSamples, or the row's read-back would misprint it and writing the compiled value into the "
+	"ini would move it (og-session-runtime task 35).");
+static_assert(TimeConfig{}.recentreSettleSamples >= TimeConfig{}.rttOutlierConsecutiveLimit,
+	"TimeConfig::recentreSettleSamples' compiled default must span a whole outlier run (rttOutlierConsecutiveLimit) at "
+	"the engine source's one reading per tick, so a join's inflated RTT is either rejected or re-seeded inside the settle "
+	"window before the clock re-centres on it (og-input-latency task 27: the window is 'the size rttOutlierConsecutiveLimit "
+	"already uses'; a window of ticks since P3-11).");
+static_assert(TimeConfig{}.backDateM0P50ThresholdTicks < 0,
+	"TimeConfig::backDateM0P50ThresholdTicks must be below 0: an honest session's m0 p50 sits at about 0 in steady "
+	"state, and the clock's dead band lets it fall a few ticks below, so a threshold at or above 0 flags honest "
+	"sessions (og-input-latency P3-1).");

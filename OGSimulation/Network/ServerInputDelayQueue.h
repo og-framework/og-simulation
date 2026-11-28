@@ -63,14 +63,15 @@
 //
 // ENGINE-AGNOSTIC. Sim-core header: includes ONLY other `OGSimulation/` headers
 // and the STL — no UE types, no engine headers. Wire identity arrives as the
-// opaque `Address` parameter, bound in production to `FUEConnectionHandle` and
-// in the Catch2 suite to `FStandaloneTestHandle`.
+// opaque `Address` parameter, bound in production to og-sim-net's
+// `SimNetConnectionHandle` (the Unreal `FUEConnectionHandle` until og-input-latency
+// task P5-7; deleted by P5-9) and in the Catch2 suite to `FStandaloneTestHandle`.
 //
 // ---------------------------------------------------------------------------
 // THREADING CONTRACT — THIS CLASS IS **NOT** THREAD-SAFE. (Added T10, 2026-07-20.)
 //
-// It is intended for SINGLE-THREADED use, and in the UE binding that thread is
-// the GAME THREAD. There is no synchronization anywhere in here: the storage is
+// It is intended for SINGLE-THREADED use: every call on one thread, the step's
+// (a FreeRunning authority's runner, which also steps). There is no synchronization anywhere in here: the storage is
 // a plain `std::deque` per address inside a plain `std::unordered_map`, with no
 // mutex and no atomics. Calling `enqueue` from one thread while another calls
 // `tryDequeueForTick` / `purgeOlderThan` / `reapDeadHandles` is a genuine data
@@ -83,28 +84,30 @@
 // runs on the PHYSICS thread under `bTickPhysicsAsync=True`). That pairing is
 // unimplementable, and the header said nothing to warn the caller off it.
 //
-// THE GAME-THREAD -> PHYSICS-THREAD TRANSITION IS NOT THIS CLASS'S JOB. It
+// A CROSS-THREAD TRANSITION IS NOT THIS CLASS'S JOB. It
 // belongs to `RemoteMoveQueue` (SimulationQueues.h), which is the seam the
 // server input path already crosses. The correct integration shape, and the one
 // T10 ships, is:
 //
-//   game thread:     RPC arrives -> enqueue() here
-//   game thread:     immediately before the physics step -> tryDequeueForTick()
-//                    here, then hand the released input to RemoteMoveQueue
-//   physics thread:  the authority tick consumes it from RemoteMoveQueue
+//   arrival:  an input bundle arrives (an RPC until og-input-latency task
+//             P5-7) -> enqueue() here
+//   release:  immediately before the authority step -> tryDequeueForTick()
+//             here, then hand the released input to RemoteMoveQueue
+//   step:     the authority tick consumes it from RemoteMoveQueue
 //
-// Both ends of THIS queue therefore sit on the game thread, and nothing about
-// this container is ever touched from the physics thread. A future caller that
-// wants to dequeue from the physics thread must NOT simply add a lock here: a
+// Both ends of THIS queue therefore run on one thread, the step's. A future
+// caller that wants to dequeue on another thread must NOT simply add a lock here: a
 // lock would fix this container's internal race and still leave the caller doing
-// ENGINE-OBJECT traversal on the physics thread — resolving a weak object handle
-// (one adapter: `TWeakObjectPtr::Get`), then walking from the owning actor to its
+// ENGINE-OBJECT traversal on a thread that may not touch engine objects — resolving a weak object handle
+// (the Unreal handle's `TWeakObjectPtr::Get`, until og-input-latency task P5-7),
+// then walking from the owning actor to its
 // transport connection (`AActor::GetNetConnection`) — which this codebase forbids.
 // ---------------------------------------------------------------------------
 //
-// CONSUMER: wired in Phase B (T10) — the UE server binding parks inbound RPC
-// input here and releases it on the game thread immediately before the authority
-// physics step. The Catch2 suite additionally drives it standalone.
+// CONSUMER: wired in Phase B (T10). Since og-input-latency task P5-7 the host parks
+// inbound input here as it arrives (through ServerReceptionCoordinator) and releases
+// it immediately before each authority step, both on the step's thread; the UE
+// server binding parked inbound RPC input here before. The Catch2 suite additionally drives it standalone.
 //
 // NAMESPACE NOTE: declared in the GLOBAL namespace, matching the rest of the
 // OGSim core (see the same note on ConnectionTierTable.h, NetConfig in
@@ -312,7 +315,9 @@ public:
     // session in impl/bugreport_authority_late_resend_double_apply.md.)
     //
     // The duplicate scan above consults ONE memory: what is parked right now. A
-    // redundancy bundle re-sends the previous `redundancyDepthTicks` captures, so
+    // redundancy bundle re-sends the previous slot-count captures
+    // (`redundancyDepthTicks` at `redundancyFrames = 0`, else
+    // SimulationNetSync::redundancySlots), so
     // if the bundle lands after the tick on which its OLDEST re-send was released,
     // that re-send is no longer parked, passes the scan as "new", is parked a
     // second time, and — being the oldest due entry — is released again on the

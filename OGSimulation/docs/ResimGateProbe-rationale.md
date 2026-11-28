@@ -56,17 +56,19 @@ to protect is intact. But the property is not preserved *verbatim*, and the head
 
 ## 2. Two objects because there are two threads
 
-`ResimGateProbe` is written only from the physics thread. `CorrectionLandingProbe` is written only
-from the game thread. They are separate objects with separate windows, never shared and never
-atomic, and that is a correctness property rather than a layout preference.
+`ResimGateProbe` is written only from the step. `CorrectionLandingProbe` is written only from the
+correction's arrival. They are separate objects with separate windows, never shared and never atomic.
+That is a correctness property for a host that delivers arrivals on another thread than the step's (as
+the host's frame thread did until og-session-runtime task 13); on a host that delivers them on the
+step's thread both run on one thread, and the split costs nothing.
 
 A single shared window would have one thread call `resetWindow` while the other is mid-increment.
 The loss is not one sample — it is **a whole window's totals**, because the reset zeroes every
 counter at once. Two objects make the race impossible rather than unlikely.
 
 **The cost, stated so nobody looks for a line that cannot exist.** The under-resimulation reading
-wants `landedBehind` (game thread) next to `requested` / `grants` / `finishes` (physics thread), and
-those cannot share one log line without sharing state across the two threads. So the reading is two
+wants `landedBehind` (the arrival) next to `requested` / `grants` / `finishes` (the step), and
+those cannot share one log line without sharing state across the two objects. So the reading is two
 adjacent Warning lines, each self-contained. `RelayReadProbe`, `RelayArrivalProbe` and
 `FrameHealthProbe` state the same one-object-per-thread rule for the same reason, so the shape is
 the family's, not this file's. `[ResimProbe.Landing]` alone already answers the
@@ -147,8 +149,8 @@ taken under the compiled default policy.
 
 ## 6. The surviving-anchor count
 
-A correction that lands on the game thread **mid-replay** raises the pending anchor past the value
-`prepareResimAll` captured. The completion edge then tries to consume the anchor with a
+A correction that lands after `prepareResimAll` captured the anchor and before the completion edge
+(**mid-replay**) raises the pending anchor past the value `prepareResimAll` captured. The completion edge then tries to consume the anchor with a
 compare-and-swap against the captured value, the compare fails, and the anchor **survives**. That is
 the mechanism working, not a defect: the gate stays open and re-requests next frame with a
 *different* anchor. `SimulationReconciliation::consumeResimAnchorsAll` carries the full argument.
@@ -167,8 +169,11 @@ the mechanism working, not a defect: the gate stays open and re-requests next fr
    because the next request's anchor differs from this one's. A nonzero here *with* a matching
    `repeatRequests` is a different story and worth investigating.
 
-⚠ **Expect nonzero, possibly large, on a shipped run.** It was structurally near-zero only under the
-compiled default. See §20 for why the header used to say the opposite.
+**Measured: zero on this project's runs.** Every complete `[ResimProbe.Gate]` window in the 767 capture
+folders under the project's `Saved/Profiling` (2026-10-09 to 2026-11-26) reads `survivingAnchors=0`: 99,447
+windows in 2,172 logs, each of whose sessions printed `[ResimGate] session policy = OnDisagreement`
+(og-session-runtime task 33b). The header used to say *"expect nonzero, possibly large"*; §20 F-36-8 records
+why that line went. A nonzero reading is still possible by the mechanism above, so property 3 stands.
 
 ## 7. The depth-policy exclusion count
 
@@ -198,17 +203,19 @@ configuration* does. See §20.
 ## 8. I3 — the physics-rewind request / refusal ledger
 
 **One adapter's binding, and why the header states it once.** The request and grant hooks, the
-rewind-frame search, the depth merge and the refusal floor are all engine-side. For one adapter —
-Unreal/Chaos — they are `FSimulationManagerAsyncCallback::TriggerRewindIfNeeded_Internal`,
+rewind-frame search, the depth merge and the refusal floor are all engine-side. On the tick driver
+they are og-simulation's `SimulationStepDriver::resimulateIfRequested`: the request, then the world's
+`hasTick` as the refusal floor, then the grant and the restore. For the former Unreal/Chaos adapter
+(removed by og-session-runtime tasks 3–6) they were `FSimulationManagerAsyncCallback::TriggerRewindIfNeeded_Internal`,
 `::FirstPreResimStep_Internal`, `FRewindData::FindValidResimFrame`, `FMath::Min` and
 `BlockResimFrame`. Another adapter substitutes its own, and the engine-free Catch2 suite drives the
 same door with no physics engine at all (`ResimGatePolicyTest.cpp`). The header declares that pair
 once at the head of I3 and names roles everywhere below it.
 
-**Why we count refusals ourselves.** One adapter compiles its own refusal diagnostics out of any
-normal build (behind `DEBUG_REWIND_DATA` / `DEBUG_NETWORK_PHYSICS`), so a refused rewind is
-**completely silent** and our side simply retries next frame, because nothing cleared
-`needsResimulation()`. Four fields end that silence: `requests`, `grants`, `refusedFrames`,
+**Why we count refusals ourselves.** The former Chaos adapter (removed by og-session-runtime tasks
+3–6) compiled its own refusal diagnostics out of any normal build (behind `DEBUG_REWIND_DATA` /
+`DEBUG_NETWORK_PHYSICS`), so a refused rewind was **completely silent** and our side simply retried
+next frame, because nothing cleared `needsResimulation()`. Four fields end that silence: `requests`, `grants`, `refusedFrames`,
 `repeatRequests`.
 
 **`requests` versus `requested` is a free wiring self-check.** The two differ only by the adapter's
@@ -275,7 +282,10 @@ body starting to move our rewind depth — and never a tuning signal.
 ~1.7-tick mean replay span of §11. A **negative** depth is clamped to 0 rather than stored: it would
 mean we asked to rewind to a frame at or ahead of the last completed one, which the ±1 skew in the
 tick↔physics-frame mapper produces transiently. It is visible as `depthMin=0` beside a nonzero
-`refusedFrames` — the skewed request lands on the engine's refusal paths, not on a moved grant.
+`refusedFrames` — the skewed request lands on the engine's refusal paths, not on a moved grant. That
+mapper was the former Chaos adapter's (removed by og-session-runtime task 4); the step driver passes the
+prediction tick and the anchor as the two frames, so its depth is the replay span in ticks and it has
+no skew.
 
 ⚠ **The two domains are separate parameters on purpose.** `lastCompletedStep` and
 `requestedChaosFrame` are physics-domain frames and are signed, because the engine's are;
@@ -287,7 +297,7 @@ prevent, and it is the mistake the ±1 skew makes cheap to commit.
 `prepares` counts `SimulationManager::prepareResimulation` calls, one per granted rewind, so
 `prepares` and `grants` must agree; they are counted on opposite sides of the adapter boundary for
 the same reason `requests` / `requested` are. `finishes` counts the `[Resim.Finish]` edge —
-`chaosIsResim && !clockIsResim` in `onPostGameSimulation` — the sub-step on which the clock's resim
+`engineIsResim && !clockIsResim` in `onPostGameSimulation` — the sub-step on which the clock's resim
 cursor caught up to the frontier and `applyResimAll` ran.
 
 `abandoned` is `prepares - finishes`: **granted resims whose apply edge never ran**, measured at
@@ -302,10 +312,10 @@ or read `stuckResimFrames`, which has no boundary term at all.
 
 **`stuckResimFrames` is the boundary-noise-free reading of the same defect**, and its side effect is
 real rather than bookkeeping. While `ClientPredictionClock::isResimulating()` stays true through
-normal prediction frames, `SimulationManager::currentStep()` returns the stale resim step on the
-game thread, so `sendLocalInputToAuthorityAll` stamps a stale tick until the next
-`startResimulation` resets the cursor. Whether input dedup absorbs that is measurable rather than
-assumable; the counter is what makes it measurable.
+normal prediction frames, `SimulationManager::currentStep()` returns the stale resim step. Until
+og-session-runtime task 13 a client's send read that step after the batch and stamped a stale tick
+until the next `startResimulation` reset the cursor; a send at capture is handed the integrated tick
+instead. The counter measures the stuck cursor itself.
 
 ## 11. I6 — the replay span
 
@@ -516,6 +526,7 @@ it replaced was compressed.
 | **F-36-5** | *"Fed from the OnRep-dispatched correction callback bound in `SimulationNetSync::registerPredictionOwner`"* | **True but no longer the useful handle.** The binding site is still that method, but the probe is now a member of `NetSyncTelemetry` and its immediate feeder is `NetSyncTelemetry::emitCorrectionArrival`, given a decision `SimulationNetSync::decideCorrectionArrival` computes. A reader following the old sentence lands two hops from the call. Both ends are named now. |
 | **F-36-6** | *"Measured healthy baseline: 15-31 % refused across all 18 archived client logs"* | **Over-narrow range attributed to a wider population.** 15–31 % is the span of the **four** runs the investigation tabulates; its own text gives **10–31 %** for the archived runs generally. §8 now states both with the population each belongs to. |
 | **F-36-7** | *"the engine-agnostic / no-simulatable / no-logger testability property that `RelayReadProbe.h` states is preserved **verbatim**"* | **The word *verbatim* is false.** That property's third clause is *no other OGSimulation header*, and this file includes one. Everything the clause protects survives, because the include is transitively `<cstdint>`-only — but not the clause. §1 states the distinction. |
+| **F-36-8** | The surviving-anchor count: *"EXPECT NONZERO, POSSIBLY LARGE, UNDER THE SHIPPED CONFIGURATION — near-0 only under the compiled default. Check the policy first"* | **Not borne out; the line was dropped (og-session-runtime task 33b).** All 99,447 complete `[ResimProbe.Gate]` windows of the 2,172 logs under `Saved/Profiling` (767 captures, 2026-10-09 to 2026-11-26, every session `OnDisagreement`) read `survivingAnchors=0`. §6 states the measurement. F-36-4's point, which policy ships, stands. |
 
 ⚠ **Two claims checked and confirmed, recorded because confirming them cost as much as refuting one.**
 `ResimGateProbe::fillSummary` really has no shipped caller — the only external callers anywhere are

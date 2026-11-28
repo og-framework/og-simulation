@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: MPL-2.0
 
 #include "OGTypes.h"
+#include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <functional>
 #include <unordered_map>
 
@@ -18,7 +21,7 @@
 // pragma optimize off — debugger-friendliness; rationale in SimulationManager.h.
 OGSIM_OPTIMIZE_OFF
 
-// NetSyncTelemetry — `SimulationNetSync`'s GAME-THREAD instrument: it owns every
+// NetSyncTelemetry — `SimulationNetSync`'s ARRIVAL-SIDE instrument (the drain's thread): it owns every
 // probe count and every shipped log line that the transport peer's decision and
 // report structs are projected into.
 // Layer: OGSimulation. Adapter-agnostic, UE/Chaos-free.
@@ -38,12 +41,15 @@ OGSIM_OPTIMIZE_OFF
 //     (`m_inputResolutionTelemetry`), not by NetSync and not by this class.
 //     Neither sibling holds a reference to the other.
 //
-//   * EVERY METHOD HERE IS GAME THREAD ONLY. Three call sites, all methods
-//     of `SimulationNetSync`:
+//   * EVERY METHOD HERE RUNS ON ONE THREAD, the step's: the thread that
+//     delivers NetSync's arrivals. Three call sites, all methods of `SimulationNetSync`:
 //
-//       emitRelayArrival        onRelayedInputReceived    replication-dispatched
-//       emitCorrectionArrival   onCorrectionReceived      replication-dispatched
+//       emitRelayArrival        onRelayedInputReceived    og-sim-net ring arrival
+//       emitCorrectionArrival   onCorrectionReceived      og-sim-net correction arrival
 //       forgetOwner             unregisterSimulatable     step 4, lifecycle
+//
+//     forgetOwner runs on that thread too for a host that unregisters through
+//     `DeferredLifecycleQueue`, which applies on the step's thread.
 //
 //     `emitCorrectionVerdictClassLine` / `emitCorrectionLandingClassLine` are
 //     reached only from `emitCorrectionArrival`, and
@@ -69,6 +75,8 @@ OGSIM_OPTIMIZE_OFF
 //                                        correction
 //       emitCorrectionVerdictClassLine   NOTHING        1 Warning, non-empty class
 //       emitCorrectionLandingClassLine   NOTHING        1 Warning, non-empty class
+//       emitVerdictMarginClassLine       NOTHING        1 Log, non-empty class, only
+//                                                       while the margin gate is on
 //       shouldLogVersionMismatchOnce     NOTHING        1 Warning per id, ever
 //       forgetOwner                      NOTHING        never logs
 //
@@ -81,6 +89,8 @@ OGSIM_OPTIMIZE_OFF
 //     in this file ships at Warning. The adapter routes on the tag prefix and
 //     the host project's log configuration sets every category it can route to
 //     at Warning, so a `Log`-severity line DOES NOT EXIST in a shipped build.
+//     The one deliberate exception is `[DivergenceProbe.Margin]` (task 2h): a
+//     Log line BECAUSE it must not exist at the shipped Warning. §15
 //     One adapter's binding: `RouteOGMessage` (`OGBrawlerSimulationManager.cpp`)
 //     reading `Config/DefaultEngine.ini`:
 //
@@ -101,13 +111,13 @@ OGSIM_OPTIMIZE_OFF
 //
 // ⛔ TWO SIBLINGS, TWO OWNERS, NO LINK — `SimulationInputResolution` owns `InputResolutionTelemetry`; neither references the other, and merging them re-crosses a thread boundary. §1
 //
-// ⛔ AN OWNER, NOT A DIAGNOSTICS VIEW — production calls into every public method here on the game thread, so nothing on this class may be grouped behind a `getDiagnostics()`. §2
+// ⛔ AN OWNER, NOT A DIAGNOSTICS VIEW — production calls into every public method here on the drain's thread, so nothing on this class may be grouped behind a `getDiagnostics()`. §2
 // ⛔ Nothing here is reachable from `SimulationNetSync::getDiagnostics()`. The read-seam / write-site rule is stated once in `docs/DiagnosticsConventions.md` §2.
 //
 // ⛔ NO REFERENCE INTO A PRODUCTION CONTAINER IS EVER HANDED IN — `emitRelayArrival` takes a report, not the arriving `RemoteInputCache<InputT>&`. §2
 // ⛔ `shouldLogVersionMismatchOnce`'s latch therefore lives here, id-keyed, rather than on the store. §7
 //
-// ⛔ EVERY METHOD ON THIS CLASS IS GAME THREAD ONLY, so no member here is atomic and none may be made concurrent. §3
+// ⛔ EVERY METHOD ON THIS CLASS RUNS ON ONE THREAD, the step's, which delivers the arrivals, so no member here is atomic and none may be made concurrent. §3
 // ⛔ `forgetOwner` is the one either-thread member and is never concurrent by construction — see `SimulationNetSync::unregisterSimulatable`'s ordering. §3
 // ⛔ `shouldLogVersionMismatchOnce` is public, but production reaches it only from `emitRelayArrival`; `emitCorrectionArrival` is the sole caller of the two class-line helpers.
 
@@ -144,7 +154,71 @@ struct CorrectionArrivalDecision
     // ⛔ `evaluated == false` IS THE STEADY STATE, not a fault: at the shipped
     // `LogOGDivergenceProbe=Warning` nothing walked, so nothing here may be printed. §12
     FieldDivergence fieldDivergence;
+
+    // THE VERDICT MARGIN — carried from `CorrectionInsertVerdict`, unmodified, for
+    // the same reason as `fieldDivergence`. `evaluated == false` is the steady state
+    // at the shipped verbosity. §15
+    VerdictMargin verdictMargin;
 };
+
+// THE `[DivergenceProbe.Margin]` BUCKETS, in line order: b0 r = 0, b1 r <= 1e-5,
+// b2 r <= 1e-3, b3 r <= 1e-1, b4 r < 1, b5 r >= 1. §15
+inline constexpr std::size_t kVerdictMarginBuckets = 6u;
+
+inline std::size_t verdictMarginBucketOf(double ratio)
+{
+    if (ratio == 0.0)
+        return 0u;
+    if (ratio <= 1e-5)
+        return 1u;
+    if (ratio <= 1e-3)
+        return 2u;
+    if (ratio <= 1e-1)
+        return 3u;
+    if (ratio < 1.0)
+        return 4u;
+    return 5u;
+}
+
+// ONE CLASS'S MARGIN WINDOW. ⛔ It closes when the verdict probe's window closes,
+// never on its own count, so `verdicts` equals the `[DivergenceProbe.Window]`
+// line's `corrections` whenever the gate was on for the whole window. §15
+struct VerdictMarginClassWindow
+{
+    std::uint32_t verdicts = 0u;
+    std::uint32_t exactFail = 0u;
+    std::uint32_t buckets[kVerdictMarginBuckets] = {};
+    std::uint32_t discrete = 0u;
+    double maxRatio = 0.0;
+    char maxField[kFieldPathCapacity] = {};
+    // The largest `r` among AGREEING verdicts only, and its leaf: what a window's b5 hides in `maxField`. §15
+    double maxAgreeRatio = 0.0;
+    char maxAgreeField[kFieldPathCapacity] = {};
+
+    void note(const VerdictMargin& margin, bool agreed)
+    {
+        ++verdicts;
+        if (margin.maxRatio > 0.0)
+            ++exactFail;
+        ++buckets[verdictMarginBucketOf(margin.maxRatio)];
+        if (margin.discrete)
+            ++discrete;
+        if (margin.maxRatio > maxRatio)
+        {
+            maxRatio = margin.maxRatio;
+            std::memcpy(maxField, margin.maxField, sizeof(maxField));
+        }
+        if (agreed && margin.maxRatio > maxAgreeRatio)
+        {
+            maxAgreeRatio = margin.maxRatio;
+            std::memcpy(maxAgreeField, margin.maxField, sizeof(maxAgreeField));
+        }
+    }
+};
+
+// The Margin line's buffer: 24 + 23 + 20 + 21 + 6 x 14 + 20 + 22 + 105 + 27 + 110 = 456
+// characters at maximum widths and two full paths, over SIMLOG's 256. §15
+inline constexpr std::size_t kVerdictMarginLineCapacity = 512u;
 
 class NetSyncTelemetry
 {
@@ -173,7 +247,7 @@ public:
     // ⚠ `RemoteInputCache::shouldLogVersionMismatchOnce` no longer exists. §7
     void emitRelayArrival(unsigned int id, const RelayedInputIngestReport& report)
     {
-        // ⛔ PROBE 2 — the GAME-THREAD replication-cadence window, measured in CAPTURE TICKS; a different object from the physics-side read probe, and they must not be merged. §5
+        // ⛔ PROBE 2 — the arrival-side cadence window (the step's thread, which delivers the arrivals), measured in CAPTURE TICKS; a different object from the physics-side read probe, and they must not be merged. §5
         // ⛔ `report.newestCaptureTick` is the newest tick THIS RING carried, not the newest the store holds.
         if (report.newestCaptureTickValid)
         {
@@ -236,7 +310,7 @@ public:
         if (report.outcome == RelayedInputIngestOutcome::VersionMismatch
             && shouldLogVersionMismatchOnce(id))
         {
-            // ⛔ ONCE per component per session — an incompatible peer re-replicates its ring forever, so an ungated line fires on every replication. §7
+            // ⛔ ONCE per component per session — an incompatible peer's ring keeps arriving, so an ungated line fires on every arrival. §7
             SIMLOG(m_logger,
                 "[Warning][RelayedInput] DROP wire-version mismatch id=%u onWire=%u expected=%u",
                 id,
@@ -296,6 +370,10 @@ public:
             decision.predictionWasCorrect ? 1u : 0u,
             fieldTail);
 
+        // ⛔ NOTED BEFORE `noteCorrection`, which counts the window's closing correction in the window it closes. §15
+        if (decision.verdictMargin.evaluated)
+            verdictMarginWindowFor(decision.characterClass).note(decision.verdictMargin, decision.predictionWasCorrect);
+
         CorrectionVerdictWindowSummary window;
         if (!m_correctionVerdictProbe.noteCorrection(
                 decision.characterClass, decision.predictionWasCorrect, window))
@@ -307,6 +385,37 @@ public:
             PredictedCharacterClass::LocallyPredicted, window.local, window.samples);
         emitCorrectionVerdictClassLine(
             PredictedCharacterClass::RemoteProxy, window.remote, window.samples);
+
+        emitVerdictMarginClassLine(PredictedCharacterClass::LocallyPredicted, m_verdictMarginLocal);
+        emitVerdictMarginClassLine(PredictedCharacterClass::RemoteProxy, m_verdictMarginRemote);
+        m_verdictMarginLocal = VerdictMarginClassWindow{};
+        m_verdictMarginRemote = VerdictMarginClassWindow{};
+    }
+
+    // ⛔ ONE per closed verdict window and class, from `emitCorrectionArrival` only; SILENT ON AN EMPTY CLASS, which is every class while the margin gate is off. §15
+    // ⛔ NO SEVERITY TOKEN: the `[DivergenceProbe` route's plain level is `Log`, so the line is off at the shipped `Warning`. A `[Log]` token would not match the route's prefix. §15
+    void emitVerdictMarginClassLine(PredictedCharacterClass characterClass,
+                                    const VerdictMarginClassWindow& classWindow)
+    {
+        if (classWindow.verdicts == 0u || !m_logger)
+        {
+            return;
+        }
+
+        char line[kVerdictMarginLineCapacity];
+        std::snprintf(line, sizeof(line),
+            "[DivergenceProbe.Margin] class=%s verdicts=%u exactFail=%u "
+            "b0=%u b1=%u b2=%u b3=%u b4=%u b5=%u discrete=%u maxRatio=%g maxField=%s "
+            "maxAgreeRatio=%g maxAgreeField=%s",
+            predictedCharacterClassName(characterClass),
+            classWindow.verdicts, classWindow.exactFail,
+            classWindow.buckets[0], classWindow.buckets[1], classWindow.buckets[2],
+            classWindow.buckets[3], classWindow.buckets[4], classWindow.buckets[5],
+            classWindow.discrete, classWindow.maxRatio,
+            classWindow.maxField[0] != '\0' ? classWindow.maxField : "-",
+            classWindow.maxAgreeRatio,
+            classWindow.maxAgreeField[0] != '\0' ? classWindow.maxAgreeField : "-");
+        m_logger(line);
     }
 
     // ⛔ ONE per-window class block; called twice, once per class, from `emitCorrectionArrival`, and ONLY when a window closed. §6
@@ -348,7 +457,7 @@ public:
             classSummary.discarded, classSummary.atFrontierRatePerMille, windowSamples);
     }
 
-    // ⛔ TRUE EXACTLY ONCE PER ID PER SESSION — an incompatible peer re-replicates its ring forever. Forgotten in `forgetOwner`, same unbounded-memo reason as `m_relayArrivalProbe`. §7
+    // ⛔ TRUE EXACTLY ONCE PER ID PER SESSION — an incompatible peer's ring keeps arriving. Forgotten in `forgetOwner`, same unbounded-memo reason as `m_relayArrivalProbe`. §7
     // ⛔ PUBLIC ON PURPOSE — `NetSyncTelemetryTest.cpp` exercises this latch directly, not only through `emitRelayArrival`'s no-logger path. §7
     bool shouldLogVersionMismatchOnce(unsigned int id)
     {
@@ -358,11 +467,11 @@ public:
 private:
     std::function<void(const char*)> m_logger;
 
-    // ⛔ GAME THREAD ONLY, and pure telemetry — nothing in the resolution path reads it, and every consumer is a SIMLOG. §8
+    // ⛔ THE DRAIN'S THREAD ONLY, and pure telemetry — nothing in the resolution path reads it, and every consumer is a SIMLOG. §8
     // ⛔ Its PHYSICS-thread sibling `RelayReadProbe` is on `InputResolutionTelemetry` — two objects because two threads. §3
-    RelayArrivalProbe m_relayArrivalProbe; // GAME thread only.
+    RelayArrivalProbe m_relayArrivalProbe; // the drain's thread only.
 
-    // ⛔ ONE object because ONE feeder, the GT correction callback; it carries no per-id state, which is why `forgetOwner` forgets `m_relayArrivalProbe` and not this one. §8
+    // ⛔ ONE object because ONE feeder, the correction callback (on the drain's thread); it carries no per-id state, which is why `forgetOwner` forgets `m_relayArrivalProbe` and not this one. §8
     CorrectionVerdictProbe m_correctionVerdictProbe;
 
     // ⛔ A SECOND OBJECT ON THE SAME SITE, DELIBERATELY — a DISCARDED correction is a non-event for the verdict and a first-class observation for the landing site, so merging forces one to adopt the other's sample set. §8
@@ -371,6 +480,15 @@ private:
 
     // See `shouldLogVersionMismatchOnce`.
     std::unordered_map<unsigned int, bool> m_versionMismatchLogged;
+
+    VerdictMarginClassWindow& verdictMarginWindowFor(PredictedCharacterClass characterClass)
+    {
+        return characterClass == PredictedCharacterClass::RemoteProxy ? m_verdictMarginRemote : m_verdictMarginLocal;
+    }
+
+    // ⛔ THE DRAIN'S THREAD ONLY, no per-id state (so `forgetOwner` has nothing to forget), and reset only when the verdict window closes. §15
+    VerdictMarginClassWindow m_verdictMarginLocal;
+    VerdictMarginClassWindow m_verdictMarginRemote;
 };
 
 OGSIM_OPTIMIZE_ON

@@ -139,6 +139,43 @@ private:
             && kLeftIndex == kRightIndex,
         "SimulationFrame: forward, right and up are three different components, and left is right's component");
 
+    template <glm::length_t Index, bool Negate>
+    static constexpr float signedPick(const glm::vec3& v)
+    {
+        // ⛔G-01  docs/SimulationFrame-guards.md
+        if constexpr (Negate)
+        {
+            return -v[Index];
+        }
+        else
+        {
+            return v[Index];
+        }
+    }
+
+    template <glm::length_t Index, bool Negate>
+    static constexpr void signedPlace(glm::vec3& out, float value)
+    {
+        if constexpr (Negate)
+        {
+            out[Index] = -value;
+        }
+        else
+        {
+            out[Index] = value;
+        }
+    }
+
+    template <glm::length_t SideIndex, bool NegateForward, bool NegateSide, bool NegateUp>
+    static constexpr glm::vec3 place(float forward, float side, float up)
+    {
+        glm::vec3 out(0.f, 0.f, 0.f);
+        signedPlace<kForwardIndex, NegateForward>(out, forward);
+        signedPlace<SideIndex, NegateSide>(out, side);
+        signedPlace<kUpIndex, NegateUp>(out, up);
+        return out;
+    }
+
 public:
     static constexpr float height(const glm::vec3& v)
     {
@@ -196,43 +233,8 @@ public:
             signedPick<2, kForwardNegative>(column));
     }
 
-private:
-    template <glm::length_t Index, bool Negate>
-    static constexpr float signedPick(const glm::vec3& v)
-    {
-        // ⛔G-01  docs/SimulationFrame-guards.md
-        if constexpr (Negate)
-        {
-            return -v[Index];
-        }
-        else
-        {
-            return v[Index];
-        }
-    }
+    // ⛔G-02  docs/SimulationFrame-guards.md
 
-    template <glm::length_t Index, bool Negate>
-    static constexpr void signedPlace(glm::vec3& out, float value)
-    {
-        if constexpr (Negate)
-        {
-            out[Index] = -value;
-        }
-        else
-        {
-            out[Index] = value;
-        }
-    }
-
-    template <glm::length_t SideIndex, bool NegateForward, bool NegateSide, bool NegateUp>
-    static constexpr glm::vec3 place(float forward, float side, float up)
-    {
-        glm::vec3 out(0.f, 0.f, 0.f);
-        signedPlace<kForwardIndex, NegateForward>(out, forward);
-        signedPlace<SideIndex, NegateSide>(out, side);
-        signedPlace<kUpIndex, NegateUp>(out, up);
-        return out;
-    }
 };
 
 static_assert(simFrameDetail::picksKeepTheSignOfZero<simFrame>(-0.f) && simFrameDetail::picksKeepTheSignOfZero<simFrame>(0.f),

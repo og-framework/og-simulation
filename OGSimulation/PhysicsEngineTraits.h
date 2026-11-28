@@ -25,23 +25,18 @@ concept PhysicsEngineTraits = requires(EngineLogSink logger)
 	typename EngineTraitsT::CategoryTable;
 	{ EngineTraitsT::kName } -> std::convertible_to<const char*>;
 	{ EngineTraitsT::computeDeterminismFingerprint(logger) } -> std::same_as<std::optional<uint64_t>>;
-	{ EngineTraitsT::kHasWorldHost } -> std::convertible_to<bool>;
-} && (!EngineTraitsT::kHasWorldHost || requires
-{
 	typename PhysicsEngineWorldHostTemplate<EngineTraitsT::template WorldHost>;
 	{ &EngineTraitsT::logEngineMessage } -> std::convertible_to<EngineLogSink>;
-});
+};
 
 template <typename BindingT, typename EngineTraitsT>
 concept PhysicsEngineBinding = PhysicsEngineTraits<EngineTraitsT> && requires
 {
 	typename BindingT::Simulatable;
 	{ BindingT::categoryChannels() } -> std::same_as<typename EngineTraitsT::CategoryTable>;
-} && (!EngineTraitsT::kHasWorldHost || requires
-{
 	typename EngineTraitsT::template WorldHost<typename BindingT::Simulatable>;
 	{ BindingT::kParkSnap } -> std::convertible_to<float>;
-});
+};
 
 namespace physicsEngineSeamSelfCheck
 {
@@ -64,56 +59,48 @@ struct TraitsCore
 
 struct DriverScheduledTraits : TraitsCore
 {
-	static constexpr bool kHasWorldHost = true;
 	template <typename SimulatableT> using WorldHost = WorldHostOf<SimulatableT>;
 	static void logEngineMessage(const char*);
 };
 
-struct SelfScheduledTraits : TraitsCore
-{
-	static constexpr bool kHasWorldHost = false;
-};
-
 struct DriverScheduledTraitsWithoutWorldHost : TraitsCore
 {
-	static constexpr bool kHasWorldHost = true;
 	static void logEngineMessage(const char*);
 };
 
 struct DriverScheduledTraitsWithNullLogSink : TraitsCore
 {
-	static constexpr bool kHasWorldHost = true;
 	template <typename SimulatableT> using WorldHost = WorldHostOf<SimulatableT>;
 	static constexpr std::nullptr_t logEngineMessage = nullptr;
 };
 
-struct SelfScheduledBinding
+struct BindingCore
 {
 	using Simulatable = physicsEngineSeamSelfCheck::Simulatable;
 	static int categoryChannels();
 };
 
-struct DriverScheduledBinding : SelfScheduledBinding
+struct DriverScheduledBinding : BindingCore
 {
 	static constexpr float kParkSnap = 0.f;
 };
 
-static_assert(PhysicsEngineTraits<DriverScheduledTraits> && PhysicsEngineTraits<SelfScheduledTraits>,
-	"PhysicsEngineTraits self-check: the reference shapes (every member; a world-host template exactly when "
-	"kHasWorldHost) must model the concept.");
+static_assert(PhysicsEngineTraits<DriverScheduledTraits>,
+	"PhysicsEngineTraits self-check: the reference shape (every member, the world-host template and the log sink "
+	"among them) must model the concept.");
 static_assert(!PhysicsEngineTraits<DriverScheduledTraitsWithoutWorldHost>,
-	"PhysicsEngineTraits self-check: traits with kHasWorldHost true and no WorldHost template must NOT model the "
-	"concept.");
+	"PhysicsEngineTraits self-check: traits without a WorldHost template must NOT model the concept: every engine "
+	"is scheduled by the tick driver through its world host. Was the self-scheduled engine shape, which modelled "
+	"the concept with no world host while a world-host flag was false (the flag removed by og-session-runtime "
+	"task 6).");
 static_assert(!PhysicsEngineTraits<DriverScheduledTraitsWithNullLogSink>,
-	"PhysicsEngineTraits self-check: a driver-scheduled engine's log sink must be a function, never a typed none: a "
+	"PhysicsEngineTraits self-check: an engine's log sink must be a function, never a typed none: a "
 	"std::nullptr_t member converts to a function pointer, so a host that stored it would compile and make a null "
-	"call. Was a self-scheduled engine's typed-none log sink, before the sink was required only when "
-	"kHasWorldHost.");
-static_assert(PhysicsEngineBinding<DriverScheduledBinding, DriverScheduledTraits>
-		&& PhysicsEngineBinding<SelfScheduledBinding, SelfScheduledTraits>,
+	"call. Was a self-scheduled engine's typed-none log sink, before the sink was required of every engine.");
+static_assert(PhysicsEngineBinding<DriverScheduledBinding, DriverScheduledTraits>,
 	"PhysicsEngineBinding self-check: a binding with a simulatable, a category table and a park snap must model the "
-	"concept over a driver-scheduled engine, and one without the park snap over a self-scheduled engine.");
-static_assert(!PhysicsEngineBinding<SelfScheduledBinding, DriverScheduledTraits>,
-	"PhysicsEngineBinding self-check: a binding of a driver-scheduled engine without kParkSnap must NOT model the "
 	"concept.");
+static_assert(!PhysicsEngineBinding<BindingCore, DriverScheduledTraits>,
+	"PhysicsEngineBinding self-check: a binding without kParkSnap must NOT model the concept. Was the self-scheduled "
+	"binding shape, which modelled it over a self-scheduled engine until og-session-runtime task 6.");
 } // namespace physicsEngineSeamSelfCheck

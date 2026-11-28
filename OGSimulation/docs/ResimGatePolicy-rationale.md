@@ -63,11 +63,10 @@ trigger. Termination is now structural, not policed by a re-derivation of state 
 
 Exactly the `correctionRotation` argument (`Network/CorrectionRotation.h`), for exactly the same
 reason. `shouldSetPendingAnchor` is consulted from `StateCorrectionCache::tryInsertingCorrectState`'s
-hit branch on the **game thread** (W1); `policyEnforcesDepthCeiling` and `isAnchorWithinDepthPolicy`
-are consulted from `SimulationReconciliation::checkDivergenceAll`, per character, on the **physics
-thread** (R1); `classifyResimSlotWrite` is consulted from
-`StateCorrectionCache::tryInsertingResimulatedState` on the **physics thread**, reading landing stamps
-the game thread wrote. Neither call site can be reached from a test without a cache or a storage tuple
+hit branch, where a correction is inserted (W1); `policyEnforcesDepthCeiling` and `isAnchorWithinDepthPolicy`
+are consulted from `SimulationReconciliation::checkDivergenceAll`, per character, in the step (R1);
+`classifyResimSlotWrite` is consulted from `StateCorrectionCache::tryInsertingResimulatedState` in a replay,
+reading landing stamps the insert wrote. Neither call site can be reached from a test without a cache or a storage tuple
 respectively. Pure predicates here can be swept exhaustively; the wiring is then proven by one case per
 site (`ResimGate.Policy.TheResimGateProbeAccessorObservesTheShippedFeed` and neighbours in
 `ResimGatePolicyTest.cpp`, `og-simulation-tests`). A green kernel with an unwired caller ships the
@@ -90,8 +89,10 @@ The argument is about correctness, not cost:
    constant.
 2. **The throttle is already structural**, and it is demand-driven rather than arbitrary: the gate is
    consulted only on non-resim physics frames — the host physics engine asks whether to rewind on
-   solver advances only, never from inside its own rewind loop (one adapter's binding: Chaos calling
-   `TriggerRewindIfNeeded_Internal`) — and the anchor is consumed only on the completion edge.
+   solver advances only, never from inside its own rewind loop (on the tick driver the step driver's
+   `resimulateIfRequested`, once per client tick before the step; the former Chaos adapter, removed by
+   og-session-runtime task 3, had Chaos calling TriggerRewindIfNeeded_Internal) — and the anchor is consumed
+   only on the completion edge.
    So at most one resim can be in flight, and at most one more can be pending. Corrections arriving
    during a replay coalesce into the pending anchor via the CAS-max and fire once, as a single deeper
    replay, instead of N shallow ones. The bound is "one resim per completed resim", which scales with
@@ -157,8 +158,8 @@ whether this configuration runs today.
 
 ## 6. The defect this repairs — the HOLLOW ANCHOR
 
-`tryInsertingCorrectState` writes authority state into slot T on the game thread. An in-flight replay
-on the physics thread then reaches tick T, and `tryInsertingResimulatedState` overwrote slot T with the
+`tryInsertingCorrectState` writes authority state into slot T. A replay then reaches tick T, and
+`tryInsertingResimulatedState` overwrote slot T with the
 *replayed* state, unconditionally — while `m_containsCorrectTick` stayed set, so the slot claimed
 authority provenance over a re-derivation. Item 45's surviving anchor then correctly triggered a
 follow-up resim at T, `prepareResimAll` restored the clobbered state, and the replay faithfully
@@ -217,8 +218,8 @@ on `StateCorrectionCache::m_slotLandingSeqNr`'s declaration).
 A slot is FRESH iff **either** clause holds, and **neither clause alone suffices**, because the defect
 has three exposure populations:
 
-- **(a) mid-replay landings** — a correction lands on the game thread while the physics thread is
-  replaying;
+- **(a) mid-replay landings** — a correction lands while a replay is in flight, between its prepare and
+  its completion edge;
 - **(b) the multi-character min-fold** — a character's corrected slot *above* the shared restore tick,
   landed *before* prepare;
 - **(c) post-item-46 agreeing landings above the anchor.**

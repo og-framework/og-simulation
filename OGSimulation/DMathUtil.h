@@ -2,13 +2,18 @@
 // SPDX-License-Identifier: MPL-2.0
 
 #ifdef OG_STANDALONE_BUILD
-  #define FORCEINLINE __forceinline
+  #if defined(_MSC_VER)
+    #define FORCEINLINE __forceinline
+  #else
+    #define FORCEINLINE inline __attribute__((always_inline))
+  #endif
 #endif
 
 #include <vector>
 #include <limits>
 #include "glm/vec3.hpp"
 #include <glm/gtc/quaternion.hpp>
+#include "OGSimulation/SimTrig.h"
 
 namespace dMathUtil
 {
@@ -21,13 +26,13 @@ namespace dMathUtil
 		const glm::vec3 cross = glm::cross(fromDirection, toDirection);
 		if (glm::dot(cross, cross) == 0.f)
 		{
-			outTransform = dot > 0.f ? glm::mat4(1.f) : glm::rotate(glm::mat4(1.f), glm::pi<float>(), antiparallelAxis);
+			outTransform = dot > 0.f ? glm::mat4(1.f) : simTrig::rotate(glm::mat4(1.f), glm::pi<float>(), antiparallelAxis);
 			return;
 		}
 
-		const float angle = glm::acos(dot);
+		const float angle = simTrig::acos(dot);
 		const glm::vec3 rotationAxis = glm::normalize(cross);
-		outTransform = glm::rotate(glm::mat4(1.f), angle, rotationAxis);
+		outTransform = simTrig::rotate(glm::mat4(1.f), angle, rotationAxis);
 	}
 
 	FORCEINLINE glm::mat4 getRotationMatrix(glm::vec3 fromDirection, glm::vec3 toDirection)
@@ -37,9 +42,9 @@ namespace dMathUtil
 		if (fromEqualsTo)
 			return glm::mat4(1.0f);
 
-		const float angle = glm::acos(dot);
+		const float angle = simTrig::acos(dot);
 		const glm::vec3 rotationAxis = glm::normalize(glm::cross(fromDirection, toDirection));
-		return glm::rotate(glm::mat4(1.f), angle, rotationAxis);
+		return simTrig::rotate(glm::mat4(1.f), angle, rotationAxis);
 	}
 }
 

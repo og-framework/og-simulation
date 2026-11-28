@@ -117,8 +117,9 @@
 // per-window data: 60 characters per character per resim. At Warning it would be
 // T19's 10 MB defect with a different tag. `LogOGResimProbe` ships at Warning, so
 // the line does not exist on a default run; `-LogCmds="LogOGResimProbe Verbose"`
-// turns it on beside the existing `[ResimProbe.Request]` / `[ResimProbe.Stranded]`
-// per-event lines, which is the same knob and the same family.
+// turns it on beside the `[ResimProbe.Stranded]` per-event line, which is the same
+// knob and the same family (so was `[ResimProbe.Request]`, whose only emitter was the
+// former Chaos host, removed by og-session-runtime task 3).
 //
 // -------------------------------------------------------------------------
 // THREADING — the same pre-existing race, deliberately not a new one.

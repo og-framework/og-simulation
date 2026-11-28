@@ -1,4 +1,7 @@
 <!-- SPDX-License-Identifier: MPL-2.0 -->
+<!-- lint-external-ref: OnRep -- Unreal Engine replication hook name, outside every scan root -->
+<!-- lint-external-ref: FInputRedundancyBundle -- deleted by og-input-latency task P5-9 (the relay actors, their listeners, the Iris sim buffers, serializers and proofs, and UEConnectionHandle); kept in the history -->
+<!-- lint-external-ref: USimulatableNetSyncComponent -- deleted by og-input-latency task P5-8 (the net-sync component, the pawn's subobject, the bundle builder and the owner binding's net half); kept in the history -->
 # `SimulationNetSync.h` — rationale archive
 
 **Relocation history, retired rationale and archived measurement records for
@@ -38,10 +41,11 @@ through it.
 
 | name in the quotes | the ROLE it plays for the core | note |
 |---|---|---|
-| `FRelayedInputRing` | one adapter's **wire type for the relay ring** — the replicated carrier that moves a connection's relayed inputs to observing peers | the core sees only the accessor/callback pair; §-numbered blocks below say so explicitly |
-| `FInputRedundancyBundle` | one adapter's **wire type for the local-input RPC**, carrying the most-recent `redundancyDepth` ticks in one unreliable send | the core handles only its decoded contents |
-| `USimmableUpdateComponent` | one adapter's **per-character component**: it registers the character with the core and is the owner the core's callbacks are bound to | since og-ue-simulationcomponentandmanagersplit task 20a the replicated correction-state buffer behind those callbacks is held by a sibling component, `USimulatableNetSyncComponent`, which this one forwards to; since task 20b the relayed-ring link behind the relayed-input callbacks is held there too; since task 29 its registration loop is the generic skeleton of its binding base, `UESimulatableOwnerBinding` |
-| `Iris` | that engine's **replication system** — the party that batches, drops and rolls back property writes | role words: *the replication system* / *the replication poll* |
+| `FRelayedInputRing` | was one adapter's **wire type for the relay ring** — the replicated carrier that moved a connection's relayed inputs to observing peers (deleted by og-input-latency task P5-9; since P5-7 og-sim-net's `RelayRingBuffer`) | the core sees only the accessor/callback pair; §-numbered blocks below say so explicitly |
+| `FInputRedundancyBundle` | was one adapter's **wire type for the local-input RPC**, carrying the most-recent `redundancyDepth` ticks in one unreliable send (deleted by og-input-latency task P5-9; since P5-7 og-sim-net's `InputBundleBuffer` on the SimInput lane) | the core handles only its decoded contents |
+| `USimmableUpdateComponent` | one adapter's **per-character component**: it registers the character with the core and is the owner the core's callbacks are bound to | since og-ue-simulationcomponentandmanagersplit task 20a the replicated correction-state buffer behind those callbacks is held by a sibling component, `USimulatableNetSyncComponent` (deleted by og-input-latency task P5-8), which this one forwarded to; since task 20b the relayed-ring link behind the relayed-input callbacks is held there too; since task 29 its registration loop is the generic skeleton of its binding base, `UESimulatableOwnerBinding` |
+| `Iris` | that engine's **replication system** (the sim traffic's until og-input-latency task P5-7; og-net's sim lanes since) — the party that batches, drops and rolls back property writes | role words: *the replication system* / *the replication poll* |
+| `OnRep` / `OnRep_*`, `RPC` | that engine's **property notification** and **remote call**: the arrival of a replicated value on a client, and a client-to-server call | the sim traffic's until og-input-latency task P5-7. Since then a correction, a relay ring and an input bundle arrive through og-sim-net's sessions, in their drain (`SimNetClient::onCorrection`, `SimNetClient::onRing`, `SimNetServer::receiveBundle`), on the step's thread (until og-session-runtime task 13 a frame-locked client drained on the game thread). A quoted OnRep or RPC below is that arrival |
 | `Config/DefaultEngine.ini` | one adapter's **host-application configuration surface**, where shipped policy and log values are set | another adapter supplies the same values under its own keys |
 
 ⛔ **None of these is a dependency of this core**, and none of them appears in `SimulationNetSync.h`
@@ -1652,3 +1656,93 @@ standalone-truth rule existed, and it sealed an engine identifier as the reader'
 grep handle. Wave 6 is the ruling that such a handle does not belong in an
 engine-free header. **The seal is not wrong; it is superseded at exactly one
 token, and the token landed here.**
+
+## §17 — Additions after the archive: the redundancy window counted in frames (og-input-latency task 7, 2026-11-11)
+
+This section is not archived prose. It was written with the code it describes, and the header's `§17` pointers land
+here.
+
+**What it changes.** `sendLocalInputToAuthorityAll` takes a third argument, `redundancyFrames`
+(`TimeConfig::redundancyFrames`, read live at each send). Each local sender's
+bundle now carries `slots` entries instead of `redundancyDepth`, and `releaseAllButRecent` keeps the same `slots`. The
+owner concept is unchanged: the owner still receives one scalar and still builds the bundle from the queue, so no wire
+type enters this layer. The header includes the engine-free codec header only for `inputRedundancyBundle::kMaxSlots`.
+
+**Why frames, not ticks.** `redundancyDepthTicks` counts the window in ticks. A client that steps two ticks per frame
+sends one bundle per two ticks, so a depth of 3 overlaps the next bundle by one tick only. Losing one bundle then loses
+its middle tick, which is og-simulation-tests' `LinkModelPinsTodayTest.cpp` case (i). Counting the window in frames
+keeps the overlap at `redundancyFrames - 1` whole sends, whatever the step rate. *Today it counts ticks (og-session-runtime
+task 33):* since the send moved to capture (og-input-latency Ph4; the frame-locked send retired by og-session-runtime task
+12) a client sends once per captured tick, so `ticksPerFrameEma` sits at 1, a "frame" here is one tick, and the slot count
+below is `redundancyDepthTicks` or `redundancyFrames`, whichever is larger (bounded as the bullets say). The knob keeps its name (`TimeConfig-rationale.md`
+§12).
+
+**`redundancySlots(ticksSinceLastSend, redundancyDepthTicks, redundancyFrames)`.** The first argument is the
+sender's smoothed ticks per send, `RedundancySendCadence::ticksPerFrameEma`, not one raw interval.
+* `redundancyFrames <= 0` returns `redundancyDepthTicks` exactly, unclamped. This is the EQUIV default: the owner
+  receives the value it received before this change, and the release keeps the same count, so the bundle bytes are
+  today's. The `[Network][RedundancyWindow]` pin case compares the bytes of three irregular sessions (depths 3, 5 and
+  10) against values recorded from the pre-task code.
+* Otherwise the result is `redundancyFrames × max(1, ticksPerFrameEma)`, rounded to nearest (half up), and then
+  bounded below by min(`redundancyDepthTicks`, `inputRedundancyBundle::kMaxSlots`) and above by `kMaxSlots`. The
+  floor keeps a sender from ever re-sending fewer ticks than today; the min keeps the floor from exceeding the cap when
+  a depth above 8 is configured, where `std::clamp`'s bounds would cross.
+* Rounding to nearest rather than up keeps a 30 fps client on a 60 Hz tick at `slots=6` when its frame times jitter
+  around two ticks (an EMA of 2.03 rounds to 6, where `ceil` would give 7).
+* `max(1, …)` makes a client that sends more often than it steps (100 fps on 60 Hz, where some sends carry no new
+  tick) count as one tick per send, so its window stays `redundancyFrames` ticks and never drops below the depth.
+
+**The cadence: `RedundancySendCadence` and `noteRedundancySend`.** One record per local sender, in
+`m_redundancyCadences`, keyed by the sender id. Each send folds `currentTick - lastSentTick` into an exponential
+moving average with weight `kTicksPerFrameEmaWeight` (1/8, exact in binary, about eight sends of memory: roughly a
+quarter of a second at 30 fps).
+* The first send has no interval. It uses the record's initial 1.0, which gives `slots` = max(depth, frames),
+  capped at `kMaxSlots`.
+* The second send's interval seeds the EMA directly, so a steady cadence of k ticks per send gives exactly k from the
+  second send on. Starting at 1.0 instead would take six sends to reach 8 slots at four ticks per frame, and a loss in
+  that ramp would lose ticks.
+* A backwards tick (the clock was resynced back, or `currentStep()` still returns a stale resim step) samples 0. A
+  forward jump samples at most `kMaxSlots`, so one resync cannot hold the window at the cap for longer than the EMA's
+  memory.
+
+**Lifetime.** `m_redundancyCadences` is touched only by the send and by `unregisterSimulatableContainers` step 2,
+which erases the entry beside the sender maps. A re-registration therefore starts a fresh cadence. ⚠ It is the third
+container in step 2 that the send reads. The deferral fence on `clearOwnerCallbacks` names the two sender maps; the
+cadence map adds to the same requirement, because the send looks it up with `operator[]` on every send and inserts on
+a sender's first send. A host that adopts `DeferredLifecycleQueue` must send on the step's thread, where the queue
+applies the unregistration, so the send and step 2 share one thread (og-input-latency P5-17).
+
+**The log line.** `[SendLocalInputToServer] id=… tick=… depth=… slots=…`: `slots=` is appended, so existing greps on
+`depth=` still match. At the default, every line reads `depth=3 slots=3` on a 60 Hz tick.
+
+**The third argument has no default**, for the reason `correctionRotationK` has none (§9): a default would let a call
+site acquire a window size by accident. Both concepts that name the send (`SimulationNetSyncConcept` here and
+`SimulationNetSyncPublishConcept` in `SimulationManager.h`) take it as an `int32` parameter.
+
+**What the window cannot buy.** A tick recovered from the next bundle reaches the server one frame later than it
+would have. With k ticks per frame and a one-tick link, the oldest tick of a lost bundle arrives 2k ticks after its
+capture, so the server parks it only if its input delay is at least 2k ticks; below that the delay queue drops it as
+late however many slots the client sends. At 30 fps on a 60 Hz tick that is 4 ticks, which the no-tier fallback
+delay already gives; at 15 fps it is 8.
+
+⚠ **The server's late counter also counts redundant copies.** The delay queue counts an arriving copy of a tick its
+slot already released as late (`ServerInputDelayQueue::enqueue`, the `lastReleasedBySlot` branch). A wider window
+re-sends older ticks, so with `redundancyFrames > 0` `lateDroppedCount()` (and `[InputStats] late=`) rises with no
+input lost. Read lost input from the server's never-released ticks or `[InputGap]`, not from that counter.
+
+**Tests.** og-simulation-tests `Network/RedundancyWindowTest.cpp` drives a real `SimulationNetSync` with one local
+sender, a recording owner that builds the bundle with the codec as the engine adapter does, the seeded `LinkModel`, and
+a real `ServerReceptionCoordinator` whose delay is set to 8 ticks for every case, so the cases differ only in the
+client's window. It pins the bytes at 0 frames, sweeps `redundancySlots`' bounds, shows that at
+`redundancyFrames = 3` any single lost bundle (except the last) leaves no tick unparked at 1 to 4 steps per frame, and
+that at 0 the two-steps-per-frame case still loses the middle tick.
+
+## §18 — The verdict margin, carried (og-input-latency task 2h, 2026-11-12)
+
+`decideCorrectionArrival` copies a second report from the cache's `CorrectionInsertVerdict` into the
+`CorrectionArrivalDecision`: `decision.verdictMargin = verdict.verdictMargin;`, right after `fieldDivergence`. The
+header's "CARRIED, NEVER RECOMPUTED" fence above the `fieldDivergence` copy (it cites §11) applies to it unchanged: this
+class has neither
+state, so it cannot compute a margin,
+and the cache measured it under its own gate (`docs/SimulationComparison-rationale.md` §8). The line it feeds is
+`NetSyncTelemetry`'s (`docs/Telemetry-rationale.md` §15).

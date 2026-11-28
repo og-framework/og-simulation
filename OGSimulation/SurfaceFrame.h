@@ -12,6 +12,7 @@
 
 #include "OGSimulation/OGAssert.h"
 #include "OGSimulation/SimulationFrame.h"
+#include "OGSimulation/SimTrig.h"
 
 namespace surfaceFrame
 {
@@ -93,7 +94,7 @@ namespace surfaceFrame
         const glm::vec3 xyz(q.x, q.y, q.z);
         const float s = glm::length(xyz);
         // ⛔G-02  docs/SurfaceFrame-guards.md
-        const float angle = 2.f * std::atan2(s, q.w);
+        const float angle = 2.f * simTrig::atan2(s, q.w);
         const glm::vec3 axis = s > 0.f ? xyz / s : simFrame::kUp;
         return AngleAxis{angle, axis};
     }

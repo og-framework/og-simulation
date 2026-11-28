@@ -37,6 +37,8 @@ enum class Point : uint8_t
 	ClientReceived,
 	StepEnd,
 	Rendered,
+	Healed,
+	NetReceived,
 	Count
 };
 
@@ -54,6 +56,11 @@ enum class Hop : uint8_t
 	H6,
 	H6c,
 	H7,
+	H6L,
+	N4,
+	N6,
+	N6c,
+	N6u,
 	Wire,
 	Count
 };
@@ -74,6 +81,11 @@ constexpr const char* hopName(Hop hop)
 	case Hop::H6:    return "H6";
 	case Hop::H6c:   return "H6c";
 	case Hop::H7:    return "H7";
+	case Hop::H6L:   return "H6L";
+	case Hop::N4:    return "N4";
+	case Hop::N6:    return "N6";
+	case Hop::N6c:   return "N6c";
+	case Hop::N6u:   return "N6u";
 	case Hop::Wire:  return "WIRE";
 	case Hop::Count: break;
 	}
@@ -99,6 +111,11 @@ inline constexpr std::array<HopRoute, kHopCount - 1> kHopRoutes{ {
 	{ Hop::H6,  Stream::Input, Point::ClientReceived, Point::Consumed },
 	{ Hop::H6c, Stream::State, Point::ClientReceived, Point::Consumed },
 	{ Hop::H7,  Stream::State, Point::StepEnd,        Point::Rendered },
+	{ Hop::H6L, Stream::Input, Point::ClientReceived, Point::Healed },
+	{ Hop::N4,  Stream::Input, Point::NetReceived,    Point::ServerReceived },
+	{ Hop::N6,  Stream::Input, Point::NetReceived,    Point::ClientReceived },
+	{ Hop::N6c, Stream::State, Point::NetReceived,    Point::ClientReceived },
+	{ Hop::N6u, Stream::Input, Point::NetReceived,    Point::Consumed },
 } };
 
 constexpr bool hopRoutesAreIndexedByHop()
@@ -129,18 +146,43 @@ static_assert(kHopCount <= 32u, "HopMask is 32 bits wide");
 
 inline constexpr HopMask kClientHops =
 	hopBit(Hop::H1) | hopBit(Hop::H2) | hopBit(Hop::H3) | hopBit(Hop::H6) | hopBit(Hop::H6c)
-	| hopBit(Hop::H7) | hopBit(Hop::Wire);
+	| hopBit(Hop::H7) | hopBit(Hop::H6L) | hopBit(Hop::Wire);
 
 inline constexpr HopMask kServerHops =
 	hopBit(Hop::H3) | hopBit(Hop::H3c) | hopBit(Hop::H4) | hopBit(Hop::H4r) | hopBit(Hop::H5)
 	| hopBit(Hop::H7) | hopBit(Hop::Wire);
+
+inline constexpr HopMask kServerNetHops = hopBit(Hop::N4);
+
+inline constexpr HopMask kClientNetHops = hopBit(Hop::N6) | hopBit(Hop::N6c) | hopBit(Hop::N6u);
+
+static_assert(kClientHops
+		== (hopBit(Hop::H1) | hopBit(Hop::H2) | hopBit(Hop::H3) | hopBit(Hop::H6) | hopBit(Hop::H6c)
+			| hopBit(Hop::H7) | hopBit(Hop::H6L) | hopBit(Hop::Wire)),
+	"kClientHops must be exactly H1 H2 H3 H6 H6c H7 H6L WIRE: net hops stay off until the host stamps "
+	"NetReceived; was og-input-latency P8-5");
+
+static_assert(kServerHops
+		== (hopBit(Hop::H3) | hopBit(Hop::H3c) | hopBit(Hop::H4) | hopBit(Hop::H4r) | hopBit(Hop::H5)
+			| hopBit(Hop::H7) | hopBit(Hop::Wire)),
+	"kServerHops must be exactly H3 H3c H4 H4r H5 H7 WIRE: net hops stay off until the host stamps "
+	"NetReceived; was og-input-latency P8-5");
+
+static_assert(kClientNetHops == (hopBit(Hop::N6) | hopBit(Hop::N6c) | hopBit(Hop::N6u))
+		&& kHopRoutes[static_cast<std::size_t>(Hop::N6u)].stream == Stream::Input
+		&& kHopRoutes[static_cast<std::size_t>(Hop::N6u)].from == Point::NetReceived
+		&& kHopRoutes[static_cast<std::size_t>(Hop::N6u)].to == Point::Consumed,
+	"kClientNetHops must be exactly N6 N6c N6u, and N6u must stay a relayed input's og-net arrival -> the start of the step "
+	"that uses it (Input, NetReceived -> Consumed), the per-input arrival margin that a sum of the N6 and H6 window "
+	"percentiles only approximates; was og-input-latency P5-37");
 
 enum class EventKind : uint8_t
 {
 	Stamp,
 	StampPending,
 	StampNewestPending,
-	Sample
+	Sample,
+	StampHealedIfPending
 };
 
 struct Event
@@ -190,6 +232,13 @@ struct Event
 		event.kind    = EventKind::Sample;
 		event.hop     = hop;
 		event.seconds = durationSeconds;
+		return event;
+	}
+
+	static Event stampHealedIfPending(uint32_t lane, uint32_t captureTick, double seconds)
+	{
+		Event event = stamp(Stream::Input, lane, captureTick, Point::Healed, seconds);
+		event.kind  = EventKind::StampHealedIfPending;
 		return event;
 	}
 };
@@ -263,6 +312,8 @@ struct HopSummary
 	uint32_t noEnd      = 0u;
 	uint32_t outOfOrder = 0u;
 	uint32_t overflow   = 0u;
+	uint32_t healedByUse        = 0u;
+	uint32_t healedByCorrection = 0u;
 };
 
 struct WindowReport
@@ -326,6 +377,9 @@ public:
 			break;
 		case EventKind::Sample:
 			addSample(event.hop, event.seconds);
+			break;
+		case EventKind::StampHealedIfPending:
+			stampHealedIfPending(event.lane, event.tick, event.seconds);
 			break;
 		}
 	}
@@ -396,22 +450,55 @@ public:
 		}
 	}
 
-	void addSample(Hop hop, double durationSeconds)
+	void stampHealedIfPending(uint32_t lane, uint32_t captureTick, double seconds)
+	{
+		const LaneState* laneState = findLane(lane);
+		if (laneState == nullptr)
+			return;
+		Slot& slot = slotFor(laneIndexOf(*laneState), Stream::Input, captureTick);
+		if (slot.live && slot.tick == captureTick
+			&& isPending(slot, Point::ClientReceived, Point::Healed, seconds))
+		{
+			setPoint(Stream::Input, slot, Point::Healed, seconds);
+		}
+	}
+
+	void stampHealedByCorrection(uint32_t lane, uint32_t correctionTick, uint32_t delayTicks, double seconds)
+	{
+		const LaneState* laneState = findLane(lane);
+		if (laneState == nullptr || correctionTick < delayTicks)
+			return;
+		const uint32_t newestContainedCapture = correctionTick - delayTicks;
+		const std::size_t laneIndex = laneIndexOf(*laneState);
+		for (uint32_t ring = 0; ring < m_config.ticksPerLane; ++ring)
+		{
+			Slot& slot = slotAt(laneIndex, Stream::Input, ring);
+			if (slot.live && slot.tick <= newestContainedCapture
+				&& isPending(slot, Point::ClientReceived, Point::Healed, seconds))
+			{
+				slot.healedByCorrection = true;
+				setPoint(Stream::Input, slot, Point::Healed, seconds);
+			}
+		}
+	}
+
+	bool addSample(Hop hop, double durationSeconds)
 	{
 		if (!isEnabled(hop))
-			return;
+			return false;
 		HopState& state = m_hops[static_cast<std::size_t>(hop)];
 		if (!std::isfinite(durationSeconds) || durationSeconds < 0.0)
 		{
 			++state.outOfOrder;
-			return;
+			return false;
 		}
 		if (state.samples.size() >= m_config.maxSamplesPerHop)
 		{
 			++state.overflow;
-			return;
+			return false;
 		}
 		state.samples.push_back(durationSeconds);
+		return true;
 	}
 
 	void forgetLane(uint32_t lane)
@@ -474,6 +561,7 @@ private:
 	{
 		uint32_t                           tick         = 0u;
 		bool                               live         = false;
+		bool                               healedByCorrection = false;
 		uint16_t                           pointMask    = 0u;
 		uint16_t                           resolvedMask = 0u;
 		std::array<double, kPointCount>    at{};
@@ -500,6 +588,8 @@ private:
 		uint32_t            noEnd      = 0u;
 		uint32_t            outOfOrder = 0u;
 		uint32_t            overflow   = 0u;
+		uint32_t            healedByUse        = 0u;
+		uint32_t            healedByCorrection = 0u;
 
 		void resetWindow()
 		{
@@ -508,8 +598,20 @@ private:
 			noEnd      = 0u;
 			outOfOrder = 0u;
 			overflow   = 0u;
+			healedByUse        = 0u;
+			healedByCorrection = 0u;
 		}
 	};
+
+	const LaneState* findLane(uint32_t lane) const
+	{
+		for (const LaneState& state : m_lanes)
+		{
+			if (state.used && state.id == lane)
+				return &state;
+		}
+		return nullptr;
+	}
 
 	LaneState* findOrAllocateLane(uint32_t lane)
 	{
@@ -598,7 +700,11 @@ private:
 			if (!slot.hasPoint(fromIndex) || !slot.hasPoint(toIndex))
 				continue;
 			slot.resolvedMask |= routeBit;
-			addSample(route.hop, slot.at[toIndex] - slot.at[fromIndex]);
+			if (addSample(route.hop, slot.at[toIndex] - slot.at[fromIndex]) && route.to == Point::Healed)
+			{
+				HopState& state = m_hops[static_cast<std::size_t>(route.hop)];
+				++(slot.healedByCorrection ? state.healedByCorrection : state.healedByUse);
+			}
 		}
 	}
 
@@ -630,6 +736,8 @@ private:
 		summary.noEnd      = state.noEnd;
 		summary.outOfOrder = state.outOfOrder;
 		summary.overflow   = state.overflow;
+		summary.healedByUse        = state.healedByUse;
+		summary.healedByCorrection = state.healedByCorrection;
 		if (summary.n == 0u)
 			return summary;
 

@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
 #include "OGSimulation/OGExport.h"
+#include <array>
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <limits>
@@ -19,7 +21,7 @@ OGSIM_OPTIMIZE_OFF
 // THE CLOCK'S EVENT SEAM - seven plain words the clock owns as ONE member, written PER EVENT
 // on the physics thread and read as `clock.getDiagnostics().skipCount()` and its six siblings.
 //
-// ⛔ DIAGNOSTIC ONLY: four write sites in `advancePrediction`, no production reader, no decision.
+// ⛔ DIAGNOSTIC ONLY: five write sites in `advancePrediction` (four until og-input-latency P6-2), no production reader, no decision.
 //
 // ⭐ STRUCTURAL, not merely asserted: clock logic cannot name a word without `m_eventSeamDiagnostics.`.
 //
@@ -32,7 +34,7 @@ OGSIM_OPTIMIZE_OFF
 //
 // ⛔ EVERY BRANCH WRITES ITS TICK BEFORE ITS COUNT - a count-then-tick reader tears one way only.
 //
-// ⚠ Both stall branches write, debt and graduated; instrumenting one under-counts silently.
+// ⚠ Both stall branches and both skip branches write, debt and graduated; instrumenting one under-counts silently.
 //
 // ⛔ Nothing here reaches the wire, the correction payload or `compute_checksum`.
 struct EventSeamDiagnostics
@@ -44,6 +46,31 @@ struct EventSeamDiagnostics
     unsigned int hardResyncCount        = 0;
     unsigned int lastHardResyncFromTick = 0;
     unsigned int lastHardResyncToTick   = 0;
+};
+
+// [og-time-dilation task 5] The clock's correction phase, as one off-thread reader sees it
+// (ClientPredictionClock::publishedCorrectionPhase). A production output for the dilation
+// controller's freeze, not a diagnostic. Rationale: docs/TimeConfig-rationale.md §18.
+struct ClockCorrectionPhase
+{
+    bool     recentreArmed  = false;  // isRecentreArmed()
+    bool     recentring     = false;  // isRecentring()
+    bool     transitionDebt = false;  // getPendingInputDelayTransitionTicks() != 0: Stalls or Skips owed (P6-2)
+    bool     awaitsFirstRtt = false;  // a hard resync waits for the first RTT reading (§16)
+    uint32_t hardResyncs    = 0;      // the clock's hard resyncs, modulo 2^24
+
+    bool operator==(const ClockCorrectionPhase&) const = default;
+};
+
+// [og-time-dilation task 10c] The clock's last target read, as one off-thread reader sees it
+// (ClientPredictionClock::publishedTargetRead): the dilation controller's guard centre input.
+// Rationale: docs/TimeConfig-rationale.md §18.
+struct ClockTargetRead
+{
+    uint32_t advances   = 0;  // advancePrediction() calls so far, modulo 2^32: a new read changes it
+    uint32_t targetTick = 0;  // getLastAuthorityTick() + getPredictionOffsetTicks() as that advance read it
+
+    bool operator==(const ClockTargetRead&) const = default;
 };
 
 // ClientPredictionClock — client-only tick counter with graduated drift correction
@@ -85,41 +112,56 @@ using PCClockLoggerFn = std::function<void(const char*)>;
     OGSIMULATION_API SimulationTimeStep getPredictionStep() const;
 
     // -----------------------------------------------------------------------
-    // Input-delay-increase stall (T11, D5.3)
+    // Input-delay transition debt (T11, D5.3; signed since og-input-latency P6-2)
     //
     // NOTE ON THE NAME: this mechanism never resimulates anything — it only
     // declines to advance the prediction frontier for N calls (an AdvanceResult
-    // Stall). It is unrelated to the resimulation-depth machinery in TimeConfig,
-    // which owns the codebase's other vocabulary for "give ticks back".
+    // Stall), or advances it by two (an AdvanceResult Skip). It is unrelated to
+    // the resimulation-depth machinery in TimeConfig, which owns the codebase's
+    // other vocabulary for "give ticks back".
     // -----------------------------------------------------------------------
 
-    // Register the effective-input-delay change produced by an authoritative
-    // RTT tier transition, as reported by `tierDelayDeltaTicks(oldTier, newTier)`
-    // (ConnectionTierTable.h). Called on the CLIENT from the replicated-tier
-    // OnRep handler — under Option A that OnRep delta is the only transition
-    // signal the client has.
+    // Register a change in the client's effective input delay, in ticks: the
+    // value `UESimulationSession::recomputeAndPublishEffectiveInputDelay`
+    // returns when the relay-delay floor or the connection tier arrives (the
+    // effective delay after the arrival minus the one before it, the no-tier
+    // fallback included). Positive means Stalls are owed, negative Skips; the
+    // debt is ONE signed counter, so opposite requests net. 0 is a no-op.
     //
-    // WHY A STALL AT ALL. An upward transition RAISES the effective input
+    // WHY A STALL FOR A RAISE. An upward transition RAISES the effective input
     // delay: an input captured at tick T now lands at T + newDelay instead of
     // T + oldDelay. Every already-predicted tick ahead of the frontier was
     // computed against the OLD, smaller delay, so the frontier now sits
     // `delta` ticks further ahead of where the new delay says it should. The
     // client must give those ticks back.
     //
-    // POSITIVE DELTAS ONLY. `deltaDelayTicks <= 0` is a no-op: a DOWNWARD
-    // transition lets the client predict FURTHER ahead, which the ordinary
-    // drift path reaches on its own by advancing normally. There is nothing to
-    // undo, so forcing a forward jump here would be an unnecessary
-    // discontinuity.
-    //
-    // ACCUMULATES. Consecutive upward transitions add their deltas: two
-    // unpaid transitions owe the sum, never just the most recent one.
+    // WHY A SKIP FOR A DECREASE — A REVERSAL (og-input-latency P6-2). Until P6-2
+    // this block said a downward transition was a no-op "which the ordinary
+    // drift path reaches on its own by advancing normally". That was false: the
+    // drift path's target is the authority tick plus the prediction offset
+    // (NetworkTimeEstimator::getPredictionOffsetTicks: the RTT, its jitter term
+    // and the floor), which never reads the input delay, so no drift Skip ever
+    // comes. Meanwhile the server re-times its parked inputs to the smaller
+    // delay, and its drain releases ONE input per slot per tick, oldest first
+    // (ServerInputDelayQueue::tryDequeueForTick): at the switch two are due, and
+    // with a gap-free capture stream the drain then stays `-delta` ticks late
+    // for the rest of the session. Each Skip leaves one capture tick
+    // unproduced; that gap drains one tick of the backlog when the release
+    // front reaches it. Pinned by og-simulation-tests' DelayTransitionTest.
+    OGSIMULATION_API void requestInputDelayTransition(int32_t deltaDelayTicks);
+
+    // The T11 entry point, kept: POSITIVE DELTAS ONLY (`deltaDelayTicks <= 0`
+    // is a no-op); a positive delta is forwarded to requestInputDelayTransition.
     OGSIMULATION_API void requestInputDelayIncreaseStall(int32_t deltaDelayTicks);
 
-    // Ticks of stall still owed. Nonzero means advancePrediction() will
-    // return Stall on the next call(s) instead of applying ordinary drift
-    // correction. Exposed for tests and telemetry.
+    // Ticks of stall still owed: max(0, the signed debt). Nonzero means
+    // advancePrediction() will return Stall on the next call(s) instead of
+    // applying ordinary drift correction. 0 while Skips are owed. Exposed for
+    // tests and telemetry.
     OGSIMULATION_API unsigned int getRequiredInputDelayIncreaseStallTicks() const;
+
+    // The signed debt itself: > 0 Stalls owed, < 0 Skips owed, 0 none.
+    OGSIMULATION_API int32_t getPendingInputDelayTransitionTicks() const;
 
     // -----------------------------------------------------------------------
     // Resimulation
@@ -149,6 +191,75 @@ using PCClockLoggerFn = std::function<void(const char*)>;
     // Returns the drift action that advancePrediction() *would* apply right now.
     // Does not mutate any state.
     OGSIMULATION_API DriftAction evaluateDrift() const;
+
+    // -----------------------------------------------------------------------
+    // One-shot re-centre (og-input-latency task 27; TimeConfig::recentreSettleSamples)
+    //
+    // Armed at construction and by every hard resync. Once the clock has made
+    // recentreSettleSamples advances with an RTT reading since the arm (a time
+    // window, og-input-latency P3-11) and the estimator has taken
+    // kRecentreMinSamples measured samples since it (P3-12), the next
+    // advancePrediction() past the warm-up guard decides ONCE and logs one
+    // [Clock.Recentre] line. It owes N graduated corrections, N the rounded
+    // median lead error of the last kRecentreMedianAdvances advances, and pays
+    // them one per gradualCorrectionRate advances, inside the dead band too;
+    // no later reading ends the debt, a hard resync clears it. Then the dead
+    // band applies again, until the RTT-only offset (the prediction offset
+    // without its jitter term, floored at predOffsetFloorTicks as it is) has
+    // stood kRecentreRearmTicks or more from its value at the decision on every
+    // one of the last kRecentreMedianAdvances advances: that re-arms it
+    // (reworks 2-4). The decision itself still aims at the full prediction offset.
+    // recentreSettleSamples == 0 never decides.
+    // Rationale: docs/TimeConfig-rationale.md §14.
+    // -----------------------------------------------------------------------
+
+    static constexpr unsigned int kRecentreMedianAdvances = 15u;
+    static_assert(kRecentreMedianAdvances % 2u == 1u,
+        "ClientPredictionClock: the re-centre's median run must be odd, so a full run's median is one reading "
+        "(og-input-latency task 27 rework 1, review_27 F3)");
+
+    static constexpr unsigned int kRecentreRearmTicks = 2u;
+    static_assert(kRecentreRearmTicks >= 2u,
+        "ClientPredictionClock: a re-arm on a 1-tick offset move would chase the offset's ceil() wobble on a steady "
+        "link (og-input-latency task 27 rework 2, Ph3 R10)");
+
+    // [P3-12] The settle window's sample floor. Rationale: docs/TimeConfig-rationale.md §14.
+    static constexpr unsigned int kRecentreMinSamples = 8u;
+    static_assert(kRecentreMinSamples <= TimeConfig{}.recentreSettleSamples,
+        "ClientPredictionClock: the re-centre's sample floor must not exceed the default window's advances, so at one "
+        "reading per advance (the engine source) the advances still bind and the floor binds only when advances outrun "
+        "time, as in a catch-up batch (og-input-latency P3-12, Ph4 gate R3: joins decided on 1-6 samples)");
+
+    // True while a re-centre is armed and has not yet decided.
+    OGSIMULATION_API bool isRecentreArmed() const;
+
+    // True while a re-centre still owes corrections.
+    OGSIMULATION_API bool isRecentring() const;
+
+    // -----------------------------------------------------------------------
+    // The published correction phase (og-time-dilation task 5)
+    //
+    // One relaxed atomic word: the re-centre's arm and debt, the input-delay
+    // transition debt (either sign, og-input-latency P6-2), the
+    // wait for the first RTT reading and the hard-resync count, as of the last
+    // advancePrediction() or input-delay transition request (and construction).
+    // Each of those stores it as its last statement; this decodes it with one
+    // relaxed load, from any thread. No clock decision reads it: it is the
+    // dilation controller's freeze input. Rationale: docs/TimeConfig-rationale.md §18.
+    // -----------------------------------------------------------------------
+    OGSIMULATION_API ClockCorrectionPhase publishedCorrectionPhase() const;
+
+    // -----------------------------------------------------------------------
+    // The published target read (og-time-dilation task 10c)
+    //
+    // One relaxed 64-bit atomic word: the number of advances and the target tick
+    // (authority tick + prediction offset) the last advancePrediction() read.
+    // Every advance stores it after the phase word, on every path; nothing else
+    // stores it. This decodes it with one relaxed load, from any thread. No clock
+    // decision reads it: it is the dilation controller's guard centre input.
+    // Rationale: docs/TimeConfig-rationale.md §18.
+    // -----------------------------------------------------------------------
+    OGSIMULATION_API ClockTargetRead publishedTargetRead() const;
 
     // -----------------------------------------------------------------------
     // Resync callbacks
@@ -224,6 +335,56 @@ using PCClockLoggerFn = std::function<void(const char*)>;
 private:
     void fireResyncCallbacks(unsigned int newTick);
 
+    // [og-time-dilation task 5] advancePrediction()'s body. advancePrediction() is its one
+    // caller and publishes after it returns, so no return path here can skip the store. §18
+    AdvanceResult advanceAndCorrect();
+    void          publishCorrectionPhase();
+    void          publishTargetRead();  // [og-time-dilation task 10c] advancePrediction() only. §18
+
+    // [og-time-dilation task 5] The word's layout. §18
+    static constexpr uint32_t kPhaseRecentreArmedBit  = 1u << 0;
+    static constexpr uint32_t kPhaseRecentringBit     = 1u << 1;
+    static constexpr uint32_t kPhaseTransitionDebtBit = 1u << 2;
+    static constexpr uint32_t kPhaseAwaitsFirstRttBit = 1u << 3;
+    static constexpr uint32_t kPhaseHardResyncShift   = 8u;
+    static constexpr uint32_t kPhaseHardResyncMask    = (1u << (32u - kPhaseHardResyncShift)) - 1u;
+    static_assert((kPhaseAwaitsFirstRttBit << 1u) <= (1u << kPhaseHardResyncShift),
+        "ClientPredictionClock: the correction phase's flag bits must sit below its hard-resync count "
+        "(og-time-dilation task 5)");
+
+    // [P3-10] One advance's estimator read (readTarget) and the resync onto the first
+    // RTT reading's target. See advancePrediction.
+    struct TargetRead
+    {
+        bool         hasFirstRtt     = false;  // the flag, read once
+        bool         firstRttSettled = false;  // ... and already true on the previous advance
+        unsigned int offsetTicks     = 0;
+        unsigned int targetTick      = 0;
+    };
+    TargetRead readTarget() const;
+    bool firstRttResyncDue(const TargetRead& estimate, bool pastGuard, int drift) const;
+
+    // [task 27] The re-centre's pieces. With recentreSettleSamples == 0 the
+    // window is never full, so the decision never fires and nothing corrects.
+    // A reading is the lead over the authority tick, stored UNCORRECTED (as if
+    // the clock had taken no Skip or Stall since the arm), so the clock's own
+    // corrections inside the run do not move its median.
+    // [P3-11] The window is time: it counts the advances since the arm on which
+    // the estimator had a reading (hasFirstRtt), not the samples it took.
+    enum class RecentreCause { Join, Resync, Rearm };
+
+    bool recentreWindowFull(unsigned int windowAdvances) const;
+    void countRecentreWindow(bool hasReading);
+    void armRecentre(RecentreCause cause, unsigned int frontierTick);
+    unsigned int recentreRttOffsetTicks() const;
+    bool recentreOffsetMoved() const;
+    bool recentreRearmDue() const;
+    void trackRecentreRearm(bool pastGuard);
+    void recordRecentreReading(bool pastGuard);
+    int  recentreCorrectionTicks(unsigned int uncorrectedTick, const int* extraReading) const;
+    int  recentrePendingTicks(bool hasReading) const;
+    void decideRecentre(unsigned int targetTick);
+
     const TimeConfig&           m_config;
     const NetworkTimeEstimator& m_estimator;
 
@@ -231,9 +392,50 @@ private:
     unsigned int m_resimulationTick         = 0;
     unsigned int m_gradualCorrectionCounter = 0;  // cycles 0 .. gradualCorrectionRate-1
 
-    // [T11] Unpaid input-delay-increase stall, in ticks. Paid down one tick per
-    // advancePrediction() call (as a Stall), cleared by a hard resync.
-    unsigned int m_requiredInputDelayIncreaseStallTicks = 0;
+    // [T11, signed since og-input-latency P6-2] The unpaid input-delay transition:
+    // > 0 Stalls owed, < 0 Skips owed. Paid one tick per advancePrediction() call
+    // toward 0 by compare-exchange, cleared by a hard resync. The request runs where
+    // the floor and the tier arrive, on the step's thread with the payment
+    // (docs/ThreadingCrossings.md row 12). Atomic because until og-session-runtime
+    // task 13 a frame-locked client requested on its frame thread; the atomic and its
+    // static_assert are code and stay.
+    static_assert(std::atomic<int32_t>::is_always_lock_free,
+        "ClientPredictionClock: the input-delay transition debt is requested off the clock's thread on a frame-locked "
+        "client, so it must be a lock-free atomic (og-input-latency P6-2; it was a plain unsigned before)");
+    std::atomic<int32_t> m_pendingInputDelayTransitionTicks{0};
+
+    // [P6-2] Pays one tick of the debt toward 0 and returns the sign it paid:
+    // +1 a Stall, -1 a Skip, 0 nothing owed.
+    int32_t consumeOneInputDelayTransitionTick();
+
+    // [P3-10] Set by a hard resync that landed on the floor offset with no settled RTT
+    // reading (with the re-centre on), with the offset it landed on; cleared on the
+    // first advance past the guard whose reading is settled. The flag as the last
+    // advance read it: a reading is settled once two advances in a row read it.
+    bool         m_resyncAwaitsFirstRtt    = false;
+    unsigned int m_resyncOffsetTicks       = 0;
+    bool         m_firstRttSeenLastAdvance = false;
+
+    // [task 27] The one-shot re-centre: armed at construction and by a hard
+    // resync, with the estimator's measured-sample count at that moment.
+    bool         m_recentreArmed       = true;
+    bool         m_recentreAhead       = false;  // the debt's direction: true = client ahead, Stall
+    unsigned int m_recentreOwedTicks   = 0;      // corrections still owed; only a correction or a hard resync lowers it
+    unsigned int m_recentreBaseSamples = 0;      // for the line's samples= field
+    unsigned int m_recentreWindowAdvances = 0;   // [P3-11] advances with a reading since the arm
+    unsigned int m_recentreUncorrectedTick = 0;  // the frontier had every advance since the arm been Normal
+    std::array<int, kRecentreMedianAdvances> m_recentreReadings{};
+    unsigned int m_recentreReadingCount = 0;
+    unsigned int m_recentreReadingNext  = 0;
+
+    // [task 27 reworks 2-4] The re-arm: the floored RTT-only offset at the last decision, and how
+    // many advances in a row it has stood kRecentreRearmTicks or more from that.
+    RecentreCause m_recentreCause          = RecentreCause::Join;
+    bool          m_recentreDecidedOnce    = false;
+    unsigned int  m_recentreDecisionRttOffset = 0;
+    unsigned int  m_recentreRearmRun       = 0;
+    unsigned int  m_recentreRearmFromOffset = 0;  // the decision's RTT-only offset, for the re-armed decision's line
+    unsigned int  m_recentreRearmToOffset   = 0;  // the RTT-only offset when it re-armed
 
     struct RegisteredResyncCallback
     {
@@ -246,6 +448,35 @@ private:
 
     // ⛔ THE EVENT SEAM, whole and behind its own type; the contract is at `EventSeamDiagnostics`.
     EventSeamDiagnostics m_eventSeamDiagnostics;
+
+    // [og-time-dilation task 5] The hard resyncs, counted for the published phase. Its own
+    // count: the event seam's is diagnostic only and has no production reader. §18
+    uint32_t m_hardResyncCount = 0;
+
+    // [og-time-dilation task 5] The published correction phase: one writer (the clock's
+    // thread), relaxed, read by publishedCorrectionPhase() from any thread. No clock
+    // decision reads it. §18
+    static_assert(std::atomic<uint32_t>::is_always_lock_free,
+        "ClientPredictionClock: the published correction phase is read off the clock's thread, so it must be a lock-free "
+        "atomic (og-time-dilation task 5)");
+    std::atomic<uint32_t> m_publishedPhase{0};
+
+    // [og-time-dilation task 10c] The published target read: the target tick the last
+    // advance read (set right after its readTarget()), the advances so far, and the word
+    // they are stored into, (advances << 32) | target. Same contract as the phase word. §18
+    unsigned int m_lastReadTargetTick = 0;
+    uint32_t     m_advances           = 0;
+    static_assert(std::atomic<uint64_t>::is_always_lock_free,
+        "ClientPredictionClock: the published target read is read off the clock's thread, so it must be a lock-free "
+        "atomic, one 64-bit word so a reader never sees a count from one advance and a target from another "
+        "(og-time-dilation task 10c)");
+    std::atomic<uint64_t> m_publishedTargetRead{0};
+
+    // [og-time-dilation task 5] The fence test's instrument: declared here, defined ONLY in
+    // og-simulation-tests (the NetworkTimeEstimatorReadProbe pattern), so it adds no surface
+    // a consumer can call. It overwrites and reads both published words and reads the
+    // first-RTT wait. §18
+    friend struct ClientPredictionClockPhaseProbe;
 };
 
 OGSIM_OPTIMIZE_ON

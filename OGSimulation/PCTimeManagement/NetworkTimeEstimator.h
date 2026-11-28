@@ -8,6 +8,7 @@
 #include <functional>
 
 #include "TimeConfig.h"
+#include "ServerTickEstimator.h"
 
 #include "OGSimulation/CompilerControl.h"
 
@@ -21,31 +22,94 @@ OGSIM_OPTIMIZE_OFF
 // ============================================================
 // THREAD-SAFETY CONTRACT
 // ============================================================
-// This class is accessed from two threads without a mutex:
+// This class is written on one thread and read on two, without a mutex:
 //
-//   Game thread (GT)  — writes via: updateRTT(), recordAuthorityTick()
-//                       Called from the adapter's timing-buffer arrival callback,
-//                       on the thread replication delivers on. One adapter binds
-//                       that to `AOGBrawlerSimulationManager::onTimingInfoReceived`,
-//                       fed from `ASimulationTimingRelay::OnRep_Buffer`.
+//   Writer (the step's thread) — updateRTT(), recordAuthorityTick(), and
+//                       since og-input-latency P3-10 noteEngineRttSample(),
+//                       noteSimClockSample() and noteRttSourceChanged(), which
+//                       must run on that same writer thread. Called from the
+//                       clock arrival callback, fed through the port at the
+//                       start of each step; since og-input-latency task 27 at
+//                       most one clock sample per feed, the newest. Until
+//                       og-session-runtime task 13 a frame-locked client fed
+//                       it on its frame thread (the GT of
+//                       docs/ThreadingCrossings.md rows 9 and 10).
 //
-//   Physics thread (PT) — reads via: getTargetPredictionTick(), getLastAuthorityTick(),
-//                          getSmoothedRTT(), getSmoothedJitter(), getPredictionOffsetTicks()
+//   Frame-thread reader — the clock-dilation stage before the pump
+//                       (`clockDilation::beforeClientPump`) reads
+//                       getSmoothedRTT(), getSmoothedJitter(),
+//                       activeJitterMultiplier(), getLastAuthorityTick(),
+//                       getPredictionOffsetTicks() and the server-tick sensor
+//                       while the step's thread writes them: the crossing the
+//                       atomics synchronize.
+//
+//   Step-thread reader (PT) — reads via: hasFirstRTTSample(), then
+//                          getPredictionOffsetTicks() and getLastAuthorityTick(),
+//                          which the clock sums into its target (since P3-10
+//                          rework 1, in place of getTargetPredictionTick());
+//                          getMeasuredRTTSampleCount(), getLastAuthorityTick() and
+//                          getPredictionOffsetTicks() directly for the clock's re-centre.
 //                          Called inside ClientPredictionClock::advancePrediction().
+//                          The other accessors read the same members and are
+//                          safe from any thread.
 //
-// m_authorityTick is declared std::atomic<unsigned int> so that PT reads of
-// the server tick are always coherent, regardless of platform.
+// m_authorityTick, m_smoothedRTT, m_smoothedJitter, m_hasFirstSample,
+// m_measuredRTTSamples and (since P3-13, for the offset's per-source jitter
+// multiplier) m_activeRttSource are all std::atomic, with ONE writer (the step's thread) and
+// memory_order_relaxed on every access. Every cross-thread read is therefore correctly synchronized on every
+// platform — no data race, no torn value — not only on x86-64, where a relaxed
+// atomic compiles to the same plain load and store the old fields used.
 //
-// m_smoothedRTT and m_smoothedJitter are plain double.  On x86-64, naturally-
-// aligned 8-byte stores and loads are single-bus-cycle operations and cannot
-// tear.  This holds for MSVC/Clang on Windows x64 (UE's primary PT target).
-// If this class is ever ported to ARM or compiled with unaligned-access enabled,
-// wrap these fields in std::atomic<double> as well.
+// Each member is coherent on its own; the four are NOT a snapshot. A read
+// may combine values written by different writer calls (e.g. the first-sample
+// flag already true while the seed is not yet visible). The worst outcome is
+// one frame's offset computed from that mix (the floor, in the flag example),
+// superseded by the next read. That is accepted: the estimate is data.
+// The one reader that acts once on the flag, ClientPredictionClock's second
+// resync (P3-10), reads it once per advance and decides only on an advance
+// whose previous advance already read it true, so a mixed read is superseded
+// for it too (ThreadingCrossings.md row 10).
 //
-// m_hasFirstSample is written exactly once (GT, on the first updateRTT call)
-// and thereafter only read (PT).  On x86-64 this is safe; on weaker memory
-// models a one-time publish fence or atomic<bool> would be needed.
+// The static_assert on std::atomic<double> below replaces the old caveat
+// "if this class is ever ported to ARM ... wrap these fields in
+// std::atomic<double>": a platform without lock-free 8-byte atomics now
+// fails to compile instead of silently taking a lock on the step.
 // ============================================================
+
+// One SimClock ping/pong, in seconds: the RTT with the server's turnaround removed,
+// the NTP offset theta, and the four stamps (t0/t3 on the client's clock, t1/t2 on
+// the server's). og-sim names no og-sim-net type: og-sim-net builds this one from
+// the pong (simNetClock::sampleOf, SimNetClock.h).
+// Since og-time-dilation task 3 also the pong's server tick and that tick's age at
+// the pong's send (server seconds); a pong that carries no tick leaves kNoServerTick,
+// which the server-tick estimator ignores. The new fields stay last, so a positional
+// copy of the first six is unchanged.
+// Rationale: docs/TimeConfig-rationale.md §15.
+struct SimClockRttSample
+{
+    static constexpr uint32_t kNoServerTick = ServerTickEstimator::kNoServerTick;
+
+    double   rttSeconds           = 0.0;
+    double   thetaSeconds         = 0.0;
+    double   t0Seconds            = 0.0;
+    double   t1Seconds            = 0.0;
+    double   t2Seconds            = 0.0;
+    double   t3Seconds            = 0.0;
+    uint32_t serverTick           = kNoServerTick;
+    double   serverTickAgeSeconds = 0.0;
+};
+
+// The SimClock shadow, the [ClockSource.Window] line's reading. §15
+struct ClockSourceShadow
+{
+    unsigned int samples            = 0;    // valid SimClock samples so far
+    unsigned int invalidSamples     = 0;    // non-finite stamps or an RTT not above 0, ignored
+    double       simClockRttSeconds = 0.0;  // EMA of the SimClock RTT at rttSmoothingAlpha, no gate
+    double       offsetSeconds      = 0.0;  // theta of the minimum-RTT sample of the last kClockOffsetSamples
+    double       owdVarUpSeconds    = 0.0;  // RFC 3550 interarrival jitter of t1 - t0
+    double       owdVarDownSeconds  = 0.0;  // RFC 3550 interarrival jitter of t3 - t2
+};
+
 class NetworkTimeEstimator
 {
 public:
@@ -58,7 +122,7 @@ using LoggerFn = std::function<void(const char*)>;
     OGSIMULATION_API explicit NetworkTimeEstimator(const TimeConfig& config, LoggerFn logger);
 
     // -----------------------------------------------------------------------
-    // Mutators — called from the game thread (see the THREAD-SAFETY CONTRACT above)
+    // Mutators — called on the step's thread (see the THREAD-SAFETY CONTRACT above)
     // -----------------------------------------------------------------------
 
     // Feed a new raw RTT sample (seconds).  Updates smoothed RTT and jitter.
@@ -79,7 +143,40 @@ using LoggerFn = std::function<void(const char*)>;
     // network conditions — force a re-seed after
     // `rttOutlierConsecutiveLimit` of them, so the filter can always follow the
     // network. Full derivation at the gate in the implementation.
+    //
+    // A reading of exactly 0 before the first sample above 0 is VALID but does
+    // not seed: it latches nothing and moves nothing (one ping source reads 0
+    // before it has measured anything; og-input-latency P5-28). After a seed a
+    // 0 is an ordinary low reading.
     OGSIMULATION_API void updateRTT(double rawRTTSeconds);
+
+    // -----------------------------------------------------------------------
+    // The clock RTT source (og-input-latency P3-10; TimeConfig::clockRttSource).
+    // Same thread as updateRTT. Rationale: docs/TimeConfig-rationale.md §15.
+    //
+    // The active source starts as Engine. An engine reading reaches updateRTT
+    // only while Engine is active. A valid SimClock sample always feeds the
+    // shadow; with clockRttSource == SimClock the first one switches the active
+    // source (noteRttSourceChanged) and from then on every one reaches updateRTT.
+    // -----------------------------------------------------------------------
+    OGSIMULATION_API void noteEngineRttSample(double rawRTTSeconds);
+    OGSIMULATION_API void noteSimClockSample(const SimClockRttSample& sample);
+
+    // The next sample is the new source's first. NEVER a reset: the estimate,
+    // the first-sample flag and the counts stay. That sample moves the RTT EMA
+    // but not the jitter EMA, and if it reads above the estimate (and under the
+    // cold-start ceiling) the plausibility gate is re-based on it, so a step up
+    // does not run into the escape hatch's re-seed. A no-op before the first seed.
+    OGSIMULATION_API void noteRttSourceChanged();
+
+    OGSIMULATION_API TimeConfig::ClockRttSource getActiveRttSource() const;
+
+    // The SimClock shadow. Read it on the writer's thread (plain members).
+    OGSIMULATION_API ClockSourceShadow getClockSourceShadow() const;
+
+    // NTP's clock-filter register (RFC 5905 §10): the offset is the minimum-RTT
+    // sample's theta among this many.
+    static constexpr unsigned int kClockOffsetSamples = 8u;
 
     // Store the latest tick received from the server.
     OGSIMULATION_API void recordAuthorityTick(unsigned int serverTick);
@@ -88,14 +185,16 @@ using LoggerFn = std::function<void(const char*)>;
     // Accessors — called by ClientPredictionClock / SimulationManager
     // -----------------------------------------------------------------------
 
-    // authorityTick + ceil((smoothedRTT + jitterMultiplier * smoothedJitter) * tickFrequency)
+    // authorityTick + ceil((smoothedRTT + m * smoothedJitter) * tickFrequency), m the active
+    // source's multiplier: jitterMultiplier (Engine) or simClockJitterMultiplier (SimClock).
     OGSIMULATION_API unsigned int  getTargetPredictionTick()  const;
 
     OGSIMULATION_API unsigned int  getLastAuthorityTick()     const;
     OGSIMULATION_API double        getSmoothedRTT()           const;
     OGSIMULATION_API double        getSmoothedJitter()        const;
 
-    // Has any VALID RTT sample ever landed? False means the offset accessors
+    // Has any VALID RTT sample above 0 ever landed (a 0 does not seed, P5-28;
+    // an outlier escape's re-seed counts)? False means the offset accessors
     // are reporting the configured floor and nothing else — the distinction
     // that the pre-T21 silent-zero defect erased. (T21.)
     //
@@ -117,7 +216,7 @@ using LoggerFn = std::function<void(const char*)>;
     // counts samples the ENGINE said do not exist: these are well-formed
     // readings the ESTIMATOR judged to be frame-hitch artifacts. Keeping the two
     // separate is what lets a PIE trace tell "the ping source is broken" from
-    // "the game thread is hitching".
+    // "the host's frame is hitching".
     OGSIMULATION_API unsigned int  getOutlierRejectedSampleCount() const;
 
     // How many times the outlier gate's escape hatch fired — i.e. how many times
@@ -129,6 +228,24 @@ using LoggerFn = std::function<void(const char*)>;
 
     // Number of ticks added on top of authorityTick to form the target.
     OGSIMULATION_API unsigned int  getPredictionOffsetTicks() const;
+
+    // Running total of MEASURED samples: past updateRTT's validity gate (plausible
+    // or not) and above 0. A 0 reading is counted out because it carries no
+    // measurement: one adapter's ping source (an averaged RoundTrip) reads 0 until
+    // its first averaging bucket fills, about a second into the connection.
+    // ClientPredictionClock reads it on the PT to count its re-centre's settle
+    // window (og-input-latency task 27).
+    OGSIMULATION_API unsigned int  getMeasuredRTTSampleCount() const;
+
+    // The multiplier getPredictionOffsetTicks applies to the smoothed jitter: the
+    // active RTT source's (jitterMultiplier or simClockJitterMultiplier). §17
+    OGSIMULATION_API double        activeJitterMultiplier() const;
+
+    // The server-tick estimate (og-time-dilation task 3), fed every valid SimClock
+    // sample at either source, after updateRTT. Its accessors read relaxed atomics:
+    // safe from the owner thread like the PT accessors above. §15,
+    // docs/ServerTickEstimator-rationale.md
+    OGSIMULATION_API const ServerTickEstimator& serverTickEstimator() const;
 
 private:
     // True when `rawRTTSeconds` is plausible given the current estimate. Cold
@@ -143,10 +260,16 @@ private:
 
     const TimeConfig& m_config;
 
-    std::atomic<unsigned int> m_authorityTick{0}; // GT writes, PT reads — explicit atomic
-    double m_smoothedRTT          = 0.0;
-    double m_smoothedJitter       = 0.0;
-    bool   m_hasFirstSample       = false;
+    static_assert(std::atomic<double>::is_always_lock_free,
+        "NetworkTimeEstimator: needs lock-free double atomics for its GT->PT estimate. Was the "
+        "THREAD-SAFETY CONTRACT's ARM caveat: 'if ported to ARM, wrap these fields in std::atomic<double>'");
+
+    // GT writes, PT reads — relaxed atomics, one writer (see the contract above).
+    std::atomic<unsigned int> m_authorityTick{0};
+    std::atomic<double>       m_smoothedRTT{0.0};
+    std::atomic<double>       m_smoothedJitter{0.0};
+    std::atomic<bool>         m_hasFirstSample{false};
+    std::atomic<unsigned int> m_measuredRTTSamples{0};
 
     // T21 validity-gate bookkeeping. GT-only, like every other non-atomic
     // member here: both are touched exclusively inside updateRTT (a GT writer
@@ -167,7 +290,41 @@ private:
     unsigned int m_outlierWindowRejects   = 0; // rejections in the current window
     unsigned int m_outlierWindowEscapes   = 0; // escapes in the current window
 
+    // P3-10 source-switch bookkeeping, writer-thread only like the counters above,
+    // except the active source: since P3-13 the offset reads it (each source has its
+    // own jitter multiplier), so it is a relaxed atomic with the estimate's one writer.
+    std::atomic<TimeConfig::ClockRttSource> m_activeRttSource{TimeConfig::ClockRttSource::Engine};
+    static_assert(std::atomic<TimeConfig::ClockRttSource>::is_always_lock_free,
+        "NetworkTimeEstimator: the offset reads the active RTT source on the PT (P3-13), so it must be a lock-free atomic.");
+    bool         m_rttSourceChangePending = false; // the next sample is the new source's first
+    bool         m_skipNextJitterUpdate   = false; // that sample's distance is the bias step, not jitter
+    double       m_gateRebaseRTTSeconds   = 0.0;   // 0 = not re-based; else the gate's reference floor
+    unsigned int m_gateRebaseSamplesLeft  = 0;     // the re-base lapses after rttOutlierConsecutiveLimit samples
+
+    // P3-10 SimClock shadow, writer-thread only.
+    struct ShadowOffsetSample
+    {
+        double rttSeconds;
+        double thetaSeconds;
+    };
+    ClockSourceShadow m_shadow;
+    ShadowOffsetSample m_shadowOffsetRing[kClockOffsetSamples] = {};
+    unsigned int      m_shadowOffsetNext   = 0;
+    double            m_shadowLastUpTransit   = 0.0;
+    double            m_shadowLastDownTransit = 0.0;
+
+    // og-time-dilation task 3: one writer, noteSimClockSample; default config with
+    // this estimator's tickFrequency. docs/ServerTickEstimator-rationale.md
+    ServerTickEstimator m_serverTickEstimator;
+
     LoggerFn m_logger;
+
+    // P3-10 rework 1: a reader's view of a GT write landing mid-read. Empty in shipped
+    // code: only this friend sets it, and it is declared here and defined ONLY in
+    // og-simulation-tests (the LocalInputCacheTearProbe pattern), so it adds no surface
+    // a consumer can call. hasFirstRTTSample() runs it after its load. ThreadingCrossings.md row 10.
+    friend struct NetworkTimeEstimatorReadProbe;
+    std::function<void()> m_afterFirstSampleLoad;
 };
 
 OGSIM_OPTIMIZE_ON

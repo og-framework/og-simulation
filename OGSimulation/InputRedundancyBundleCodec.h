@@ -4,11 +4,12 @@
 // ---------------------------------------------------------------------------
 // InputRedundancyBundleCodec
 //
-// Engine-agnostic byte-codec for the FInputRedundancyBundle wire payload
+// Engine-agnostic byte-codec for the input redundancy bundle's wire payload
 // (proposal §3.1 step 8; R-T5 immutability invariant; risks_and_plan.md §5.2).
 //
-// The unreliable + redundancy input channel re-sends the last
-// `redundancyDepthTicks` ticks of input every frame so a dropped UDP datagram
+// The unreliable + redundancy input channel re-sends the last few ticks of
+// input every frame (`redundancyDepthTicks` at `redundancyFrames = 0`, else
+// SimulationNetSync::redundancySlots) so a dropped UDP datagram
 // self-heals on the next send (the R-T1 streeting-saturation mitigation). The
 // bundle on the wire is a length-prefixed byte blob:
 //
@@ -19,23 +20,21 @@
 //
 // WHY THIS LIVES IN CORE: the bundle's append/dedup/iteration logic is
 // pure byte manipulation over the og-simulation serialization free functions —
-// it has no Unreal dependency. The UE-side wrapper FInputRedundancyBundle
-// (Plugins/OGSimulation/Source/OGSimulationUnreal/SyncedSimulationStateBuffer.h) is a USTRUCT that
-// owns a UPROPERTY TArray<uint8> for replication and *delegates* every operation
-// to the templates here. Hoisting the algorithm into core lets the pure-C++
-// Low-Level-Tests exercise the REAL code path (WireFormat_Bundle.cpp) without
-// linking the engine-coupled OGSimulationUnreal module. The UE-only parts of the
-// wire format (custom NetSerialize watermark trim on the correction/input sync
-// buffers) are not codified here and their regression tests are deferred to a
-// future engine-coupled LLT target — see docs/low-level-tests.md
-// "Future: testing UE-coupled code".
+// it has no Unreal dependency. The production buffer is og-simulation's own
+// InputBundleBuffer (Network/SimPayloadBuffers.h): og-sim-net's channel fills and
+// sends it (SimNetChannel::sendLocalInputToAuthority) and its server decodes it, and
+// it *delegates* every operation to the templates here. Until og-input-latency task
+// P5-9 deleted it, the buffer was the UE-side wrapper FInputRedundancyBundle, a USTRUCT
+// that owned a UPROPERTY TArray<uint8> for replication, with its own NetSerialize.
+// Hoisting the algorithm into core lets the pure-C++ Low-Level-Tests exercise the
+// REAL code path (WireFormat_Bundle.cpp) without an engine.
 //
 // BUFFER CONCEPT: every template below operates on a `Buffer` that exposes
 //   - std::int32_t bundleByteNum() const;                  // current byte count
 //   - void          bundleAddZeroedBytes(std::int32_t n);  // grow by n zeroed bytes
 //   - template <typename T> void writeToBuffer(std::uint32_t off, const T& v);
 //   - template <typename T> T    readFromBuffer(std::uint32_t off) const;
-// FInputRedundancyBundle (the adapter's array-backed payload) and the test buffer
+// InputBundleBuffer (the fixed-array production payload) and the test buffer
 // (std::vector-backed) both satisfy this. The per-slot input serialization reuses
 // the same field-wise machinery as the state-sync buffers (SimulationSerialization.h
 // / SimulationComposite.h): the serialized size of one slot's input is a
@@ -44,7 +43,7 @@
 //   - plain Serializable InputType -> syncSize<InputType>()
 //   - SimulationComposite<Ts...>   -> compositeSyncSize<Ts...>()
 //
-// INVARIANT (R-T5 / D3.11): inputs written into FInputRedundancyBundle are
+// INVARIANT (R-T5 / D3.11): inputs written into a redundancy bundle are
 // append-only and immutable per capture-tick. The client MUST NOT revise the
 // input value for a previously-emitted capture-tick; any producer that does so
 // silently loses the corrected value at the dedup-by-capture-tick step on the
@@ -71,8 +70,12 @@
 // drops an append that would exceed kMaxSlots in every build config, and
 // appendSlot() keeps its OG_CHECK in front so a checked build still aborts
 // loudly at the offending producer. Note this is DEFENCE IN DEPTH, not a live
-// bug fix: the sole production caller (buildRedundancyBundle) already clamps
-// depth to min(redundancyDepthTicks, kMaxSlots), so an overflow is unreachable
+// bug fix: the sole production caller (og-sim-net's
+// SimNetChannel::sendLocalInputToAuthority, through InputBundleBuffer::appendSlot;
+// the Unreal buildRedundancyBundle until og-input-latency task P5-8 deleted it)
+// already clamps the slot count it is handed to kMaxSlots — that count is
+// SimulationNetSync::redundancySlots, which is redundancyDepthTicks at
+// redundancyFrames = 0 — so an overflow is unreachable
 // through the current call graph. The kernel bound exists so a future caller
 // that skips the clamp — or a rewritten client driving the codec directly —
 // cannot emit an over-budget bundle in a shipping build, where an unguarded
@@ -100,7 +103,8 @@ namespace inputRedundancyBundle
 	// in that frame); flip U left it at 2.
 	inline constexpr std::uint8_t  kWireFormatVersion = 3;
 	// Hard upper bound on slots for wire safety; the runtime depth is
-	// min(TimeConfig::redundancyDepthTicks, kMaxSlots).
+	// min(SimulationNetSync::redundancySlots, kMaxSlots), which is
+	// min(TimeConfig::redundancyDepthTicks, kMaxSlots) at redundancyFrames = 0.
 	inline constexpr std::uint8_t  kMaxSlots          = 8;
 
 	// Wire-payload header layout.
@@ -269,7 +273,7 @@ namespace inputRedundancyBundle
 		OG_CHECK(!containsCaptureTick<InputType>(buf, captureTick),
 			"R-T5 invariant violation: cannot revise already-sent capture_tick");
 		OG_CHECK(!isFull(buf),
-			"FInputRedundancyBundle overflow: slot_count would exceed kMaxSlots");
+			"Input redundancy bundle overflow: slot_count would exceed kMaxSlots");
 
 		// Shipping path: the OG_CHECKs above are no-ops, so the kernel's silent
 		// drops are what keep an already-emitted capture tick immutable and the
